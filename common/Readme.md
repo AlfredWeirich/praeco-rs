@@ -7,6 +7,10 @@ It is designed to be a central repository for reusable components such as:
 - **JWT Validation Structures**: Shared token claims and parsing helpers.
 - **Security Primitives**: Core structures used for authentication and authorization.
 
+*(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
+
+> **Note:** This crate is part of the [praeco-rs](https://github.com/AlfredWeirich/praeco-rs) project — an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. Check out the main repository to see how all the pieces fit together!
+
 ## Usage
 
 This crate is primarily intended to be consumed by other `praeco-*` crates (like `praeco-rs` and `praeco-client`), but can be used standalone if you need a highly optimized HTTP/2 or HTTP/3 compatible Hyper client.

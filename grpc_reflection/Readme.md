@@ -4,6 +4,10 @@
 
 This crate enables the unique **JSON Transcoding** feature of the gateway. It allows the proxy to act as a bridge between modern REST/JSON clients (like web browsers or standard HTTP tools) and binary gRPC backend services.
 
+*(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
+
+> **Note:** This crate is part of the [praeco-rs](https://github.com/AlfredWeirich/praeco-rs) project — an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. Check out the main repository to see how all the pieces fit together!
+
 ## How it works
 
 1. **Schema Discovery**: Connects to upstream gRPC servers and uses gRPC Server Reflection to download the protobuf schemas on-the-fly.

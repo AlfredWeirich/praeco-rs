@@ -2,6 +2,10 @@
 
 **praeco-jwt-creator** is a developer utility designed to generate valid JSON Web Tokens (JWT) for testing the authentication layer of `praeco-rs`.
 
+*(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
+
+> **Note:** This crate is part of the [praeco-rs](https://github.com/AlfredWeirich/praeco-rs) project — an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. Check out the main repository to see how all the pieces fit together!
+
 ## Features
 
 - Easily generate signed JWTs using local private keys.
