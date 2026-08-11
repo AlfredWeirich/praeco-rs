@@ -1,0 +1,40 @@
+[package]
+name = "praeco-reflection"
+version = "0.4.0"
+edition = "2024"
+description = "gRPC reflection proxy logic for praeco-rs"
+license = "MIT OR Apache-2.0"
+authors = ["Alfred Weirich"]
+repository = "https://github.com/AlfredWeirich/praeco-rs"
+
+[[bin]]
+name = "grpc_server"
+path = "src/grpc_server.rs"
+
+
+[[bin]]
+name = "grpc_router"
+path = "src/router.rs"
+
+[[bin]]
+name = "static_client"
+path = "src/static_client.rs"
+
+[dependencies]
+clap = { version = "4.5.40", features = ["derive"] }
+tokio = { version = "1.0", features = ["full"] }
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+hyper = { version = "1.4", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.0"
+tokio-stream = "0.1.18"
+tonic-reflection = { version = "0.12.3", features = ["server"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+[build-dependencies]
+tonic-build = "0.12"

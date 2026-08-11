@@ -1,0 +1,140 @@
+
+# praeco-rs - Enterprise Zero-Trust API Gateway: the European sovereign proxy
+
+`praeco-rs` is an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. It is built on top of the Tokio async runtime, Hyper v1, Tower, and Rustls.
+
+Designed for zero-trust enterprise environments, it provides deep mTLS integration, declarative middleware pipelines, dynamic JSON-to-gRPC transcoding (acting as a REST-to-gRPC Gateway), and zero-downtime hot-reloading.
+
+---
+
+## 1. Features
+
+| Feature | `praeco-rs` | Pingora (Cloudflare) | Sōzu |
+| :--- | :--- | :--- | :--- |
+| **Primary Architecture** | Tokio, Hyper v1, Tower, Rustls | Custom Async Runtime & State Machine | Custom Event Loop (Mio) |
+| **HTTP Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC) | HTTP/1.1, HTTP/2 (H3 in progress) | HTTP/1.1, HTTP/2 |
+| **Security & Auth** | Deep mTLS OID-extraction (RBAC), JWT | Pluggable, but requires custom code | Standard TLS, SNI routing |
+| **gRPC Support** | **Full (with JSON Transcoding via Reflection)** | Basic Proxying | Basic Proxying |
+| **Observability** | Native OpenTelemetry (OTLP) Tracing | Pluggable via Rust code | Pluggable via Rust code |
+| **Middleware Model** | Declarative `tower::Service` stack via TOML | Callbacks / Traits on Session | Custom Filters |
+| **WAF / Inspection** | Built-in Regex Path/Query Allow-Listing | Pluggable / Scriptable | Custom Filters |
+| **Configuration** | Hot-Reloadable (SIGHUP + ArcSwap) | Programmable (in Rust) | Dynamic (Zero-Downtime Hot-Reload) |
+| **Load Balancing** | Advanced (RoundRobin, LeastConn, Sticky, Random, HighestScore) | Advanced (Consistent Hash, Least Conn) | Advanced |
+
+---
+
+## 2. Advantages of `praeco-rs`
+
+> [!TIP]
+> **Why choose `praeco-rs`?** It shines in highly secure, zero-trust enterprise environments where gRPC interoperability, advanced load distribution, and strict rate control are primary requirements.
+
+- **Declarative Middleware Pipeline**: The entire middleware stack (Timeout, Concurrency Limits, Rate Limiting, Compression, CORS, OTLP Tracing) can be configured, reordered, and toggled on/off in `Config.toml` in seconds, **without writing or recompiling any Rust code**.
+- **Native OpenTelemetry (OTLP) Integration**: `praeco-rs` integrates directly with the `tracing` and `opentelemetry` ecosystem, allowing you to export distributed traces directly to Jaeger, Zipkin, or Datadog via standard OTLP right out of the box.
+- **Lightweight WAF (Inspection Layer)**: Includes a highly optimized Regex-based inspection middleware that validates the `(method, path, query)` against a configured allow-list. It operates with zero heap allocations on the happy path, dropping malicious requests before they consume downstream resources.
+- **Out-of-the-box REST to gRPC Gateway**: Unlike Pingora or Sōzu, `praeco-rs` can dynamically reflect backend gRPC schemas and translate incoming REST/JSON requests into binary Protobuf on the fly (JSON-to-gRPC transcoding). This eliminates the need for separate sidecars like Envoy for transcoding.
+- **Bespoke Zero-Trust RBAC via Custom OIDs**: The proxy natively extracts custom Object Identifiers (OIDs) directly from mTLS client certificates (or JWTs) and maps them to internal `UserRole`s (e.g., Admin, Operator). 
+  * **Upstream Protection**: This allows you to define route-level permissions (`allowed_roles = ["Admin"]`) in the config. The proxy acts as a strict Policy Enforcement Point (PEP). Malicious or unauthorized requests are rejected at the edge with a 403, **shielding your upstream servers** from ever needing to implement complex certificate parsing or role-validation logic themselves.
+  * **Identity Forwarding**: If the upstream server needs to know who the caller is (e.g., for detailed logs or resource-based authorization), the proxy can forward the extracted roles (from the OID), the SAN, or even the entire client certificate as secure HTTP headers (`client_cert_forwarding`) to the upstream.
+- **Advanced Upstream Management**: Built-in support for multiple load-balancing strategies (`RoundRobin`, `Random`, `LeastConnections`, `Sticky`, `HighestScore`) combined with **Active Health Checking** ensures traffic is only routed to healthy nodes.
+- **Built-in Rate Limiting & Traffic Shaping**: Includes flexible token-bucket/window rate limiting strategies, global concurrency limits, and request timeouts to prevent abuse and cascaded failures, right out of the box.
+- **Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload the `Config.toml` and rebuild its routing tables on the fly using `ArcSwap`, without dropping active connections.
+- **End-to-End mTLS Bridging**: In addition to mTLS termination at the gateway, the proxy can establish a completely **new mTLS connection to the upstream servers** (including its own client certificate). This guarantees a fully encrypted and authenticated zero-trust chain deep into the internal backend.
+- **HTTP/3 Native**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3`, providing better performance on unreliable networks.
+
+---
+
+## 3. Disadvantages of `praeco-rs`
+
+> [!WARNING]
+> **Where it falls short**: `praeco-rs` is an incredibly feature-rich API Gateway, but differs from edge-tier CDNs in a few specific areas.
+
+- **No Native Caching Layer**: Unlike Pingora, which is designed to replace Nginx as an edge cache, `praeco-rs` acts strictly as an API Gateway and auth bridge. It does not cache HTTP responses.
+- **Community & Maturity**: Pingora is backed by Cloudflare processing trillions of requests. `praeco-rs` is currently a bespoke, highly specialized enterprise solution. While its core leverages production-ready crates (`hyper`, `tower`), the proxy itself lacks the widespread community testing of older proxies.
+
+---
+
+## 4. Open Points & Roadmap
+
+To elevate `praeco-rs` even further, the following points remain on the roadmap:
+
+### 1. Distributed Caching
+Implementing an HTTP response caching layer (e.g., using Redis) for specific routes to reduce backend load, similar to what Pingora offers out of the box for CDN use-cases.
+
+### 2. Flawless Trace Propagation (Tracing Polish)
+OpenTelemetry is already built-in. However, if the proxy translates an incoming JSON/REST request into a gRPC request on-the-fly, it must be absolutely ensured that the unique Request ID (Trace ID) is never lost. This is the only way tools like Jaeger can exactly map an error in the backend to the original REST request of the client. This requires more in-depth testing in complex edge cases.
+
+### 3. Circuit Breaking
+Currently, the proxy regularly checks in the background (Health Checks) whether a backend is still alive. If it is dead, no more traffic is sent there.
+A **Circuit Breaker** would go one step further: If a backend suddenly becomes extremely slow or throws errors (even though the last health check was still "OK"), the circuit "trips" immediately. The proxy instantly blocks further traffic to this node to prevent a complete traffic jam in the system (Cascading Failure).
+
+### 4. Pluggable End-Services (Beyond Routing)
+Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying) or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
+- **Static File Server**: Serving SPAs (React/Vue) directly from a local directory alongside API routes.
+- **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
+- **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
+- **Auth Provider / Token Service (IdP)**: Taking advantage of the proxy's mTLS validation capabilities to act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use.
+- **Aggregator / Fan-Out Service**: Accepting a single client request and internally fanning it out to multiple backend microservices, assembling their JSON responses into a single cohesive payload before returning it to the client.
+
+---
+
+## Usage / Quick Start
+
+`praeco-rs` is entirely driven by its declarative configuration file. 
+Here is a **minimal example** of a `Config.toml` that sets up a simple reverse proxy with logging and compression:
+
+```toml
+# Config.toml
+enable_opentelemetry = false
+pki_base_oid = "1.3.6.1.4.1.65111"
+
+[[Server]]
+name = "api_gateway"
+ip = "0.0.0.0"
+port = 1336
+protocol = "http"
+authentication = "None"
+service = "Router"
+enabled = true
+
+[Server.ReverseRoutes."/api/"]
+upstreams = ["http://127.0.0.1:8080"]
+backend_type = "rest"
+
+[Server.Layers]
+enabled = ["Logger", "Compression", "ConcurrencyLimit"]
+
+[Server.Layers.ConcurrencyLimit]
+max_requests = 1000
+```
+
+> **Full Configuration Reference:**
+> The proxy offers extensive settings for mTLS, RBAC OIDs, JSON-to-gRPC transcoding, and rate limiting. 
+> **See the [Config.md](Config.md) file for a complete documentation of all available parameters.**
+
+### Installation & Running
+
+**Option 1: Install via Cargo (Recommended)**
+If you just want to run the proxy, you can install the pre-compiled executable directly from GitHub. Cargo will automatically download the source and compile it in release mode:
+
+```bash
+cargo install --git https://github.com/AlfredWeirich/praeco-rs.git
+```
+
+Then start the proxy by simply calling the executable (it looks for `Config.toml` in the current directory, or you can pass the path):
+
+```bash
+praeco-rs
+# OR with a specific config:
+praeco-rs /path/to/your/Config.toml
+```
+
+**Option 2: Run from Source (Development)**
+If you cloned the repository and want to run it directly from the source code:
+
+```bash
+cargo run -p praeco-rs --release
+# OR using the provided start script:
+./start_server.sh
+```
+
+By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process.
