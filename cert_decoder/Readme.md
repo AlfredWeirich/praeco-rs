@@ -4,6 +4,10 @@
 
 In the `praeco-rs` ecosystem, this tool is essential for the zero-trust RBAC (Role-Based Access Control) architecture. It allows the proxy to parse client certificates during the mTLS handshake and extract custom enterprise OIDs (Object Identifiers). These OIDs are then mapped to specific user roles dynamically.
 
+*(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
+
+> **Note:** This crate is part of the [praeco-rs](https://github.com/AlfredWeirich/praeco-rs) project — an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. Check out the main repository to see how all the pieces fit together!
+
 ## Features
 
 - Parse PEM-encoded X.509 certificates.
