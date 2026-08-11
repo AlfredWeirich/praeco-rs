@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package system;
+
+// ----------------------------------------------------
+// 1. Identity Service
+// ----------------------------------------------------
+service IdentityService {
+  rpc Login (LoginRequest) returns (AuthTokenResponse);
+}
+
+message LoginRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message AuthTokenResponse {
+  string token = 1;
+  int64 expires_in_seconds = 2;
+}
+
+// ----------------------------------------------------
+// 2. System Metrics
+// ----------------------------------------------------
+service SystemMetrics {
+  rpc GetSystemStatus (MetricsQuery) returns (HealthStatus);
+  rpc health (HealthQuery) returns (HealthScore);
+}
+
+message HealthQuery {}
+
+message MetricsQuery {
+  bool include_cpu = 1;
+  bool include_memory = 2;
+}
+
+message HealthScore {
+  uint32 score = 1; // 0 to 100
+}
+
+message HealthStatus {
+  string status = 1;
+  double cpu_usage_percent = 2;
+  double memory_usage_mb = 3;
+  int64 uptime_seconds = 4;
+}
+
+// ----------------------------------------------------
+// 3. Stateful Store Service
+// ----------------------------------------------------
+service StoreService {
+  rpc StoreData (StoreRequest) returns (StoreResponse);
+  rpc RetrieveData (RetrieveRequest) returns (RetrieveResponse);
+}
+
+message StoreRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message StoreResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RetrieveRequest {
+  string key = 1;
+}
+
+message RetrieveResponse {
+  bool found = 1;
+  string value = 2;
+}

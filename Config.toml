@@ -1,0 +1,31 @@
+###############################################################################
+# GLOBAL SYSTEM SETTINGS
+# These settings affect the overall performance and base identity of the gateway.
+###############################################################################
+
+# The number of worker threads for the Tokio async runtime.
+# Default: (Available CPU Cores * 2). 
+# Manual override is useful for high-performance tuning on dedicated hardware.
+# tokio_threads = 32
+
+# Enable or disable background OpenTelemetry Tracing (Jaeger)
+enable_opentelemetry = true
+jaeger_endpoint = "http://localhost:4317"
+otel_log_level = "info"
+
+# The Base Object Identifier (OID) used for security validation.
+# This acts as the root for interpreting client certificate extensions and JWT claims.
+# Private Enterprise Number (PEN)
+pki_base_oid = "1.3.6.1.4.1.65111"
+
+# Directory path for persistent log files.
+# If commented out or omitted, the application will only log to Standard Output (stdout).
+# log_dir = "log"
+
+###############################################################################
+# SERVER INSTANCE DEFINITIONS
+# Server definitions have been moved to the conf.d/ directory.
+# The proxy will automatically merge all [[Server]] blocks found there.
+###############################################################################
+
+includes = ["/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/proxy_conf.d/*.toml"]
