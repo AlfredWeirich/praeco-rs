@@ -3,6 +3,8 @@
 
 `praeco-rs` is an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. It is built on top of the Tokio async runtime, Hyper v1, Tower, and Rustls.
 
+*(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
+
 Designed for zero-trust enterprise environments, it provides deep mTLS integration, declarative middleware pipelines, dynamic JSON-to-gRPC transcoding (acting as a REST-to-gRPC Gateway), and zero-downtime hot-reloading.
 
 ---
