@@ -8,69 +8,75 @@ authors = ["Alfred Weirich"]
 repository = "https://github.com/AlfredWeirich/praeco-rs"
 
 [dependencies]
+# --- Core ---
 anyhow = "1.0.98"
-asn1-rs = { version = "0.7.1", features = ["bigint"] }
-async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
+thiserror = "2.0.12"
 bytes = "1.10.1"
-common = { package = "praeco-common", version = "0.4.0", path = "../common" }
 futures = "0.3.30"
 futures-util = "0.3"
-#h3 = "0.0.8"
-#h3-quinn = "0.0.8"
-http-body = "1.0.1"
-http-body-util = "0.1.3"
+pin-project = "1.1.10"
+common = { package = "praeco-common", version = "0.4.0", path = "../common" }
+
+# --- Async Runtime (Tokio) ---
+tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+tokio-stream = "0.1.18"
+tokio-rustls = "0.26.2"
+# Optional dependencies for tokio-console (uncomment to debug):
+# tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "tracing"] }
+# console-subscriber = "0.4.1"
+
+# --- HTTP & Networking (Hyper, Tower) ---
 hyper = { version = "1.6.0", features = ["http1", "server", "http2", "client"] }
 hyper-util = { version = "0.1.11", features = ["tokio", "server-auto", "service", "client-legacy", "http1", "http2"] }
-jsonwebtoken = "9.3.1"
-local-ip-address = "0.6.5"
+http-body = "1.0.1"
+http-body-util = "0.1.3"
+tower = { version = "0.4.13", features = ["util", "make", "limit"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
 matchit = "0.9.1"
-num_cpus = "1.17.0"
-pem = "3.0.6"
-pin-project = "1.1.10"
+local-ip-address = "0.6.5"
+urlencoding = "2.1"
+
+# --- HTTP/3 & QUIC (Requires git master for Quinn 0.11 support) ---
 quinn = { version = "0.11", features = ["rustls"] }
-regex = "1.11.1"
+h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
+
+# --- TLS, Cryptography & Auth ---
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pki-types = "1.12.0"
-serde = { version = "1.0.207", features = ["derive"] }
-thiserror = "2.0.12"
-# for tokio console
-# tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "tracing"] }
-tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread", "signal"] }
-tokio-rustls = "0.26.2"
-tokio-util = { version = "0.7", features = ["io", "codec"] }
-toml = "0.8.23"
-tower = { version = "0.4.13", features = ["util", "make", "limit"] }
+pem = "3.0.6"
+x509-parser = "0.18.0"
+asn1-rs = { version = "0.7.1", features = ["bigint"] }
+jsonwebtoken = "9.3.1"
+
+# --- OpenTelemetry, Tracing & Logging ---
 tracing = "0.1.41"
-urlencoding = "2.1"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-x509-parser = "0.18.0"
-mimalloc = { version = "*", features = ["v3"] }
-tower-http = { version = "0.5.2", features = ["cors", "trace"] }
 opentelemetry = { version = "0.24", features = ["trace"] }
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
 opentelemetry-http = "0.13"
 tracing-opentelemetry = "0.25"
 
-
-# Optional/Disabled dependencies
-# console-subscriber = "0.4.1" # for tokio console only
-# rustls-native-certs = "0.8.3"
-# rustls-pemfile = "2.2.0"
-glob = "0.3"
-
-# HTTP/3: We MUST use git master for Quinn 0.11 support
-h3 = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
-h3-quinn = { git = "https://github.com/hyperium/h3", rev = "704b37a2e82cf4c8de379ec779dbc2a23bfcb9a1" }
-arc-swap = "1.8.2"
-fastrand = "2.3.0"
+# --- gRPC (Tonic & Prost) ---
 tonic = { version = "0.12", features = ["channel", "tls", "tls-roots", "tls-webpki-roots"] }
+tonic-reflection = { version = "0.12.3", features = ["server"] }
 prost = "0.13"
 prost-reflect = { version = "0.14", features = ["serde", "serde1"] }
+
+# --- Serialization & Utilities ---
+serde = { version = "1.0.207", features = ["derive"] }
 serde_json = "1.0"
-tokio-stream = "0.1.18"
-tonic-reflection = { version = "0.12.3", features = ["server"] }
+toml = "0.8.23"
+regex = "1.11.1"
+glob = "0.3"
+arc-swap = "1.8.2"
+fastrand = "2.3.0"
+num_cpus = "1.17.0"
+mimalloc = { version = "*", features = ["v3"] }
 
 [[bin]]
 name = "praeco-rs"
