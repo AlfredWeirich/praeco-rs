@@ -144,3 +144,234 @@ cargo run -p praeco-rs --release
 ```
 
 By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process.
+
+
+### Attachment:
+Here is a **FULL example** of a `Config.toml` from a productiove system:
+
+```toml
+###############################################################################
+# GLOBAL SYSTEM SETTINGS
+# These settings affect the overall performance and base identity of the gateway.
+###############################################################################
+
+# The number of worker threads for the Tokio async runtime.
+# Default: (Available CPU Cores * 2). 
+# Manual override is useful for high-performance tuning on dedicated hardware.
+tokio_threads = 50
+
+# Enable or disable background OpenTelemetry Tracing (Jaeger)
+# If false, TraceLayer is silently skipped and no background export tasks are started.
+enable_opentelemetry = true
+jaeger_endpoint = "http://localhost:4317"
+otel_log_level = "info"
+
+# The Base Object Identifier (OID) used for security validation.
+# This acts as the root for interpreting client certificate extensions and JWT claims.
+# Private Enterprise Number (PEN)
+pki_base_oid = "1.3.6.1.4.1.65111"
+
+# Automatically include all server configurations from the apps.d directory
+includes = ["./apps.d/*.toml"]
+
+# Directory path for persistent log files.
+# If commented out or omitted, the application will only log to Standard Output (stdout).
+log_dir = "log"
+
+# =============================================================================
+# XYZ_APP CONFIGURATION
+# This file contains all server instances required for the XYZ_APP backend.
+# =============================================================================
+
+[[Server]]
+# =============================================================================
+# Main API Gateway (Internal - mTLS Required)
+# =============================================================================
+    name = "server_name" 
+    ip = "0.0.0.0"
+    port = 1336
+    enabled = true
+    protocol = "https"
+    authentication = "ClientCert"
+    service = "Router"
+
+    [Server.Layers]
+    enabled = ["Decompression", "MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.Decompression]
+    max_decompressed_bytes = 10485760  # 10 MB limit
+
+    [Server.server_certs]
+    ssl_certificate = "PATH_TO_CERT/fullchain12.pem"
+    ssl_certificate_key = "PATH_TO_CERT/privkey12.pem"
+
+    [[Server.client_certs]]
+    ssl_client_ca = "PATH_TO_CERT/ca.pem"
+    ssl_client_crl = "PATH_TO_CERT/ca.crl.pem"
+
+    [Server.client_cert_forwarding]
+    header_cert = "x-client-cert"
+    header_san = "x-client-san"
+
+    [Server.Layers.ConcurrencyLimit]
+    max_concurrent_requests = 10000
+
+    [Server.Layers.MaxPayload]
+    max_bytes = 10485760 # 10 MB Limit
+
+    [Server.AllowedPathes.POST]
+    "/ENDPOINT.ABC_Service/GetConversations" = ["^/ENDPOINT\\.ABC_Service/GetConversations$"]
+    "/ENDPOINT.ABC_Service/GetMessages" = ["^/ENDPOINT\\.ABC_Service/GetMessages$"]
+   ...
+    "/ENDPOINT.ABC_Service/UpdateMemberRole" = ["^/ENDPOINT\\.ABC_Service/UpdateMemberRole$"]
+    "/ENDPOINT.ABC_Service/GetOrders" = ["^/ENDPOINT\\.ABC_Service/GetOrders$"]
+    "/ENDPOINT.ABC_Service/UpdateOrderStatus" = ["^/ENDPOINT\\.ABC_Service/UpdateOrderStatus$"]
+
+    [Server.ReverseRoutes."/"]
+    upstreams = ["https://127.0.0.1:50051"]
+    active_health_check_interval = 60
+    backend_type = "grpc_passthrough"
+
+    [Server.RouterParams]
+    protocol = "https"
+    authentication = "ClientCert"
+    ssl_client_certificate = "PATH_TO_CERT/proxy-client.pem"
+    ssl_client_key = "PATH_TO_CERT/proxy-client.key"
+    ssl_root_certificate = "PATH_TO_CERT/ca.pem"
+
+    [Server.Layers.RateLimiter]
+    requests_per_second = 500000
+
+    [Server.Layers.TokenBucketRateLimiter]
+    max_capacity = 1000     
+    refill = 50           
+    duration_micros = 10000 
+
+[[Server]]
+# =============================================================================
+# Onboarding Server (Public - no mTLS)
+# =============================================================================
+    name = "onboarding"
+    ip = "0.0.0.0"
+    port = 1337
+    protocol = "https"
+    service = "Router"
+    enabled = true
+    authentication = "None"
+
+    [Server.server_certs]
+    ssl_certificate = "PATH_TO_CERT/fullchain12.pem"
+    ssl_certificate_key = "PATH_TO_CERT/privkey12.pem"
+
+    [Server.Layers]
+    enabled = ["MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.ConcurrencyLimit]
+    max_concurrent_requests = 128
+
+    [Server.Layers.MaxPayload]
+    max_bytes = 2000000 # 2 MB Limit (CSR requests are small)
+
+    [Server.Layers.TokenBucketRateLimiter]
+    max_capacity = 15     
+    refill = 5           
+    duration_micros = 1000000 
+
+    [Server.AllowedPathes.POST]
+    "/ENDPOINT.ObSrv/RequestOnboarding" = ["^/ENDPOINT\\.ObSrv/RequestOnboarding$"]
+    "/ENDPOINT.ObSrv/SubmitOnboarding" = ["^/ENDPOINT\\.ObSrv/SubmitOnboarding$"]
+
+    [Server.ReverseRoutes."/"]
+    upstreams = ["https://127.0.0.1:50052"]
+    backend_type = "grpc_passthrough"
+
+    [Server.RouterParams]
+    protocol = "https"
+    authentication = "None"
+    ssl_root_certificate = "PATH_TO_CERT/ca.pem"
+
+    [Server.client_cert_forwarding]
+    header_cert = "x-client-cert"
+    header_san = "x-client-san"
+
+[[Server]]
+# =============================================================================
+# Management & Admin Server (Port 1338 /admin & gRPC-Web)
+# =============================================================================
+    name = "admin"
+    ip = "0.0.0.0"
+    port = 1338
+    protocol = "https"
+    authentication = "ClientCert"
+    service = "Router"
+    enabled = true
+    
+    [Server.oid_mapping]
+        "1" = "Admin"
+        "2" = "Seller"
+    
+    [Server.server_certs]
+        ssl_certificate = "PATH_TO_CERT/fullchain12.pem"
+        ssl_certificate_key = "PATH_TO_CERT/privkey12.pem"
+    
+    [[Server.client_certs]]
+        ssl_client_ca = "PATH_TO_CERT/ca.pem"
+        ssl_client_crl = "PATH_TO_CERT/ca.crl.pem"
+    
+    [Server.client_cert_forwarding]
+        header_cert = "x-client-cert"
+        header_san = "x-client-san"
+    
+    [Server.Layers]
+        enabled = ["Logger",  "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+    
+    [Server.Layers.SecurityHeaders]
+        content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        strict_transport_security = "max-age=63072000; includeSubDomains; preload"
+        x_content_type_options = "nosniff"
+        x_frame_options = "DENY"
+    
+    [Server.Layers.Decompression]
+        max_decompressed_bytes = 10485760
+    
+    [Server.Layers.ConcurrencyLimit]
+        max_concurrent_requests = 10000
+    
+    [Server.Layers.MaxPayload]
+        max_bytes = 10485760
+    
+    [Server.Layers.TokenBucketRateLimiter]
+        max_capacity = 1000
+        refill = 50
+        duration_micros = 10000
+    
+    [Server.AllowedPathes.GET]
+        "/admin" = ["^/admin$"]
+        "/admin/" = ["^/admin/$"]
+        "/admin/index.html" = ["^/admin/index\\.html$"]
+        "/favicon.ico" = ["^/favicon\\.ico$"]
+        "/apple-touch-icon.png" = ["^/apple-touch-icon\\.png$"]
+        "/apple-touch-icon-precomposed.png" = ["^/apple-touch-icon-precomposed\\.png$"]
+    
+    [Server.AllowedPathes.POST]
+        "/api/WhoAmI" = ["^/api/WhoAmI$"]
+        "/api/GetUsers" = ["^/api/GetUsers$"]
+        "/api/GetAdminDevices" = ["^/api/GetAdminDevices$"]
+        "/api/AdminBlockDevice" = ["^/api/AdminBlockDevice$"]
+        ...
+        "/api/AdminAddMember" = ["^/api/AdminAddMember$"]
+        "/api/AdminUpdateProductCreator" = ["^/api/AdminUpdateProductCreator$"]
+        "/api/AdminCreateChannel" = ["^/api/AdminCreateChannel$"]
+    
+    [Server.ReverseRoutes."/"]
+        upstreams = ["https://127.0.0.1:50053"]
+        backend_type = "grpc_passthrough"
+        allowed_roles = ["Admin", "Seller"]
+    
+    [Server.RouterParams]
+        protocol = "https"
+        authentication = "ClientCert"
+        ssl_client_certificate = "PATH_TO_CERT/proxy-client.pem"
+        ssl_client_key = "PATH_TO_CERT/proxy-client.key"
+        ssl_root_certificate = "PATH_TO_CERT/ca.pem"
+```toml
