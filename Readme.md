@@ -9,6 +9,10 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 
 ---
 
+**Next release**: Built-in Identity Provider (IdP) service that issues signed JWTs by leveraging the gateway's existing mTLS infrastructure — eliminating the need for external auth systems like Keycloak. Supports direct certificate-to-token exchange for API clients and a QR-code-based device authentication flow for browser users, where a trusted mobile app confirms the login via its client certificate.
+
+---
+
 ## 1. Features
 
 | Feature | `praeco-rs` | Pingora (Cloudflare) | Sōzu |
