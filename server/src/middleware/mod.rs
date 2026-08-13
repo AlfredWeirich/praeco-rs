@@ -38,6 +38,10 @@ pub mod counter;
 pub mod delay;
 /// Simple echo service used for diagnostics and load testing.
 pub mod echo;
+/// Identity Provider end-service.
+pub mod idp;
+/// Identity Provider session validation.
+pub mod idp_session;
 /// Regex-based request path inspection (allow-list enforcement).
 pub mod inspection;
 /// JWT bearer-token authentication middleware.

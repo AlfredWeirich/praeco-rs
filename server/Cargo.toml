@@ -1,6 +1,6 @@
 [package]
 name = "praeco-rs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Ultra-fast API Gateway with mTLS OID authorization and gRPC JSON-transcoding"
 license = "MIT OR Apache-2.0"
@@ -76,6 +76,7 @@ glob = "0.3"
 arc-swap = "1.8.2"
 fastrand = "2.3.0"
 num_cpus = "1.17.0"
+dashmap = "6.0"
 mimalloc = { version = "*", features = ["v3"] }
 
 [[bin]]

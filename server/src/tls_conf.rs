@@ -115,10 +115,13 @@ pub fn tls_config(
     server_name: &'static str,
     _server_cert_config: &ServerCertConfig, // Kept for signature compatibility for now, but not used directly
     client_ca_configs: Option<&[ClientCertConfig]>,
-    require_client_auth: bool,
+    authentication_method: crate::configuration::AuthenticationMethod,
 ) -> Result<RustlsServerConfig, Error> {
     // Create a fresh Rustls config builder (TLS 1.3 by default)
     let config_builder = rustls::ServerConfig::builder();
+
+    let require_client_auth = authentication_method == crate::configuration::AuthenticationMethod::ClientCert
+        || authentication_method == crate::configuration::AuthenticationMethod::OptionalClientCert;
 
     // Determine if client authentication (mTLS) is required
     let config = if require_client_auth {
@@ -159,10 +162,14 @@ pub fn tls_config(
         // Build a WebPKI-based client certificate verifier with loaded root CAs and CRLs.
         // This verifier checks that client certificates are signed by a trusted CA
         // and have not been revoked (if CRLs are provided).
-        let client_verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-            .with_crls(crls)
-            //.allow_unknown_revocation_status()
-            .build()
+        let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
+            .with_crls(crls);
+
+        if authentication_method == crate::configuration::AuthenticationMethod::OptionalClientCert {
+            builder = builder.allow_unauthenticated();
+        }
+
+        let client_verifier = builder.build()
             .map_err(|e| {
                 Error::msg(format!(
                     "{server_name}: Failed to build client verifier: {e}",

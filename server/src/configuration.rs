@@ -73,6 +73,8 @@ pub enum ServiceType {
     Echo,
     /// A reverse-proxy router with RBAC and URI rewriting.
     Router,
+    /// An Identity Provider that issues JWTs (e.g. for mTLS to JWT or DeviceAuth).
+    Idp,
 }
 
 /// How clients authenticate with this server instance.
@@ -88,6 +90,9 @@ pub enum AuthenticationMethod {
     /// Mutual TLS (mTLS) — client must present a valid certificate.
     #[serde(alias = "ClientCert", alias = "mTLS")]
     ClientCert,
+    /// Optional Mutual TLS (mTLS) — client may present a valid certificate, but connection succeeds without it.
+    #[serde(alias = "OptionalClientCert")]
+    OptionalClientCert,
 }
 
 // ============================================================================
@@ -196,6 +201,10 @@ pub struct ServerConfig {
     /// auth settings, TLS for upstream connections).
     #[serde(rename = "RouterParams")]
     pub router_params: Option<RouterParams>,
+
+    /// Additional parameters for the IdP service (JWT signing key, expiration, etc.).
+    #[serde(rename = "IdpParams")]
+    pub idp_params: Option<IdpParams>,
 
     /// Pre-parsed and sorted reverse-proxy routes. Computed in [`ServerConfig::finalize`].
     #[serde(skip)]
@@ -454,8 +463,8 @@ pub enum MiddlewareLayer {
     RateLimiter(RateLimiter),
     /// Introduces a fixed delay (in microseconds) before processing requests.
     Delay(u64),
-    /// Authenticates requests using JWT tokens (carries public key paths).
-    JwtAuth(Vec<String>),
+    /// Authenticates requests using JWT tokens (carries full config including public keys and cookie fallback).
+    JwtAuth(JwtAuthConfig),
     /// Limits the number of concurrent requests.
     ConcurrencyLimit(usize),
     /// Limits the maximum size of request payloads (in bytes).
@@ -551,6 +560,35 @@ pub struct RouterParams {
     pub ssl_client_key: Option<String>,
 }
 
+/// Parameters for the Identity Provider (IdP) service.
+///
+/// Controls how the IdP issues tokens and manages sessions.
+#[derive(Debug, Deserialize, Clone)]
+pub struct IdpParams {
+    /// Path to the Ed25519 private key used to sign issued JWTs.
+    pub jwt_private_key: String,
+    /// Expiration time for issued tokens in seconds (default: 900 / 15 mins).
+    #[serde(default = "default_token_expiry")]
+    pub token_expiry_seconds: u64,
+    /// Time-to-live for QR code login sessions in seconds (default: 120).
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_seconds: u64,
+    /// Name of the cookie to set for the issued JWT (default: "__Host-jwt").
+    #[serde(default = "default_cookie_name")]
+    pub cookie_name: String,
+    /// Default redirect path after successful login if no `redirect` param is present.
+    #[serde(default = "default_redirect")]
+    pub redirect_after_login: String,
+    /// If true, displays the session ID on the web UI for testing purposes.
+    pub debug_show_session_id: Option<bool>,
+}
+
+fn default_token_expiry() -> u64 { 900 }
+fn default_session_ttl() -> u64 { 120 }
+fn default_cookie_name() -> String { "__Host-jwt".to_string() }
+fn default_redirect() -> String { "/".to_string() }
+
+
 /// Server TLS certificate and key paths.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerCertConfig {
@@ -612,6 +650,10 @@ pub struct DelayConfig {
 pub struct JwtAuthConfig {
     /// List of file paths to PEM-encoded Ed25519 public keys.
     pub jwt_public_keys: Vec<String>,
+    /// Optional cookie name to extract the JWT from if the Authorization header is missing.
+    pub cookie_fallback: Option<String>,
+    /// Optional redirect URL if authentication fails (useful for redirecting to the IdP).
+    pub redirect_on_failure: Option<String>,
 }
 
 /// Configuration for the concurrency limit layer.
@@ -841,6 +883,7 @@ impl ServerConfig {
     /// the offending server by name.
     pub fn finalize(&mut self) -> Result<(), Error> {
         self.static_name = Some(Box::leak(self.name.clone().into_boxed_str()));
+        let server_name = self.name.clone();
 
         // Eagerly pre-load TLS CertifiedKey if HTTPS is enabled
         if self.protocol == Protocol::Https {
@@ -864,7 +907,7 @@ impl ServerConfig {
         // We discard the result ('let _') because we only care if it fails.
         let _ = self
             .layers
-            .build_middleware_layers()
+            .build_middleware_layers(&server_name)
             .with_context(|| format!("Configuration error in Server '{}'", self.name))?;
         // 3. === VALIDATION: HTTPS Requirements ===
         if self.protocol == Protocol::Https {
@@ -917,8 +960,34 @@ impl ServerConfig {
                     )));
                 }
             }
+
+            AuthenticationMethod::OptionalClientCert => {
+                if self.client_certs.is_none() {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Authentication is 'OptionalClientCert' (mTLS), but [[Server.client_certs]] is missing.",
+                        self.name
+                    )));
+                }
+            }
             AuthenticationMethod::None => {
                 // No specific config required for None
+            }
+        }
+
+        // 5. Validate Service Requirements
+        if self.service == ServiceType::Idp {
+            let idp_params = self.idp_params.as_ref().ok_or_else(|| {
+                Error::msg(format!(
+                    "Configuration error in Server '{}': Service is 'Idp', but [Server.IdpParams] section is missing.",
+                    self.name
+                ))
+            })?;
+            
+            if idp_params.cookie_name.starts_with("__Host-") && self.protocol != Protocol::Https {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{}': Service is 'Idp' using '__Host-' cookie, but Protocol is not 'Https'. This will be rejected by browsers.",
+                    self.name
+                )));
             }
         }
 
@@ -1131,7 +1200,7 @@ impl Layers {
     ///
     /// Returns an error if an unknown layer name is encountered or if a required
     /// configuration section is absent.
-    pub fn build_middleware_layers(&self) -> Result<Vec<MiddlewareLayer>, Error> {
+    pub fn build_middleware_layers(&self, server_name: &str) -> Result<Vec<MiddlewareLayer>, Error> {
         let mut layers: Vec<MiddlewareLayer> = self
             .enabled
             .iter()
@@ -1160,8 +1229,13 @@ impl Layers {
                 "JwtAuth" | "JWT" => self
                     .jwt_config
                     .as_ref()
-                    .map(|c| MiddlewareLayer::JwtAuth(c.jwt_public_keys.clone()))
-                    .context("Missing [Layers.JWT]"),
+                    .map(|c| MiddlewareLayer::JwtAuth(c.clone()))
+                    .ok_or_else(|| {
+                        Error::msg(format!(
+                            "{}: Missing [Server.Layers.JWT] section for JwtAuth layer",
+                            server_name
+                        ))
+                    }),
                 "ConcurrencyLimit" => self
                     .concurrency_limit_config
                     .as_ref()

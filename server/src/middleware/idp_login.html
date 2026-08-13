@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure Device Authentication</title>
+    <!-- We use qrious from CDN for now. In a fully air-gapped environment, 
+         you can download this file and host it alongside this HTML. -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --text-color: #f8fafc;
+            --card-bg: #1e293b;
+            --border-color: #334155;
+            --accent-color: #3b82f6;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        .container {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+            max-width: 400px;
+            width: 100%;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin-top: 0;
+            margin-bottom: 10px;
+            color: var(--text-color);
+        }
+
+        p {
+            font-size: 0.95rem;
+            color: #94a3b8;
+            margin-bottom: 30px;
+            line-height: 1.5;
+        }
+
+        .qr-container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            display: inline-block;
+            margin-bottom: 30px;
+        }
+
+        .status {
+            font-size: 0.9rem;
+            color: #94a3b8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border-color);
+            border-top-color: var(--accent-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .error {
+            color: #ef4444;
+            display: none;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Device Authentication</h1>
+        <p>Scan this QR code with your trusted mobile app to securely log in to the dashboard.</p>
+        
+        <div class="qr-container">
+            <canvas id="qr-code"></canvas>
+            <div id="debug-session" style="display: none; margin-top: 15px; font-family: monospace; color: #3b82f6; font-size: 0.8rem; word-break: break-all;"></div>
+        </div>
+
+        <div class="status" id="status-container">
+            <div class="spinner"></div>
+            <span id="status-text">Waiting for device...</span>
+        </div>
+
+        <div class="error" id="error-message"></div>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', async () => {
+            const errorEl = document.getElementById('error-message');
+            const statusEl = document.getElementById('status-container');
+            const statusText = document.getElementById('status-text');
+
+            try {
+                // 1. Fetch a new session from the IdP
+                const loginRes = await fetch('/auth/login', { method: 'POST' });
+                if (!loginRes.ok) {
+                    throw new Error("Failed to initialize login session");
+                }
+                const data = await loginRes.json();
+                const sessionId = data.session;
+
+                // 2. Render the QR code using the session ID
+                new QRious({
+                    element: document.getElementById('qr-code'),
+                    value: sessionId,
+                    size: 250,
+                    level: 'H'
+                });
+
+                const showDebug = {{DEBUG_SESSION_FLAG}};
+                if (showDebug) {
+                    const debugEl = document.getElementById('debug-session');
+                    debugEl.style.display = 'block';
+                    debugEl.textContent = 'Session ID: ' + sessionId;
+                }
+
+                // 3. Poll for status confirmation
+                const pollInterval = setInterval(async () => {
+                    try {
+                        const statusRes = await fetch('/auth/status?session=' + encodeURIComponent(sessionId));
+                        
+                        // If the proxy returns 302 or redirects, the browser follows it automatically!
+                        // If it followed the redirect and landed on the dashboard, we are done.
+                        if (statusRes.redirected) {
+                            clearInterval(pollInterval);
+                            statusText.textContent = "Login confirmed!";
+                            statusEl.querySelector('.spinner').style.display = 'none';
+                            window.location.href = statusRes.url; // Force navigate to the redirected URL
+                            return;
+                        }
+
+                        if (!statusRes.ok) {
+                            // Non-200 means something might be wrong (e.g. session expired)
+                            if (statusRes.status === 404) {
+                                clearInterval(pollInterval);
+                                throw new Error("Session expired. Please refresh the page.");
+                            }
+                        }
+
+                    } catch (e) {
+                        clearInterval(pollInterval);
+                        statusEl.style.display = 'none';
+                        errorEl.style.display = 'block';
+                        errorEl.textContent = e.message;
+                    }
+                }, 1500);
+
+            } catch (err) {
+                statusEl.style.display = 'none';
+                errorEl.style.display = 'block';
+                errorEl.textContent = err.message;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -9,7 +9,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 
 ---
 
-**Next release**: Built-in Identity Provider (IdP) service that issues signed JWTs by leveraging the gateway's existing mTLS infrastructure — eliminating the need for external auth systems like Keycloak. Supports direct certificate-to-token exchange for API clients and a QR-code-based device authentication flow for browser users, where a trusted mobile app confirms the login via its client certificate.
+**Newly Added**: Built-in Identity Provider (IdP) service that issues signed JWTs by leveraging the gateway's existing mTLS infrastructure — eliminating the need for external auth systems like Keycloak. Supports direct certificate-to-token exchange for API clients and a QR-code-based device authentication flow for browser users, where a trusted mobile app confirms the login via its client certificate.
 
 ---
 
@@ -45,6 +45,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 - **Built-in Rate Limiting & Traffic Shaping**: Includes flexible token-bucket/window rate limiting strategies, global concurrency limits, and request timeouts to prevent abuse and cascaded failures, right out of the box.
 - **Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload the `Config.toml` and rebuild its routing tables on the fly using `ArcSwap`, without dropping active connections.
 - **End-to-End mTLS Bridging**: In addition to mTLS termination at the gateway, the proxy can establish a completely **new mTLS connection to the upstream servers** (including its own client certificate). This guarantees a fully encrypted and authenticated zero-trust chain deep into the internal backend.
+- **Built-in Identity Provider (IdP)**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support advanced authentication flows like QR-code-based cross-device logins.
 - **HTTP/3 Native**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3`, providing better performance on unreliable networks.
 
 ---
@@ -74,11 +75,10 @@ Currently, the proxy regularly checks in the background (Health Checks) whether 
 A **Circuit Breaker** would go one step further: If a backend suddenly becomes extremely slow or throws errors (even though the last health check was still "OK"), the circuit "trips" immediately. The proxy instantly blocks further traffic to this node to prevent a complete traffic jam in the system (Cascading Failure).
 
 ### 4. Pluggable End-Services (Beyond Routing)
-Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying) or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
+Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Static File Server**: Serving SPAs (React/Vue) directly from a local directory alongside API routes.
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
-- **Auth Provider / Token Service (IdP)**: Taking advantage of the proxy's mTLS validation capabilities to act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use.
 - **Aggregator / Fan-Out Service**: Accepting a single client request and internally fanning it out to multiple backend microservices, assembling their JSON responses into a single cohesive payload before returning it to the client.
 
 ---
