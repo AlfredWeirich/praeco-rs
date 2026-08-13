@@ -1,0 +1,43 @@
+# IdP Test Configuration
+
+[[Server]]
+name = "IdpService"
+ip = "127.0.0.1"
+port = 8443
+enabled = true
+service = "Idp"
+protocol = "https"
+authentication = "OptionalClientCert"
+
+# We map OID "1.2.3.4" to Admin, etc.
+[Server.oid_mapping]
+"1" = "Admin"
+"2" = "Viewer"
+
+# Server Certificate
+[Server.server_certs]
+ssl_certificate = "server_certs/fullchain11.pem"
+ssl_certificate_key = "server_certs/privkey11.pem"
+
+# Client CA for validating devices scanning the QR code
+[[Server.client_certs]]
+ssl_client_ca = "client_certs/ca.cert.pem"
+
+# IdP specific settings
+[Server.IdpParams]
+jwt_private_key = "jwt_creator/private_key.pem"
+token_expiry_seconds = 900
+session_ttl_seconds = 1200
+cookie_name = "__Host-jwt"
+redirect_after_login = "/dashboard"
+debug_show_session_id = true
+
+# Layers (Empty for IdP typically, except maybe Logger/Timing)
+[Server.Layers]
+enabled = ["Logger", "Timing", "SecurityHeaders"]
+
+[Server.Layers.SecurityHeaders]
+content_security_policy = "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'unsafe-inline'; connect-src 'self'"
+strict_transport_security = "max-age=63072000; includeSubDomains; preload"
+x_content_type_options = "nosniff"
+x_frame_options = "DENY"

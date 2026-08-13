@@ -53,6 +53,10 @@ pub struct JwtAuthLayer {
     server_name: &'static str,
     /// Server-specific OID mapping (stored as a Vec for fast linear search of small maps).
     oid_mapping: Arc<Vec<(String, crate::configuration::UserRole)>>,
+    /// Optional cookie name to extract the JWT from.
+    cookie_fallback: Option<String>,
+    /// Optional URL to redirect to instead of returning 401.
+    redirect_on_failure: Option<String>,
 }
 
 impl JwtAuthLayer {
@@ -65,6 +69,8 @@ impl JwtAuthLayer {
         key_files: Vec<String>,
         server_name: &'static str,
         oid_mapping_hash: Arc<std::collections::HashMap<String, crate::configuration::UserRole>>,
+        cookie_fallback: Option<String>,
+        redirect_on_failure: Option<String>,
     ) -> Self {
         let decoding_keys = load_decoding_keys(&key_files);
 
@@ -78,6 +84,8 @@ impl JwtAuthLayer {
             decoding_keys: Arc::new(decoding_keys),
             server_name,
             oid_mapping: Arc::new(oid_mapping),
+            cookie_fallback,
+            redirect_on_failure,
         }
     }
 }
@@ -91,6 +99,8 @@ impl<S> Layer<S> for JwtAuthLayer {
             decoding_keys: Arc::clone(&self.decoding_keys),
             server_name: self.server_name,
             oid_mapping: Arc::clone(&self.oid_mapping),
+            cookie_fallback: self.cookie_fallback.clone(),
+            redirect_on_failure: self.redirect_on_failure.clone(),
         }
     }
 }
@@ -112,6 +122,10 @@ pub struct JwtAuthService<S> {
     server_name: &'static str,
     /// Server-specific OID mapping (stored as a Vec for fast linear search).
     oid_mapping: Arc<Vec<(String, crate::configuration::UserRole)>>,
+    /// Optional cookie name to extract the JWT from.
+    cookie_fallback: Option<String>,
+    /// Optional URL to redirect to instead of returning 401.
+    redirect_on_failure: Option<String>,
 }
 
 impl<S, ReqBody> Service<Request<ReqBody>> for JwtAuthService<S>
@@ -156,14 +170,30 @@ where
         tracing::trace!("{}: Processing JWT Authentication", server_name);
 
         // Extract the token from the "Authorization: Bearer <token>" header.
-        let token = req
+        let mut token = req
             .headers()
             .get("Authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
             .map(|s| s.trim().to_string());
 
+        // If not found in header, check the cookie fallback (if configured).
+        if token.is_none() {
+            if let Some(cookie_name) = &self.cookie_fallback {
+                if let Some(cookie_header) = req.headers().get("Cookie").and_then(|v| v.to_str().ok()) {
+                    for cookie in cookie_header.split(';') {
+                        let cookie = cookie.trim();
+                        if let Some(val) = cookie.strip_prefix(&format!("{}=", cookie_name)) {
+                            token = Some(val.trim().to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let mut inner = self.inner.clone();
+        let redirect = self.redirect_on_failure.clone();
 
         Box::pin(async move {
             match token {
@@ -211,13 +241,13 @@ where
                         }
                         Err(e) => {
                             error!("{}: Invalid JWT: {}", server_name, e);
-                            unauthorized_response()
+                            unauthorized_response(redirect.as_deref())
                         }
                     }
                 }
                 None => {
-                    error!("{}: Missing Authorization header", server_name);
-                    unauthorized_response()
+                    error!("{}: Missing Authorization header or cookie", server_name);
+                    unauthorized_response(redirect.as_deref())
                 }
             }
         })
@@ -228,7 +258,20 @@ where
 ///
 /// Generic over the error type `T` so it can be used in any `Result<Response, T>`
 /// context — the `Ok` variant is always returned, making the error type irrelevant.
-fn unauthorized_response<T>() -> Result<Response<ServiceRespBody>, T> {
+fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRespBody>, T> {
+    if let Some(url) = redirect {
+        let body: ServiceRespBody = Full::new(Bytes::new())
+            .map_err(SrvError::from)
+            .boxed();
+        let mut resp = Response::new(body);
+        *resp.status_mut() = StatusCode::FOUND;
+        resp.headers_mut().insert(
+            hyper::header::LOCATION,
+            hyper::header::HeaderValue::from_str(url).unwrap(),
+        );
+        return Ok(resp);
+    }
+
     let body: ServiceRespBody = Full::new(Bytes::from("Unauthorized"))
         .map_err(SrvError::from)
         .boxed();

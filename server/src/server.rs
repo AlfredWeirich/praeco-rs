@@ -752,7 +752,7 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 /// A `Result` which is `Ok` containing a `BoxedCloneService` if successful,
 /// or an `Error` if the service stack cannot be built (e.g., missing compiled paths).
 fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneService, Error> {
-    let layers = server_config.layers.build_middleware_layers()?;
+    let layers = server_config.layers.build_middleware_layers(&server_config.name)?;
 
     // Ensure compiled paths are available.
     // While the InspectionLayer will also validate this, checking here provides
@@ -771,6 +771,11 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
             EchoService::new(server_config.static_name.expect("static_name missing")).boxed_clone()
         }
         ServiceType::Router => RouterService::new(server_config.clone()).boxed_clone(),
+        ServiceType::Idp => {
+            let params = server_config.idp_params.as_ref().expect("IdpParams missing").clone();
+            let idp_service = praeco_rs::middleware::idp::IdpService::new(params, server_config.static_name.expect("static_name missing")).expect("Failed to init IdP Service");
+            tower::util::BoxCloneService::new(idp_service)
+        }
     };
 
     let applied = apply_layers(
@@ -854,10 +859,16 @@ fn apply_layers(
                     .layer(svc)
                     .boxed_clone()
             }
-            MiddlewareLayer::JwtAuth(keys) => {
-                JwtAuthLayer::new(keys, server_name, oid_mapping.clone())
-                    .layer(svc)
-                    .boxed_clone()
+            MiddlewareLayer::JwtAuth(cfg) => {
+                JwtAuthLayer::new(
+                    cfg.jwt_public_keys.clone(),
+                    server_name,
+                    oid_mapping.clone(),
+                    cfg.cookie_fallback.clone(),
+                    cfg.redirect_on_failure.clone(),
+                )
+                .layer(svc)
+                .boxed_clone()
             }
             MiddlewareLayer::RateLimiter(praeco_rs::configuration::RateLimiter::Simple(cfg)) => {
                 let dur = Duration::from_secs_f32(1.0 / cfg.requests_per_second as f32);
@@ -1256,6 +1267,8 @@ async fn handle_h3_connection(
 
     // Wrap the ROLES in Arc, not the OIDs.
     let shared_roles = Arc::new(roles);
+    // Preserve raw OIDs for IdP to embed in JWTs
+    let shared_oids = Arc::new(oids);
     // --- OPTIMIZATION END ---
 
     // 3. HTTP/3 Connection Setup
@@ -1276,6 +1289,7 @@ async fn handle_h3_connection(
                 let svc = base_svc.clone();
                 // Cheap clone of the already calculated roles
                 let roles_for_req = shared_roles.clone();
+                let shared_oids_for_req = shared_oids.clone();
 
                 let req_cert_pem = client_cert_pem.clone();
                 let req_cert_san = client_cert_san.clone();
@@ -1292,6 +1306,7 @@ async fn handle_h3_connection(
                                 roles_for_req,
                                 req_cert_pem,
                                 req_cert_san,
+                                shared_oids_for_req,
                             );
 
                             let (parts, _) = req.into_parts();
@@ -1444,7 +1459,9 @@ fn build_rustls_config(config: &ServerConfig) -> Result<RustlsServerConfig, Erro
         config.name
     ))?;
 
-    let client_certs = if config.authentication == AuthenticationMethod::ClientCert {
+    let client_certs = if config.authentication == AuthenticationMethod::ClientCert
+        || config.authentication == AuthenticationMethod::OptionalClientCert
+    {
         Some(
             config
                 .client_certs
@@ -1460,7 +1477,7 @@ fn build_rustls_config(config: &ServerConfig) -> Result<RustlsServerConfig, Erro
         config.static_name.expect("static_name missing"),
         server_certs,
         client_certs,
-        config.authentication == AuthenticationMethod::ClientCert,
+        config.authentication,
     )?;
 
     Ok(tls_config)

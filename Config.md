@@ -88,8 +88,8 @@ You can define multiple `[[Server]]` blocks to run multiple listeners simultaneo
 | `port` | Integer | The TCP port of the listener. | **Example:** `1336` |
 | `enabled` | Boolean | Main switch to turn the server on or off. | `true`, `false` (**Default:** `true`) |
 | `protocol` | String | Transport protocol. (If `https`, `[Server.server_certs]` must be configured). | `"http"`, `"https"` (**Default:** `"http"`) |
-| `authentication` | String | Authentication method for incoming connections. | `"None"` (Public)<br>`"ClientCert"` or `"mTLS"` (Certificate-based)<br>`"JWT"` (Token-based) |
-| `service` | String | The base service that processes the request after the middleware. | `"Echo"` (Returns request)<br>`"Router"` (Reverse proxy) |
+| `authentication` | String | Authentication method for incoming connections. | `"None"` (Public)<br>`"ClientCert"` or `"mTLS"` (Strict Certificate-based)<br>`"OptionalClientCert"` (Client cert requested but not required, useful for IdP device auth)<br>`"JWT"` (Token-based) |
+| `service` | String | The base service that processes the request after the middleware. | `"Echo"` (Returns request)<br>`"Router"` (Reverse proxy)<br>`"Idp"` (Identity Provider for JWT issuance) |
 
 ### Server.oid_mapping
 Defines **per server** how the OID suffixes (Object Identifiers) extracted from certificates or JWT tokens are mapped to internal permission roles (Roles).
@@ -124,6 +124,17 @@ This configuration controls the secure passing of client identities to backend s
 * `header_san`: String. HTTP header name for the SAN (Subject Alternative Name).
 * `header_roles`: String. HTTP header name for the forwarded user roles (e.g., `x-user-roles`).
 * `header_client_ip`: String. HTTP header name for the client IP address (e.g., `x-forwarded-for`).
+
+### Identity Provider (IdP) Configuration
+
+#### `[Server.IdpParams]` (Required if `service = "Idp"`)
+Configures the built-in Identity Provider, which issues JWTs based on mTLS or Device Authentication (QR-Code flow). When using this service, you should typically set `authentication = "OptionalClientCert"`.
+
+* `jwt_private_key`: String. Path to the Ed25519 or RSA private key (PEM format) used to sign the issued JWTs.
+* `token_expiry_seconds`: Integer. Time to live (TTL) for the issued JWT in seconds.
+* `session_ttl_seconds`: Integer. Time to live for the QR-Code login session in seconds (how long the user has to scan the code).
+* `cookie_name`: String. The name of the cookie in which the JWT will be stored. (e.g., `"__Host-jwt"`). If using a `__Host-` prefixed cookie, the `protocol` MUST be `"https"`.
+* `redirect_after_login`: String. The URL path to which the user's browser is redirected after successfully obtaining the JWT via the `/auth/status` endpoint (e.g., `"/dashboard"`).
 
 ---
 

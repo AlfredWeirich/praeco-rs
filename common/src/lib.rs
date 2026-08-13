@@ -19,7 +19,7 @@
 // === External Crates ===
 use anyhow::Error;
 #[allow(unused_imports)]
-use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -135,6 +135,9 @@ pub struct Claims {
     pub exp: usize,
     /// Custom OID suffixes for role mapping (e.g. `["1", "2.3"]`).
     pub oids: Vec<String>,
+    /// Optional JWT ID (for revocation, e.g. QR code sessions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
 }
 
 /// Loads Ed25519 public key files and converts them into [`DecodingKey`]s.
@@ -162,6 +165,25 @@ pub fn load_decoding_keys(key_paths: &[String]) -> Vec<DecodingKey> {
             DecodingKey::from_ed_pem(pem.as_bytes()).expect("Failed to parse key")
         })
         .collect()
+}
+
+/// Loads an Ed25519 private key file and converts it into an [`EncodingKey`].
+///
+/// Used by the JWT IdP layer to sign new tokens.
+///
+/// # Arguments
+///
+/// * `path` – PEM file path containing an Ed25519 private key.
+///
+/// # Panics
+///
+/// Panics if the file cannot be read or is not a valid Ed25519 PEM.
+pub fn load_encoding_key(path: &str) -> EncodingKey {
+    let pem = std::fs::read_to_string(path).unwrap_or_else(|_| {
+        error!("Failed to read private key file: {}", path);
+        panic!("Failed to read private key file: {}", path);
+    });
+    EncodingKey::from_ed_pem(pem.as_bytes()).expect("Failed to parse private key")
 }
 
 /// Verifies a JWT token against a set of decoding keys.
@@ -193,6 +215,22 @@ pub fn verify_jwt(token: &str, decoding_keys: &[DecodingKey]) -> Result<Claims, 
         }
     }
     Err(Error::msg("JWT verification failed with all keys"))
+}
+
+/// Signs a JWT token with the given `Claims` and `EncodingKey`.
+///
+/// # Algorithm
+///
+/// Hard-coded to **EdDSA** (Ed25519).
+///
+/// # Errors
+///
+/// Returns an error if token signing fails.
+pub fn sign_jwt(claims: &Claims, encoding_key: &EncodingKey) -> Result<String, Error> {
+    let header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+    let token = encode(&header, claims, encoding_key)
+        .map_err(|e| Error::msg(format!("Failed to sign JWT: {}", e)))?;
+    Ok(token)
 }
 
 /// Builds a Rustls [`ClientConfig`] for outgoing TLS connections.

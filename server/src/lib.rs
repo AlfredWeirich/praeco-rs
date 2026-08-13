@@ -200,6 +200,11 @@ pub struct PemCertExtension(pub String);
 #[derive(Clone, Debug)]
 pub struct SanCertExtension(pub String);
 
+/// Raw OID suffix strings extracted from the client certificate.
+/// Preserved so that the IdP service can embed them in issued JWTs.
+#[derive(Clone, Debug)]
+pub struct OidCertExtension(pub Vec<String>);
+
 pub struct ConnectionHandler {
     /// The fully assembled middleware + routing pipeline, type-erased and
     /// cloneable so it can be shared across all requests on this connection.
@@ -221,6 +226,9 @@ pub struct ConnectionHandler {
 
     /// The client's Subject Alternative Name (SAN).
     client_cert_san: Option<String>,
+
+    /// The raw OID suffixes extracted from the client certificate.
+    client_oids: Arc<Vec<String>>,
 }
 
 impl ConnectionHandler {
@@ -278,6 +286,7 @@ impl ConnectionHandler {
             client_roles: Arc::new(final_roles),
             client_cert_pem,
             client_cert_san,
+            client_oids: Arc::new(oids),
         }
     }
 
@@ -299,6 +308,7 @@ impl ConnectionHandler {
         roles: Arc<Vec<UserRole>>, // Pass roles, not OIDs
         client_cert_pem: Option<String>,
         client_cert_san: Option<String>,
+        client_oids: Arc<Vec<String>>,
     ) -> Self {
         Self {
             inner_service: service,
@@ -306,6 +316,7 @@ impl ConnectionHandler {
             client_roles: roles,
             client_cert_pem,
             client_cert_san,
+            client_oids,
         }
     }
 
@@ -351,6 +362,11 @@ impl ConnectionHandler {
         }
         if let Some(san) = self.client_cert_san.clone() {
             req.extensions_mut().insert(SanCertExtension(san));
+        }
+
+        // 4. Inject raw OIDs for downstream services (e.g. IdP) to embed in JWTs
+        if !self.client_oids.is_empty() {
+            req.extensions_mut().insert(OidCertExtension((*self.client_oids).clone()));
         }
 
         // Tower service contract: poll_ready() MUST be called before call().
@@ -412,6 +428,7 @@ impl Clone for ConnectionHandler {
             client_roles: self.client_roles.clone(),
             client_cert_pem: self.client_cert_pem.clone(),
             client_cert_san: self.client_cert_san.clone(),
+            client_oids: self.client_oids.clone(),
         }
     }
 }
