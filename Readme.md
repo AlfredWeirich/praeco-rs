@@ -1,6 +1,12 @@
 
 # praeco-rs - Enterprise Zero-Trust API Gateway: the European sovereign proxy
 
+https://medium.com/@alfred.weirich/tokio-tower-hyper-and-rustls-building-high-performance-and-secure-servers-in-rust-part-11-7782d195ce2a?source=friends_link&sk=00042bfce222ddd16d8cd5f0380f161a
+
+Part 1 to 11
+
+---
+
 `praeco-rs` is an ultra-fast, highly configurable, and secure API Gateway and Reverse Proxy written in Rust. It is built on top of the Tokio async runtime, Hyper v1, Tower, and Rustls.
 
 *(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
