@@ -116,7 +116,10 @@
 
             try {
                 // 1. Fetch a new session from the IdP
-                const loginRes = await fetch('/auth/login', { method: 'POST' });
+                const loginRes = await fetch('/auth/login', { 
+                    method: 'POST',
+                    credentials: 'include'
+                });
                 if (!loginRes.ok) {
                     throw new Error("Failed to initialize login session");
                 }
@@ -141,23 +144,23 @@
                 // 3. Poll for status confirmation
                 const pollInterval = setInterval(async () => {
                     try {
-                        const statusRes = await fetch('/auth/status?session=' + encodeURIComponent(sessionId));
+                        const statusRes = await fetch('/auth/status?session=' + encodeURIComponent(sessionId), {
+                            credentials: 'include'
+                        });
                         
-                        // If the proxy returns 302 or redirects, the browser follows it automatically!
-                        // If it followed the redirect and landed on the dashboard, we are done.
-                        if (statusRes.redirected) {
-                            clearInterval(pollInterval);
-                            statusText.textContent = "Login confirmed!";
-                            statusEl.querySelector('.spinner').style.display = 'none';
-                            window.location.href = statusRes.url; // Force navigate to the redirected URL
-                            return;
-                        }
-
                         if (!statusRes.ok) {
-                            // Non-200 means something might be wrong (e.g. session expired)
                             if (statusRes.status === 404) {
                                 clearInterval(pollInterval);
                                 throw new Error("Session expired. Please refresh the page.");
+                            }
+                        } else {
+                            const data = await statusRes.json();
+                            if (data.status === 'confirmed' && data.redirect) {
+                                clearInterval(pollInterval);
+                                statusText.textContent = "Login confirmed!";
+                                statusEl.querySelector('.spinner').style.display = 'none';
+                                window.location.href = data.redirect;
+                                return;
                             }
                         }
 
