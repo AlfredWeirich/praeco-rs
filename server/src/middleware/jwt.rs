@@ -180,13 +180,19 @@ where
         // If not found in header, check the cookie fallback (if configured).
         if token.is_none() {
             if let Some(cookie_name) = &self.cookie_fallback {
-                if let Some(cookie_header) = req.headers().get("Cookie").and_then(|v| v.to_str().ok()) {
-                    for cookie in cookie_header.split(';') {
-                        let cookie = cookie.trim();
-                        if let Some(val) = cookie.strip_prefix(&format!("{}=", cookie_name)) {
-                            token = Some(val.trim().to_string());
-                            break;
+                let cookie_prefix = format!("{}=", cookie_name);
+                for cookie_header in req.headers().get_all("Cookie").iter() {
+                    if let Ok(v) = cookie_header.to_str() {
+                        for cookie in v.split(';') {
+                            let cookie = cookie.trim();
+                            if let Some(val) = cookie.strip_prefix(&cookie_prefix) {
+                                token = Some(val.trim().to_string());
+                                break;
+                            }
                         }
+                    }
+                    if token.is_some() {
+                        break;
                     }
                 }
             }

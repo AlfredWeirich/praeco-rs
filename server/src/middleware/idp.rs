@@ -75,15 +75,17 @@ impl IdpService {
         let token = sign_jwt(&claims, &self.encoding_key)?;
 
         let cookie_val = format!(
-            "{}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={}",
+            "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
             self.params.cookie_name, token, self.params.token_expiry_seconds
         );
 
+        let body = format!(r#"{{"status":"confirmed","redirect":"{}"}}"#, self.params.redirect_after_login);
+        
         let resp = Response::builder()
-            .status(StatusCode::FOUND)
+            .status(StatusCode::OK)
             .header(hyper::header::SET_COOKIE, cookie_val)
-            .header(hyper::header::LOCATION, &self.params.redirect_after_login)
-            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from(body)).map_err(SrvError::from).boxed())
             .unwrap();
             
         Ok(resp)
@@ -158,6 +160,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                     let res = Response::builder()
                         .status(StatusCode::OK)
                         .header("Content-Type", "text/html")
+                        .header("Cache-Control", "no-store, no-cache, must-revalidate")
                         .body(Full::new(Bytes::from(html)).map_err(SrvError::from).boxed())
                         .unwrap();
                     Ok(res)
