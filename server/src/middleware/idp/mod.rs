@@ -18,7 +18,9 @@ use tower::Service;
 use tracing::{debug, error, info};
 
 use crate::{configuration::IdpParams, SrvError, ServiceRespBody};
-use super::idp_session::{SessionStore, SessionStatus};
+
+mod session;
+use session::{SessionStore, SessionStatus};
 
 /// The Identity Provider service.
 #[derive(Clone)]
