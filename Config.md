@@ -352,3 +352,18 @@ Configures the outgoing connection of the proxy to the backend servers.
 | `ssl_client_certificate` | String | Proxy Client Certificate for mTLS to the backend. | `"/path/to/proxy-client.pem"` |
 | `ssl_client_key` | String | Proxy Private Key for mTLS to the backend. | `"/path/to/proxy-client.key"` |
 | `jwt` | String | Path to a JWT file, which is sent to the backend when `authentication = "JWT"`. | `"/path/to/token.jwt"` |
+
+---
+
+## Appendix: Certificates and Keys Overview
+
+In a Zero-Trust architecture, `praeco-rs` relies heavily on various cryptographic keys and certificates. Here is a compact overview of what they do, where they are configured, and how to generate them.
+
+| Type | Used For | Parameter in `Config.toml` | How to Generate / Where to Get |
+| :--- | :--- | :--- | :--- |
+| **Server TLS Certificate (Public)** | Authenticates the server to incoming clients (HTTPS). Must be a fullchain/PEM. | `[Server.server_certs.ssl_certificate]` | Production: **Let's Encrypt** (Certbot).<br>Local/Test: OpenSSL or `rcgen`. |
+| **Server TLS Key (Private)** | Private key belonging to the server certificate. Must be unencrypted PEM. | `[Server.server_certs.ssl_certificate_key]` | Along with the Server TLS Certificate. |
+| **Root CA Certificate (Public)** | The Trust Anchor. Used by the proxy to verify incoming mTLS client certificates, or by the proxy to verify backend server certificates. | `[[Server.client_certs.ssl_client_ca]]`<br>`[Server.RouterParams.ssl_root_certificate]` | Created automatically by `./client_certs/generate_mtls_oid_certs.sh` (`ca.cert.pem`). |
+| **Client mTLS Certificate & Key** | Given to clients (Devices, iOS App) to authenticate themselves against the proxy. Contains OIDs for Role Mapping. | (Used by Clients)<br>For Proxy-to-Backend:<br>`ssl_client_certificate` / `key` | Use the provided script:<br>`./client_certs/generate_mtls_oid_certs.sh -c <name> -o <roles>` |
+| **JWT Private Key** | Used by the Identity Provider (`service = "Idp"`) to securely sign the issued JWTs. | `[Server.IdpParams.jwt_private_key]` | OpenSSL (Ed25519 recommended):<br>`openssl genpkey -algorithm ed25519 -out idp_private.pem` |
+| **JWT Public Key** | Used by Resource Servers (and the IdP's JWKS endpoint) to verify the signatures of the JWTs. | `[Server.IdpParams.jwt_public_key]`<br>`[Server.Layers.JWT.jwt_public_keys]` | Extracted from Private Key:<br>`openssl pkey -in idp_private.pem -pubout -out idp_public.pem` |
