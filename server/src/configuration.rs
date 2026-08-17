@@ -587,6 +587,8 @@ pub struct IdpParams {
     /// Optional allowed audiences (`aud`). If requested by client, it must be in this list.
     #[serde(default)]
     pub allowed_audiences: Vec<String>,
+    /// Optional path to the Ed25519 public key. If provided, exposed at /.well-known/jwks.json.
+    pub jwt_public_key: Option<String>,
 }
 
 fn default_token_expiry() -> u64 { 900 }

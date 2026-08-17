@@ -29,6 +29,7 @@ pub struct IdpService {
     session_store: SessionStore,
     encoding_key: Arc<EncodingKey>,
     server_name: &'static str,
+    jwks_payload: Option<Arc<String>>,
 }
 
 impl IdpService {
@@ -38,11 +39,41 @@ impl IdpService {
         
         let encoding_key = common::load_encoding_key(&params.jwt_private_key);
 
+        let mut jwks_payload = None;
+        if let Some(pub_key_path) = &params.jwt_public_key {
+            match std::fs::read_to_string(pub_key_path) {
+                Ok(pem_str) => {
+                    if let Ok(pem) = pem::parse(&pem_str) {
+                        let der = pem.contents();
+                        // For Ed25519 SubjectPublicKeyInfo, it's 44 bytes and the last 32 bytes are the raw key.
+                        if der.len() >= 32 {
+                            let raw_key = &der[der.len() - 32..];
+                            use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                            let x = URL_SAFE_NO_PAD.encode(raw_key);
+                            let jwks = format!(
+                                r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","use":"sig","kid":"praeco-key-1","x":"{}"}}]}}"#,
+                                x
+                            );
+                            jwks_payload = Some(Arc::new(jwks));
+                        } else {
+                            tracing::warn!("{}: Invalid public key length in {}", server_name, pub_key_path);
+                        }
+                    } else {
+                        tracing::warn!("{}: Failed to parse PEM in {}", server_name, pub_key_path);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("{}: Failed to read public key {}: {}", server_name, pub_key_path, e);
+                }
+            }
+        }
+
         Ok(Self {
             params,
             session_store,
             encoding_key: Arc::new(encoding_key),
             server_name,
+            jwks_payload,
         })
     }
 
@@ -107,6 +138,21 @@ impl Service<Request<crate::SrvBody>> for IdpService {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
         
+        // Handle JWKS endpoint directly
+        if method == Method::GET && path == "/.well-known/jwks.json" {
+            if let Some(jwks) = &self.jwks_payload {
+                let body_bytes = Bytes::from(jwks.as_str().to_string());
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(hyper::header::CONTENT_TYPE, "application/jwk-set+json")
+                    .body(Full::new(body_bytes).map_err(SrvError::from).boxed())
+                    .unwrap();
+                return Box::pin(async move { Ok(resp) });
+            } else {
+                return Box::pin(async move { Ok(Self::response_err(StatusCode::NOT_FOUND, "JWKS not configured")) });
+            }
+        }
+
         // Extract query parameters manually
         let query = req.uri().query().unwrap_or("").to_string();
         let session_id = query.split('&')

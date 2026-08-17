@@ -131,6 +131,7 @@ This configuration controls the secure passing of client identities to backend s
 Configures the built-in Identity Provider, which issues JWTs based on mTLS or Device Authentication (QR-Code flow). When using this service, you should typically set `authentication = "OptionalClientCert"`.
 
 * `jwt_private_key`: String. Path to the Ed25519 or RSA private key (PEM format) used to sign the issued JWTs.
+* `jwt_public_key`: String. Path to the corresponding public key. Required to expose the `/.well-known/jwks.json` endpoint for dynamic key discovery by APIs.
 * `token_expiry_seconds`: Integer. Time to live (TTL) for the issued JWT in seconds.
 * `session_ttl_seconds`: Integer. Time to live for the QR-Code login session in seconds (how long the user has to scan the code).
 * `cookie_name`: String. The name of the cookie in which the JWT will be stored. (e.g., `"__Host-jwt"`). If using a `__Host-` prefixed cookie, the `protocol` MUST be `"https"`.
