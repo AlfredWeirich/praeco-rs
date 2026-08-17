@@ -15,7 +15,10 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 
 ---
 
-**Newly Added**: Built-in Identity Provider (IdP) service that issues signed JWTs by leveraging the gateway's existing mTLS infrastructure — eliminating the need for external auth systems like Keycloak. Supports direct certificate-to-token exchange for API clients and a QR-code-based device authentication flow for browser users, where a trusted mobile app confirms the login via its client certificate.
+**Newly Added**: 
+* **Built-in Identity Provider (IdP)**: Issues signed JWTs by leveraging the gateway's existing mTLS infrastructure. The IdP securely manages identities and issues tokens containing strict `iss` (Issuer) and `aud` (Audience) claims to prevent confused-deputy attacks across services.
+* **Dynamic Key Discovery (JWKS)**: The IdP exposes a standard `/.well-known/jwks.json` endpoint to serve its public keys dynamically. This enables downstream Resource Servers to fetch and verify JWT signatures automatically, supporting seamless, zero-downtime key rotation.
+* **Advanced Role Mapping (RBAC)**: Extracted custom Object Identifiers (OIDs) from mTLS client certificates are mapped to internal roles (`UserRole`), extending the strict access control directly into the JWTs issued by the IdP.
 
 ---
 
