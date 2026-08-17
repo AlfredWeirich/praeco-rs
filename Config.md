@@ -205,7 +205,9 @@ Here is an overview of the most useful values for configuration:
 * `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing.
 
 #### `[Server.Layers.JWT]`
-* `jwt_public_keys`: Array of strings. File paths to public keys (PEM) to verify JWT signatures.
+* `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures.
+* `cookie_fallback`: String *(optional)*. The name of the HTTP cookie to read the JWT from if the `Authorization: Bearer <token>` header is absent (e.g. `"admin-jwt"`).
+* `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
 
 #### `[Server.Layers.RateLimiter]` (Simple)
 * `requests_per_second`: Integer. Strict limit of requests per second.
