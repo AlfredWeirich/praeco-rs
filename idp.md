@@ -18,6 +18,22 @@ This flow is designed for native apps or devices that have already been provisio
 5. The signed JWT is returned directly to the client in a JSON response (`{"token": "..."}`).
 6. The client can then use this JWT in the `Authorization: Bearer <token>` header for subsequent API requests.
 
+### Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Trusted Client / Device<br/>(Client Cert & Key)
+    participant Praeco as praeco-rs Gateway<br/>(TLS Handshake)
+    participant IdP as IdpService<br/>(/auth/token)
+
+    Client->>Praeco: POST /auth/token (mTLS Handshake)
+    Note over Client,Praeco: Gateway validates Client Cert against CA Root
+    Praeco->>IdP: Request with Extensions (SAN, CN, OIDs)
+    Note over IdP: 1. Extract Subject (SAN/CN)<br/>2. Extract Roles (OIDs)<br/>3. Sign JWT with IdP Private Key
+    IdP-->>Client: 200 OK {"token": "eyJ0eXAi..."}
+    Note over Client: Stores JWT for Bearer Authorization
+```
+
 **cURL Example:**
 ```bash
 # Request a JWT using mTLS client certificates
@@ -52,6 +68,41 @@ This flow allows a user on an untrusted device (like a desktop web browser) to s
    
 5. **Authenticated Access:** 
    The browser is now authenticated. Subsequent requests from the browser will automatically include the JWT cookie, which the gateway can validate.
+
+### Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Browser as Desktop Browser<br/>(Untrusted Client)
+    participant IdP as praeco-rs IdP<br/>(Port 1339)
+    actor Mobile as Mobile App / iPhone<br/>(Trusted Device with mTLS)
+    participant Admin as Admin Dashboard / Gateway<br/>(Port 1338)
+
+    %% Step 1: Session Initiation
+    Browser->>IdP: 1. POST /auth/login (Standard TLS)
+    IdP-->>Browser: 200 OK {"session": "abc123xyz"}
+    Note over Browser: Generates & Displays QR Code
+
+    %% Step 2: Polling begins
+    Browser->>IdP: 2. GET /auth/status?session=abc123xyz
+    IdP-->>Browser: 200 OK {"status": "pending"}
+
+    %% Step 3: Mobile scan & confirmation
+    Note over Mobile: User scans QR Code
+    Mobile->>IdP: 3. POST /auth/confirm?session=abc123xyz (mTLS)
+    Note over IdP: Validates mTLS Certificate<br/>Extracts UUID & Role OIDs<br/>Marks session "confirmed"
+    IdP-->>Mobile: 200 OK {"status": "confirmed"}
+
+    %% Step 4: Token Issuance
+    Browser->>IdP: 4. GET /auth/status?session=abc123xyz (Next Poll)
+    Note over IdP: Session Confirmed!<br/>Issues signed JWT with Mobile claims
+    IdP-->>Browser: 200 OK Set-Cookie: praeco_jwt=... (HttpOnly, Secure, SameSite=Lax)<br/>{"status": "confirmed", "redirect": "/admin"}
+
+    %% Step 5: Authenticated Dashboard Access
+    Browser->>Admin: 5. GET /admin (with praeco_jwt Cookie)
+    Note over Admin: Gateway verifies JWT via IdP Public Key
+    Admin-->>Browser: 200 OK (Serves Admin Dashboard)
+```
 
 **cURL Example / Script:**
 
