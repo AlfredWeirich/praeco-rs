@@ -57,6 +57,10 @@ pub struct JwtAuthLayer {
     cookie_fallback: Option<String>,
     /// Optional URL to redirect to instead of returning 401.
     redirect_on_failure: Option<String>,
+    /// Optional expected issuer.
+    expected_issuer: Option<String>,
+    /// Optional expected audience.
+    expected_audience: Option<String>,
 }
 
 impl JwtAuthLayer {
@@ -71,6 +75,8 @@ impl JwtAuthLayer {
         oid_mapping_hash: Arc<std::collections::HashMap<String, crate::configuration::UserRole>>,
         cookie_fallback: Option<String>,
         redirect_on_failure: Option<String>,
+        expected_issuer: Option<String>,
+        expected_audience: Option<String>,
     ) -> Self {
         let decoding_keys = load_decoding_keys(&key_files);
 
@@ -86,6 +92,8 @@ impl JwtAuthLayer {
             oid_mapping: Arc::new(oid_mapping),
             cookie_fallback,
             redirect_on_failure,
+            expected_issuer,
+            expected_audience,
         }
     }
 }
@@ -101,6 +109,8 @@ impl<S> Layer<S> for JwtAuthLayer {
             oid_mapping: Arc::clone(&self.oid_mapping),
             cookie_fallback: self.cookie_fallback.clone(),
             redirect_on_failure: self.redirect_on_failure.clone(),
+            expected_issuer: self.expected_issuer.clone(),
+            expected_audience: self.expected_audience.clone(),
         }
     }
 }
@@ -126,6 +136,10 @@ pub struct JwtAuthService<S> {
     cookie_fallback: Option<String>,
     /// Optional URL to redirect to instead of returning 401.
     redirect_on_failure: Option<String>,
+    /// Optional expected issuer.
+    expected_issuer: Option<String>,
+    /// Optional expected audience.
+    expected_audience: Option<String>,
 }
 
 impl<S, ReqBody> Service<Request<ReqBody>> for JwtAuthService<S>
@@ -201,11 +215,16 @@ where
         let mut inner = self.inner.clone();
         let redirect = self.redirect_on_failure.clone();
 
+        let expected_iss = self.expected_issuer.clone();
+        let expected_aud = self.expected_audience.clone();
+
         Box::pin(async move {
             match token {
                 Some(token_str) => {
                     let claims_result =
-                        tokio::task::spawn_blocking(move || verify_jwt(&token_str, &decoding_keys))
+                        tokio::task::spawn_blocking(move || {
+                            verify_jwt(&token_str, &decoding_keys, expected_iss.as_deref(), expected_aud.as_deref())
+                        })
                             .await;
 
                     let claims = match claims_result {

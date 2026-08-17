@@ -866,6 +866,8 @@ fn apply_layers(
                     oid_mapping.clone(),
                     cfg.cookie_fallback.clone(),
                     cfg.redirect_on_failure.clone(),
+                    cfg.expected_issuer.clone(),
+                    cfg.expected_audience.clone(),
                 )
                 .layer(svc)
                 .boxed_clone()

@@ -131,6 +131,11 @@ pub fn load_single_key(path: &str, _server_name: &str) -> PrivateKeyDer<'static>
 pub struct Claims {
     /// Subject identifier (usually user ID or account ID).
     pub sub: String,
+    /// Issuer of the JWT.
+    pub iss: String,
+    /// Optional Audience of the JWT.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
     /// Expiration time as a UNIX timestamp (seconds since epoch).
     pub exp: usize,
     /// Custom OID suffixes for role mapping (e.g. `["1", "2.3"]`).
@@ -201,12 +206,23 @@ pub fn load_encoding_key(path: &str) -> EncodingKey {
 /// # Errors
 ///
 /// Returns an error if **none** of the provided keys can verify the token.
-pub fn verify_jwt(token: &str, decoding_keys: &[DecodingKey]) -> Result<Claims, Error> {
-    // Parse the header to determine algorithm and check token format
-    // let header = decode_header(token)?;
-    // let alg = header.alg;
-    // let validation = Validation::new(alg);
-    let validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
+pub fn verify_jwt(
+    token: &str,
+    decoding_keys: &[DecodingKey],
+    expected_issuer: Option<&str>,
+    expected_audience: Option<&str>,
+) -> Result<Claims, Error> {
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    
+    if let Some(iss) = expected_issuer {
+        validation.set_issuer(&[iss]);
+    }
+    
+    if let Some(aud) = expected_audience {
+        validation.set_audience(&[aud]);
+    } else {
+        validation.validate_aud = false;
+    }
 
     // Try verifying the JWT with each decoding key
     for key in decoding_keys {
