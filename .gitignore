@@ -48,3 +48,5 @@ $RECYCLE.BIN/
 /Cargo.lock
 
 .tokensave/*
+jwt_creator/token1.jwt
+jwt_creator/token2.jwt
