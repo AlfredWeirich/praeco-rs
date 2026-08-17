@@ -50,6 +50,7 @@ pem = "3.0.6"
 x509-parser = "0.18.0"
 asn1-rs = { version = "0.7.1", features = ["bigint"] }
 jsonwebtoken = "9.3.1"
+base64 = "0.22"
 
 # --- OpenTelemetry, Tracing & Logging ---
 tracing = "0.1.41"

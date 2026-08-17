@@ -154,3 +154,27 @@ curl -s -v "https://localhost:1339/auth/status?session=abc123xyz"
   - **`HttpOnly` (XSS Protection):** This flag ensures that the cookie cannot be accessed via client-side scripts (e.g., JavaScript using `document.cookie`). If an attacker successfully injects malicious JavaScript into the application (Cross-Site Scripting), they still cannot steal the JWT to impersonate the user.
   - **`Secure`:** Ensures the cookie is only transmitted over encrypted (HTTPS) connections, preventing interception via Man-in-the-Middle (MitM) attacks on unencrypted networks.
   - **`SameSite=Lax` (CSRF Protection):** This flag instructs the browser not to send the cookie with cross-site requests (e.g., if a malicious site tries to trigger a request to the IdP on behalf of the user). `Lax` allows the cookie to be sent when navigating to the origin site (top-level navigation), balancing security with a smooth user experience.
+
+## 3. Dynamic Key Discovery (JWKS)
+
+To allow downstream API servers (Resource Servers) to independently and securely verify the signatures of the JWTs issued by the IdP, the IdP exposes a standard JSON Web Key Set (JWKS) endpoint.
+
+**Endpoint:** `GET /.well-known/jwks.json`
+
+When `jwt_public_key` is configured in `IdpParams`, the IdP automatically reads the PEM file, extracts the raw public key bytes (e.g., Ed25519 `x` coordinate), and computes a standard `kid` (Key ID) via SHA-256 thumbprint. It then serves the key in JWK format according to RFC 7517.
+
+**Example Response:**
+```json
+{
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "kid": "A1b2C3d4...",
+      "x": "base64url-encoded-key-bytes"
+    }
+  ]
+}
+```
+
+Resource Servers can periodically poll this endpoint to maintain an up-to-date cache of trusted signing keys, enabling zero-downtime key rotation without manual configuration distribution.
