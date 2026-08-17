@@ -119,6 +119,19 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 }
             });
 
+        let requested_aud = query.split('&')
+            .find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == "aud" {
+                    parts.next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            });
+
+        let aud = requested_aud.filter(|a| self.params.allowed_audiences.contains(a))
+            .or_else(|| self.params.allowed_audiences.first().cloned());
+
         // Determine if the request has a valid mTLS certificate.
         // ConnectionHandler always injects PemCertExtension on successful mTLS.
         // OidCertExtension carries the raw OID suffixes for JWT embedding.
@@ -141,6 +154,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             Some(Claims {
                 sub,
+                iss: self.params.issuer.clone(),
+                aud,
                 exp: 0, // Will be set before signing
                 oids,
                 jti: None,

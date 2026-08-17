@@ -581,12 +581,19 @@ pub struct IdpParams {
     pub redirect_after_login: String,
     /// If true, displays the session ID on the web UI for testing purposes.
     pub debug_show_session_id: Option<bool>,
+    /// The issuer claim (`iss`) for generated JWTs. (default: "praeco-idp")
+    #[serde(default = "default_issuer")]
+    pub issuer: String,
+    /// Optional allowed audiences (`aud`). If requested by client, it must be in this list.
+    #[serde(default)]
+    pub allowed_audiences: Vec<String>,
 }
 
 fn default_token_expiry() -> u64 { 900 }
 fn default_session_ttl() -> u64 { 120 }
 fn default_cookie_name() -> String { "__Host-jwt".to_string() }
 fn default_redirect() -> String { "/".to_string() }
+fn default_issuer() -> String { "praeco-idp".to_string() }
 
 
 /// Server TLS certificate and key paths.
@@ -654,6 +661,10 @@ pub struct JwtAuthConfig {
     pub cookie_fallback: Option<String>,
     /// Optional redirect URL if authentication fails (useful for redirecting to the IdP).
     pub redirect_on_failure: Option<String>,
+    /// Optional expected issuer (`iss`) to validate against.
+    pub expected_issuer: Option<String>,
+    /// Optional expected audience (`aud`) to validate against.
+    pub expected_audience: Option<String>,
 }
 
 /// Configuration for the concurrency limit layer.
