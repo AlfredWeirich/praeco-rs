@@ -2,7 +2,9 @@
 # GLOBAL SYSTEM SETTINGS
 ###############################################################################
 pki_base_oid = "1.3.6.1.4.1.65111"
-enable_opentelemetry = false
+enable_opentelemetry = true
+jaeger_endpoint = "http://localhost:4317"
+otel_log_level = "info"
 
 [[Server]]
 name = "tunnel_api"
@@ -13,7 +15,7 @@ port = 0 # Ignored because tunnel is active
 enabled = true
 protocol = "https"
 authentication = "None"
-service = "Echo"
+service = "Router"
 
 [Server.tunnel]
 target_url = "tls://localhost:7001"
@@ -28,3 +30,16 @@ ssl_certificate_key = "server_certs/self_signed/privkey_self.pem"
 
 [Server.Layers]
 enabled = ["Logger"]
+
+[Server.ReverseRoutes."/"]
+upstreams = ["https://127.0.0.1:1338"]
+backend_type = "rest"
+
+[Server.RouterParams]
+protocol = "https"
+authentication = "None"
+ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+
+[Server.AllowedPathes.GET]
+"/admin" = ["^/admin.*"]
+"/" = ["^/$"]

@@ -71,7 +71,8 @@ use tokio_util::sync::CancellationToken;
 use tower::{Layer, limit::ConcurrencyLimit};
 use praeco_rs::BoxCloneSyncServiceExt;
 use arc_swap::ArcSwap;
-use tracing::{error, info, trace, warn};
+#[allow(unused_imports)]
+use tracing::{debug, error, info, trace, warn, Instrument};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
@@ -325,6 +326,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
     }
 
     info!("All servers shut down cleanly.");
+    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }
 
@@ -371,22 +373,45 @@ async fn start_single_server(
 
     if let Some(tunnel) = &server_config.tunnel {
         info!("{}: Connecting to Zero-Trust Tunnel at {}", server_config.name, tunnel.target_url);
-        let tls_config: RustlsServerConfig = match build_rustls_config(server_config.as_ref()) {
-            Ok(cfg) => cfg,
+        let tls_config: Arc<RustlsServerConfig> = match build_rustls_config(server_config.as_ref()) {
+            Ok(cfg) => Arc::new(cfg),
             Err(e) => {
                 error!("{}: TLS Setup Error: {:?}", server_config.name, e);
                 return;
             }
         };
-        if let Err(e) = run_tunnel(
-            tunnel.clone(),
-            tls_config,
-            dynamic_stack,
-            cancel_token,
-            server_config.static_name.expect("missing static_name"),
-            oid_mapping,
-        ).await {
-            error!("{}: Tunnel crashed: {:?}", server_config.name, e);
+
+        let mut retry_count = 0;
+        let initial_delay = Duration::from_secs(1);
+
+        loop {
+            if cancel_token.is_cancelled() {
+                break;
+            }
+
+            if let Err(e) = run_tunnel(
+                tunnel.clone(),
+                tls_config.clone(),
+                dynamic_stack.clone(),
+                cancel_token.clone(),
+                server_config.static_name.expect("missing static_name"),
+                oid_mapping.clone(),
+            ).await {
+                error!("{}: Tunnel crashed: {:?}", server_config.name, e);
+            } else {
+                info!("{}: Tunnel connection ended cleanly", server_config.name);
+            }
+
+            retry_count += 1;
+            let delay = initial_delay * 2u32.pow(retry_count.min(6));
+            warn!("{}: Reconnecting tunnel in {:?}", server_config.name, delay);
+            
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {},
+                _ = cancel_token.cancelled() => {
+                    break;
+                }
+            }
         }
         return;
     }
@@ -1570,7 +1595,8 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
             .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(jaeger_endpoint))
             .with_trace_config(
                 opentelemetry_sdk::trace::Config::default()
-                    .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(0.5))))
+                // .with_sampler(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(0.5))))
+                    .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
                     .with_resource(Resource::new(vec![
                         KeyValue::new("service.name", "praeco-rs")
                     ])),
@@ -1580,6 +1606,10 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
 
         // We MUST set the provider globally, otherwise it gets dropped at the end of this function
         opentelemetry::global::set_tracer_provider(provider.clone());
+        
+        let _ = opentelemetry::global::set_error_handler(|err| {
+            tracing::error!("OpenTelemetry Export Error: {:?}", err);
+        });
 
         // Also set the global TextMapPropagator so we can inject traceparent headers into outgoing requests!
         opentelemetry::global::set_text_map_propagator(
@@ -1632,15 +1662,16 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
 use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain))]
 async fn run_tunnel(
     tunnel: praeco_rs::configuration::TunnelConfig,
-    tls_config: RustlsServerConfig,
+    tls_config: Arc<RustlsServerConfig>,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     // 1. Prepare Outbound mTLS
     let mut root_store = rustls::RootCertStore::empty();
@@ -1664,8 +1695,9 @@ async fn run_tunnel(
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
     // 2. Connect to Relay
-    let relay_host = tunnel.target_url.trim_start_matches("tls://").split(':').next().unwrap_or(&tunnel.target_url);
-    let relay_port = tunnel.target_url.split(':').last().unwrap_or("7000").parse::<u16>().unwrap_or(7000);
+    let parsed_url = url::Url::parse(&tunnel.target_url).context("Invalid tunnel target URL")?;
+    let relay_host = parsed_url.host_str().unwrap_or("localhost");
+    let relay_port = parsed_url.port().unwrap_or(7001);
     
     let tcp_stream = TcpStream::connect((relay_host, relay_port)).await?;
     let domain = rustls::pki_types::ServerName::try_from(relay_host.to_string())?;
@@ -1683,9 +1715,8 @@ async fn run_tunnel(
     info!("{}: Tunnel connected successfully to {}", server_name, tunnel.target_url);
 
     // 5. Accept Streams loop
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
+    loop {
+        tokio::select! {
                 _ = cancel_token.cancelled() => break,
                 inbound = std::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => {
                     match inbound {
@@ -1737,7 +1768,7 @@ async fn run_tunnel(
                                         warn!("{}: TLS handshake via tunnel failed", server_name);
                                     }
                                 }
-                            });
+                            }.instrument(tracing::info_span!("tunneled_connection", server = %server_name, sni = %tunnel.sni_domain)));
                         }
                         Some(Err(e)) => {
                             error!("{}: Tunnel error: {:?}", server_name, e);
@@ -1751,7 +1782,7 @@ async fn run_tunnel(
                 }
             }
         }
-    });
 
     Ok(())
 }
+

@@ -8,13 +8,14 @@ Der Relay Server operiert als reiner **Layer-4 Router** mit SNI-Erkennung (Serve
 
 Das System besteht aus zwei Ebenen:
 
-1. **Control Plane (Port 7001 / mTLS + Yamux):**
+1. **Control Plane (Standard Port 7001 / mTLS + Yamux):**
    - Lokale Praeco-Instanzen verbinden sich ausgehend (outbound) mit diesem Port.
    - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) abgesichert.
    - Praeco meldet über ein einfaches Textprotokoll (`REGISTER <sni_domain>\n`), für welche Domain es verantwortlich ist (z.B. `api.aweirich.eu`).
    - Anschließend wird die Verbindung auf das **Yamux** Multiplexing-Protokoll umgeschaltet, sodass mehrere unabhängige Streams durch eine einzige TCP-Verbindung geleitet werden können.
+   - **Health Checks:** Der Relay-Server überwacht die Tunnel-Gesundheit durch aktives Ping-Verhalten. Alle 30 Sekunden werden Yamux-Streams getestet, um unsauber beendete TCP-Verbindungen (Praeco-Zombies) aufzuspüren und aus dem System zu entfernen.
 
-2. **Data Plane (Port 443 / SNI-Routing):**
+2. **Data Plane (Standard Port 443 / SNI-Routing):**
    - Nimmt öffentliche Client-Verbindungen (z.B. aus dem Webbrowser) unverschlüsselt auf TCP-Ebene an.
    - Der Server liest den initialen TLS-Handshake (`ClientHello`), um die angefragte SNI (Domain) zu extrahieren.
    - Er sucht nach einer aktiven Praeco-Verbindung für diese SNI.
@@ -31,29 +32,34 @@ cargo build --release -p relay-server
 
 Das fertige Binary liegt danach in `target/release/relay-server`.
 
-## Konfiguration (Umgebungsvariablen)
+## Konfiguration (`RelayConfig.toml`)
 
-Der Relay Server benötigt zwingend Zertifikate für die Control Plane, um sich gegenüber der Praeco-Instanz zu authentifizieren und deren Zertifikate zu überprüfen.
+Der Relay Server wird über eine TOML-Datei namens `RelayConfig.toml` (im Arbeitsverzeichnis) gesteuert. Fehlt die Datei, lädt er Standardwerte.
+Hier ist eine Beispielkonfiguration:
 
-Folgende Umgebungsvariablen werden unterstützt:
+```toml
+control_plane_addr = "0.0.0.0:7001"
+data_plane_addr = "0.0.0.0:443"
 
-| Variable | Standardwert (Fallback) | Beschreibung |
-| :--- | :--- | :--- |
-| `RELAY_CA_CERT` | `server_certs/self_signed/myca.pem` | Pfad zur Root-CA, mit der die Client-Zertifikate von Praeco geprüft werden. |
-| `RELAY_SERVER_CERT` | `server_certs/self_signed/fullchain_self.pem` | Pfad zum Server-Zertifikat (Public Key) für die Control Plane. |
-| `RELAY_SERVER_KEY` | `server_certs/self_signed/privkey_self.pem` | Pfad zum privaten Schlüssel des Servers. |
+# Zertifikate für die Control-Plane Authentifizierung
+ca_cert_path = "server_certs/self_signed/myca.pem"
+server_cert_path = "server_certs/self_signed/fullchain_self.pem"
+server_key_path = "server_certs/self_signed/privkey_self.pem"
+
+# Tracing / OpenTelemetry
+enable_opentelemetry = false
+jaeger_endpoint = "http://localhost:4317"
+otel_log_level = "info"
+```
+
+### Logging & Tracing
+Analog zu Praeco ist der Relay-Server in **OpenTelemetry** integriert. Sind die OTLP-Parameter konfiguriert und `enable_opentelemetry = true` gesetzt, schickt der Relay-Server seine strukturierten Kontext-Logs (wie z.B. SNI, Client IPs) direkt in das zentrale Jaeger-Backend. Das ermöglicht ein nahtloses Tracing über die gesamte Netzwerk-Infrastruktur hinweg!
 
 ## Ausführen
 
 ```bash
-# Starten mit den Default-Zertifikatspfaden
+# Starten mit den Einstellungen aus der RelayConfig.toml
 cargo run --bin=relay-server
-
-# Starten mit spezifischen Zertifikaten (z.B. für die Produktion)
-RELAY_CA_CERT=/etc/ssl/myca.pem \
-RELAY_SERVER_CERT=/etc/ssl/server.pem \
-RELAY_SERVER_KEY=/etc/ssl/server.key \
-./target/release/relay-server
 ```
 
-> **Wichtig:** Auf Linux/Mac-Systemen benötigt der Prozess Root-Rechte (bzw. `CAP_NET_BIND_SERVICE`), um auf Port 443 (Data Plane) lauschen zu dürfen.
+> **Wichtig:** Auf Linux/Mac-Systemen benötigt der Prozess Root-Rechte (bzw. `CAP_NET_BIND_SERVICE`), wenn er wie im Standard konfiguriert auf Port 443 (Data Plane) lauscht. Durch Anpassen der `data_plane_addr` in der Config kann dies bei Bedarf auf unprivilegierte Ports verlegt werden.

@@ -1,0 +1,11 @@
+control_plane_addr = "0.0.0.0:7001"
+data_plane_addr = "0.0.0.0:443"
+
+ca_cert_path = "server_certs/self_signed/myca.pem"
+server_cert_path = "server_certs/self_signed/fullchain_self.pem"
+server_key_path = "server_certs/self_signed/privkey_self.pem"
+
+# Enable or disable background OpenTelemetry Tracing (Jaeger)
+enable_opentelemetry = true
+jaeger_endpoint = "http://localhost:4317"
+otel_log_level = "info"
