@@ -469,8 +469,8 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
         // gRPC-specific pool: gRPC strictly requires HTTP/2 multiplexing.
         // We enforce `http2_only: true` so it strictly negotiates H2 during the TLS ALPN handshake.
         let grpc_pool_config = common::client::ClientPoolConfig {
-            idle_timeout: Some(Duration::from_secs(90)),
-            max_idle_per_host: Some(1024),
+            idle_timeout: Some(Duration::from_secs(30)),
+            max_idle_per_host: Some(16),
             http2_only: true, // Force HTTP/2 for gRPC
         };
         // Build the client specifically for gRPC health checks
@@ -479,8 +479,8 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
         // Standard REST/HTTP pool: Allows HTTP/1.1 or H2 depending on what the upstream server supports.
         let pool_config = common::client::ClientPoolConfig {
-            idle_timeout: Some(Duration::from_secs(90)),
-            max_idle_per_host: Some(1024),
+            idle_timeout: Some(Duration::from_secs(30)),
+            max_idle_per_host: Some(16),
             http2_only: false, // Default negotiation for standard web traffic
         };
 
@@ -639,8 +639,10 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                                     // Dispatch the request asynchronously over the connection pool
                                     let req = req_builder.body(req_body).unwrap();
-                                    match client.request(req).await {
-                                        Ok(mut resp) => {
+                                    // TODO: Move this hardcoded 5s timeout to Config.toml in the future
+                                    match tokio::time::timeout(Duration::from_secs(5), client.request(req)).await {
+                                        Ok(Ok(mut resp)) => {
+
                                             // We consider any 200 OK status as a healthy indication
                                             let is_ok = resp.status() == StatusCode::OK;
                                             let mut health_score_ok = true;
@@ -721,11 +723,19 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                 }
                                             }
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
                                             target_arc.upstreams[idx].current_score.store(0, std::sync::atomic::Ordering::Relaxed);
-                                            // Network errors or timeout means the node is dead/unresponsive
+                                            // Network errors means the node is dead/unresponsive
                                             if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
-                                                tracing::warn!("{}: Health check failed for '{}': {}", server_name, final_uri, e);
+                                                tracing::warn!("{}: Health check network error for '{}': {}", server_name, final_uri, e);
+                                                target_arc.upstreams[idx].is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            }
+                                        }
+                                        Err(_) => {
+                                            target_arc.upstreams[idx].current_score.store(0, std::sync::atomic::Ordering::Relaxed);
+                                            // Timeout means the node is dead/unresponsive
+                                            if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                                tracing::warn!("{}: Health check timed out after 5s for '{}'", server_name, final_uri);
                                                 target_arc.upstreams[idx].is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
                                             }
                                         }
