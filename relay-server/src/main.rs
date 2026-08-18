@@ -44,15 +44,24 @@ fn setup_tracing(config: &RelayConfig) {
     let jaeger_endpoint = config.jaeger_endpoint.as_deref().unwrap_or("http://localhost:4317");
     let otel_log_level = config.otel_log_level.as_deref().unwrap_or("info");
 
+    let otel_sample_ratio = config.otel_sample_ratio.unwrap_or(1.0);
+
     let console_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = tracing_subscriber::fmt::layer().with_ansi(true).with_filter(console_filter);
 
     let telemetry_layer = if enable_otlp {
+        let sampler = if (otel_sample_ratio - 1.0).abs() < f64::EPSILON {
+            opentelemetry_sdk::trace::Sampler::AlwaysOn
+        } else {
+            opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(otel_sample_ratio)))
+        };
+
         let provider = opentelemetry_otlp::new_pipeline()
             .tracing()
             .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(jaeger_endpoint))
             .with_trace_config(
                 opentelemetry_sdk::trace::Config::default()
+                    .with_sampler(sampler)
                     .with_resource(Resource::new(vec![KeyValue::new("service.name", "praeco-relay")])),
             )
             .install_batch(opentelemetry_sdk::runtime::Tokio)

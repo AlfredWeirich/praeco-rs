@@ -127,6 +127,8 @@ pub struct Config {
     pub jaeger_endpoint: Option<String>,
     /// Log level for traces exported to Jaeger (default: "info")
     pub otel_log_level: Option<String>,
+    /// Sampling ratio for OTLP traces (0.0 to 1.0, default: 1.0 = AlwaysOn)
+    pub otel_sample_ratio: Option<f64>,
 
     /// Pre-parsed integer representation of [`pki_base_oid`](Config::pki_base_oid).
     /// Computed in [`Config::init`] for fast OID prefix matching in

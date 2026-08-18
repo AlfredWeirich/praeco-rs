@@ -14,6 +14,7 @@ pub struct RelayConfig {
     pub enable_opentelemetry: Option<bool>,
     pub jaeger_endpoint: Option<String>,
     pub otel_log_level: Option<String>,
+    pub otel_sample_ratio: Option<f64>,
 }
 
 impl Default for RelayConfig {
@@ -27,6 +28,7 @@ impl Default for RelayConfig {
             enable_opentelemetry: Some(false),
             jaeger_endpoint: Some("http://localhost:4317".into()),
             otel_log_level: Some("info".into()),
+            otel_sample_ratio: Some(1.0),
         }
     }
 }
