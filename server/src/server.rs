@@ -231,13 +231,41 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                 };
 
                 info!("Successfully parsed new Config.toml");
-                let mut next_active_servers = std::collections::HashMap::new();
 
-                // 2. Diff and manage listeners
+                // 2. DRY-RUN PASS: Build all service stacks first
+                let mut reload_errors = Vec::new();
+                let mut built_stacks = std::collections::HashMap::new();
+
                 for new_server in &new_config.servers {
                     if !new_server.enabled { continue; }
+                    let server_config_arc = Arc::new(new_server.clone());
+                    match build_service_stack(&server_config_arc) {
+                        Ok(svc) => {
+                            built_stacks.insert(new_server.port, (server_config_arc, svc));
+                        }
+                        Err(e) => {
+                            error!("{}: FAILED to build service stack (dry-run): {:?}", new_server.name, e);
+                            reload_errors.push((new_server.name.clone(), e.to_string()));
+                        }
+                    }
+                }
 
-                    let needs_restart = match active_servers.get(&new_server.port) {
+                if !reload_errors.is_empty() {
+                    error!("Hot-reload aborted! {} server(s) failed to build their service stacks:", reload_errors.len());
+                    for (name, err) in &reload_errors {
+                        error!(" - {}: {}", name, err);
+                    }
+                    error!("Keeping previous configuration completely intact.");
+                    continue; // Abort SIGHUP handling, leave `active_servers` unmodified
+                }
+
+                // 3. APPLY PASS: Diff and manage listeners
+                info!("Dry-run passed. Applying new configuration...");
+                let mut next_active_servers = std::collections::HashMap::new();
+
+                for (port, (server_config_arc, service_stack)) in built_stacks {
+                    let new_server = &server_config_arc;
+                    let needs_restart = match active_servers.get(&port) {
                         None => true, // New listener on this port
                         Some((_, old_server, _)) => {
                             // Restart listener if fundamental binding parameters changed
@@ -246,46 +274,33 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                     };
 
                     if needs_restart {
-                        info!("Starting new listener for '{}' on port {}", new_server.name, new_server.port);
+                        info!("Starting new listener for '{}' on port {}", new_server.name, port);
                         let cancel_token = CancellationToken::new();
-                        let server_config_arc = Arc::new(new_server.clone());
-
-                        let service_stack = match build_service_stack(&server_config_arc) {
-                            Ok(svc) => svc,
-                            Err(e) => {
-                                error!("{}: Failed to build service stack: {:?}", new_server.name, e);
-                                continue;
-                            }
-                        };
                         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
                         next_active_servers.insert(
-                            new_server.port,
+                            port,
                             (cancel_token.clone(), server_config_arc.clone(), dynamic_stack.clone()),
                         );
 
+                        let cloned_config = server_config_arc.clone();
                         server_join_set.spawn(async move {
-                            start_single_server(server_config_arc, cancel_token, dynamic_stack).await;
+                            start_single_server(cloned_config, cancel_token, dynamic_stack).await;
                         });
                     } else {
                         // Keep listener alive!
                         // Removing from active_servers so we know which ones to drop later
-                        let (old_token, _, dynamic_stack) = active_servers.remove(&new_server.port).unwrap();
-                        let server_config_arc = Arc::new(new_server.clone());
+                        let (old_token, _, dynamic_stack) = active_servers.remove(&port).unwrap();
+                        
+                        // Hot-swap service stack for new config
+                        dynamic_stack.store(Arc::new(service_stack));
+                        info!("Hot-swapped service stack for '{}' on port {}", new_server.name, port);
 
-                        // Rebuild service stack for new config
-                        if let Ok(new_svc) = build_service_stack(&server_config_arc) {
-                            dynamic_stack.store(Arc::new(new_svc));
-                            info!("Hot-swapped service stack for '{}' on port {}", new_server.name, new_server.port);
-                        } else {
-                            error!("Failed to rebuild service stack for '{}', keeping old stack", new_server.name);
-                        }
-
-                        next_active_servers.insert(new_server.port, (old_token, server_config_arc, dynamic_stack));
+                        next_active_servers.insert(port, (old_token, server_config_arc.clone(), dynamic_stack));
                     }
                 }
 
-                // 3. Stop drained/removed listeners
+                // 4. Stop drained/removed listeners
                 for (port, (token, old_server, _)) in active_servers.drain() {
                     info!("Stopping listener for '{}' on port {}", old_server.name, port);
                     token.cancel();
