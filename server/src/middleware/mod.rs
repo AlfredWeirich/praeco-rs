@@ -57,6 +57,8 @@ pub mod router;
 pub mod security_headers;
 /// Request timing / duration measurement.
 pub mod timing;
+/// Trace ID injection for observability.
+pub mod trace_id;
 
 // ── Convenience re-exports ───────────────────────────────────────────────────
 
@@ -72,3 +74,4 @@ pub use rate_limiter::{SimpleRateLimiterLayer, TokenBucketRateLimiterLayer};
 pub use router::RouterService;
 pub use security_headers::SecurityHeadersLayer;
 pub use timing::TimingLayer;
+pub use trace_id::TraceIdLayer;

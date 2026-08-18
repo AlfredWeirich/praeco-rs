@@ -858,6 +858,7 @@ fn apply_layers(
         .into_iter()
         .rev()
         .fold(service, |svc, layer| match layer {
+            MiddlewareLayer::TraceId => praeco_rs::middleware::TraceIdLayer::new().layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Timing => TimingLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Counter => CountingLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Logger => LoggerLayer::new(server_name).layer(svc).boxed_clone_sync(),

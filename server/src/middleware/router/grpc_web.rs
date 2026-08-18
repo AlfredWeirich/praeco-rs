@@ -211,6 +211,14 @@ pub async fn handle_grpc_web(
         };
 
         *proxy_req.version_mut() = hyper::Version::HTTP_2;
+
+        // Ensure x-trace-id is present for gRPC backends that expect it
+        if let Some(trace_id) = current_headers.get("traceparent") {
+            if !current_headers.contains_key("x-trace-id") {
+                current_headers.insert("x-trace-id", trace_id.clone());
+            }
+        }
+
         *proxy_req.headers_mut() = current_headers;
 
         // Inject OpenTelemetry context (e.g., traceparent) into the outgoing request headers.
