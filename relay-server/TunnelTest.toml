@@ -1,0 +1,30 @@
+###############################################################################
+# GLOBAL SYSTEM SETTINGS
+###############################################################################
+pki_base_oid = "1.3.6.1.4.1.65111"
+enable_opentelemetry = false
+
+[[Server]]
+name = "tunnel_api"
+
+ip = "0.0.0.0" # Ignored because tunnel is active
+port = 0 # Ignored because tunnel is active
+
+enabled = true
+protocol = "https"
+authentication = "None"
+service = "Echo"
+
+[Server.tunnel]
+target_url = "tls://localhost:7001"
+sni_domain = "api.aweirich.eu"
+client_cert_path = "server_certs/self_signed/fullchain_self.pem"
+client_key_path = "server_certs/self_signed/privkey_self.pem"
+ca_cert_path = "server_certs/self_signed/myca.pem"
+
+[Server.server_certs]
+ssl_certificate = "server_certs/self_signed/fullchain_self.pem"
+ssl_certificate_key = "server_certs/self_signed/privkey_self.pem"
+
+[Server.Layers]
+enabled = ["Logger"]
