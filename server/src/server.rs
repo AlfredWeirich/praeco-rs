@@ -68,7 +68,9 @@ use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, runtime::Builder};
 
 use tokio_util::sync::CancellationToken;
-use tower::{Layer, ServiceExt, limit::ConcurrencyLimit};
+use tower::{Layer, limit::ConcurrencyLimit};
+use praeco_rs::BoxCloneSyncServiceExt;
+use arc_swap::ArcSwap;
 use tracing::{error, info, trace};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
@@ -97,7 +99,7 @@ use hyper_util::rt::{TokioExecutor, TokioTimer};
 use hyper_util::server::conn::auto;
 use praeco_rs::H3Body;
 use rustls::ServerConfig as RustlsServerConfig;
-use std::sync::Mutex;
+
 
 ///    Main entry point for the server application.
 ///
@@ -157,13 +159,13 @@ fn main() -> Result<(), Error> {
 async fn main_async(config: Arc<Config>) -> Result<(), Error> {
     let mut server_join_set = tokio::task::JoinSet::new();
 
-    // Map: port -> (CancellationToken, Arc<ServerConfig>, Arc<Mutex<BoxedCloneService>>)
+    // Map: port -> (CancellationToken, Arc<ServerConfig>, Arc<ArcSwap<BoxedCloneService>>)
     let mut active_servers: HashMap<
         u16,
         (
             CancellationToken,
             Arc<ServerConfig>,
-            Arc<Mutex<BoxedCloneService>>,
+            Arc<ArcSwap<BoxedCloneService>>,
         ),
     > = HashMap::new();
 
@@ -188,7 +190,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                 continue;
             }
         };
-        let dynamic_stack = Arc::new(Mutex::new(service_stack));
+        let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
         active_servers.insert(
             server_config.port,
@@ -255,7 +257,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                                 continue;
                             }
                         };
-                        let dynamic_stack = Arc::new(Mutex::new(service_stack));
+                        let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
                         next_active_servers.insert(
                             new_server.port,
@@ -273,7 +275,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
 
                         // Rebuild service stack for new config
                         if let Ok(new_svc) = build_service_stack(&server_config_arc) {
-                            *dynamic_stack.lock().unwrap() = new_svc;
+                            dynamic_stack.store(Arc::new(new_svc));
                             info!("Hot-swapped service stack for '{}' on port {}", new_server.name, new_server.port);
                         } else {
                             error!("Failed to rebuild service stack for '{}', keeping old stack", new_server.name);
@@ -330,7 +332,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
 async fn start_single_server(
     server_config: Arc<ServerConfig>,
     cancel_token: CancellationToken,
-    dynamic_stack: Arc<Mutex<BoxedCloneService>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
 ) {
     if server_config.service == ServiceType::Router {
         spawn_router_health_checks(&server_config, cancel_token.clone());
@@ -393,7 +395,7 @@ async fn start_single_server(
                 res = listener.accept() => {
                     match res {
                         Ok((stream, peer_addr)) => {
-                            let svc = dynamic_stack.lock().unwrap().clone(); // fresh stack per connection
+                            let svc = (**dynamic_stack.load()).clone(); // fresh stack per connection
                             let conn_token = cancel_token.clone();
                             let oid_mapping = oid_mapping.clone();
                             tokio::spawn(async move {
@@ -768,13 +770,13 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
 
     let base_service = match server_config.service {
         ServiceType::Echo => {
-            EchoService::new(server_config.static_name.expect("static_name missing")).boxed_clone()
+            EchoService::new(server_config.static_name.expect("static_name missing")).boxed_clone_sync()
         }
-        ServiceType::Router => RouterService::new(server_config.clone()).boxed_clone(),
+        ServiceType::Router => RouterService::new(server_config.clone()).boxed_clone_sync(),
         ServiceType::Idp => {
             let params = server_config.idp_params.as_ref().expect("IdpParams missing").clone();
             let idp_service = praeco_rs::middleware::idp::IdpService::new(params, server_config.static_name.expect("static_name missing")).expect("Failed to init IdP Service");
-            tower::util::BoxCloneService::new(idp_service)
+            praeco_rs::BoxCloneSyncService::new(idp_service)
         }
     };
 
@@ -814,7 +816,7 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         )
         .service(applied);
 
-    Ok(traced.boxed_clone())
+    Ok(traced.boxed_clone_sync())
 }
 
 /// Applies the configured middleware layers to the base service.
@@ -846,18 +848,18 @@ fn apply_layers(
         .into_iter()
         .rev()
         .fold(service, |svc, layer| match layer {
-            MiddlewareLayer::Timing => TimingLayer::new(server_name).layer(svc).boxed_clone(),
-            MiddlewareLayer::Counter => CountingLayer::new(server_name).layer(svc).boxed_clone(),
-            MiddlewareLayer::Logger => LoggerLayer::new(server_name).layer(svc).boxed_clone(),
+            MiddlewareLayer::Timing => TimingLayer::new(server_name).layer(svc).boxed_clone_sync(),
+            MiddlewareLayer::Counter => CountingLayer::new(server_name).layer(svc).boxed_clone_sync(),
+            MiddlewareLayer::Logger => LoggerLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Inspection => {
                 InspectionLayer::new(compiled_allowed_pathes.clone(), server_name)
                     .layer(svc)
-                    .boxed_clone()
+                    .boxed_clone_sync()
             }
             MiddlewareLayer::Delay(micros) => {
                 DelayLayer::new(Duration::from_micros(micros), server_name)
                     .layer(svc)
-                    .boxed_clone()
+                    .boxed_clone_sync()
             }
             MiddlewareLayer::JwtAuth(cfg) => {
                 JwtAuthLayer::new(
@@ -870,13 +872,13 @@ fn apply_layers(
                     cfg.expected_audience.clone(),
                 )
                 .layer(svc)
-                .boxed_clone()
+                .boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(praeco_rs::configuration::RateLimiter::Simple(cfg)) => {
                 let dur = Duration::from_secs_f32(1.0 / cfg.requests_per_second as f32);
                 SimpleRateLimiterLayer::new(dur, server_name)
                     .layer(svc)
-                    .boxed_clone()
+                    .boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(
                 praeco_rs::configuration::RateLimiter::TokenBucket(cfg),
@@ -887,25 +889,25 @@ fn apply_layers(
                 server_name,
             )
             .layer(svc)
-            .boxed_clone(),
+            .boxed_clone_sync(),
             MiddlewareLayer::ConcurrencyLimit(max_requests) => {
                 // Here we directly use the extracted usize value
-                ConcurrencyLimit::new(svc, max_requests).boxed_clone()
+                ConcurrencyLimit::new(svc, max_requests).boxed_clone_sync()
             }
             MiddlewareLayer::Compression => SrvCompressionLayer::new(server_name)
                 .layer(svc)
-                .boxed_clone(),
+                .boxed_clone_sync(),
             MiddlewareLayer::Decompression(max_bytes) => {
                 SrvDecompressionLayer::new(server_name, max_bytes)
                     .layer(svc)
-                    .boxed_clone()
+                    .boxed_clone_sync()
             }
             MiddlewareLayer::MaxPayload(max_bytes) => MaxPayloadLayer::new(max_bytes, server_name)
                 .layer(svc)
-                .boxed_clone(),
+                .boxed_clone_sync(),
             MiddlewareLayer::AltSvc => {
                 // We use the actual running port of the server
-                AltSvcLayer::new(server_port).layer(svc).boxed_clone()
+                AltSvcLayer::new(server_port).layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::Cors(cfg) => {
                 let origins: Vec<hyper::http::HeaderValue> = cfg
@@ -933,7 +935,7 @@ fn apply_layers(
                         $cors
                             .allow_credentials(cfg.allow_credentials)
                             .layer(svc)
-                            .boxed_clone()
+                            .boxed_clone_sync()
                     };
                 }
 
@@ -989,7 +991,7 @@ fn apply_layers(
                 }
             }
             MiddlewareLayer::SecurityHeaders(cfg) => {
-                SecurityHeadersLayer::new(cfg).layer(svc).boxed_clone()
+                SecurityHeadersLayer::new(cfg).layer(svc).boxed_clone_sync()
             }
         })
 }
@@ -1007,7 +1009,7 @@ fn apply_layers(
 pub async fn run_dual_stack(
     server_addr: SocketAddr,
     tls_config: RustlsServerConfig,
-    dynamic_stack: Arc<Mutex<BoxedCloneService>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
@@ -1054,7 +1056,7 @@ pub async fn run_dual_stack(
 async fn run_tcp_listener(
     server_addr: SocketAddr,
     tls_config: Arc<RustlsServerConfig>,
-    dynamic_stack: Arc<Mutex<BoxedCloneService>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
@@ -1100,7 +1102,7 @@ async fn run_tcp_listener(
                                         Vec::new()
                                     };
 
-                                    let svc = dynamic_stack.lock().unwrap().clone(); // fresh stack
+                                    let svc = (**dynamic_stack.load()).clone(); // fresh stack
                                     // Use the standard constructor which wraps Vec in Arc
                                     let handler = ConnectionHandler::new(svc, peer_addr, client_oids, client_cert_pem, client_cert_san, oid_mapping.clone());
 
@@ -1152,7 +1154,7 @@ async fn run_tcp_listener(
 async fn run_udp_listener(
     server_addr: SocketAddr,
     tls_config: Arc<RustlsServerConfig>,
-    dynamic_stack: Arc<Mutex<BoxedCloneService>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
@@ -1224,7 +1226,7 @@ async fn run_udp_listener(
 /// 4. **Serve**: Passes each request to our `ConnectionHandler`.
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
-    dynamic_stack: Arc<Mutex<BoxedCloneService>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     #[allow(unused_variables)] server_name: &str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1281,7 +1283,7 @@ async fn handle_h3_connection(
     // --- MUTEX OPTIMIZATION ---
     // Lock the Mutex ONCE per QUIC connection, not per HTTP/3 request stream!
     // The underlying Tower service handles its own cheap lock-free cloning.
-    let base_svc = dynamic_stack.lock().unwrap().clone();
+    let base_svc = (**dynamic_stack.load()).clone();
 
     // 4. Request Loop
     loop {

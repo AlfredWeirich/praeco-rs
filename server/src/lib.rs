@@ -34,7 +34,6 @@ use std::pin::Pin;
 
 use std::task::{Context, Poll};
 use tower::Service;
-use tower::util::BoxCloneService;
 
 // ── Public Modules ───────────────────────────────────────────────────────────
 
@@ -63,13 +62,86 @@ pub type SrvBody = BoxBody<Bytes, SrvError>;
 /// bodies need different constraints) without touching every signature.
 pub type ServiceRespBody = SrvBody;
 
+pub trait CloneSyncService<R, U, E>: Send + Sync {
+    fn clone_box(&self) -> Box<dyn CloneSyncService<R, U, E>>;
+    fn poll_ready_box(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), E>>;
+    fn call_box(&mut self, request: R) -> Pin<Box<dyn Future<Output = Result<U, E>> + Send>>;
+}
+
+impl<R, U, E, S> CloneSyncService<R, U, E> for S
+where
+    S: Service<R, Response = U, Error = E> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+{
+    fn clone_box(&self) -> Box<dyn CloneSyncService<R, U, E>> {
+        Box::new(self.clone())
+    }
+
+    fn poll_ready_box(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), E>> {
+        self.poll_ready(cx)
+    }
+
+    fn call_box(&mut self, request: R) -> Pin<Box<dyn Future<Output = Result<U, E>> + Send>> {
+        Box::pin(self.call(request))
+    }
+}
+
+pub struct BoxCloneSyncService<T, U, E>(Box<dyn CloneSyncService<T, U, E>>);
+
+impl<T, U, E> BoxCloneSyncService<T, U, E> {
+    pub fn new<S>(inner: S) -> Self
+    where
+        S: Service<T, Response = U, Error = E> + Clone + Send + Sync + 'static,
+        S::Future: Send + 'static,
+    {
+        BoxCloneSyncService(Box::new(inner))
+    }
+}
+
+impl<T, U, E> Clone for BoxCloneSyncService<T, U, E> {
+    fn clone(&self) -> Self {
+        BoxCloneSyncService(self.0.clone_box())
+    }
+}
+
+impl<T, U, E> Service<T> for BoxCloneSyncService<T, U, E> {
+    type Response = U;
+    type Error = E;
+    type Future = Pin<Box<dyn Future<Output = Result<U, E>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), E>> {
+        self.0.poll_ready_box(cx)
+    }
+
+    fn call(&mut self, request: T) -> Self::Future {
+        self.0.call_box(request)
+    }
+}
+
+pub trait BoxCloneSyncServiceExt<T>: Service<T> {
+    fn boxed_clone_sync(self) -> BoxCloneSyncService<T, Self::Response, Self::Error>
+    where
+        Self: Sized + Clone + Send + Sync + 'static,
+        Self::Future: Send + 'static;
+}
+
+impl<R, S: Service<R>> BoxCloneSyncServiceExt<R> for S {
+    fn boxed_clone_sync(self) -> BoxCloneSyncService<R, Self::Response, Self::Error>
+    where
+        Self: Sized + Clone + Send + Sync + 'static,
+        Self::Future: Send + 'static,
+    {
+        BoxCloneSyncService::new(self)
+    }
+}
+
 /// A fully assembled, type-erased, **cloneable** Tower service.
 ///
 /// This is the end product of stacking all middleware layers. It accepts a
 /// `Request<SrvBody>` and produces a `Response<ServiceRespBody>`. Because it
 /// is clone-able, it can be shared across connections via cheap `Arc`-based
 /// cloning internally.
-pub type BoxedCloneService = BoxCloneService<Request<SrvBody>, Response<ServiceRespBody>, SrvError>;
+pub type BoxedCloneService = BoxCloneSyncService<Request<SrvBody>, Response<ServiceRespBody>, SrvError>;
 
 // ── HTTP/3 Body Adapter ──────────────────────────────────────────────────────
 
