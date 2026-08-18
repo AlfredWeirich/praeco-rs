@@ -447,6 +447,8 @@ pub struct ParsedRoute {
 /// and may carry configuration data extracted from sibling TOML sections.
 #[derive(Debug, Clone)]
 pub enum MiddlewareLayer {
+    /// Injects a Trace ID into requests for observability.
+    TraceId,
     /// Tracks request/response timing.
     Timing,
     /// Counts the number of requests.
@@ -1224,6 +1226,7 @@ impl Layers {
                     .as_ref()
                     .map(|c| MiddlewareLayer::MaxPayload(c.max_bytes))
                     .context("Layer 'MaxPayload' enabled but [Server.Layers.MaxPayload] section is missing"),
+                "TraceId" => Ok(MiddlewareLayer::TraceId),
                 "Timing" => Ok(MiddlewareLayer::Timing),
                 "Counter" => Ok(MiddlewareLayer::Counter),
                 "Logger" => Ok(MiddlewareLayer::Logger),

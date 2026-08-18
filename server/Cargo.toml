@@ -79,6 +79,7 @@ fastrand = "2.3.0"
 num_cpus = "1.17.0"
 dashmap = "6.0"
 mimalloc = { version = "*", features = ["v3"] }
+uuid = { version = "1.24.1", features = ["v4"] }
 
 [[bin]]
 name = "praeco-rs"
