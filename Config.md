@@ -152,6 +152,7 @@ Each layer takes over a specific task in the request lifecycle:
 
 | Layer Name | Brief Explanation |
 | :--- | :--- |
+| `"TraceId"` | Extracts or generates a W3C-compliant Trace ID and injects it into the request context for end-to-end tracing. Must be the FIRST layer! |
 | `"Timing"` | Measures the processing duration of each request (useful for metrics). |
 | `"Counter"` | Counts the number of currently processed requests. |
 | `"Logger"` | Logs details about the request and response (e.g., path, status code, IP). |
