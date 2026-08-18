@@ -1,0 +1,19 @@
+[package]
+name = "relay-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.39", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1.12"
+rustls-pemfile = "2.2"
+yamux = "0.14" 
+dashmap = "6.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+tls-parser = "0.12"
+nom = "7.1"
+tokio-util = { version = "0.7", features = ["compat"] }
