@@ -50,3 +50,6 @@ $RECYCLE.BIN/
 .tokensave/*
 jwt_creator/token1.jwt
 jwt_creator/token2.jwt
+jwt_cnf.md
+Zero-Trust Reverse Tunneling.md
+idee_jwt_cnf.md

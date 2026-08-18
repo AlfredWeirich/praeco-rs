@@ -139,6 +139,19 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `issuer`: String. The issuer claim (`iss`) injected into the generated JWTs (default: `"praeco-idp"`).
 * `allowed_audiences`: Array of strings. A list of allowed target audiences (`aud`). If a client requests a specific audience via the `?aud=` query parameter, it must match one of the entries in this list.
 
+### Outbound Zero-Trust Tunneling (SNI Relay)
+
+#### `[Server.tunnel]` (Optional)
+Configures this server instance to bypass opening a local listening port (ignores `ip` and `port`), and instead establish an outbound, multiplexed mTLS connection to a standalone Relay Server. The Relay Server handles incoming internet traffic and routes it back to this instance based on SNI (Server Name Indication).
+
+> **Note on `ip` and `port`:** Even when the tunnel is active and Praeco does not open a local port, the `ip` and `port` fields **must** still be provided in the `[[Server]]` block due to the strict typing of the TOML parser. You can set them to dummy values in this case (e.g., `ip = "0.0.0.0"` and `port = 0`).
+
+* `target_url`: String. The URL of the relay server control plane (e.g., `"tls://relay.example.com:7001"`).
+* `sni_domain`: String. The domain name this server is responsible for. The relay server routes traffic for this SNI to this tunnel. (e.g., `"api.example.com"`).
+* `client_cert_path`: String. Path to the client certificate (PEM) used to authenticate against the relay.
+* `client_key_path`: String. Path to the client private key (PEM).
+* `ca_cert_path`: String. Path to the CA certificate (PEM) that signed the relay server's certificate.
+
 ---
 
 ## Middleware Layer (`[Server.Layers]`)

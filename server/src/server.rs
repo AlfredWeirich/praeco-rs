@@ -71,7 +71,7 @@ use tokio_util::sync::CancellationToken;
 use tower::{Layer, limit::ConcurrencyLimit};
 use praeco_rs::BoxCloneSyncServiceExt;
 use arc_swap::ArcSwap;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
@@ -368,6 +368,28 @@ async fn start_single_server(
 
     // === HTTPS / DUAL STACK PATH ===
     let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    if let Some(tunnel) = &server_config.tunnel {
+        info!("{}: Connecting to Zero-Trust Tunnel at {}", server_config.name, tunnel.target_url);
+        let tls_config: RustlsServerConfig = match build_rustls_config(server_config.as_ref()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!("{}: TLS Setup Error: {:?}", server_config.name, e);
+                return;
+            }
+        };
+        if let Err(e) = run_tunnel(
+            tunnel.clone(),
+            tls_config,
+            dynamic_stack,
+            cancel_token,
+            server_config.static_name.expect("missing static_name"),
+            oid_mapping,
+        ).await {
+            error!("{}: Tunnel crashed: {:?}", server_config.name, e);
+        }
+        return;
+    }
 
     if server_config.protocol == Protocol::Https {
         let tls_config: RustlsServerConfig = match build_rustls_config(server_config.as_ref()) {
@@ -1605,4 +1627,131 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
         tracing::subscriber::set_global_default(subscriber)?;
         Ok(None)
     }
+}
+use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
+use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
+
+async fn run_tunnel(
+    tunnel: praeco_rs::configuration::TunnelConfig,
+    tls_config: RustlsServerConfig,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+    // 1. Prepare Outbound mTLS
+    let mut root_store = rustls::RootCertStore::empty();
+    let ca_file = std::fs::File::open(&tunnel.ca_cert_path)?;
+    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(ca_file)) {
+        root_store.add(cert?)?;
+    }
+    
+    let cert_file = std::fs::File::open(&tunnel.client_cert_path)?;
+    let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()?;
+        
+    let key_file = std::fs::File::open(&tunnel.client_key_path)?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))?
+        .ok_or("No private key found")?;
+
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)?;
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+    // 2. Connect to Relay
+    let relay_host = tunnel.target_url.trim_start_matches("tls://").split(':').next().unwrap_or(&tunnel.target_url);
+    let relay_port = tunnel.target_url.split(':').last().unwrap_or("7000").parse::<u16>().unwrap_or(7000);
+    
+    let tcp_stream = TcpStream::connect((relay_host, relay_port)).await?;
+    let domain = rustls::pki_types::ServerName::try_from(relay_host.to_string())?;
+    
+    let mut tls_stream = connector.connect(domain, tcp_stream).await?;
+
+    // 3. Register SNI
+    let reg_cmd = format!("REGISTER {}\n", tunnel.sni_domain);
+    tls_stream.write_all(reg_cmd.as_bytes()).await?;
+
+    // 4. Setup Yamux
+    let cfg = yamux::Config::default();
+    let mut connection = yamux::Connection::new(tls_stream.compat(), cfg, yamux::Mode::Client);
+
+    info!("{}: Tunnel connected successfully to {}", server_name, tunnel.target_url);
+
+    // 5. Accept Streams loop
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                inbound = std::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => {
+                    match inbound {
+                        Some(Ok(yamux_stream)) => {
+                            trace!("{}: Tunneled connection accepted", server_name);
+                            let acceptor = acceptor.clone();
+                            let dynamic_stack = dynamic_stack.clone();
+                            let oid_mapping = oid_mapping.clone();
+                            
+                            // We must create a dummy SocketAddr since tunnels don't have real remote IPs (unless we proxy protocol it)
+                            let peer_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+
+                            tokio::spawn(async move {
+                                // Provide AsyncRead/Write compat for hyper
+                                let compat_stream = yamux_stream.compat();
+
+                                let tls_result = tokio::time::timeout(
+                                    Duration::from_secs(10),
+                                    acceptor.accept(compat_stream),
+                                ).await;
+
+                                match tls_result {
+                                    Ok(Ok(tls_stream)) => {
+                                        let (_, session) = tls_stream.get_ref();
+                                        let certs = session.peer_certificates();
+                                        let mut client_cert_pem = None;
+                                        let mut client_cert_san = None;
+                                        let client_oids = if let Some(c) = certs.and_then(|c| c.first()) {
+                                            let (pem, san) = extract_cert_san_and_pem(c.as_ref());
+                                            client_cert_pem = pem;
+                                            client_cert_san = san;
+                                            extract_oids_from_cert(c.as_ref())
+                                        } else {
+                                            Vec::new()
+                                        };
+
+                                        let svc = (**dynamic_stack.load()).clone();
+                                        let handler = ConnectionHandler::new(svc, peer_addr, client_oids, client_cert_pem, client_cert_san, oid_mapping.clone());
+
+                                        let mut builder = auto::Builder::new(TokioExecutor::new());
+                                        builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
+                                        builder.http2().timer(TokioTimer::new())
+                                            .initial_stream_window_size(1024 * 1024)
+                                            .max_concurrent_streams(1024);
+                                        
+                                        let _ = builder.serve_connection(TokioIo::new(tls_stream), handler).await;
+                                    }
+                                    _ => {
+                                        warn!("{}: TLS handshake via tunnel failed", server_name);
+                                    }
+                                }
+                            });
+                        }
+                        Some(Err(e)) => {
+                            error!("{}: Tunnel error: {:?}", server_name, e);
+                            break;
+                        }
+                        None => {
+                            info!("{}: Tunnel closed by Relay", server_name);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
 }

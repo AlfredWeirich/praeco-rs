@@ -139,6 +139,15 @@ pub struct Config {
 //  Per-Server Configuration
 // ============================================================================
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct TunnelConfig {
+    pub target_url: String,
+    pub sni_domain: String,
+    pub client_cert_path: String,
+    pub client_key_path: String,
+    pub ca_cert_path: String,
+}
+
 /// Configuration for a single server instance (one listener address).
 ///
 /// Each `ServerConfig` produces one TCP listener (and optionally one UDP
@@ -158,6 +167,10 @@ pub struct ServerConfig {
     pub ip: String,
     /// TCP/UDP port to listen on.
     pub port: u16,
+    
+    /// Optional Tunnel configuration for Outbound Zero-Trust connections (SNI Relay)
+    #[serde(default)]
+    pub tunnel: Option<TunnelConfig>,
     /// Whether this server instance should be started. Defaults to `true`.
     #[serde(default = "default_true")]
     pub enabled: bool,
