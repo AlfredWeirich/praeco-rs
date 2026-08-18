@@ -1205,6 +1205,34 @@ impl CompiledAllowedPathes {
 }
 
 impl Layers {
+    /// Validates the order of middleware layers in `enabled`.
+    fn validate_middleware_order(&self) -> Result<(), Error> {
+        // Rule 1: TraceId (if present) must be first
+        if let Some(idx) = self.enabled.iter().position(|l| l == "TraceId") {
+            if idx != 0 {
+                return Err(Error::msg(
+                    "TraceId layer must be FIRST (outermost) in [Server.Layers].enabled to capture all requests."
+                ));
+            }
+        }
+
+        // Rule 2: Inspection must come AFTER Decompression
+        if let Some(insp_idx) = self.enabled.iter().position(|l| l == "Inspection") {
+            if let Some(decomp_idx) = self.enabled.iter().position(|l| l == "Decompression") {
+                if insp_idx < decomp_idx {
+                    return Err(Error::msg(
+                        format!(
+                            "Inspection (at index {}) must come AFTER Decompression (at index {}). Otherwise the WAF inspects compressed bytes!",
+                            insp_idx, decomp_idx
+                        )
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Maps the enabled layer names to their corresponding [`MiddlewareLayer`] variants.
     ///
     /// Each string in [`Layers::enabled`] is matched against known layer names.
@@ -1214,8 +1242,10 @@ impl Layers {
     /// # Errors
     ///
     /// Returns an error if an unknown layer name is encountered or if a required
-    /// configuration section is absent.
+    /// configuration section is absent, or if the layer order is invalid.
     pub fn build_middleware_layers(&self, server_name: &str) -> Result<Vec<MiddlewareLayer>, Error> {
+        self.validate_middleware_order()?;
+
         let mut layers: Vec<MiddlewareLayer> = self
             .enabled
             .iter()
