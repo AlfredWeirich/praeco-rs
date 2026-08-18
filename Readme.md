@@ -19,6 +19,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 * **Built-in Identity Provider (IdP)**: Issues signed JWTs by leveraging the gateway's existing mTLS infrastructure. The IdP securely manages identities and issues tokens containing strict `iss` (Issuer) and `aud` (Audience) claims to prevent confused-deputy attacks across services.
 * **Dynamic Key Discovery (JWKS)**: The IdP exposes a standard `/.well-known/jwks.json` endpoint to serve its public keys dynamically. This enables downstream Resource Servers to fetch and verify JWT signatures automatically, supporting seamless, zero-downtime key rotation.
 * **Advanced Role Mapping (RBAC)**: Extracted custom Object Identifiers (OIDs) from mTLS client certificates are mapped to internal roles (`UserRole`), extending the strict access control directly into the JWTs issued by the IdP.
+* **Outbound Zero-Trust Tunneling (SNI Relay)**: Enables Praeco instances to run behind strict NATs or firewalls without opening local ports. Instances establish outbound multiplexed mTLS connections (`yamux`) to a standalone Relay Server, which routes incoming internet traffic securely back to the correct instance using SNI (Server Name Indication).
 
 ---
 
@@ -56,6 +57,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 - **End-to-End mTLS Bridging**: In addition to mTLS termination at the gateway, the proxy can establish a completely **new mTLS connection to the upstream servers** (including its own client certificate). This guarantees a fully encrypted and authenticated zero-trust chain deep into the internal backend.
 - **Built-in Identity Provider (IdP)**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support advanced authentication flows like QR-code-based cross-device logins.
 - **HTTP/3 Native**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3`, providing better performance on unreliable networks.
+- **Outbound Zero-Trust Tunneling (SNI Relay)**: For deployments behind restrictive NATs or firewalls, `praeco-rs` can bypass local port binding entirely. Instead, it establishes an outbound, multiplexed mTLS connection (via Yamux) to a standalone Relay Server. The Relay Server accepts incoming internet traffic (Port 443) and routes it strictly via SNI to the corresponding Praeco instance, achieving complete End-to-End TLS without the Relay Server terminating the client connection.
 
 ---
 
