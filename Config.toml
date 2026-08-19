@@ -12,6 +12,7 @@
 enable_opentelemetry = true
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
+#otel_sample_ratio = 0.9
 
 # The Base Object Identifier (OID) used for security validation.
 # This acts as the root for interpreting client certificate extensions and JWT claims.
