@@ -11,6 +11,12 @@
     ip = "0.0.0.0"
     port = 1336
     enabled = true
+    [Server.tunnel]
+    target_url = "tls://localhost:7001"
+    sni_domain = "wurzelwerk.api.aweirich.eu"
+    client_cert_path = "server_certs/self_signed/praeco_client.pem"
+    client_key_path = "server_certs/self_signed/praeco_client.key"
+    ca_cert_path = "server_certs/self_signed/relay_ca.pem"
     protocol = "https"
     authentication = "ClientCert"
     service = "Router"
@@ -22,8 +28,8 @@
     max_decompressed_bytes = 10485760  # 10 MB limit
 
     [Server.server_certs]
-    ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
-    ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+    ssl_certificate = "server_certs/self_signed/praeco_public.pem"
+    ssl_certificate_key = "server_certs/self_signed/praeco_public.key"
 
     [[Server.client_certs]]
     ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
@@ -105,10 +111,17 @@
     service = "Router"
     enabled = true
     authentication = "None"
+    [Server.tunnel]
+    target_url = "tls://localhost:7001"
+    sni_domain = "wurzelwerk.onboarding.aweirich.eu"
+    client_cert_path = "server_certs/self_signed/praeco_client.pem"
+    client_key_path = "server_certs/self_signed/praeco_client.key"
+    ca_cert_path = "server_certs/self_signed/relay_ca.pem"
+    authentication = "None"
 
     [Server.server_certs]
-    ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
-    ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+    ssl_certificate = "server_certs/self_signed/praeco_public.pem"
+    ssl_certificate_key = "server_certs/self_signed/praeco_public.key"
 
     [Server.Layers]
     enabled = ["MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
@@ -152,10 +165,16 @@
     authentication = "None"
     service = "Router"
     enabled = true
+    [Server.tunnel]
+    target_url = "tls://localhost:7001"
+    sni_domain = "wurzelwerk.admin.aweirich.eu"
+    client_cert_path = "server_certs/self_signed/praeco_client.pem"
+    client_key_path = "server_certs/self_signed/praeco_client.key"
+    ca_cert_path = "server_certs/self_signed/relay_ca.pem"
     
     [Server.server_certs]
-        ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
-        ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+        ssl_certificate = "server_certs/self_signed/praeco_public.pem"
+        ssl_certificate_key = "server_certs/self_signed/praeco_public.key"
 
     [Server.oid_mapping]
         "1" = "Admin"
@@ -167,7 +186,7 @@
     [Server.Layers.JWT]
         jwt_public_keys = ["/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/idp_public.pem"]
         cookie_fallback = "admin-jwt"
-        redirect_on_failure = "https://localhost:1339/auth/login_page"
+        redirect_on_failure = "https://wurzelwerk.idp.aweirich.eu/auth/login_page"
         expected_issuer = "praeco-idp"
         expected_audience = "praeco-admin"
     
@@ -251,10 +270,16 @@
     authentication = "OptionalClientCert"
     service = "Idp"
     enabled = true
+    [Server.tunnel]
+    target_url = "tls://localhost:7001"
+    sni_domain = "wurzelwerk.idp.aweirich.eu"
+    client_cert_path = "server_certs/self_signed/praeco_client.pem"
+    client_key_path = "server_certs/self_signed/praeco_client.key"
+    ca_cert_path = "server_certs/self_signed/relay_ca.pem"
     
     [Server.server_certs]
-        ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
-        ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+        ssl_certificate = "server_certs/self_signed/praeco_public.pem"
+        ssl_certificate_key = "server_certs/self_signed/praeco_public.key"
         
     [[Server.client_certs]]
         ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
@@ -265,7 +290,7 @@
         token_expiry_seconds = 28800 # 8 hours
         session_ttl_seconds = 120
         cookie_name = "admin-jwt"
-        redirect_after_login = "https://localhost:1338/admin"
+        redirect_after_login = "https://wurzelwerk.admin.aweirich.eu/admin"
         debug_show_session_id = true
 
     [Server.Layers]
