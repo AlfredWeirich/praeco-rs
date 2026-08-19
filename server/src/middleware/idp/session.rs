@@ -44,11 +44,13 @@ impl SessionStore {
 
     /// Creates a new pending session and returns its unique, random ID.
     pub fn create_session(&self) -> String {
+        use rand::Rng;
+        let mut rng = rand::rngs::OsRng;
         // Generate a random 32-character alphanumeric string for the session ID
         let mut session_id = String::with_capacity(32);
         const CHARSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         for _ in 0..32 {
-            let ch = CHARSET[fastrand::usize(..CHARSET.len())] as char;
+            let ch = CHARSET[rng.gen_range(0..CHARSET.len())] as char;
             session_id.push(ch);
         }
 

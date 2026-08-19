@@ -406,7 +406,8 @@ impl RouteTarget {
                 slice[count % slice.len()]
             }
             LbStrategy::Random => {
-                let index = fastrand::usize(..slice.len());
+                use rand::Rng;
+                let index = rand::thread_rng().gen_range(0..slice.len());
                 slice[index]
             }
             LbStrategy::LeastConnections => slice
@@ -424,7 +425,7 @@ impl RouteTarget {
                     hasher.finish() as usize
                 } else {
                     // Fallback to random if no IP is provided
-                    fastrand::usize(..)
+                    rand::random::<usize>()
                 };
                 slice[hash % slice.len()]
             }
