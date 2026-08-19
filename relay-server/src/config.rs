@@ -50,6 +50,7 @@ impl Default for RelayConfig {
             ca_cert_path: "server_certs/self_signed/myca.pem".into(),
             server_cert_path: "server_certs/self_signed/fullchain_self.pem".into(),
             server_key_path: "server_certs/self_signed/privkey_self.pem".into(),
+            crl_path: None,
             enable_opentelemetry: Some(false),
             jaeger_endpoint: Some("http://localhost:4317".into()),
             otel_log_level: Some("info".into()),
