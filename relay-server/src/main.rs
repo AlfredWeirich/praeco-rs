@@ -33,9 +33,44 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use std::time::Duration;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 use yamux::{Config as YamuxConfig, Connection, Mode, Stream as YamuxStream};
 use tls_parser::{parse_tls_plaintext, TlsExtension, TlsMessageHandshake};
+
+/// Basic token bucket rate limiter tracking capacity per IP.
+struct TokenBucket {
+    tokens: f32,
+    last_update: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: f32) -> Self {
+        Self {
+            tokens: burst,
+            last_update: Instant::now(),
+        }
+    }
+
+    fn consume(&mut self, rate: f32, burst: f32) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f32();
+        
+        // Refill tokens based on elapsed time and rate
+        self.tokens += elapsed * rate;
+        if self.tokens > burst {
+            self.tokens = burst;
+        }
+        self.last_update = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Represents a control handle to an active Yamux multiplexed connection.
 /// Used to request new outbound streams from the Relay to the Praeco backend.
@@ -140,8 +175,11 @@ async fn main() -> Result<()> {
 
     // --- Spawn Data Plane ---
     let data_addr = config.data_plane_addr.clone();
+    let rate_rate = config.rate_limit_connections_per_sec.unwrap_or(50) as f32;
+    let rate_burst = config.rate_limit_burst.unwrap_or(100) as f32;
+    
     tokio::spawn(async move {
-        if let Err(e) = run_data_plane(active_tunnels, &data_addr).await {
+        if let Err(e) = run_data_plane(active_tunnels, &data_addr, rate_rate, rate_burst).await {
             error!("Data plane failed: {}", e);
         }
     });
@@ -322,15 +360,37 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
 /// Extracts the Server Name Indication (SNI) from the initial TLS ClientHello.
 /// Looks up the SNI in the `tunnels` map, opens a new stream over the corresponding
 /// Yamux connection, and blindly copies the bidirectional TCP traffic.
-async fn run_data_plane(tunnels: SessionMap, addr: &str) -> Result<()> {
+/// Applies a Token-Bucket rate limit per client IP to mitigate L4 connection floods.
+async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("Data plane listening on {} (SNI-Routing)", addr);
+
+    let rate_limits: Arc<DashMap<IpAddr, TokenBucket>> = Arc::new(DashMap::new());
+    
+    // Spawn a cleanup task to prevent DashMap from growing indefinitely
+    let cleanup_limits = rate_limits.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            // Remove buckets that haven't been used in 2 minutes
+            cleanup_limits.retain(|_, bucket| bucket.last_update.elapsed() < Duration::from_secs(120));
+        }
+    });
 
     loop {
         let (mut client_stream, client_addr) = match listener.accept().await {
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        // --- Rate Limiting Check ---
+        let mut bucket = rate_limits.entry(client_addr.ip()).or_insert_with(|| TokenBucket::new(burst));
+        if !bucket.consume(rate, burst) {
+            warn!(target: "relay::data_plane", client_ip = %client_addr, "Rate limit exceeded, dropping connection");
+            continue; // Drop instantly
+        }
+        drop(bucket); // Explicitly release the lock before spawning
 
         let tunnels = tunnels.clone();
         tokio::spawn(async move {
