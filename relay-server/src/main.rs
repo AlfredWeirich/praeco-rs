@@ -95,7 +95,8 @@ impl Control {
 type SessionMap = Arc<DashMap<String, (Control, u64)>>;
 
 /// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
-fn setup_tracing(config: &RelayConfig) {
+/// Returns the TracerProvider so it isn't dropped prematurely.
+fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::TracerProvider> {
     let enable_otlp = config.enable_opentelemetry.unwrap_or(false);
     let jaeger_endpoint = config.jaeger_endpoint.as_deref().unwrap_or("http://localhost:4317");
     let otel_log_level = config.otel_log_level.as_deref().unwrap_or("info");
@@ -105,7 +106,7 @@ fn setup_tracing(config: &RelayConfig) {
     let console_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = tracing_subscriber::fmt::layer().with_ansi(true).with_filter(console_filter);
 
-    let telemetry_layer = if enable_otlp {
+    if enable_otlp {
         let sampler = if (otel_sample_ratio - 1.0).abs() < f64::EPSILON {
             opentelemetry_sdk::trace::Sampler::AlwaysOn
         } else {
@@ -132,15 +133,21 @@ fn setup_tracing(config: &RelayConfig) {
         let tracer = provider.tracer("praeco-relay");
         let telemetry_filter = EnvFilter::new(otel_log_level);
         
-        Some(tracing_opentelemetry::layer().with_tracer(tracer).with_filter(telemetry_filter))
+        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer).with_filter(telemetry_filter);
+        
+        tracing_subscriber::registry()
+            .with(stdout_layer)
+            .with(telemetry_layer)
+            .init();
+            
+        Some(provider)
     } else {
+        tracing_subscriber::registry()
+            .with(stdout_layer)
+            .init();
+            
         None
-    };
-
-    tracing_subscriber::registry()
-        .with(stdout_layer)
-        .with(telemetry_layer)
-        .init();
+    }
 }
 
 /// Entry point for the Relay Server.
@@ -151,7 +158,7 @@ fn setup_tracing(config: &RelayConfig) {
 async fn main() -> Result<()> {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "RelayConfig.toml".to_string());
     let config = RelayConfig::load(&config_path)?;
-    setup_tracing(&config);
+    let _tracer_provider = setup_tracing(&config);
     
     // Install default crypto provider for rustls
     rustls::crypto::ring::default_provider()
