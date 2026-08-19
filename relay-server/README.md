@@ -6,6 +6,12 @@ Der **Praeco SNI Relay Server** ist eine hochperformante, leichtgewichtige Kompo
 
 Der Relay Server operiert als reiner **Layer-4 Router** mit SNI-Erkennung (Server Name Indication) und terminiert den TLS-Traffic der Endnutzer **nicht**. Dies garantiert echte End-to-End-Verschlüsselung (E2EE) bis in die lokale Praeco-Instanz.
 
+### Sicherheitsvorteile der Zero-Trust Architektur
+1. **Keine offenen Inbound-Ports (Unsichtbarkeit):** Der Praeco-Server muss nicht aus dem Internet erreichbar sein. Automatisierte Port-Scans und OS-Level Exploits laufen ins Leere, da der Server physisch "nicht existiert" (er verbindet sich nur ausgehend zum Relay).
+2. **Isolierter "Blast Radius" (DDoS Schutz):** Layer-3/4 DDoS-Angriffe treffen ausschließlich den Relay-Server in der Cloud. Das Heimnetzwerk / Rechenzentrum bleibt unberührt.
+3. **Echte End-to-End Verschlüsselung (E2EE):** Im Gegensatz zu Cloudflare oder Nginx terminiert der Relay den Traffic nicht. Bei einer Kompromittierung des Relays sieht der Angreifer nur verschlüsselten Datenmüll. Die privaten TLS-Zertifikate verlassen den Praeco-Server nie.
+4. **Minimale Angriffsfläche (Attack Surface):** Da der Relay nur TCP-Streams routet und keine HTTP(s)-Header parst, ist er immun gegen komplexe Layer-7 Exploits (wie *HTTP/2 Rapid Reset* oder Header Smuggling).
+
 Das System besteht aus zwei Ebenen:
 
 1. **Control Plane (Standard Port 7001 / mTLS + Yamux):**
