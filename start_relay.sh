@@ -16,4 +16,4 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-RUST_LOG="warn,relay_server=${LOG_LEVEL}" cargo run -p relay-server --release -- "${CARGO_ARGS[@]}"
+RUST_LOG="warn,praeco_relay_server=${LOG_LEVEL}" cargo run -p praeco-relay-server --release -- "${CARGO_ARGS[@]}"
