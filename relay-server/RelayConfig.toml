@@ -24,14 +24,18 @@ data_plane_addr = "0.0.0.0:443"
 # Nur Gateways, deren Zertifikat von dieser CA ausgestellt wurde, dürfen Tunnel aufbauen.
 # WICHTIG: Das hier hinterlegte CA-Zertifikat MUSS die Instanz sein, die das `client_cert_path` 
 # Zertifikat im TunnelTest.toml (beim Praeco Gateway) ausgestellt hat.
-ca_cert_path = "server_certs/self_signed/myca.pem"
+ca_cert_path = "server_certs/self_signed/relay_ca.pem"
+
+# (Optional) Pfad zu einer Certificate Revocation List (CRL) im PEM Format.
+# Wird genutzt, um kompromittierte Gateway-Zertifikate (ausgestellt von der CA oben) abzulehnen.
+# crl_path = "server_certs/self_signed/relay_ca.crl.pem"
 
 # Zertifikat und privater Schlüssel des Relay-Servers selbst.
 # Damit beweist das Relay gegenüber den Praeco-Gateways seine eigene Identität.
 # WICHTIG: Das hier konfigurierte Zertifikat MUSS von der CA ausgestellt worden sein,
 # die beim Praeco Gateway (TunnelTest.toml) unter `[Server.tunnel] ca_cert_path` konfiguriert ist.
-server_cert_path = "server_certs/self_signed/fullchain_self.pem"
-server_key_path = "server_certs/self_signed/privkey_self.pem"
+server_cert_path = "server_certs/self_signed/relay_server.pem"
+server_key_path = "server_certs/self_signed/relay_server.key"
 
 # Enable or disable background OpenTelemetry Tracing (Jaeger)
 enable_opentelemetry = true
