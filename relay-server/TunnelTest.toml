@@ -5,30 +5,50 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 enable_opentelemetry = true
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
+#otel_sample_ratio=0.9
 
 [[Server]]
 name = "tunnel_api"
 
+###### IGNORED in TUNNEL MODE######
 ip = "0.0.0.0" # Ignored because tunnel is active
 port = 0 # Ignored because tunnel is active
+###### IGNORED in TUNNEL MODE######
 
 enabled = true
 protocol = "https"
 authentication = "None"
 service = "Router"
 
+###### TUNNEL MODE######
 [Server.tunnel]
 target_url = "tls://localhost:7001"
 sni_domain = "api.aweirich.eu"
+
+# --- RELAY AUTHENTICATION (Control Plane) ---
+# Diese Zertifikate werden vom Praeco Gateway an den Relay-Server gesendet (mTLS Client).
+# Sie beweisen gegenüber dem Relay, dass dieser Tunnel die Domain aus Feld 'sni_domain' registrieren darf.
 client_cert_path = "server_certs/self_signed/fullchain_self.pem"
 client_key_path = "server_certs/self_signed/privkey_self.pem"
+
+# CA zur Verifikation des Relay-Servers selbst (sodass Praeco weiß, dass es mit dem echten Relay spricht).
 ca_cert_path = "server_certs/self_signed/myca.pem"
+###### TUNNEL MODE######
 
 [Server.server_certs]
+# --- END-TO-END ENCRYPTION (Data Plane) ---
+# Diese Zertifikate terminieren den eigentlichen Datenverkehr des Endnutzers.
+# Der Client-Browser sieht dieses Zertifikat. Das Relay leitet den Traffic nur als TCP-Stream durch
+# und kann den Traffic NICHT entschlüsseln.
 ssl_certificate = "server_certs/self_signed/fullchain_self.pem"
 ssl_certificate_key = "server_certs/self_signed/privkey_self.pem"
 
 [Server.Layers]
+# "Inspection" muss zwingend aktiviert sein, damit AllowedPathes wirksam wird!
+#enabled = ["Logger", "Inspection"]
+#[Server.AllowedPathes.GET]
+#"/admin" = ["^/admin.*"]
+#"/" = ["^/$"]
 enabled = ["Logger"]
 
 [Server.ReverseRoutes."/"]
@@ -39,7 +59,3 @@ backend_type = "rest"
 protocol = "https"
 authentication = "None"
 ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
-
-[Server.AllowedPathes.GET]
-"/admin" = ["^/admin.*"]
-"/" = ["^/$"]
