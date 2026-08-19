@@ -26,12 +26,22 @@ target_url = "tls://localhost:7001"
 sni_domain = "api.aweirich.eu"
 
 # --- RELAY AUTHENTICATION (Control Plane) ---
-# Diese Zertifikate werden vom Praeco Gateway an den Relay-Server gesendet (mTLS Client).
+# Diese Zertifikate werden vom Praeco Gateway an den Relay-Server gesendet.
+# Praeco baut zu Port 7001 eine mTLS (Mutual TLS) Verbindung auf
+# Das bedeutet, sowohl der Relay-Server als auch das Praeco-Gateway authentifizieren sich gegenseitig per Zertifikat.
 # Sie beweisen gegenüber dem Relay, dass dieser Tunnel die Domain aus Feld 'sni_domain' registrieren darf.
+#
+# Welche Zertifikate muessen matchen:
+# WICHTIG: Dieses Client-Zertifikat MUSS von der CA signiert sein, die im Relay-Server unter 
+# `ca_cert_path` (in RelayConfig.toml) hinterlegt ist. Ausserdem MUSS dieses Zertifikat den Namen
+# aus `sni_domain` als Subject Alternative Name (SAN) enthalten.
 client_cert_path = "server_certs/self_signed/fullchain_self.pem"
 client_key_path = "server_certs/self_signed/privkey_self.pem"
 
 # CA zur Verifikation des Relay-Servers selbst (sodass Praeco weiß, dass es mit dem echten Relay spricht).
+# Welche Zertifikate muessen matchen:
+# WICHTIG: Diese CA MUSS das Zertifikat ausgestellt haben, welches das Relay unter 
+# `server_cert_path` (in RelayConfig.toml) nutzt.
 ca_cert_path = "server_certs/self_signed/myca.pem"
 ###### TUNNEL MODE######
 
