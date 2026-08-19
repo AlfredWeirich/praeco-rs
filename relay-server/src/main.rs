@@ -161,8 +161,12 @@ async fn main() -> Result<()> {
 
     let active_tunnels: SessionMap = Arc::new(DashMap::new());
 
-    let tls_acceptor = setup_mtls_acceptor(&config.ca_cert_path, &config.server_cert_path, &config.server_key_path)
-        .context("Failed to setup mTLS acceptor")?;
+    let tls_acceptor = setup_mtls_acceptor(
+        &config.ca_cert_path, 
+        &config.server_cert_path, 
+        &config.server_key_path,
+        config.crl_path.as_ref(),
+    ).context("Failed to setup mTLS acceptor")?;
 
     // --- Spawn Control Plane ---
     let control_tunnels = active_tunnels.clone();
@@ -191,7 +195,7 @@ async fn main() -> Result<()> {
 }
 
 /// Loads certificates and constructs a `TlsAcceptor` configured for strict mTLS.
-fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
+fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str, crl_path: Option<&String>) -> Result<TlsAcceptor> {
     let ca_file = File::open(ca_path)?;
     let mut ca_reader = BufReader::new(ca_file);
     let mut root_store = RootCertStore::empty();
@@ -199,7 +203,16 @@ fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str) -> Result
         root_store.add(cert?).unwrap();
     }
     
-    let verifier = WebPkiClientVerifier::builder(Arc::new(root_store)).build()?;
+    let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+    
+    if let Some(path) = crl_path {
+        let crl_file = File::open(path)?;
+        let mut crl_reader = BufReader::new(crl_file);
+        let crls = rustls_pemfile::crls(&mut crl_reader).collect::<Result<Vec<_>, _>>()?;
+        verifier_builder = verifier_builder.with_crls(crls);
+    }
+    
+    let verifier = verifier_builder.build()?;
 
     let cert_file = File::open(cert_path)?;
     let mut cert_reader = BufReader::new(cert_file);

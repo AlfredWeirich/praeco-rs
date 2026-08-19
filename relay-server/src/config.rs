@@ -23,6 +23,9 @@ pub struct RelayConfig {
     /// Path to the server's private key for the control plane.
     pub server_key_path: String,
     
+    /// Optional path to a Certificate Revocation List (CRL) for rejecting revoked Gateways.
+    pub crl_path: Option<String>,
+    
     /// Flag to enable or disable OpenTelemetry Tracing (Jaeger).
     pub enable_opentelemetry: Option<bool>,
     /// Jaeger OTLP gRPC endpoint.
@@ -70,8 +73,7 @@ impl RelayConfig {
     /// Returns a parsed `RelayConfig` or an error if parsing fails.
     pub fn load(path: &str) -> Result<Self> {
         if !std::path::Path::new(path).exists() {
-            // Return default config if file doesn't exist
-            return Ok(Self::default());
+            anyhow::bail!("Configuration file not found at path: {}. A valid configuration is strictly required for secure Relay operation.", path);
         }
         let content = fs::read_to_string(path).context("Failed to read Config.toml")?;
         let config: RelayConfig = toml::from_str(&content).context("Failed to parse Config.toml")?;
