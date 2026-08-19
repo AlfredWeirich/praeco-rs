@@ -128,7 +128,7 @@ Wenn eine neue Verbindung denselben SNI-Eintrag ersetzt, kann das Ende der alten
 
 ## Weitere Findings
 
-### Upstream-TLS ist optional und damit leicht falsch zu konfigurieren
+### Upstream-TLS ist optional und damit leicht falsch zu konfigurieren (ÜBERSPRUNGEN)
 
 **Schweregrad: Mittel**
 
@@ -152,7 +152,7 @@ Der Datenpfad versucht, SNI aus einem einzelnen begrenzten Read zu gewinnen. TCP
 
 **Verbesserung:** Bis zu einer festen Maximalgröße akkumulieren, bis SNI sicher erkannt ist oder ein kurzer Handshake-Timeout abläuft. Kein unbeschränktes Puffern.
 
-### Session-IDs verwenden keinen expliziten CSPRNG
+### Session-IDs verwenden keinen expliziten CSPRNG (UMGESETZT)
 
 **Schweregrad: Mittel**
 
