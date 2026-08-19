@@ -35,14 +35,14 @@ sni_domain = "api.aweirich.eu"
 # WICHTIG: Dieses Client-Zertifikat MUSS von der CA signiert sein, die im Relay-Server unter 
 # `ca_cert_path` (in RelayConfig.toml) hinterlegt ist. Ausserdem MUSS dieses Zertifikat den Namen
 # aus `sni_domain` als Subject Alternative Name (SAN) enthalten.
-client_cert_path = "server_certs/self_signed/fullchain_self.pem"
-client_key_path = "server_certs/self_signed/privkey_self.pem"
+client_cert_path = "server_certs/self_signed/praeco_client.pem"
+client_key_path = "server_certs/self_signed/praeco_client.key"
 
 # CA zur Verifikation des Relay-Servers selbst (sodass Praeco weiß, dass es mit dem echten Relay spricht).
 # Welche Zertifikate muessen matchen:
 # WICHTIG: Diese CA MUSS das Zertifikat ausgestellt haben, welches das Relay unter 
 # `server_cert_path` (in RelayConfig.toml) nutzt.
-ca_cert_path = "server_certs/self_signed/myca.pem"
+ca_cert_path = "server_certs/self_signed/relay_ca.pem"
 ###### TUNNEL MODE######
 
 [Server.server_certs]
@@ -50,8 +50,8 @@ ca_cert_path = "server_certs/self_signed/myca.pem"
 # Diese Zertifikate terminieren den eigentlichen Datenverkehr des Endnutzers.
 # Der Client-Browser sieht dieses Zertifikat. Das Relay leitet den Traffic nur als TCP-Stream durch
 # und kann den Traffic NICHT entschlüsseln.
-ssl_certificate = "server_certs/self_signed/fullchain_self.pem"
-ssl_certificate_key = "server_certs/self_signed/privkey_self.pem"
+ssl_certificate = "server_certs/self_signed/praeco_public.pem"
+ssl_certificate_key = "server_certs/self_signed/praeco_public.key"
 
 [Server.Layers]
 # "Inspection" muss zwingend aktiviert sein, damit AllowedPathes wirksam wird!
