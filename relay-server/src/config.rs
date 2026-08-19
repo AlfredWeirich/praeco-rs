@@ -31,6 +31,11 @@ pub struct RelayConfig {
     pub otel_log_level: Option<String>,
     /// Sampling ratio for OTLP traces (0.0 to 1.0).
     pub otel_sample_ratio: Option<f64>,
+    
+    /// Max allowed new TCP connections per second per IP.
+    pub rate_limit_connections_per_sec: Option<u32>,
+    /// Max allowed burst of TCP connections per IP.
+    pub rate_limit_burst: Option<u32>,
 }
 
 impl Default for RelayConfig {
@@ -46,6 +51,8 @@ impl Default for RelayConfig {
             jaeger_endpoint: Some("http://localhost:4317".into()),
             otel_log_level: Some("info".into()),
             otel_sample_ratio: Some(1.0),
+            rate_limit_connections_per_sec: Some(50),
+            rate_limit_burst: Some(100),
         }
     }
 }
