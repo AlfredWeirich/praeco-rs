@@ -168,6 +168,7 @@
         jwt_public_keys = ["/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/idp_public.pem"]
         cookie_fallback = "admin-jwt"
         redirect_on_failure = "https://localhost:1339/auth/login_page"
+        expected_issuer = "praeco-idp"
     
     [Server.Layers.SecurityHeaders]
         content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
