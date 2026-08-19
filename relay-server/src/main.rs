@@ -1,3 +1,16 @@
+//! # Praeco Relay Server
+//!
+//! The relay server provides a Zero-Trust, SNI-based TCP proxy. It acts as an
+//! intermediary between the public internet (Data Plane) and the internal Praeco
+//! gateway instances (Control Plane) which may be behind a NAT or firewall.
+//!
+//! Internal gateways register via an mTLS connection and establish a Yamux multiplexed
+//! tunnel. The data plane parses the SNI from incoming TLS ClientHellos and routes
+//! the raw TCP streams over the Yamux tunnel to the corresponding backend server.
+//!
+//! This preserves end-to-end encryption, as TLS is terminated at the backend Praeco
+//! server, not at the relay.
+
 mod config;
 
 use anyhow::{Context, Result};
@@ -24,12 +37,18 @@ use std::time::Duration;
 use yamux::{Config as YamuxConfig, Connection, Mode, Stream as YamuxStream};
 use tls_parser::{parse_tls_plaintext, TlsExtension, TlsMessageHandshake};
 
+/// Represents a control handle to an active Yamux multiplexed connection.
+/// Used to request new outbound streams from the Relay to the Praeco backend.
 #[derive(Clone)]
 struct Control {
     tx: mpsc::Sender<oneshot::Sender<Result<YamuxStream, yamux::ConnectionError>>>,
 }
 
 impl Control {
+    /// Opens a new stream over the multiplexed Yamux connection.
+    ///
+    /// This method sends a request to the connection driver task to open a new stream.
+    /// It returns a `YamuxStream` which implements `AsyncRead` and `AsyncWrite`.
     async fn open_stream(&mut self) -> Result<YamuxStream, yamux::ConnectionError> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(tx).await.map_err(|_| yamux::ConnectionError::Closed)?;
@@ -37,8 +56,10 @@ impl Control {
     }
 }
 
+/// Thread-safe map storing the active SNI-to-Control routing table.
 type SessionMap = Arc<DashMap<String, Control>>;
 
+/// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
 fn setup_tracing(config: &RelayConfig) {
     let enable_otlp = config.enable_opentelemetry.unwrap_or(false);
     let jaeger_endpoint = config.jaeger_endpoint.as_deref().unwrap_or("http://localhost:4317");
@@ -87,6 +108,10 @@ fn setup_tracing(config: &RelayConfig) {
         .init();
 }
 
+/// Entry point for the Relay Server.
+///
+/// Loads the configuration, sets up observability, initializes the mTLS acceptor,
+/// and spawns the Data Plane (HTTPS traffic) and Control Plane (internal mTLS registration).
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = RelayConfig::load("RelayConfig.toml")?;
@@ -127,6 +152,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Loads certificates and constructs a `TlsAcceptor` configured for strict mTLS.
 fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     let ca_file = File::open(ca_path)?;
     let mut ca_reader = BufReader::new(ca_file);
@@ -152,6 +178,11 @@ fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str) -> Result
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Runs the Control Plane, accepting incoming mTLS registrations from Praeco servers.
+///
+/// When a Praeco instance connects, it sends a `REGISTER <sni>` command.
+/// The relay creates a Yamux session, stores the control handle in the `tunnels` map,
+/// and spawns a connection driver loop to multiplex incoming data plane requests.
 async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr: &str) -> Result<()> {
     let listener = TcpListener::bind(addr).await.context("Failed to bind control plane")?;
     info!("Control plane listening on mTLS {}", addr);
@@ -286,6 +317,11 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
     }
 }
 
+/// Runs the Data Plane, accepting public TCP connections and routing them via SNI.
+///
+/// Extracts the Server Name Indication (SNI) from the initial TLS ClientHello.
+/// Looks up the SNI in the `tunnels` map, opens a new stream over the corresponding
+/// Yamux connection, and blindly copies the bidirectional TCP traffic.
 async fn run_data_plane(tunnels: SessionMap, addr: &str) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("Data plane listening on {} (SNI-Routing)", addr);
@@ -349,6 +385,9 @@ async fn run_data_plane(tunnels: SessionMap, addr: &str) -> Result<()> {
     }
 }
 
+/// Best-effort extraction of the SNI domain name from a raw TLS ClientHello packet.
+/// 
+/// Relies on `tls_parser` to interpret the raw bytes without completing a handshake.
 fn extract_sni(buf: &[u8]) -> Option<String> {
     match parse_tls_plaintext(buf) {
         Ok((_, pt)) => {
@@ -375,6 +414,8 @@ fn extract_sni(buf: &[u8]) -> Option<String> {
     }
 }
 
+/// Validates the structure of an SNI hostname against basic RFC 1035 constraints.
+/// Prevents path traversal or code injection if the SNI is logged or used in a DashMap.
 fn is_valid_sni(sni: &str) -> bool {
     if sni.is_empty() || sni.len() > 253 {
         return false;
