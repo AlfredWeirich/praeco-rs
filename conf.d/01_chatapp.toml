@@ -1,0 +1,276 @@
+# =============================================================================
+# CHATAPP CONFIGURATION
+# This file contains all server instances required for the ChatApp backend.
+# =============================================================================
+
+[[Server]]
+# =============================================================================
+# Main API Gateway (Internal - mTLS Required)
+# =============================================================================
+    name = "wurzelwerk" 
+    ip = "0.0.0.0"
+    port = 1336
+    enabled = true
+    protocol = "https"
+    authentication = "ClientCert"
+    service = "Router"
+
+    [Server.Layers]
+    enabled = ["Decompression", "MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.Decompression]
+    max_decompressed_bytes = 10485760  # 10 MB limit
+
+    [Server.server_certs]
+    ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
+    ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+
+    [[Server.client_certs]]
+    ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+    ssl_client_crl = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.crl.pem"
+
+    [Server.client_cert_forwarding]
+    header_cert = "x-client-cert"
+    header_san = "x-client-san"
+
+    [Server.Layers.ConcurrencyLimit]
+    max_concurrent_requests = 10000
+
+    [Server.Layers.MaxPayload]
+    max_bytes = 10485760 # 10 MB Limit
+
+    [Server.AllowedPathes.POST]
+    "/chat.ChatService/GetConversations" = ["^/chat\\.ChatService/GetConversations$"]
+    "/chat.ChatService/GetMessages" = ["^/chat\\.ChatService/GetMessages$"]
+    "/chat.ChatService/SendMessage" = ["^/chat\\.ChatService/SendMessage$"]
+    "/chat.ChatService/StreamMessages" = ["^/chat\\.ChatService/StreamMessages$"]
+    "/chat.ChatService/RegisterKeyPackage" = ["^/chat\\.ChatService/RegisterKeyPackage$"]
+    "/chat.ChatService/ClientLog" = ["^/chat\\.ChatService/ClientLog$"]
+    "/chat.ChatService/GetDevices" = ["^/chat\\.ChatService/GetDevices$"]
+    "/chat.ChatService/BlockDevice" = ["^/chat\\.ChatService/BlockDevice$"]
+    "/chat.ChatService/RemoveDevice" = ["^/chat\\.ChatService/RemoveDevice$"]
+    "/chat.ChatService/AddMember" = ["^/chat\\.ChatService/AddMember$"]
+    "/chat.ChatService/RemoveMember" = ["^/chat\\.ChatService/RemoveMember$"]
+    "/chat.ChatService/GetConversationMembers" = ["^/chat\\.ChatService/GetConversationMembers$"]
+    "/chat.ChatService/CreateConversation" = ["^/chat\\.ChatService/CreateConversation$"]
+    "/chat.ChatService/SearchUsers" = ["^/chat\\.ChatService/SearchUsers$"]
+    "/chat.ChatService/DeleteConversation" = ["^/chat\\.ChatService/DeleteConversation$"]
+    "/chat.ChatService/MarkAsRead" = ["^/chat\\.ChatService/MarkAsRead$"]
+    "/chat.ChatService/StreamGlobalEvents" = ["^/chat\\.ChatService/StreamGlobalEvents$"]
+    "/chat.ChatService/RegisterPushToken" = ["^/chat\\.ChatService/RegisterPushToken$"]
+    "/chat.ChatService/SendGlobalEvent" = ["^/chat\\.ChatService/SendGlobalEvent$"]
+    "/chat.ChatService/GetRoomProducts" = ["^/chat\\.ChatService/GetRoomProducts$"]
+    "/chat.ChatService/DeleteRoomProduct" = ["^/chat\\.ChatService/DeleteRoomProduct$"]
+    "/chat.ChatService/GetCart" = ["^/chat\\.ChatService/GetCart$"]
+    "/chat.ChatService/AddToCart" = ["^/chat\\.ChatService/AddToCart$"]
+    "/chat.ChatService/RemoveFromCart" = ["^/chat\\.ChatService/RemoveFromCart$"]
+    "/chat.ChatService/PlaceOrder" = ["^/chat\\.ChatService/PlaceOrder$"]
+    "/chat.ChatService/GetMyOrders" = ["^/chat\\.ChatService/GetMyOrders$"]
+    "/chat.ChatService/SubscribeOrderUpdates" = ["^/chat\\.ChatService/SubscribeOrderUpdates$"]
+    "/chat.ChatService/CreateRoomProduct" = ["^/chat\\.ChatService/CreateRoomProduct$"]
+    "/chat.ChatService/CheckoutCart" = ["^/chat\\.ChatService/CheckoutCart$"]
+    "/chat.ChatService/UpdateRoomProduct" = ["^/chat\\.ChatService/UpdateRoomProduct$"]
+    "/chat.ChatService/UpdateMemberRole" = ["^/chat\\.ChatService/UpdateMemberRole$"]
+    "/chat.ChatService/GetOrders" = ["^/chat\\.ChatService/GetOrders$"]
+    "/chat.ChatService/UpdateOrderStatus" = ["^/chat\\.ChatService/UpdateOrderStatus$"]
+
+    [Server.ReverseRoutes."/"]
+    upstreams = ["https://127.0.0.1:50051"]
+    active_health_check_interval = 60
+    backend_type = "grpc_passthrough"
+
+    [Server.RouterParams]
+    protocol = "https"
+    authentication = "ClientCert"
+    ssl_client_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/proxy-client.pem"
+    ssl_client_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/proxy-client.key"
+    ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+
+    [Server.Layers.RateLimiter]
+    requests_per_second = 500000
+
+    [Server.Layers.TokenBucketRateLimiter]
+    max_capacity = 1000     
+    refill = 50           
+    duration_micros = 10000 
+
+[[Server]]
+# =============================================================================
+# Onboarding Server (Public - no mTLS)
+# =============================================================================
+    name = "wurzelwerk_onboarding"
+    ip = "0.0.0.0"
+    port = 1337
+    protocol = "https"
+    service = "Router"
+    enabled = true
+    authentication = "None"
+
+    [Server.server_certs]
+    ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
+    ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+
+    [Server.Layers]
+    enabled = ["MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.ConcurrencyLimit]
+    max_concurrent_requests = 128
+
+    [Server.Layers.MaxPayload]
+    max_bytes = 2000000 # 2 MB Limit (CSR requests are small)
+
+    [Server.Layers.TokenBucketRateLimiter]
+    max_capacity = 15     
+    refill = 5           
+    duration_micros = 1000000 
+
+    [Server.AllowedPathes.POST]
+    "/chat.OnboardingService/RequestOnboarding" = ["^/chat\\.OnboardingService/RequestOnboarding$"]
+    "/chat.OnboardingService/SubmitOnboarding" = ["^/chat\\.OnboardingService/SubmitOnboarding$"]
+
+    [Server.ReverseRoutes."/"]
+    upstreams = ["https://127.0.0.1:50052"]
+    backend_type = "grpc_passthrough"
+
+    [Server.RouterParams]
+    protocol = "https"
+    authentication = "None"
+    ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+
+    [Server.client_cert_forwarding]
+    header_cert = "x-client-cert"
+    header_san = "x-client-san"
+
+[[Server]]
+# =============================================================================
+# Management & Admin Server (Port 1338 /admin & gRPC-Web)
+# =============================================================================
+    name = "wurzelwerk_admin"
+    ip = "0.0.0.0"
+    port = 1338
+    protocol = "https"
+    authentication = "None"
+    service = "Router"
+    enabled = true
+    
+    [Server.server_certs]
+        ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
+        ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+
+    [Server.oid_mapping]
+        "1" = "Admin"
+        "2" = "Seller"
+    
+    [Server.Layers]
+        enabled = ["Logger",  "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit", "JwtAuth"]
+
+    [Server.Layers.JWT]
+        jwt_public_keys = ["/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/idp_public.pem"]
+        cookie_fallback = "admin-jwt"
+        redirect_on_failure = "https://localhost:1339/auth/login_page"
+    
+    [Server.Layers.SecurityHeaders]
+        content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
+        strict_transport_security = "max-age=63072000; includeSubDomains; preload"
+        x_content_type_options = "nosniff"
+        x_frame_options = "DENY"
+    
+    [Server.Layers.Decompression]
+        max_decompressed_bytes = 10485760
+    
+    [Server.Layers.ConcurrencyLimit]
+        max_concurrent_requests = 10000
+    
+    [Server.Layers.MaxPayload]
+        max_bytes = 10485760
+    
+    [Server.Layers.TokenBucketRateLimiter]
+        max_capacity = 1000
+        refill = 50
+        duration_micros = 10000
+    
+    [Server.AllowedPathes.GET]
+        "/admin" = ["^/admin$"]
+        "/admin/" = ["^/admin/$"]
+        "/admin/index.html" = ["^/admin/index\\.html$"]
+        "/favicon.ico" = ["^/favicon\\.ico$"]
+        "/apple-touch-icon.png" = ["^/apple-touch-icon\\.png$"]
+        "/apple-touch-icon-precomposed.png" = ["^/apple-touch-icon-precomposed\\.png$"]
+    
+    [Server.AllowedPathes.POST]
+        "/api/Logout" = ["^/api/Logout$"]
+        "/api/WhoAmI" = ["^/api/WhoAmI$"]
+        "/api/GetUsers" = ["^/api/GetUsers$"]
+        "/api/GetAdminDevices" = ["^/api/GetAdminDevices$"]
+        "/api/AdminBlockDevice" = ["^/api/AdminBlockDevice$"]
+        "/api/AdminUnblockDevice" = ["^/api/AdminUnblockDevice$"]
+        "/api/AdminRemoveDevice" = ["^/api/AdminRemoveDevice$"]
+        "/api/AdminCreateRoom" = ["^/api/AdminCreateRoom$"]
+        "/api/AdminAddSellerToRoom" = ["^/api/AdminAddSellerToRoom$"]
+        "/api/AdminRemoveSellerFromRoom" = ["^/api/AdminRemoveSellerFromRoom$"]
+        "/api/GetAdminConversations" = ["^/api/GetAdminConversations$"]
+        "/api/GetAdminOrders" = ["^/api/GetAdminOrders$"]
+        "/api/AdminUpdateOrderStatus" = ["^/api/AdminUpdateOrderStatus$"]
+        "/api/GetDatabaseTables" = ["^/api/GetDatabaseTables$"]
+        "/api/GetTableContent" = ["^/api/GetTableContent$"]
+        "/api/AdminAddProduct" = ["^/api/AdminAddProduct$"]
+        "/api/AdminGetProducts" = ["^/api/AdminGetProducts$"]
+        "/api/AdminDeleteProduct" = ["^/api/AdminDeleteProduct$"]
+        "/api/AdminDeleteRoom" = ["^/api/AdminDeleteRoom$"]
+        "/api/AdminAddUser" = ["^/api/AdminAddUser$"]
+        "/api/AdminDeleteUser" = ["^/api/AdminDeleteUser$"]
+        "/api/AdminGetMembers" = ["^/api/AdminGetMembers$"]
+        "/api/AdminRemoveMember" = ["^/api/AdminRemoveMember$"]
+        "/api/AdminAddMember" = ["^/api/AdminAddMember$"]
+        "/api/AdminUpdateProductCreator" = ["^/api/AdminUpdateProductCreator$"]
+        "/api/AdminCreateChannel" = ["^/api/AdminCreateChannel$"]
+        "/api/AdminPreRegisterSeller" = ["^/api/AdminPreRegisterSeller$"]
+    
+    [Server.ReverseRoutes."/"]
+        upstreams = ["https://127.0.0.1:50053"]
+        backend_type = "grpc_passthrough"
+        allowed_roles = ["Admin", "Seller"]
+    
+    [Server.RouterParams]
+        protocol = "https"
+        authentication = "ClientCert"
+        ssl_client_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/proxy-client.pem"
+        ssl_client_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/proxy-client.key"
+        ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+
+[[Server]]
+# =============================================================================
+# Identity Provider (IdP) for Admin Dashboard (Port 1339)
+# =============================================================================
+    name = "wurzelwerk_idp"
+    ip = "0.0.0.0"
+    port = 1339
+    protocol = "https"
+    authentication = "OptionalClientCert"
+    service = "Idp"
+    enabled = true
+    
+    [Server.server_certs]
+        ssl_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/fullchain12.pem"
+        ssl_certificate_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/privkey12.pem"
+        
+    [[Server.client_certs]]
+        ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+    
+    [Server.IdpParams]
+        jwt_private_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/idp_private.pem"
+        jwt_public_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/idp_public.pem"
+        token_expiry_seconds = 28800 # 8 hours
+        session_ttl_seconds = 120
+        cookie_name = "admin-jwt"
+        redirect_after_login = "https://localhost:1338/admin"
+        debug_show_session_id = true
+
+    [Server.Layers]
+        enabled = ["Logger", "SecurityHeaders"]
+
+    [Server.Layers.SecurityHeaders]
+        content_security_policy = "default-src 'none'; script-src 'unsafe-inline' https://cdnjs.cloudflare.com; style-src 'unsafe-inline'; connect-src 'self'"
+        strict_transport_security = "max-age=63072000; includeSubDomains; preload"
+        x_content_type_options = "nosniff"
+        x_frame_options = "DENY"
