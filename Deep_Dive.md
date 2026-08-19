@@ -136,7 +136,7 @@ Der Connector unterstützt `http://` und `https://`. Wenn ein produktiver Upstre
 
 **Verbesserung:** `require_tls = true` als Produktionsdefault, explizite Development-Ausnahme, Allowlist für Upstream-Schemata und Tests gegen HTTP-Upstreams.
 
-### CRL-Strategie ist nicht über alle TLS-Grenzen konsistent
+### CRL-Strategie ist nicht über alle TLS-Grenzen konsistent (UMGESETZT)
 
 **Schweregrad: Mittel bis hoch**
 
@@ -160,7 +160,7 @@ DeviceAuth-Session-IDs werden mit `fastrand` erzeugt. Für Login-/Polling-Sessio
 
 **Verbesserung:** `OsRng` verwenden, mindestens 128 Bit Zufall erzeugen, Session-IDs nur gekürzt oder gehasht loggen und Ablauf/Einmaligkeit serverseitig erzwingen.
 
-### Fehlende Konfiguration fällt beim Relay auf gefährliche Defaults zurück
+### Fehlende Konfiguration fällt beim Relay auf gefährliche Defaults zurück (UMGESETZT)
 
 **Schweregrad: Mittel bis hoch**
 
@@ -168,7 +168,7 @@ Wenn die Relay-Konfiguration fehlt, werden Bindings auf öffentlichen Adressen u
 
 **Verbesserung:** Produktionsstart ohne explizite Konfiguration abbrechen; Development-Defaults nur mit `--development` oder einer gleichwertigen expliziten Markierung aktivieren. Bind-Adresse, Zertifikatspfade und Berechtigungen beim Start ausgeben und validieren.
 
-### Absolute Include-Pfade machen die Gateway-Konfiguration nicht reproduzierbar
+### Absolute Include-Pfade machen die Gateway-Konfiguration nicht reproduzierbar (UMGESETZT)
 
 **Schweregrad: Mittel**
 
