@@ -28,3 +28,4 @@ opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.25"
 tonic = { version = "0.12", features = ["channel", "tls", "tls-roots", "tls-webpki-roots"] }
+x509-parser = "0.18.1"
