@@ -33,6 +33,8 @@ struct Claims1 {
     iat: u64,
     exp: u64,
     jti: String, // Unique identifier for the token
+    iss: String,
+    aud: String,
     oids: Vec<String>,
 }
 
@@ -41,6 +43,8 @@ struct Claims1 {
 struct Claims2 {
     sub: String,
     name: String,
+    iss: String,
+    aud: String,
     oids: Vec<String>,
 }
 
@@ -96,6 +100,8 @@ fn main() -> Result<(), String> {
         iat: now,
         exp: now + 3600 * 24 * 30, // 30 days
         jti: uuid::Uuid::new_v4().to_string(),
+        iss: "praeco-auth".to_string(),
+        aud: "praeco-gateway".to_string(),
         oids: ["1".to_string(), "2".to_string()].to_vec(),
     };
 
@@ -106,6 +112,8 @@ fn main() -> Result<(), String> {
         iat: now,
         exp: now + 3600, // 1h
         jti: uuid::Uuid::new_v4().to_string(),
+        iss: "praeco-auth".to_string(),
+        aud: "praeco-gateway".to_string(),
         oids: ["1".to_string(), "2".to_string()].to_vec(),
     };
 

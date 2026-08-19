@@ -209,20 +209,13 @@ pub fn load_encoding_key(path: &str) -> EncodingKey {
 pub fn verify_jwt(
     token: &str,
     decoding_keys: &[DecodingKey],
-    expected_issuer: Option<&str>,
-    expected_audience: Option<&str>,
+    expected_issuer: &str,
+    expected_audience: &str,
 ) -> Result<Claims, Error> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
     
-    if let Some(iss) = expected_issuer {
-        validation.set_issuer(&[iss]);
-    }
-    
-    if let Some(aud) = expected_audience {
-        validation.set_audience(&[aud]);
-    } else {
-        validation.validate_aud = false;
-    }
+    validation.set_issuer(&[expected_issuer]);
+    validation.set_audience(&[expected_audience]);
 
     // Try verifying the JWT with each decoding key
     for key in decoding_keys {

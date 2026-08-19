@@ -680,10 +680,10 @@ pub struct JwtAuthConfig {
     pub cookie_fallback: Option<String>,
     /// Optional redirect URL if authentication fails (useful for redirecting to the IdP).
     pub redirect_on_failure: Option<String>,
-    /// Optional expected issuer (`iss`) to validate against.
-    pub expected_issuer: Option<String>,
-    /// Optional expected audience (`aud`) to validate against.
-    pub expected_audience: Option<String>,
+    /// The expected issuer (`iss`) to validate against. This is mandatory.
+    pub expected_issuer: String,
+    /// The expected audience (`aud`) to validate against. This is mandatory.
+    pub expected_audience: String,
 }
 
 /// Configuration for the concurrency limit layer.
