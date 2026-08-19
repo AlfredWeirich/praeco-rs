@@ -92,7 +92,7 @@ impl Control {
 }
 
 /// Thread-safe map storing the active SNI-to-Control routing table.
-type SessionMap = Arc<DashMap<String, Control>>;
+type SessionMap = Arc<DashMap<String, (Control, u64)>>;
 
 /// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
 fn setup_tracing(config: &RelayConfig) {
@@ -247,8 +247,31 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 }
             };
 
+            // --- Extract Client Certificate SANs (P0.2) ---
+            let mut allowed_snis = Vec::new();
+            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                if let Some(cert_der) = certs.first() {
+                    if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) {
+                        for ext in cert.iter_extensions() {
+                            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                                for name in &san.general_names {
+                                    if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                                        allowed_snis.push(dns.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if allowed_snis.is_empty() {
+                warn!(target: "relay::control_plane", client_ip = %client_addr, "No DNS SANs found in client certificate");
+                return;
+            }
+
             let mut buf = [0u8; 1024];
             let mut line = String::new();
+            let mut total_read = 0;
             let timeout_res = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let n = match tls_stream.read(&mut buf).await {
@@ -256,25 +279,37 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                         Ok(n) => n,
                         Err(_) => return false,
                     };
+                    total_read += n;
                     line.push_str(&String::from_utf8_lossy(&buf[..n]));
                     if line.contains('\n') {
                         return true;
+                    }
+                    // Prevent memory exhaustion (P0.4)
+                    if total_read > 1024 {
+                        return false;
                     }
                 }
             }).await;
 
             if !timeout_res.unwrap_or(false) {
-                warn!(target: "relay::control_plane", client_ip = %client_addr, "REGISTER command failed or timed out");
+                warn!(target: "relay::control_plane", client_ip = %client_addr, "REGISTER command failed, timed out or too long");
                 return;
             }
 
-            let parts: Vec<&str> = line.trim().split_whitespace().collect();
-            if parts.is_empty() || parts[0] != "REGISTER" {
-                warn!(target: "relay::control_plane", client_ip = %client_addr, "Invalid register command");
+            // --- Safe Parsing (P0.4) ---
+            let line_trimmed = line.trim();
+            let Some(("REGISTER", sni_raw)) = line_trimmed.split_once(' ') else {
+                warn!(target: "relay::control_plane", client_ip = %client_addr, "Invalid register command format");
+                return;
+            };
+            let sni = sni_raw.trim().to_string();
+
+            // --- Verify SNI against Certificate SANs (P0.2) ---
+            if !allowed_snis.contains(&sni) {
+                warn!(target: "relay::control_plane", client_ip = %client_addr, requested_sni = %sni, "SNI not authorized by client certificate");
                 return;
             }
 
-            let sni = parts[1].to_string();
             info!(target: "relay::control_plane", sni = %sni, "Praeco tunnel registered");
 
             let cfg = YamuxConfig::default();
@@ -283,7 +318,12 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
             let (tx, mut rx) = mpsc::channel(32);
             let control = Control { tx };
 
-            tunnels.insert(sni.clone(), control.clone());
+            // --- Store with Generation ID (P0.5) ---
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static GENERATION: AtomicU64 = AtomicU64::new(1);
+            let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+
+            tunnels.insert(sni.clone(), (control.clone(), my_generation));
 
             // Health check keepalive ping task
             let ping_sni = sni.clone();
@@ -295,14 +335,22 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 interval.tick().await; 
                 loop {
                     interval.tick().await;
-                    if !ping_tunnels.contains_key(&ping_sni) {
-                        break;
+                    // Check if we are still the active generation (P0.5)
+                    let still_active = if let Some(entry) = ping_tunnels.get(&ping_sni) {
+                        entry.value().1 == my_generation
+                    } else {
+                        false
+                    };
+                    if !still_active {
+                        break; // Another tunnel took over or it was deleted
                     }
+                    
                     match ping_control.open_stream().await {
                         Ok(s) => drop(s), // Ping OK
                         Err(_) => {
                             warn!(target: "relay::control_plane", sni = %ping_sni, "Heartbeat failed, removing tunnel");
-                            ping_tunnels.remove(&ping_sni);
+                            // Remove only if generation matches (P0.5)
+                            ping_tunnels.remove_if(&ping_sni, |_, (_, g)| *g == my_generation);
                             break;
                         }
                     }
@@ -350,7 +398,8 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 std::task::Poll::Pending
             }).await;
 
-            tunnels.remove(&sni);
+            // Remove only if generation matches (P0.5)
+            tunnels.remove_if(&sni, |_, (_, g)| *g == my_generation);
         }.instrument(info_span!("control_connection", client_ip = %client_addr)));
     }
 }
@@ -414,8 +463,8 @@ async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) 
                 return;
             }
 
-            let mut control = match tunnels.get_mut(&sni) {
-                Some(c) => c.clone(),
+            let mut control = match tunnels.get(&sni) {
+                Some(entry) => entry.value().0.clone(),
                 None => {
                     warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "No active tunnel for SNI");
                     return;
