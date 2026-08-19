@@ -500,10 +500,24 @@ async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) 
                 return;
             }
 
-            let _ = tokio::time::timeout(
+            info!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Routing connection via tunnel");
+
+            let res = tokio::time::timeout(
                 Duration::from_secs(300),
                 tokio::io::copy_bidirectional(&mut client_stream, &mut tokio_tunnel)
             ).await;
+
+            match res {
+                Ok(Ok((up, down))) => {
+                    info!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, up_bytes = up, down_bytes = down, "Connection closed cleanly");
+                }
+                Ok(Err(e)) => {
+                    warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, error = %e, "Connection closed with error");
+                }
+                Err(_) => {
+                    warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Connection timed out");
+                }
+            }
         }.instrument(info_span!("data_connection", client_ip = %client_addr)));
     }
 }
