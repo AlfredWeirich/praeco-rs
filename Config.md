@@ -225,8 +225,8 @@ Here is an overview of the most useful values for configuration:
 * `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures.
 * `cookie_fallback`: String *(optional)*. The name of the HTTP cookie to read the JWT from if the `Authorization: Bearer <token>` header is absent (e.g. `"admin-jwt"`).
 * `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
-* `expected_issuer`: String *(optional)*. If provided, the JWT must contain an `iss` claim that exactly matches this string.
-* `expected_audience`: String *(optional)*. If provided, the JWT must contain an `aud` claim that exactly matches this string.
+* `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that exactly matches this string. This prevents the "Confused Deputy" problem by ensuring tokens from other Identity Providers using the same key cannot be used.
+* `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that exactly matches this string. Ensures the token was specifically issued for this gateway/application.
 
 #### `[Server.Layers.RateLimiter]` (Simple)
 * `requests_per_second`: Integer. Strict limit of requests per second.
@@ -381,3 +381,20 @@ In a Zero-Trust architecture, `praeco-rs` relies heavily on various cryptographi
 | **Client mTLS Certificate & Key** | Given to clients (Devices, iOS App) to authenticate themselves against the proxy. Contains OIDs for Role Mapping. | (Used by Clients)<br>For Proxy-to-Backend:<br>`ssl_client_certificate` / `key` | Use the provided script:<br>`./client_certs/generate_mtls_oid_certs.sh -c <name> -o <roles>` |
 | **JWT Private Key** | Used by the Identity Provider (`service = "Idp"`) to securely sign the issued JWTs. | `[Server.IdpParams.jwt_private_key]` | OpenSSL (Ed25519 recommended):<br>`openssl genpkey -algorithm ed25519 -out idp_private.pem` |
 | **JWT Public Key** | Used by Resource Servers (and the IdP's JWKS endpoint) to verify the signatures of the JWTs. | `[Server.IdpParams.jwt_public_key]`<br>`[Server.Layers.JWT.jwt_public_keys]` | Extracted from Private Key:<br>`openssl pkey -in idp_private.pem -pubout -out idp_public.pem` |
+
+---
+
+## Relay Server Configuration (`RelayConfig.toml`)
+
+The Praeco Relay Server operates as a standalone proxy (TCP/SNI router) and uses its own configuration file, typically named `RelayConfig.toml`.
+
+| Parameter | Data Type | Description | Default Value |
+| :--- | :--- | :--- | :--- |
+| `control_plane_addr` | String | The address where the Relay accepts incoming mTLS Yamux tunnels from Praeco backend instances. | `"0.0.0.0:7001"` |
+| `data_plane_addr` | String | The address where the Relay accepts public internet HTTPS traffic (SNI Routing). | `"0.0.0.0:443"` |
+| `ca_cert_path` | String | Path to the CA certificate used to verify the mTLS connections from backend instances. | `"../client_certs/ca.cert.pem"` |
+| `server_cert_path` | String | Path to the Relay's own public TLS certificate (for the control plane). | `"server.crt"` |
+| `server_key_path` | String | Path to the Relay's private key. | `"server.key"` |
+| `enable_opentelemetry` | Boolean | Enables Jaeger tracing for the Relay. | `false` |
+| `rate_limit_connections_per_sec` | Integer | Limits the number of new TCP connections allowed per second per IP address on the Data Plane (DDoS mitigation). | `50` |
+| `rate_limit_burst` | Integer | The maximum burst of TCP connections allowed at once per IP. | `100` |

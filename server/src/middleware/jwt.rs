@@ -57,10 +57,10 @@ pub struct JwtAuthLayer {
     cookie_fallback: Option<String>,
     /// Optional URL to redirect to instead of returning 401.
     redirect_on_failure: Option<String>,
-    /// Optional expected issuer.
-    expected_issuer: Option<String>,
-    /// Optional expected audience.
-    expected_audience: Option<String>,
+    /// Expected issuer.
+    expected_issuer: String,
+    /// Expected audience.
+    expected_audience: String,
 }
 
 impl JwtAuthLayer {
@@ -75,8 +75,8 @@ impl JwtAuthLayer {
         oid_mapping_hash: Arc<std::collections::HashMap<String, crate::configuration::UserRole>>,
         cookie_fallback: Option<String>,
         redirect_on_failure: Option<String>,
-        expected_issuer: Option<String>,
-        expected_audience: Option<String>,
+        expected_issuer: String,
+        expected_audience: String,
     ) -> Self {
         let decoding_keys = load_decoding_keys(&key_files);
 
@@ -136,10 +136,10 @@ pub struct JwtAuthService<S> {
     cookie_fallback: Option<String>,
     /// Optional URL to redirect to instead of returning 401.
     redirect_on_failure: Option<String>,
-    /// Optional expected issuer.
-    expected_issuer: Option<String>,
-    /// Optional expected audience.
-    expected_audience: Option<String>,
+    /// Expected issuer.
+    expected_issuer: String,
+    /// Expected audience.
+    expected_audience: String,
 }
 
 impl<S, ReqBody> Service<Request<ReqBody>> for JwtAuthService<S>
@@ -223,7 +223,7 @@ where
                 Some(token_str) => {
                     let claims_result =
                         tokio::task::spawn_blocking(move || {
-                            verify_jwt(&token_str, &decoding_keys, expected_iss.as_deref(), expected_aud.as_deref())
+                            verify_jwt(&token_str, &decoding_keys, expected_iss.as_str(), expected_aud.as_str())
                         })
                             .await;
 
