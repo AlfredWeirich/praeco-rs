@@ -1,7 +1,11 @@
 [package]
-name = "relay-server"
+name = "praeco-relay-server"
 version = "0.1.0"
 edition = "2024"
+description = "Relay server for praeco-rs"
+license = "MIT OR Apache-2.0"
+authors = ["Alfred Weirich"]
+repository = "https://github.com/AlfredWeirich/praeco-rs"
 
 [dependencies]
 tokio = { version = "1.39", features = ["full"] }
