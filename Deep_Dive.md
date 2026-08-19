@@ -84,7 +84,7 @@ Das ist eine klassische Verwechslung von "Client darf das Relay benutzen" mit "C
 
 **Akzeptanzkriterium:** Ein Client kann nur SNI-Namen registrieren, die seiner zertifikatsgebundenen Policy entsprechen.
 
-### 3. Response-Header können JWTs in Logs und Tracing schreiben
+### 3. Response-Header können JWTs in Logs und Tracing schreiben (Dies überspringen wir zunächst)
 
 **Schweregrad: Hoch**
 
