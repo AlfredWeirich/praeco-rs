@@ -149,7 +149,8 @@ fn setup_tracing(config: &RelayConfig) {
 /// and spawns the Data Plane (HTTPS traffic) and Control Plane (internal mTLS registration).
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = RelayConfig::load("RelayConfig.toml")?;
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "RelayConfig.toml".to_string());
+    let config = RelayConfig::load(&config_path)?;
     setup_tracing(&config);
     
     // Install default crypto provider for rustls
