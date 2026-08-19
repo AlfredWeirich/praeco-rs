@@ -1,7 +1,31 @@
+# ==========================================
+# Network Bindings
+# ==========================================
+
+# Control Plane: Die interne Adresse, an der sich die Praeco-Gateways (unsere eigenen 
+# Reverse Proxies) per mTLS anmelden, um ihre Tunnel-Verbindungen aufzubauen. 
+# Endbenutzer/Clients verbinden sich niemals hierher.
 control_plane_addr = "0.0.0.0:7001"
+
+# Data Plane: Der öffentlich erreichbare Entrypoint für Endbenutzer (meist Port 443).
+# Das Relay terminiert hier KEIN TLS, sondern liest nur den SNI (Server Name) und leitet
+# den rohen TLS-Datenstrom an den passenden Tunnel im Control Plane weiter.
 data_plane_addr = "0.0.0.0:443"
 
+
+# ==========================================
+# mTLS Certificates (Control Plane Only)
+# ==========================================
+# WICHTIG: Diese Zertifikate werden AUSSCHLIESSLICH für die interne Absicherung der 
+# Tunnel-Verbindungen auf dem `control_plane_addr` (Port 7001) genutzt. 
+# Der öffentliche Traffic auf der `data_plane_addr` nutzt diese Zertifikate nicht.
+
+# CA-Zertifikat, um die Praeco-Gateways (Clients) zu authentifizieren. 
+# Nur Gateways, deren Zertifikat von dieser CA ausgestellt wurde, dürfen Tunnel aufbauen.
 ca_cert_path = "server_certs/self_signed/myca.pem"
+
+# Zertifikat und privater Schlüssel des Relay-Servers selbst.
+# Damit beweist das Relay gegenüber den Praeco-Gateways seine eigene Identität.
 server_cert_path = "server_certs/self_signed/fullchain_self.pem"
 server_key_path = "server_certs/self_signed/privkey_self.pem"
 
