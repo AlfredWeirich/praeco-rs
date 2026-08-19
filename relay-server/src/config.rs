@@ -1,23 +1,40 @@
+//! # Relay Server Configuration
+//!
+//! This module defines the `RelayConfig` struct which contains all
+//! configuration options for the Praeco Relay Server, including
+//! network addresses, TLS certificate paths, and OpenTelemetry settings.
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::fs;
 
+/// Configuration for the Praeco Relay Server.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RelayConfig {
+    /// The address (IP:Port) where the control plane (mTLS from Praeco) listens.
     pub control_plane_addr: String,
+    /// The address (IP:Port) where the data plane (public HTTPS traffic) listens.
     pub data_plane_addr: String,
     
+    /// Path to the Certificate Authority (CA) used to verify connecting Praeco instances.
     pub ca_cert_path: String,
+    /// Path to the server's public certificate chain for the control plane.
     pub server_cert_path: String,
+    /// Path to the server's private key for the control plane.
     pub server_key_path: String,
     
+    /// Flag to enable or disable OpenTelemetry Tracing (Jaeger).
     pub enable_opentelemetry: Option<bool>,
+    /// Jaeger OTLP gRPC endpoint.
     pub jaeger_endpoint: Option<String>,
+    /// Log level for traces exported to Jaeger.
     pub otel_log_level: Option<String>,
+    /// Sampling ratio for OTLP traces (0.0 to 1.0).
     pub otel_sample_ratio: Option<f64>,
 }
 
 impl Default for RelayConfig {
+    /// Provides sensible default values for local development and testing.
     fn default() -> Self {
         Self {
             control_plane_addr: "0.0.0.0:7001".into(),
@@ -34,6 +51,16 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
+    /// Loads the configuration from a TOML file at the specified path.
+    /// If the file does not exist, it falls back to `RelayConfig::default()`.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `path` - The file path to the TOML configuration file.
+    /// 
+    /// # Returns
+    /// 
+    /// Returns a parsed `RelayConfig` or an error if parsing fails.
     pub fn load(path: &str) -> Result<Self> {
         if !std::path::Path::new(path).exists() {
             // Return default config if file doesn't exist
