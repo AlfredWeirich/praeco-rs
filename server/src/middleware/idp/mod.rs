@@ -107,10 +107,13 @@ impl IdpService {
 
         let token = sign_jwt(&claims, &self.encoding_key)?;
 
-        let cookie_val = format!(
+        let mut cookie_val = format!(
             "{}={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age={}",
             self.params.cookie_name, token, self.params.token_expiry_seconds
         );
+        if let Some(domain) = &self.params.cookie_domain {
+            cookie_val.push_str(&format!("; Domain={}", domain));
+        }
 
         let body = format!(r#"{{"status":"confirmed","redirect":"{}"}}"#, self.params.redirect_after_login);
         
