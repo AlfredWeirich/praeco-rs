@@ -13,8 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to write generated files. We should never write generated code to `src/`.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // Configure the Tonic Protobuf compiler
-    tonic_build::configure()
+    // Configure the Tonic Protobuf compiler using tonic-prost-build
+    tonic_prost_build::configure()
         // IMPORTANT FOR REFLECTION:
         // By default, tonic only generates Rust code (.rs files).
         // However, gRPC Server Reflection requires the raw layout of the schema

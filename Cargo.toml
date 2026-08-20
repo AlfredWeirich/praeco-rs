@@ -36,13 +36,14 @@ hyper-util = "0.1"
 hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 http-body = "1.0"
 http-body-util = "0.1"
-tower = { version = "0.4.13", features = ["util", "make", "limit"] }
-tower-http = { version = "0.5.2", features = ["cors", "trace"] }
-tonic = { version = "0.12.3", features = ["channel", "tls", "tls-roots", "tls-webpki-roots"] }
-tonic-reflection = { version = "0.12.3", features = ["server"] }
-tonic-build = "0.12.3"
-prost = "0.13"
-prost-reflect = "0.14"
+tower = { version = "0.5", features = ["util", "make", "limit"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-webpki-roots"] }
+tonic-reflection = { version = "0.14", features = ["server"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-reflect = "0.16"
 
 # QUIC & HTTP/3
 quinn = { version = "0.11", features = ["rustls"] }
@@ -58,7 +59,7 @@ pem = "4.0"
 x509-parser = "0.18"
 asn1-rs = "0.7"
 tls-parser = "0.12"
-jsonwebtoken = "11.0"
+jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 base64 = "0.23"
 
 # Observability & Tracing (OpenTelemetry 0.24 stack)

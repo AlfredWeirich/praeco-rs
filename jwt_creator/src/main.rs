@@ -78,11 +78,15 @@ fn verify_jwt<C: serde::de::DeserializeOwned + std::fmt::Debug>(
     let public_key =
         read_to_string(public_key_path).map_err(|e| format!("Failed to read public key: {e}"))?;
 
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&["praeco-gateway"]);
+    validation.set_issuer(&["praeco-auth"]);
+
     decode::<C>(
         token,
         &DecodingKey::from_ed_pem(public_key.as_bytes())
             .map_err(|e| format!("Decoding key error: {e}"))?,
-        &Validation::new(Algorithm::EdDSA),
+        &validation,
     )
     .map(|data| data.claims)
     .map_err(|e| format!("JWT verification error: {e}"))
