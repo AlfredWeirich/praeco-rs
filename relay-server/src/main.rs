@@ -45,6 +45,11 @@ struct TokenBucket {
 }
 
 impl TokenBucket {
+    /// Creates a new `TokenBucket` initialized with the maximum burst capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `burst` - The maximum number of tokens this bucket can hold.
     fn new(burst: f32) -> Self {
         Self {
             tokens: burst,
@@ -52,6 +57,20 @@ impl TokenBucket {
         }
     }
 
+    /// Attempts to consume a single token from the bucket.
+    ///
+    /// The bucket is refilled based on the elapsed time since the last update
+    /// multiplied by the refill `rate`.
+    ///
+    /// # Arguments
+    ///
+    /// * `rate` - The number of tokens added per second.
+    /// * `burst` - The maximum capacity of the bucket.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if a token was successfully consumed, or `false` if the bucket is empty
+    /// (indicating the rate limit has been exceeded).
     fn consume(&mut self, rate: f32, burst: f32) -> bool {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f32();
@@ -260,6 +279,9 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
 
         tokio::spawn(async move {
             info!(target: "relay::control_plane", "New control connection");
+            
+            // 1. Perform strict mTLS Handshake. 
+            // The client must present a valid certificate signed by our configured CA.
             let mut tls_stream = match acceptor.accept(stream).await {
                 Ok(s) => s,
                 Err(e) => {
@@ -340,13 +362,17 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
             let control = Control { tx };
 
             // --- Store with Generation ID (P0.5) ---
+            // To handle reconnects gracefully without race conditions (where an old dying connection
+            // might delete the newly established connection's map entry), we use an atomic Generation ID.
             use std::sync::atomic::{AtomicU64, Ordering};
             static GENERATION: AtomicU64 = AtomicU64::new(1);
             let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst);
 
             tunnels.insert(sni.clone(), (control.clone(), my_generation));
 
-            // Health check keepalive ping task
+            // --- Health Check Task (Keepalive) ---
+            // Actively tests the multiplexed connection by opening dummy streams.
+            // If the backend has silently disappeared, this ensures the stale routing entry is removed.
             let ping_sni = sni.clone();
             let ping_tunnels = tunnels.clone();
             let mut ping_control = control.clone();
@@ -378,11 +404,14 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 }
             });
 
-            // Connection Driver Loop
+            // --- Connection Driver Loop ---
+            // This loop polls the Yamux multiplexer. It constantly checks for new outbound
+            // stream requests (originating from the Data Plane) and pushes them down the tunnel,
+            // whilst simultaneously driving all active streams to completion.
             let mut pending_outbound: Option<oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>> = None;
 
             std::future::poll_fn(|cx| {
-                // 1. Check for new outbound requests if we don't have one pending
+                // 1. Check for new outbound requests (from Data Plane) if we don't have one pending
                 if pending_outbound.is_none() {
                     if let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx) {
                         pending_outbound = Some(resp_tx);
@@ -397,7 +426,7 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                     }
                 }
 
-                // 3. Drive inbound streams and connection progress
+                // 3. Drive inbound streams and connection progress (keeping multiplexing alive)
                 match connection.poll_next_inbound(cx) {
                     std::task::Poll::Ready(Some(Ok(unexpected_stream))) => {
                         warn!(target: "relay::control_plane", sni = %sni, "Unexpected inbound stream from client");
