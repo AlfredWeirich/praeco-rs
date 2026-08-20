@@ -1771,8 +1771,11 @@ async fn run_tunnel(
                                         
                                         let _ = builder.serve_connection(TokioIo::new(tls_stream), handler).await;
                                     }
-                                    _ => {
-                                        warn!("{}: TLS handshake via tunnel failed", server_name);
+                                    Ok(Err(e)) => {
+                                        warn!("{}: TLS handshake via tunnel failed: {}", server_name, e);
+                                    }
+                                    Err(_) => {
+                                        warn!("{}: TLS handshake via tunnel timed out", server_name);
                                     }
                                 }
                             }.instrument(tracing::info_span!("tunneled_connection", server = %server_name, sni = %tunnel.sni_domain)));
