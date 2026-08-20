@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+
+keywords = ["x509", "certificates", "san", "decoder", "cli"]
+categories = ["command-line-utilities", "cryptography"]
+
 [dependencies]
 asn1-rs = { workspace = true, features = ["bigint"] }
 pem = { workspace = true }

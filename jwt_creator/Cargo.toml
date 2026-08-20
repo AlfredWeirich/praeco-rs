@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+
+keywords = ["jwt", "eddsa", "ed25519", "tokens", "cli"]
+categories = ["command-line-utilities", "cryptography", "authentication"]
+
 [dependencies]
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
