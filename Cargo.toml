@@ -62,15 +62,15 @@ tls-parser = "0.12"
 jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
 base64 = "0.23"
 
-# Observability & Tracing (OpenTelemetry 0.24 stack)
+# Observability & Tracing (OpenTelemetry 0.32 stack)
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.25"
-opentelemetry = { version = "0.24", features = ["trace"] }
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
-opentelemetry-http = "0.13"
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic"] }
+opentelemetry-http = "0.32"
 
 # Serialization & General Utilities
 serde = { version = "1.0", features = ["derive"] }

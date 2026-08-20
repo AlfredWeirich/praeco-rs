@@ -18,4 +18,5 @@ done
 
 LOG_LEVEL_UPPER=$(echo "$LOG_LEVEL" | tr '[:lower:]' '[:upper:]')
 
+echo RUST_LOG="warn,praeco_rs=${LOG_LEVEL},praeco_rs::middleware::logger=${LOG_LEVEL_UPPER}" cargo run -p praeco-rs --release -- "${CARGO_ARGS[@]}"
 RUST_LOG="warn,praeco_rs=${LOG_LEVEL},praeco_rs::middleware::logger=${LOG_LEVEL_UPPER}" cargo run -p praeco-rs --release -- "${CARGO_ARGS[@]}"
