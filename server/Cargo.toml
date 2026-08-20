@@ -68,8 +68,9 @@ tracing-opentelemetry = { workspace = true }
 # --- gRPC (Tonic & Prost) ---
 tonic = { workspace = true }
 tonic-reflection = { workspace = true }
+tonic-prost = { workspace = true }
 prost = { workspace = true }
-prost-reflect = { workspace = true, features = ["serde", "serde1"] }
+prost-reflect = { workspace = true, features = ["serde"] }
 
 # --- Serialization & Utilities ---
 serde = { workspace = true }
