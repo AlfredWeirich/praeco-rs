@@ -5,8 +5,94 @@ members = [
     "client", 
     "common", 
     "cert_decoder",
-    "grpc_reflection", "relay-server"]
+    "grpc_reflection", 
+    "relay-server",
+]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Alfred Weirich"]
+repository = "https://github.com/AlfredWeirich/praeco-rs"
+
+[workspace.dependencies]
+# Internal workspace crates
+common = { package = "praeco-common", version = "0.4.1", path = "common" }
+
+# Async runtime & core utilities
+tokio = { version = "1.49", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = "0.1"
+tokio-rustls = "0.26"
+futures = "0.3"
+futures-util = "0.3"
+pin-project = "1.1"
+bytes = "1.11"
+
+# Networking, HTTP & gRPC
+hyper = "1.8"
+hyper-util = "0.1"
+hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
+http-body = "1.0"
+http-body-util = "0.1"
+tower = { version = "0.4.13", features = ["util", "make", "limit"] }
+tower-http = { version = "0.5.2", features = ["cors", "trace"] }
+tonic = { version = "0.12.3", features = ["channel", "tls", "tls-roots", "tls-webpki-roots"] }
+tonic-reflection = { version = "0.12.3", features = ["server"] }
+tonic-build = "0.12.3"
+prost = "0.13"
+prost-reflect = "0.14"
+
+# QUIC & HTTP/3
+quinn = { version = "0.11", features = ["rustls"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+
+# TLS, Cryptography & Auth
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1.14"
+rustls-pemfile = "2.2"
+webpki-roots = "1.0"
+pem = "3.0"
+x509-parser = "0.18"
+asn1-rs = "0.7"
+tls-parser = "0.12"
+jsonwebtoken = "9.3"
+base64 = "0.22"
+
+# Observability & Tracing (OpenTelemetry 0.24 stack)
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = "0.25"
+opentelemetry = { version = "0.24", features = ["trace"] }
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+opentelemetry-http = "0.13"
+
+# Serialization & General Utilities
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.24", features = ["v4"] }
+regex = "1.12"
+glob = "0.3"
+arc-swap = "1.9"
+rand = "0.8"
+num_cpus = "1.17"
+dashmap = "6.2"
+nom = "7.1"
+yamux = "0.14"
+matchit = "0.9"
+local-ip-address = "0.6"
+url = "2.5"
+urlencoding = "2.1"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
+mimalloc = { version = "0.1", features = ["v3"] }
 
 [profile.release]
 opt-level = 3

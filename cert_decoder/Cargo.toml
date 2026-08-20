@@ -1,13 +1,13 @@
 [package]
 name = "praeco-cert-decoder"
 version = "0.4.1"
-edition = "2024"
+edition.workspace = true
 description = "Certificate decoder utility for praeco-rs"
-license = "MIT OR Apache-2.0"
-authors = ["Alfred Weirich"]
-repository = "https://github.com/AlfredWeirich/praeco-rs"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-asn1-rs = { version = "0.7.1", features = ["bigint"] }
-pem = "3.0.6"
-x509-parser = "0.18.0"
+asn1-rs = { workspace = true, features = ["bigint"] }
+pem = { workspace = true }
+x509-parser = { workspace = true }

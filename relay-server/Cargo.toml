@@ -1,31 +1,31 @@
 [package]
 name = "praeco-relay-server"
 version = "0.2.1"
-edition = "2024"
+edition.workspace = true
 description = "Relay server for praeco-rs"
-license = "MIT OR Apache-2.0"
-authors = ["Alfred Weirich"]
-repository = "https://github.com/AlfredWeirich/praeco-rs"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-tokio = { version = "1.39", features = ["full"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pki-types = "1.12"
-rustls-pemfile = "2.2"
-yamux = "0.14" 
-dashmap = "6.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1.0"
-tls-parser = "0.12"
-nom = "7.1"
-tokio-util = { version = "0.7", features = ["compat"] }
-serde = { version = "1.0.207", features = ["derive"] }
-toml = "0.8.23"
-opentelemetry = { version = "0.24", features = ["trace"] }
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
-tracing-opentelemetry = "0.25"
-tonic = { version = "0.12", features = ["channel", "tls", "tls-roots", "tls-webpki-roots"] }
-x509-parser = "0.18.1"
+anyhow = { workspace = true }
+dashmap = { workspace = true }
+nom = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+tls-parser = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+toml = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+x509-parser = { workspace = true }
+yamux = { workspace = true }
