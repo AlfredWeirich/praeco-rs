@@ -41,3 +41,18 @@ server_key_path = "server_certs/self_signed/relay_server.key"
 enable_opentelemetry = true
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
+
+# ==========================================
+# Connection & Timeout Settings
+# ==========================================
+
+# Inaktivitäts-Timeout (Idle Timeout) für Data Plane Client-Verbindungen in Sekunden.
+# Verbindungen werden nur getrennt, wenn für diesen Zeitraum weder Upstream noch Downstream Bytes fließen.
+# Standard: 1800 (30 Minuten). 0 = Deaktiviert (Verbindung bleibt offen, solange TCP-Keepalive antwortet).
+data_plane_idle_timeout_secs = 1800
+
+# TCP-Keepalive Probe-Intervall in Sekunden (Socket-Ebene).
+# Ermöglicht dem OS, tote Verbindungen (z.B. abgerissene Mobilfunkverbindungen) automatisch zu bereinigen.
+# Standard: 60 Sekunden.
+tcp_keepalive_secs = 60
+

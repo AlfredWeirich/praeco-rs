@@ -27,7 +27,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::{FuturesAsyncWriteCompatExt, TokioAsyncReadCompatExt};
-use tracing::{error, info, info_span, warn, Instrument};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
@@ -208,9 +208,26 @@ async fn main() -> Result<()> {
     let data_addr = config.data_plane_addr.clone();
     let rate_rate = config.rate_limit_connections_per_sec.unwrap_or(50) as f32;
     let rate_burst = config.rate_limit_burst.unwrap_or(100) as f32;
+    let idle_timeout = match config.data_plane_idle_timeout_secs.unwrap_or(1800) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
+    let tcp_keepalive = match config.tcp_keepalive_secs.unwrap_or(60) {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
     
     tokio::spawn(async move {
-        if let Err(e) = run_data_plane(active_tunnels, &data_addr, rate_rate, rate_burst).await {
+        if let Err(e) = run_data_plane(
+            active_tunnels,
+            &data_addr,
+            rate_rate,
+            rate_burst,
+            idle_timeout,
+            tcp_keepalive,
+        )
+        .await
+        {
             error!("Data plane failed: {}", e);
         }
     });
@@ -456,13 +473,145 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
     }
 }
 
+/// Result outcome for copying bidirectional traffic.
+#[derive(Debug)]
+enum CopyResult {
+    /// Both directions finished gracefully with transferred bytes (up, down).
+    Clean(u64, u64),
+    /// The connection was closed after being idle for longer than the configured timeout.
+    IdleTimeout,
+    /// An I/O error occurred during transfer.
+    Error(std::io::Error),
+}
+
+/// Helper function that continuously copies data from `reader` to `writer`,
+/// signaling activity via `activity_tx` to reset the idle watchdog timer.
+async fn copy_one_way<R, W>(
+    mut reader: R,
+    mut writer: W,
+    activity_tx: tokio::sync::mpsc::Sender<()>,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    let mut total_bytes = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            break;
+        }
+        writer.write_all(&buf[..n]).await?;
+        total_bytes += n as u64;
+        let _ = activity_tx.try_send(());
+    }
+    Ok(total_bytes)
+}
+
+/// Bidirectionally forwards traffic between two async streams with an optional idle timeout.
+///
+/// Unlike a hard lifetime timeout, this watchdog only triggers if NO data is transferred
+/// in either direction for the specified `idle_timeout` duration.
+///
+/// # Arguments
+///
+/// * `a` - The client stream (or first endpoint).
+/// * `b` - The tunnel stream (or second endpoint).
+/// * `idle_timeout` - Optional maximum idle duration before terminating inactive connections.
+///
+/// # Returns
+///
+/// * `CopyResult::Clean(up, down)` if the connection closed normally.
+/// * `CopyResult::IdleTimeout` if no data was transferred in either direction for `idle_timeout`.
+/// * `CopyResult::Error(err)` if an I/O error occurred.
+async fn copy_bidirectional_with_idle_timeout<A, B>(
+    a: A,
+    b: B,
+    idle_timeout: Option<Duration>,
+) -> CopyResult
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+{
+    let Some(timeout) = idle_timeout else {
+        // If no idle timeout is configured, rely purely on OS-level TCP keepalive
+        let mut a = a;
+        let mut b = b;
+        return match tokio::io::copy_bidirectional(&mut a, &mut b).await {
+            Ok((up, down)) => CopyResult::Clean(up, down),
+            Err(e) => CopyResult::Error(e),
+        };
+    };
+
+    let (a_read, a_write) = tokio::io::split(a);
+    let (b_read, b_write) = tokio::io::split(b);
+
+    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(64);
+
+    let forward_a_to_b = copy_one_way(a_read, b_write, activity_tx.clone());
+    let forward_b_to_a = copy_one_way(b_read, a_write, activity_tx);
+
+    tokio::pin!(forward_a_to_b);
+    tokio::pin!(forward_b_to_a);
+
+    let mut sleep = std::pin::pin!(tokio::time::sleep(timeout));
+    let mut a_done = false;
+    let mut b_done = false;
+    let mut up_bytes = 0u64;
+    let mut down_bytes = 0u64;
+
+    loop {
+        tokio::select! {
+            res = &mut forward_a_to_b, if !a_done => {
+                match res {
+                    Ok(bytes) => {
+                        up_bytes = bytes;
+                        a_done = true;
+                        if b_done {
+                            return CopyResult::Clean(up_bytes, down_bytes);
+                        }
+                    }
+                    Err(e) => return CopyResult::Error(e),
+                }
+            }
+            res = &mut forward_b_to_a, if !b_done => {
+                match res {
+                    Ok(bytes) => {
+                        down_bytes = bytes;
+                        b_done = true;
+                        if a_done {
+                            return CopyResult::Clean(up_bytes, down_bytes);
+                        }
+                    }
+                    Err(e) => return CopyResult::Error(e),
+                }
+            }
+            Some(()) = activity_rx.recv() => {
+                sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
+            }
+            _ = &mut sleep => {
+                return CopyResult::IdleTimeout;
+            }
+        }
+    }
+}
+
 /// Runs the Data Plane, accepting public TCP connections and routing them via SNI.
 ///
 /// Extracts the Server Name Indication (SNI) from the initial TLS ClientHello.
 /// Looks up the SNI in the `tunnels` map, opens a new stream over the corresponding
-/// Yamux connection, and blindly copies the bidirectional TCP traffic.
+/// Yamux connection, and forwards bidirectional TCP traffic with an activity-based idle timeout.
 /// Applies a Token-Bucket rate limit per client IP to mitigate L4 connection floods.
-async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) -> Result<()> {
+async fn run_data_plane(
+    tunnels: SessionMap,
+    addr: &str,
+    rate: f32,
+    burst: f32,
+    idle_timeout: Option<Duration>,
+    tcp_keepalive: Option<Duration>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("Data plane listening on {} (SNI-Routing)", addr);
 
@@ -484,6 +633,16 @@ async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) 
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        // --- Socket-level TCP Keepalive ---
+        if let Some(keepalive_dur) = tcp_keepalive {
+            let sock_ref = socket2::SockRef::from(&client_stream);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(keepalive_dur)
+                .with_interval(Duration::from_secs(10));
+            let _ = sock_ref.set_tcp_keepalive(&keepalive);
+            let _ = sock_ref.set_nodelay(true);
+        }
 
         // --- Rate Limiting Check ---
         let mut bucket = rate_limits.entry(client_addr.ip()).or_insert_with(|| TokenBucket::new(burst));
@@ -540,20 +699,17 @@ async fn run_data_plane(tunnels: SessionMap, addr: &str, rate: f32, burst: f32) 
 
             info!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Routing connection via tunnel");
 
-            let res = tokio::time::timeout(
-                Duration::from_secs(300),
-                tokio::io::copy_bidirectional(&mut client_stream, &mut tokio_tunnel)
-            ).await;
+            let res = copy_bidirectional_with_idle_timeout(client_stream, tokio_tunnel, idle_timeout).await;
 
             match res {
-                Ok(Ok((up, down))) => {
+                CopyResult::Clean(up, down) => {
                     info!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, up_bytes = up, down_bytes = down, "Connection closed cleanly");
                 }
-                Ok(Err(e)) => {
-                    warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, error = %e, "Connection closed with error");
+                CopyResult::Error(e) => {
+                    debug!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, error = %e, "Connection closed with I/O error");
                 }
-                Err(_) => {
-                    warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Connection timed out");
+                CopyResult::IdleTimeout => {
+                    debug!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Connection closed after idle timeout");
                 }
             }
         }.instrument(info_span!("data_connection", client_ip = %client_addr)));
