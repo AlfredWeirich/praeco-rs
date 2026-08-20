@@ -135,6 +135,7 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `token_expiry_seconds`: Integer. Time to live (TTL) for the issued JWT in seconds.
 * `session_ttl_seconds`: Integer. Time to live for the QR-Code login session in seconds (how long the user has to scan the code).
 * `cookie_name`: String. The name of the cookie in which the JWT will be stored. (e.g., `"__Host-jwt"`). If using a `__Host-` prefixed cookie, the `protocol` MUST be `"https"`.
+* `cookie_domain`: String *(optional)*. The domain for which the cookie is valid. Useful for sharing login sessions across subdomains (e.g. `".aweirich.eu"`). If omitted, the cookie is restricted to the exact hostname of the IdP.
 * `redirect_after_login`: String. The URL path to which the user's browser is redirected after successfully obtaining the JWT via the `/auth/status` endpoint (e.g., `"/dashboard"`).
 * `issuer`: String. The issuer claim (`iss`) injected into the generated JWTs (default: `"praeco-idp"`).
 * `allowed_audiences`: Array of strings. A list of allowed target audiences (`aud`). If a client requests a specific audience via the `?aud=` query parameter, it must match one of the entries in this list.
