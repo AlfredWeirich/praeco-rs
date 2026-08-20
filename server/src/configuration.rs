@@ -594,6 +594,8 @@ pub struct IdpParams {
     /// Name of the cookie to set for the issued JWT (default: "__Host-jwt").
     #[serde(default = "default_cookie_name")]
     pub cookie_name: String,
+    /// Optional domain for the cookie to allow sharing across subdomains (e.g. ".aweirich.eu").
+    pub cookie_domain: Option<String>,
     /// Default redirect path after successful login if no `redirect` param is present.
     #[serde(default = "default_redirect")]
     pub redirect_after_login: String,

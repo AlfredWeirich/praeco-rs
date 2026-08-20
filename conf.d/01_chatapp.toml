@@ -2,6 +2,7 @@
 # CHATAPP CONFIGURATION
 # This file contains all server instances required for the ChatApp backend.
 # =============================================================================
+pki_base_oid = "1.3.6.1.4.1.65111"
 
 [[Server]]
 # =============================================================================
@@ -11,15 +12,16 @@
     ip = "0.0.0.0"
     port = 1336
     enabled = true
+    protocol = "https"
+    authentication = "ClientCert"
+    service = "Router"
+
     [Server.tunnel]
     target_url = "tls://localhost:7001"
     sni_domain = "wurzelwerk.api.aweirich.eu"
     client_cert_path = "server_certs/self_signed/praeco_client.pem"
     client_key_path = "server_certs/self_signed/praeco_client.key"
     ca_cert_path = "server_certs/self_signed/relay_ca.pem"
-    protocol = "https"
-    authentication = "ClientCert"
-    service = "Router"
 
     [Server.Layers]
     enabled = ["Decompression", "MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
@@ -290,6 +292,7 @@
         token_expiry_seconds = 28800 # 8 hours
         session_ttl_seconds = 120
         cookie_name = "admin-jwt"
+        cookie_domain = ".aweirich.eu"
         redirect_after_login = "https://wurzelwerk.admin.aweirich.eu/admin"
         debug_show_session_id = true
 
