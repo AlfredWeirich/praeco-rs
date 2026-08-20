@@ -39,6 +39,11 @@ pub struct RelayConfig {
     pub rate_limit_connections_per_sec: Option<u32>,
     /// Max allowed burst of TCP connections per IP.
     pub rate_limit_burst: Option<u32>,
+
+    /// Idle timeout in seconds for data plane connections (0 or None = disabled).
+    pub data_plane_idle_timeout_secs: Option<u64>,
+    /// TCP keepalive probe interval in seconds on the data plane sockets.
+    pub tcp_keepalive_secs: Option<u64>,
 }
 
 impl Default for RelayConfig {
@@ -57,6 +62,8 @@ impl Default for RelayConfig {
             otel_sample_ratio: Some(1.0),
             rate_limit_connections_per_sec: Some(50),
             rate_limit_burst: Some(100),
+            data_plane_idle_timeout_secs: Some(1800),
+            tcp_keepalive_secs: Some(60),
         }
     }
 }
