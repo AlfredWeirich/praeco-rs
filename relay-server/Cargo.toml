@@ -10,7 +10,6 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 dashmap = { workspace = true }
-nom = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
