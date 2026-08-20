@@ -31,7 +31,6 @@ use tracing::{error, info, info_span, warn, Instrument};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
@@ -114,8 +113,8 @@ impl Control {
 type SessionMap = Arc<DashMap<String, (Control, u64)>>;
 
 /// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
-/// Returns the TracerProvider so it isn't dropped prematurely.
-fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::TracerProvider> {
+/// Returns the `SdkTracerProvider` so it isn't dropped prematurely.
+fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
     let enable_otlp = config.enable_opentelemetry.unwrap_or(false);
     let jaeger_endpoint = config.jaeger_endpoint.as_deref().unwrap_or("http://localhost:4317");
     let otel_log_level = config.otel_log_level.as_deref().unwrap_or("info");
@@ -132,39 +131,40 @@ fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::Trace
             opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(otel_sample_ratio)))
         };
 
-        let provider = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(jaeger_endpoint))
-            .with_trace_config(
-                opentelemetry_sdk::trace::Config::default()
-                    .with_sampler(sampler)
-                    .with_resource(Resource::new(vec![KeyValue::new("service.name", "praeco-relay")])),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)
-            .expect("Failed to initialize OTLP tracer");
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(jaeger_endpoint)
+            .build()
+            .expect("Failed to initialize OTLP exporter");
+
+        let resource = Resource::builder()
+            .with_service_name("praeco-relay")
+            .build();
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_sampler(sampler)
+            .with_resource(resource)
+            .build();
 
         opentelemetry::global::set_tracer_provider(provider.clone());
-        
-        let _ = opentelemetry::global::set_error_handler(|err| {
-            tracing::error!("OpenTelemetry Export Error: {:?}", err);
-        });
 
         let tracer = provider.tracer("praeco-relay");
         let telemetry_filter = EnvFilter::new(otel_log_level);
-        
+
         let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer).with_filter(telemetry_filter);
-        
+
         tracing_subscriber::registry()
             .with(stdout_layer)
             .with(telemetry_layer)
             .init();
-            
+
         Some(provider)
     } else {
         tracing_subscriber::registry()
             .with(stdout_layer)
             .init();
-            
+
         None
     }
 }
@@ -217,7 +217,9 @@ async fn main() -> Result<()> {
 
     let _ = tokio::signal::ctrl_c().await;
     info!("Shutdown signal received. Shutting down Relay Server...");
-    opentelemetry::global::shutdown_tracer_provider();
+    if let Some(provider) = _tracer_provider {
+        let _ = provider.shutdown();
+    }
     Ok(())
 }
 

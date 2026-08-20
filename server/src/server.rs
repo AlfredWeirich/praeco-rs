@@ -140,14 +140,18 @@ fn main() -> Result<(), Error> {
     let _rt_guard = runtime.enter();
 
     // Setup the tracing/logging system (stdout and optional file appender).
-    // Use _guard to keep the non-blocking appender alive until the end of main.
-    let _tracing_guard = setup_tracing(&config)?;
+    // Use _tracing_guard and _tracer_provider to keep the appender and OTLP exporter alive until main exits.
+    let (_tracing_guard, _tracer_provider) = setup_tracing(&config)?;
 
     info!("Configuration loaded from: {}", arg);
     trace!("Full Config: {:#?}", config);
 
     // Block the main thread on the execution of the asynchronous server loop.
-    runtime.block_on(main_async(config))
+    let res = runtime.block_on(main_async(config));
+    if let Some(provider) = _tracer_provider {
+        let _ = provider.shutdown();
+    }
+    res
 }
 
 /// The asynchronous main loop that manages multiple server instances.
@@ -326,7 +330,6 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
     }
 
     info!("All servers shut down cleanly.");
-    opentelemetry::global::shutdown_tracer_provider();
     Ok(())
 }
 
@@ -1562,20 +1565,22 @@ fn build_rustls_config(config: &ServerConfig) -> Result<RustlsServerConfig, Erro
 
 // --- Logging Setup ---
 
-/// Configures the global tracing subscriber for logging.
+/// Configures the global tracing subscriber for logging and OpenTelemetry tracing.
 ///
 /// # Arguments
 ///
-/// * `log_dir` - An optional directory path. If provided, logs will also be written to rolling files
-///   in this directory (rotated daily). If `None`, logs are written only to stdout.
+/// * `config` - Reference to the application configuration.
 ///
-/// By default, it uses the `RUST_LOG` environment variable filter (defaulting to "info").
-fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<WorkerGuard>, Error> {
-    use opentelemetry::KeyValue;
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_sdk::Resource;
-    use tracing_subscriber::Layer as _;
+/// Returns a tuple containing an optional `WorkerGuard` (for non-blocking file logging)
+/// and an optional `SdkTracerProvider` (for OpenTelemetry tracing).
+fn setup_tracing(
+    config: &praeco_rs::configuration::Config,
+) -> Result<(Option<WorkerGuard>, Option<opentelemetry_sdk::trace::SdkTracerProvider>), Error> {
     use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::Layer as _;
 
     let log_dir = config.log_dir.as_deref();
     let enable_otlp = config.enable_opentelemetry.unwrap_or(false);
@@ -1591,32 +1596,31 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
 
     let stdout_layer = fmt::layer().with_ansi(true).with_filter(console_filter);
 
-    let telemetry_layer = if enable_otlp {
+    let (telemetry_layer, tracer_provider) = if enable_otlp {
         let sampler = if (otel_sample_ratio - 1.0).abs() < f64::EPSILON {
             opentelemetry_sdk::trace::Sampler::AlwaysOn
         } else {
             opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(otel_sample_ratio)))
         };
 
-        let provider = opentelemetry_otlp::new_pipeline()
-            .tracing()
-            .with_exporter(opentelemetry_otlp::new_exporter().tonic().with_endpoint(jaeger_endpoint))
-            .with_trace_config(
-                opentelemetry_sdk::trace::Config::default()
-                    .with_sampler(sampler)
-                    .with_resource(Resource::new(vec![
-                        KeyValue::new("service.name", "praeco-rs")
-                    ])),
-            )
-            .install_batch(opentelemetry_sdk::runtime::Tokio)
-            .expect("Failed to initialize OTLP tracer");
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(jaeger_endpoint)
+            .build()
+            .context("Failed to initialize OTLP exporter")?;
+
+        let resource = Resource::builder()
+            .with_service_name("praeco-rs")
+            .build();
+
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_sampler(sampler)
+            .with_resource(resource)
+            .build();
 
         // We MUST set the provider globally, otherwise it gets dropped at the end of this function
         opentelemetry::global::set_tracer_provider(provider.clone());
-        
-        let _ = opentelemetry::global::set_error_handler(|err| {
-            tracing::error!("OpenTelemetry Export Error: {:?}", err);
-        });
 
         // Also set the global TextMapPropagator so we can inject traceparent headers into outgoing requests!
         opentelemetry::global::set_text_map_propagator(
@@ -1624,13 +1628,12 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
         );
 
         let tracer = provider.tracer("praeco-rs");
-        Some(
-            tracing_opentelemetry::layer()
-                .with_tracer(tracer)
-                .with_filter(telemetry_filter),
-        )
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_filter(telemetry_filter);
+        (Some(layer), Some(provider))
     } else {
-        None
+        (None, None)
     };
 
     if let Some(dir) = log_dir {
@@ -1657,12 +1660,12 @@ fn setup_tracing(config: &praeco_rs::configuration::Config) -> Result<Option<Wor
 
         tracing::subscriber::set_global_default(subscriber)?;
 
-        // Return the guard so it's not dropped
-        Ok(Some(_guard))
+        // Return the guard and provider so they are not dropped
+        Ok((Some(_guard), tracer_provider))
     } else {
         let subscriber = Registry::default().with(telemetry_layer).with(stdout_layer);
         tracing::subscriber::set_global_default(subscriber)?;
-        Ok(None)
+        Ok((None, tracer_provider))
     }
 }
 use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
