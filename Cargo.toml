@@ -16,6 +16,10 @@ license = "MIT OR Apache-2.0"
 authors = ["Alfred Weirich"]
 repository = "https://github.com/AlfredWeirich/praeco-rs"
 
+
+keywords = ["grpc", "reverse-proxy", "zero-trust", "mtls", "tunnel"]
+categories = ["network-programming", "web-programming", "cryptography", "authentication", "asynchronous"]
+
 [workspace.dependencies]
 # Internal workspace crates
 common = { package = "praeco-common", version = "0.4.1", path = "common" }

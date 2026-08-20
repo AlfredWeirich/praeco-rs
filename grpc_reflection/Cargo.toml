@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+keywords = ["grpc", "reflection", "protobuf", "proxy", "tonic"]
+categories = ["network-programming", "web-programming", "development-tools"]
+
 [[bin]]
 name = "grpc_server"
 path = "src/grpc_server.rs"

@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+
+keywords = ["praeco", "tls", "jwt", "crypto", "utilities"]
+categories = ["cryptography", "authentication", "network-programming"]
+
 [dependencies]
 anyhow = { workspace = true }
 hyper = { workspace = true, features = ["http1", "http2", "client"] }

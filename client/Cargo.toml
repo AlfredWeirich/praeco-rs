@@ -7,6 +7,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+
+keywords = ["mtls", "client", "tls", "hyper", "rustls"]
+categories = ["network-programming", "cryptography", "authentication"]
+
 [dependencies]
 anyhow = { workspace = true }
 bytes = { workspace = true }

@@ -7,6 +7,9 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+keywords = ["relay", "tunnel", "zero-trust", "mtls", "sni-routing"]
+categories = ["network-programming", "cryptography", "authentication", "asynchronous"]
+
 [dependencies]
 anyhow = { workspace = true }
 dashmap = { workspace = true }
