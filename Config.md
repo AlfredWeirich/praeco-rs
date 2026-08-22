@@ -140,6 +140,14 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `issuer`: String. The issuer claim (`iss`) injected into the generated JWTs (default: `"praeco-idp"`).
 * `allowed_audiences`: Array of strings. A list of allowed target audiences (`aud`). If a client requests a specific audience via the `?aud=` query parameter, it must match one of the entries in this list.
 
+**Claims Webhook (Dynamic Role Resolution)**
+* `claims_webhook_url`: String *(optional)*. The HTTP endpoint to POST to for dynamic claims resolution. If set, Praeco calls this endpoint during login to fetch the current user roles from the backend database, replacing the OIDs baked into the certificate.
+* `claims_webhook_timeout_ms`: Integer. Timeout for the webhook HTTP call in milliseconds (default: `3000`).
+* `on_webhook_failure`: String. Behavior if the webhook fails. Options: `"fallback_to_cert"` (default: use OIDs from the mTLS certificate) or `"reject"` (deny the login).
+* `claims_webhook_client_cert`: String *(optional)*. Path to client certificate PEM for mTLS authentication against the webhook.
+* `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
+* `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
+
 ### Outbound Zero-Trust Tunneling (SNI Relay)
 
 #### `[Server.tunnel]` (Optional)

@@ -155,7 +155,53 @@ curl -s -v "https://localhost:1339/auth/status?session=abc123xyz"
   - **`Secure`:** Ensures the cookie is only transmitted over encrypted (HTTPS) connections, preventing interception via Man-in-the-Middle (MitM) attacks on unencrypted networks.
   - **`SameSite=Lax` (CSRF Protection):** This flag instructs the browser not to send the cookie with cross-site requests (e.g., if a malicious site tries to trigger a request to the IdP on behalf of the user). `Lax` allows the cookie to be sent when navigating to the origin site (top-level navigation), balancing security with a smooth user experience.
 
-## 3. Dynamic Key Discovery (JWKS)
+## 3. Claims Webhook (Dynamic Role Resolution)
+
+By default, the IdP extracts user roles (OIDs) statically from the client's mTLS certificate. However, this means roles are "baked in" and cannot be updated without issuing a new certificate.
+
+To solve this, Praeco supports a **Claims Webhook**. When configured, the IdP makes an HTTP POST request to a backend service during login (at `/auth/confirm` or `/auth/token`). The backend can look up the user in its database and return the real-time roles. The IdP then overwrites the certificate OIDs with the dynamically fetched roles before signing the JWT.
+
+The webhook request is sent as JSON:
+```json
+{"sub": "device_id.user_uuid", "cert_oids": ["1"]}
+```
+The expected response is JSON containing the new OIDs:
+```json
+{"oids": ["2"]}
+```
+
+If the webhook fails or times out, the IdP can optionally fall back to the certificate's original OIDs (`fallback_to_cert`) or reject the login entirely (`reject`).
+
+### Sequence Diagram (QR-Code Flow with Webhook)
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Browser as Desktop Browser<br/>(Untrusted)
+    participant IdP as Praeco IdP<br/>(Port 1339)
+    actor Mobile as iPhone<br/>(mTLS Device)
+    participant Backend as Backend API<br/>(Webhook)
+
+    Browser->>IdP: 1. POST /auth/login
+    IdP-->>Browser: {"session": "abc"}
+    Note over Browser: Displays QR Code
+
+    Note over Mobile: Scans QR Code
+    Mobile->>IdP: 2. POST /auth/confirm?session=abc (mTLS)
+    Note over IdP: Validates mTLS Certificate
+
+    IdP->>Backend: 3. POST /internal/claims (mTLS)<br/>{"sub":"device.uuid","cert_oids":[]}
+    Note over Backend: SELECT role FROM users<br/>WHERE uuid = 'uuid'
+    Backend-->>IdP: {"oids": ["2"]}
+
+    Note over IdP: Overwrites claims.oids = ["2"]
+    IdP-->>Mobile: {"status":"confirmed"}
+
+    Browser->>IdP: 4. GET /auth/status
+    Note over IdP: Issues JWT with oids=["2"]
+    IdP-->>Browser: Set-Cookie: praeco_jwt=...<br/>{"status":"confirmed"}
+```
+
+## 4. Dynamic Key Discovery (JWKS)
 
 To allow downstream API servers (Resource Servers) to independently and securely verify the signatures of the JWTs issued by the IdP, the IdP exposes a standard JSON Web Key Set (JWKS) endpoint.
 
