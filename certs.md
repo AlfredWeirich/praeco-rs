@@ -24,6 +24,7 @@ Regelt, wie administrative JWT-Ausweise signiert und verifiziert werden.
   - **Praeco IdP:** Signiert JWTs mit `idp_private.pem`.
   - **ChatApp Backend:** Verifiziert diese JWTs, indem es den öffentlichen Schlüssel über die Route `/.well-known/jwks.json` abruft (`idp_jwks_url`).
   - **TLS-Abhängigkeit:** Damit die ChatApp den IdP-Endpoint sicher per HTTPS erreichen kann, muss sie dem TLS-Zertifikat des IdPs vertrauen. (Bisher über die intern mitgelieferte `public_ca.pem` gelöst).
+  - **Praeco IdP Webhook (Neu):** Der IdP ruft das ChatApp Backend unter `/internal/claims` auf, um tagesaktuelle Rollen für das JWT zu holen. Dabei authentifiziert er sich via mTLS mit dem internen `proxy-client.pem` (genau wie das Gateway), welches von der ChatApp über `ca.pem` validiert wird.
 
 ### 3. Das Relay-Tunnel Puzzle (Control Plane / Firewall-Bypass)
 Sichert den Tunnel zwischen dem lokalen Praeco-Netzwerk und dem Cloud-Relay.
@@ -127,11 +128,12 @@ graph TD
     Onboarding -- "4b. TLS Proxying<br/>Verified by: ca.pem" --> OnboardingService
     Admin -- "4c. mTLS Proxying<br/>Auth: proxy-client.pem<br/>Verified by: ca.pem" --> AdminService
 
-    %% IdP JWKS Flow
+    %% IdP JWKS Flow & Webhook
     ChatApp -- "5. Fetch /.well-known/jwks.json<br/>Verified by: public_ca.pem" --> IdP
+    IdP -- "6. Fetch /internal/claims (Webhook)<br/>Auth: proxy-client.pem<br/>Verified by: ca.pem" --> AdminService
 ```
 Key Certificate Mappings (The "Glue")
 relay_ca.pem: The exclusive CA for the Zero-Trust Tunnel. It links the Relay Server (Port 7001) and the Praeco Gateway tunnel configurations.
-ca.pem: The master internal CA. It links the iOS App (Client Certs), Praeco Gateway (Incoming mTLS + Outgoing Proxy mTLS), and the ChatApp Backend (gRPC mTLS).
+ca.pem: The master internal CA. It links the iOS App (Client Certs), Praeco Gateway (Incoming mTLS + Outgoing Proxy mTLS), Praeco IdP (Outgoing Claims Webhook mTLS), and the ChatApp Backend (gRPC mTLS).
 public_ca.pem: The CA used for public TLS endpoints (Port 443). The ChatApp currently uses this to trust the Praeco IdP when fetching the JWKS keys. (Will become obsolete with Let's Encrypt).
 idp_private.pem & JWKS: The IdP uses the private key to sign JWTs. The ChatApp fetches the public key via JWKS to verify those JWTs.

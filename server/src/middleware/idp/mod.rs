@@ -16,11 +16,15 @@ use hyper::{Method, Request, Response, StatusCode};
 use jsonwebtoken::EncodingKey;
 use tower::Service;
 use tracing::{debug, error, info};
+use anyhow::Context as _;
 
 use crate::{configuration::IdpParams, SrvError, ServiceRespBody};
 
 mod session;
 use session::{SessionStore, SessionStatus};
+
+pub mod webhook;
+use webhook::WebhookClient;
 
 /// The Identity Provider service.
 #[derive(Clone)]
@@ -30,6 +34,7 @@ pub struct IdpService {
     encoding_key: Arc<EncodingKey>,
     server_name: &'static str,
     jwks_payload: Option<Arc<String>>,
+    webhook_client: Option<WebhookClient>,
 }
 
 impl IdpService {
@@ -37,6 +42,8 @@ impl IdpService {
     pub fn new(params: IdpParams, server_name: &'static str) -> Result<Self, anyhow::Error> {
         let session_store = SessionStore::new(params.session_ttl_seconds);
         
+        let webhook_client = WebhookClient::new(&params).context("Failed to init webhook client")?;
+
         let encoding_key = common::load_encoding_key(&params.jwt_private_key);
 
         let mut jwks_payload = None;
@@ -74,6 +81,7 @@ impl IdpService {
             encoding_key: Arc::new(encoding_key),
             server_name,
             jwks_payload,
+            webhook_client,
         })
     }
 
@@ -274,10 +282,30 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         None => return Ok(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
                     };
 
-                    let claims = match mtls_claims {
+                    let mut claims = match mtls_claims {
                         Some(c) => c,
                         None => return Ok(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")),
                     };
+
+                    // Webhook: dynamic role resolution
+                    if let Some(wh) = &this.webhook_client {
+                        match wh.fetch_claims(&claims.sub, &claims.oids).await {
+                            Ok(dynamic_oids) => {
+                                info!("{}: Webhook returned OIDs: {:?}", this.server_name, dynamic_oids);
+                                claims.oids = dynamic_oids;
+                            }
+                            Err(e) => {
+                                error!("{}: Claims webhook failed: {}", this.server_name, e);
+                                if this.params.on_webhook_failure == "reject" {
+                                    return Ok(Self::response_err(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "Claims resolution failed"
+                                    ));
+                                }
+                                // "fallback_to_cert" -> keep original OIDs
+                            }
+                        }
+                    }
 
                     if this.session_store.confirm_session(&sid, claims) {
                         Ok(Self::response_ok(r#"{"status":"confirmed"}"#))
@@ -288,14 +316,33 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
                 // 4. Direct JWT issuance via mTLS (for devices that don't need QR code)
                 (Method::POST, "/auth/token") => {
-                    let claims = match mtls_claims {
+                    let mut claims = match mtls_claims {
                         Some(c) => c,
                         None => return Ok(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required")),
                     };
 
+                    // Webhook: dynamic role resolution
+                    if let Some(wh) = &this.webhook_client {
+                        match wh.fetch_claims(&claims.sub, &claims.oids).await {
+                            Ok(dynamic_oids) => {
+                                info!("{}: Webhook returned OIDs: {:?}", this.server_name, dynamic_oids);
+                                claims.oids = dynamic_oids;
+                            }
+                            Err(e) => {
+                                error!("{}: Claims webhook failed: {}", this.server_name, e);
+                                if this.params.on_webhook_failure == "reject" {
+                                    return Ok(Self::response_err(
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "Claims resolution failed"
+                                    ));
+                                }
+                                // "fallback_to_cert" -> keep original OIDs
+                            }
+                        }
+                    }
+
                     // Here we could just return the JWT in JSON or set a cookie.
                     // For now, let's return it as JSON so API clients can use it in headers.
-                    let mut claims = claims;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()

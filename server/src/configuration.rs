@@ -609,6 +609,24 @@ pub struct IdpParams {
     pub allowed_audiences: Vec<String>,
     /// Optional path to the Ed25519 public key. If provided, exposed at /.well-known/jwks.json.
     pub jwt_public_key: Option<String>,
+
+    // --- Webhook Configuration ---
+
+    /// Optional URL for dynamic claims resolution via HTTP webhook.
+    /// If set, the IdP will POST to this URL to fetch current user roles.
+    pub claims_webhook_url: Option<String>,
+    /// Timeout for the webhook HTTP call in milliseconds (default: 3000).
+    #[serde(default = "default_webhook_timeout")]
+    pub claims_webhook_timeout_ms: u64,
+    /// Behavior when the webhook call fails ("fallback_to_cert" or "reject").
+    #[serde(default = "default_on_webhook_failure")]
+    pub on_webhook_failure: String,
+    /// Path to client certificate PEM for mTLS authentication to the webhook endpoint.
+    pub claims_webhook_client_cert: Option<String>,
+    /// Path to client private key for mTLS authentication to the webhook endpoint.
+    pub claims_webhook_client_key: Option<String>,
+    /// Path to CA certificate for verifying the webhook endpoint's server certificate.
+    pub claims_webhook_ca_cert: Option<String>,
 }
 
 fn default_token_expiry() -> u64 { 900 }
@@ -616,6 +634,8 @@ fn default_session_ttl() -> u64 { 120 }
 fn default_cookie_name() -> String { "__Host-jwt".to_string() }
 fn default_redirect() -> String { "/".to_string() }
 fn default_issuer() -> String { "praeco-idp".to_string() }
+fn default_webhook_timeout() -> u64 { 3000 }
+fn default_on_webhook_failure() -> String { "fallback_to_cert".to_string() }
 
 
 /// Server TLS certificate and key paths.
