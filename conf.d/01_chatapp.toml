@@ -30,8 +30,8 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     max_decompressed_bytes = 10485760  # 10 MB limit
 
     [Server.server_certs]
-    ssl_certificate = "server_certs/letsencrypt_cert.pem"
-    ssl_certificate_key = "server_certs/letsencrypt_key.pem"
+    ssl_certificate = "server_certs/api/fullchain.pem"
+    ssl_certificate_key = "server_certs/api/privkey.pem"
 
     [[Server.client_certs]]
     ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
@@ -91,6 +91,10 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     "/chat.ChatService/UpdateOrderStatus" = ["^/chat\\.ChatService/UpdateOrderStatus$"]
     "/chat.ChatService/GetRideBookings" = ["^/chat\\.ChatService/GetRideBookings$"]
     "/chat.ChatService/SearchRideRequests" = ["^/chat\\.ChatService/SearchRideRequests$"]
+    "/chat.ChatService/SubmitRideRequest" = ["^/chat\\.ChatService/SubmitRideRequest$"]
+    "/chat.ChatService/MatchRideRequest" = ["^/chat\\.ChatService/MatchRideRequest$"]
+    "/chat.ChatService/DeleteRideRequest" = ["^/chat\\.ChatService/DeleteRideRequest$"]
+
 
     [Server.ReverseRoutes."/"]
     upstreams = ["https://127.0.0.1:50051"]
@@ -132,8 +136,8 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     authentication = "None"
 
     [Server.server_certs]
-    ssl_certificate = "server_certs/letsencrypt_cert.pem"
-    ssl_certificate_key = "server_certs/letsencrypt_key.pem"
+    ssl_certificate = "server_certs/onboarding/fullchain.pem"
+    ssl_certificate_key = "server_certs/onboarding/privkey.pem"
 
     [Server.Layers]
     enabled = ["MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
@@ -185,8 +189,8 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     ca_cert_path = "server_certs/self_signed/relay_ca.pem"
     
     [Server.server_certs]
-        ssl_certificate = "server_certs/letsencrypt_cert.pem"
-        ssl_certificate_key = "server_certs/letsencrypt_key.pem"
+        ssl_certificate = "server_certs/admin/fullchain.pem"
+        ssl_certificate_key = "server_certs/admin/privkey.pem"
 
     [Server.oid_mapping]
         "1" = "Admin"
@@ -258,6 +262,7 @@ pki_base_oid = "1.3.6.1.4.1.65111"
         "/api/AdminUpdateProductCreator" = ["^/api/AdminUpdateProductCreator$"]
         "/api/AdminCreateChannel" = ["^/api/AdminCreateChannel$"]
         "/api/AdminPreRegisterSeller" = ["^/api/AdminPreRegisterSeller$"]
+        "/api/AdminGetRides" = ["^/api/AdminGetRides$"]
     
     [Server.ReverseRoutes."/"]
         upstreams = ["https://127.0.0.1:50053"]
@@ -290,8 +295,8 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     ca_cert_path = "server_certs/self_signed/relay_ca.pem"
     
     [Server.server_certs]
-        ssl_certificate = "server_certs/letsencrypt_cert.pem"
-        ssl_certificate_key = "server_certs/letsencrypt_key.pem"
+        ssl_certificate = "server_certs/idp/fullchain.pem"
+        ssl_certificate_key = "server_certs/idp/privkey.pem"
         
     [[Server.client_certs]]
         ssl_client_ca = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
