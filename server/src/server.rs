@@ -853,6 +853,72 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
             let idp_service = praeco_rs::middleware::idp::IdpService::new(params, server_config.static_name.expect("static_name missing")).expect("Failed to init IdP Service");
             praeco_rs::BoxCloneSyncService::new(idp_service)
         }
+        ServiceType::StaticFiles => {
+            let params = server_config.static_files_params.as_ref().expect("StaticFilesParams missing").clone();
+            let serve_dir = tower_http::services::ServeDir::new(&params.root);
+            
+            struct SyncWrapper<B>(B);
+            unsafe impl<B: Send> Sync for SyncWrapper<B> {}
+            impl<B: hyper::body::Body + Unpin> hyper::body::Body for SyncWrapper<B> {
+                type Data = B::Data;
+                type Error = B::Error;
+
+                fn poll_frame(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+                    std::pin::Pin::new(&mut self.0).poll_frame(cx)
+                }
+
+                fn is_end_stream(&self) -> bool {
+                    self.0.is_end_stream()
+                }
+
+                fn size_hint(&self) -> hyper::body::SizeHint {
+                    self.0.size_hint()
+                }
+            }
+
+            if params.fallback_to_index {
+                let index_path = format!("{}/index.html", params.root.trim_end_matches('/'));
+                let fallback = serve_dir.fallback(tower_http::services::ServeFile::new(index_path));
+                let svc = tower::service_fn(move |req: hyper::Request<praeco_rs::SrvBody>| {
+                    let s = fallback.clone();
+                    async move {
+                        use tower::ServiceExt;
+                        match s.oneshot(req).await {
+                            Ok(response) => {
+                                let mapped = response.map(|b| {
+                                    use http_body_util::BodyExt;
+                                    SyncWrapper(b).map_err(|e| praeco_rs::SrvError::from(e.to_string())).boxed()
+                                });
+                                Ok(mapped)
+                            }
+                            Err(e) => Err(praeco_rs::SrvError::from(e.to_string()))
+                        }
+                    }
+                });
+                praeco_rs::BoxCloneSyncService::new(svc)
+            } else {
+                let svc = tower::service_fn(move |req: hyper::Request<praeco_rs::SrvBody>| {
+                    let s = serve_dir.clone();
+                    async move {
+                        use tower::ServiceExt;
+                        match s.oneshot(req).await {
+                            Ok(response) => {
+                                let mapped = response.map(|b| {
+                                    use http_body_util::BodyExt;
+                                    SyncWrapper(b).map_err(|e| praeco_rs::SrvError::from(e.to_string())).boxed()
+                                });
+                                Ok(mapped)
+                            }
+                            Err(e) => Err(praeco_rs::SrvError::from(e.to_string()))
+                        }
+                    }
+                });
+                praeco_rs::BoxCloneSyncService::new(svc)
+            }
+        }
     };
 
     let applied = apply_layers(

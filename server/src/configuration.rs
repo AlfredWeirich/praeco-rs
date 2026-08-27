@@ -75,6 +75,8 @@ pub enum ServiceType {
     Router,
     /// An Identity Provider that issues JWTs (e.g. for mTLS to JWT or DeviceAuth).
     Idp,
+    /// A static file server for serving SPAs and assets directly from disk.
+    StaticFiles,
 }
 
 /// How clients authenticate with this server instance.
@@ -221,6 +223,10 @@ pub struct ServerConfig {
     #[serde(rename = "IdpParams")]
     pub idp_params: Option<IdpParams>,
 
+    /// Additional parameters for the StaticFiles service (root directory, fallback behavior).
+    #[serde(rename = "StaticFilesParams")]
+    pub static_files_params: Option<StaticFilesParams>,
+
     /// Pre-parsed and sorted reverse-proxy routes. Computed in [`ServerConfig::finalize`].
     #[serde(skip)]
     pub parsed_routes: Vec<ParsedRoute>,
@@ -239,6 +245,16 @@ pub struct ServerConfig {
 // ============================================================================
 //  Supporting Structures
 // ============================================================================
+
+/// Parameters for the StaticFiles service.
+#[derive(Debug, Deserialize, Clone)]
+pub struct StaticFilesParams {
+    /// The root directory to serve files from.
+    pub root: String,
+    /// If true, requests to missing files will fallback to serving index.html (useful for SPAs).
+    #[serde(default)]
+    pub fallback_to_index: bool,
+}
 
 /// A single reverse-proxy route definition from the TOML config.
 #[derive(Debug, Deserialize, Clone)]

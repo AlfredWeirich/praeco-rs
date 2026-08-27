@@ -28,6 +28,14 @@ Das System besteht aus zwei Ebenen:
    - Es wird asynchron ein neuer **Yamux-Stream** in der bestehenden Control-Plane-Verbindung geöffnet.
    - Der gesamte TCP-Traffic wird blind durch diesen Stream geleitet. Praeco terminiert das TLS lokal.
 
+## Einschränkungen: HTTP/3 und Encrypted Client Hello (ECH)
+
+Da der Relay-Server als reiner **Layer-4 TCP-Proxy** arbeitet und TLS nicht terminiert, gibt es bei neuen Protokollen und Standards folgende architektonische Einschränkungen zu beachten:
+
+* **HTTP/3 (QUIC):** Der Relay-Server unterstützt aktuell **kein HTTP/3**. QUIC basiert auf UDP, der Relay-Server lauscht jedoch ausschließlich auf TCP-Ports und tunnelt Traffic über TCP-basierte Yamux-Streams. Eingehender UDP-Traffic wird ignoriert.
+* **Encrypted Client Hello (ECH):** Neue Browser verschlüsseln zunehmend die SNI. Da der Relay-Server den Datenstrom nicht entschlüsseln kann (ihm fehlen die privaten TLS-Schlüssel), sieht er bei aktiviertem ECH nur die unverschlüsselte "Outer SNI" (einen Dummy-Namen).
+  * **Sicherheitshinweis:** Clients nutzen ECH **nur dann**, wenn du als Betreiber ECH-Konfigurationen aktiv über das DNS (via `HTTPS`-Records, Typ 65) ankündigst. Solange du solche Records in deiner DNS-Zone nicht anlegst, fallen alle Clients auf das herkömmliche Klartext-SNI zurück, womit das Routing des Relay-Servers problemlos funktioniert.
+
 ## Kompilieren
 
 Da der Relay-Server als eigenständiges Projekt im Workspace läuft, kann er ganz normal über Cargo gebaut werden:
