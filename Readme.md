@@ -21,6 +21,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 * **Dynamic Key Discovery (JWKS)**: The IdP exposes a standard `/.well-known/jwks.json` endpoint to serve its public keys dynamically. This enables downstream Resource Servers to fetch and verify JWT signatures automatically, supporting seamless, zero-downtime key rotation.
 * **Advanced Role Mapping (RBAC)**: Extracted custom Object Identifiers (OIDs) from mTLS client certificates are mapped to internal roles (`UserRole`), extending the strict access control directly into the JWTs issued by the IdP.
 * **Outbound Zero-Trust Tunneling (SNI Relay)**: Enables Praeco instances to run behind strict NATs or firewalls without opening local ports. Instances establish outbound multiplexed mTLS connections (`yamux`) to a standalone Relay Server, which routes incoming internet traffic securely back to the correct instance using SNI (Server Name Indication).
+* **Built-in Static File Server**: A highly performant static file server built right into the gateway. It supports native SPA routing (automatic fallback to `index.html`), completely eliminating the need for Nginx when serving frontends alongside your APIs.
 
 ---
 
