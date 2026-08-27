@@ -34,6 +34,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use jsonwebtoken::DecodingKey;
 use tower::{Layer, Service};
+#[allow(unused_imports)]
 use tracing::error;
 
 // === Internal Modules ===
@@ -181,7 +182,14 @@ where
         let decoding_keys = Arc::clone(&self.decoding_keys);
         let server_name = self.server_name;
         let oid_mapping = Arc::clone(&self.oid_mapping);
-        tracing::trace!("{}: Processing JWT Authentication", server_name);
+
+        // Bypass JWT for common browser icon requests
+        let path = req.uri().path();
+        if path == "/favicon.ico" || path.starts_with("/apple-touch-icon") {
+            return Box::pin(self.inner.call(req));
+        }
+
+        tracing::trace!("{}: Processing JWT Authentication for path: {}", server_name, path);
 
         // Extract the token from the "Authorization: Bearer <token>" header.
         let mut token = req
@@ -265,13 +273,13 @@ where
                             inner.call(req).await
                         }
                         Err(e) => {
-                            error!("{}: Invalid JWT: {}", server_name, e);
+                            tracing::warn!("{}: Invalid JWT: {}", server_name, e);
                             unauthorized_response(redirect.as_deref())
                         }
                     }
                 }
                 None => {
-                    error!("{}: Missing Authorization header or cookie", server_name);
+                    tracing::debug!("{}: Missing Authorization header or cookie", server_name);
                     unauthorized_response(redirect.as_deref())
                 }
             }
