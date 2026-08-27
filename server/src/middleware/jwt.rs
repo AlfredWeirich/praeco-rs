@@ -183,13 +183,12 @@ where
         let server_name = self.server_name;
         let oid_mapping = Arc::clone(&self.oid_mapping);
 
-        // Bypass JWT for common browser icon requests
-        let path = req.uri().path();
-        if path == "/favicon.ico" || path.starts_with("/apple-touch-icon") {
-            return Box::pin(self.inner.call(req));
-        }
-
-        tracing::trace!("{}: Processing JWT Authentication for path: {}", server_name, path);
+        //  // Bypass JWT for common browser icon requests
+        // let path = req.uri().path();
+        // if path == "/favicon.ico" || path.starts_with("/apple-touch-icon") {
+        //     return Box::pin(self.inner.call(req));
+        // }
+        tracing::trace!("{}: Processing JWT Authentication for path: {}", server_name, req.uri().path());
 
         // Extract the token from the "Authorization: Bearer <token>" header.
         let mut token = req
