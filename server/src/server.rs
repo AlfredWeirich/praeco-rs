@@ -827,6 +827,64 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 ///
 /// # Returns
 /// A `Result` which is `Ok` containing a `BoxedCloneService` if successful,
+/// Helper function to wrap a `ServeDir` (with or without fallback) into
+/// Praeco's BoxCloneSyncService requirement.
+fn wrap_serve_dir<S>(serve: S) -> BoxedCloneService
+where
+    S: tower::Service<hyper::Request<praeco_rs::SrvBody>, Response = hyper::Response<tower_http::services::fs::ServeFileSystemResponseBody>> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    S::Error: std::fmt::Display + 'static,
+{
+    /// Wraps `tower_http::services::ServeFileSystemResponseBody` (which is
+    /// `Send` but not `Sync`) to satisfy the `BoxBody<Bytes, SrvError>`
+    /// (`Send + Sync`) requirement of Praeco's middleware pipeline.
+    ///
+    /// # Safety
+    /// The inner body is only ever accessed from a single `async move` task
+    /// context (by Hyper). No concurrent `&self` access occurs across threads,
+    /// so the `Sync` bound is trivially satisfied.
+    struct SyncWrapper<B>(B);
+    unsafe impl<B: Send> Sync for SyncWrapper<B> {}
+    impl<B: hyper::body::Body + Unpin> hyper::body::Body for SyncWrapper<B> {
+        type Data = B::Data;
+        type Error = B::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::pin::Pin::new(&mut self.0).poll_frame(cx)
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.0.is_end_stream()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            self.0.size_hint()
+        }
+    }
+
+    let svc = tower::service_fn(move |req: hyper::Request<praeco_rs::SrvBody>| {
+        let s = serve.clone();
+        async move {
+            use tower::ServiceExt;
+            match s.oneshot(req).await {
+                Ok(response) => {
+                    let mapped = response.map(|b| {
+                        use http_body_util::BodyExt;
+                        SyncWrapper(b).map_err(|e| praeco_rs::SrvError::from(e.to_string())).boxed()
+                    });
+                    Ok(mapped)
+                }
+                Err(e) => Err(praeco_rs::SrvError::from(e.to_string())),
+            }
+        }
+    });
+    praeco_rs::BoxCloneSyncService::new(svc)
+}
+
+/// Builds the complete `tower::Service` stack for a single server instance,
 /// or an `Error` if the service stack cannot be built (e.g., missing compiled paths).
 fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneService, Error> {
     let layers = server_config.layers.build_middleware_layers(&server_config.name)?;
@@ -855,68 +913,23 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         }
         ServiceType::StaticFiles => {
             let params = server_config.static_files_params.as_ref().expect("StaticFilesParams missing").clone();
+            
+            let abs_root = std::fs::canonicalize(&params.root)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&params.root));
+            
+            tracing::info!(
+                "Static File Server '{}' serving from: {} (fallback_to_index: {})",
+                server_config.name, abs_root.display(), params.fallback_to_index
+            );
+
             let serve_dir = tower_http::services::ServeDir::new(&params.root);
             
-            struct SyncWrapper<B>(B);
-            unsafe impl<B: Send> Sync for SyncWrapper<B> {}
-            impl<B: hyper::body::Body + Unpin> hyper::body::Body for SyncWrapper<B> {
-                type Data = B::Data;
-                type Error = B::Error;
-
-                fn poll_frame(
-                    mut self: std::pin::Pin<&mut Self>,
-                    cx: &mut std::task::Context<'_>,
-                ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-                    std::pin::Pin::new(&mut self.0).poll_frame(cx)
-                }
-
-                fn is_end_stream(&self) -> bool {
-                    self.0.is_end_stream()
-                }
-
-                fn size_hint(&self) -> hyper::body::SizeHint {
-                    self.0.size_hint()
-                }
-            }
-
             if params.fallback_to_index {
                 let index_path = format!("{}/index.html", params.root.trim_end_matches('/'));
                 let fallback = serve_dir.fallback(tower_http::services::ServeFile::new(index_path));
-                let svc = tower::service_fn(move |req: hyper::Request<praeco_rs::SrvBody>| {
-                    let s = fallback.clone();
-                    async move {
-                        use tower::ServiceExt;
-                        match s.oneshot(req).await {
-                            Ok(response) => {
-                                let mapped = response.map(|b| {
-                                    use http_body_util::BodyExt;
-                                    SyncWrapper(b).map_err(|e| praeco_rs::SrvError::from(e.to_string())).boxed()
-                                });
-                                Ok(mapped)
-                            }
-                            Err(e) => Err(praeco_rs::SrvError::from(e.to_string()))
-                        }
-                    }
-                });
-                praeco_rs::BoxCloneSyncService::new(svc)
+                wrap_serve_dir(fallback)
             } else {
-                let svc = tower::service_fn(move |req: hyper::Request<praeco_rs::SrvBody>| {
-                    let s = serve_dir.clone();
-                    async move {
-                        use tower::ServiceExt;
-                        match s.oneshot(req).await {
-                            Ok(response) => {
-                                let mapped = response.map(|b| {
-                                    use http_body_util::BodyExt;
-                                    SyncWrapper(b).map_err(|e| praeco_rs::SrvError::from(e.to_string())).boxed()
-                                });
-                                Ok(mapped)
-                            }
-                            Err(e) => Err(praeco_rs::SrvError::from(e.to_string()))
-                        }
-                    }
-                });
-                praeco_rs::BoxCloneSyncService::new(svc)
+                wrap_serve_dir(serve_dir)
             }
         }
     };
