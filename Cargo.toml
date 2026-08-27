@@ -41,7 +41,7 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
 http-body = "1.0"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util", "make", "limit"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "fs"] }
 tonic = { version = "0.14", features = ["channel", "tls-ring", "tls-webpki-roots"] }
 tonic-reflection = { version = "0.14", features = ["server"] }
 tonic-prost = "0.14"

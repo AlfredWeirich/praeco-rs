@@ -1,0 +1,22 @@
+[[Server]]
+# =============================================================================
+# Static File Server for ChatApp Frontend
+# =============================================================================
+name = "fileserver"
+ip = "0.0.0.0"
+port = 8080
+enabled = true
+protocol = "http"
+authentication = "None"
+service = "StaticFiles"
+
+[Server.StaticFilesParams]
+root = "./server/www"
+fallback_to_index = true
+
+[Server.Layers]
+    enabled = ["Logger", "Cors"]
+
+    [Server.Layers.Cors]
+    allowed_origins = ["*"]
+    allowed_methods = ["GET", "HEAD"]

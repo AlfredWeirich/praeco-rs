@@ -57,6 +57,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 - **Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload the `Config.toml` and rebuild its routing tables on the fly using `ArcSwap`, without dropping active connections.
 - **End-to-End mTLS Bridging**: In addition to mTLS termination at the gateway, the proxy can establish a completely **new mTLS connection to the upstream servers** (including its own client certificate). This guarantees a fully encrypted and authenticated zero-trust chain deep into the internal backend.
 - **Built-in Identity Provider (IdP)**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support advanced authentication flows like QR-code-based cross-device logins.
+- **Built-in Static File Server**: Beyond proxying and Identity Provider functions, Praeco can act as a highly performant static file server. It supports SPA-Routing (fallback to `index.html`) out of the box, completely eliminating the need for Nginx when serving React, Vue, or WebAssembly (e.g. Iced) frontends alongside your APIs.
 - **HTTP/3 Native**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3`, providing better performance on unreliable networks.
 - **Outbound Zero-Trust Tunneling (SNI Relay)**: For deployments behind restrictive NATs or firewalls, `praeco-rs` can bypass local port binding entirely. Instead, it establishes an outbound, multiplexed mTLS connection (via Yamux) to a standalone Relay Server. The Relay Server accepts incoming internet traffic (Port 443) and routes it strictly via SNI to the corresponding Praeco instance, achieving complete End-to-End TLS without the Relay Server terminating the client connection.
 
@@ -87,8 +88,7 @@ Currently, the proxy regularly checks in the background (Health Checks) whether 
 A **Circuit Breaker** would go one step further: If a backend suddenly becomes extremely slow or throws errors (even though the last health check was still "OK"), the circuit "trips" immediately. The proxy instantly blocks further traffic to this node to prevent a complete traffic jam in the system (Cascading Failure).
 
 ### 4. Pluggable End-Services (Beyond Routing)
-Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
-- **Static File Server**: Serving SPAs (React/Vue) directly from a local directory alongside API routes.
+Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), a `StaticFiles` service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
 - **Aggregator / Fan-Out Service**: Accepting a single client request and internally fanning it out to multiple backend microservices, assembling their JSON responses into a single cohesive payload before returning it to the client.

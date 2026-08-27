@@ -89,7 +89,7 @@ You can define multiple `[[Server]]` blocks to run multiple listeners simultaneo
 | `enabled` | Boolean | Main switch to turn the server on or off. | `true`, `false` (**Default:** `true`) |
 | `protocol` | String | Transport protocol. (If `https`, `[Server.server_certs]` must be configured). | `"http"`, `"https"` (**Default:** `"http"`) |
 | `authentication` | String | Authentication method for incoming connections. | `"None"` (Public)<br>`"ClientCert"` or `"mTLS"` (Strict Certificate-based)<br>`"OptionalClientCert"` (Client cert requested but not required, useful for IdP device auth)<br>`"JWT"` (Token-based) |
-| `service` | String | The base service that processes the request after the middleware. | `"Echo"` (Returns request)<br>`"Router"` (Reverse proxy)<br>`"Idp"` (Identity Provider for JWT issuance) |
+| `service` | String | The base service that processes the request after the middleware. | `"Echo"` (Returns request)<br>`"Router"` (Reverse proxy)<br>`"Idp"` (Identity Provider for JWT issuance)<br>`"StaticFiles"` (Static File Server for SPAs and assets) |
 
 ### Server.oid_mapping
 Defines **per server** how the OID suffixes (Object Identifiers) extracted from certificates or JWT tokens are mapped to internal permission roles (Roles).
@@ -144,6 +144,14 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `claims_webhook_url`: String *(optional)*. The HTTP endpoint to POST to for dynamic claims resolution. If set, Praeco calls this endpoint during login to fetch the current user roles from the backend database, replacing the OIDs baked into the certificate.
 * `claims_webhook_timeout_ms`: Integer. Timeout for the webhook HTTP call in milliseconds (default: `3000`).
 * `on_webhook_failure`: String. Behavior if the webhook fails. Options: `"fallback_to_cert"` (default: use OIDs from the mTLS certificate) or `"reject"` (deny the login).
+
+### Static File Server Configuration
+
+#### `[Server.StaticFilesParams]` (Required if `service = "StaticFiles"`)
+Configures the built-in Static File Server. This is highly optimized for serving Single Page Applications (SPAs) like React or Vue, as well as static assets (images, fonts, downloads) directly from the local disk without needing an external web server like Nginx.
+
+* `root`: String. The local directory path from which files should be served (e.g., `"./www"` or `"/var/www/frontend"`).
+* `fallback_to_index`: Boolean. If set to `true`, any request for a file that does not exist on disk will instead return the `index.html` file from the root directory. This is mandatory for Client-Side SPA Routing to work properly. (Default: `false`).
 * `claims_webhook_client_cert`: String *(optional)*. Path to client certificate PEM for mTLS authentication against the webhook.
 * `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
 * `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
