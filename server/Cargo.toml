@@ -3,6 +3,7 @@ name = "praeco-rs"
 version = "0.4.1"
 edition.workspace = true
 description = "Ultra-fast API Gateway with mTLS OID authorization and gRPC JSON-transcoding"
+readme = "../Readme.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
