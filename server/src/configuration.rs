@@ -1058,6 +1058,20 @@ impl ServerConfig {
                     self.name
                 )));
             }
+        } else if self.service == ServiceType::StaticFiles {
+            let params = self.static_files_params.as_ref().ok_or_else(|| {
+                Error::msg(format!(
+                    "Configuration error in Server '{}': Service is 'StaticFiles', but [Server.StaticFilesParams] section is missing.",
+                    self.name
+                ))
+            })?;
+            
+            if !std::path::Path::new(&params.root).is_dir() {
+                tracing::warn!(
+                    "Server '{}': StaticFiles root '{}' does not exist (yet). Files will return 404.",
+                    self.name, params.root
+                );
+            }
         }
 
         Ok(())
