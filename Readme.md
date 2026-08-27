@@ -17,6 +17,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 
 **Newly Added**: 
 * **Built-in Identity Provider (IdP)**: Issues signed JWTs by leveraging the gateway's existing mTLS infrastructure. The IdP securely manages identities and issues tokens containing strict `iss` (Issuer) and `aud` (Audience) claims to prevent confused-deputy attacks across services.
+* **Dynamic Claims Webhook**: The IdP can query a backend webhook in real-time during the auth flow to fetch dynamic user roles, allowing role updates without reissuing underlying mTLS certificates.
 * **Dynamic Key Discovery (JWKS)**: The IdP exposes a standard `/.well-known/jwks.json` endpoint to serve its public keys dynamically. This enables downstream Resource Servers to fetch and verify JWT signatures automatically, supporting seamless, zero-downtime key rotation.
 * **Advanced Role Mapping (RBAC)**: Extracted custom Object Identifiers (OIDs) from mTLS client certificates are mapped to internal roles (`UserRole`), extending the strict access control directly into the JWTs issued by the IdP.
 * **Outbound Zero-Trust Tunneling (SNI Relay)**: Enables Praeco instances to run behind strict NATs or firewalls without opening local ports. Instances establish outbound multiplexed mTLS connections (`yamux`) to a standalone Relay Server, which routes incoming internet traffic securely back to the correct instance using SNI (Server Name Indication).
