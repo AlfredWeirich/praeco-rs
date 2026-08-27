@@ -662,9 +662,9 @@ async fn run_data_plane(
             };
 
             let sni = match extract_sni(&buf[..n]) {
-                Some(s) => s,
-                None => {
-                    warn!(target: "relay::data_plane", client_ip = %client_addr, "Failed to parse SNI or not a TLS ClientHello");
+                Ok(s) => s,
+                Err(reason) => {
+                    warn!(target: "relay::data_plane", client_ip = %client_addr, reason = %reason, "Failed to extract SNI");
                     return;
                 }
             };
@@ -719,29 +719,46 @@ async fn run_data_plane(
 /// Best-effort extraction of the SNI domain name from a raw TLS ClientHello packet.
 /// 
 /// Relies on `tls_parser` to interpret the raw bytes without completing a handshake.
-fn extract_sni(buf: &[u8]) -> Option<String> {
+fn extract_sni(buf: &[u8]) -> Result<String, &'static str> {
     match parse_tls_plaintext(buf) {
         Ok((_, pt)) => {
+            let mut found_handshake = false;
             for msg in pt.msg {
-                if let tls_parser::TlsMessage::Handshake(TlsMessageHandshake::ClientHello(client_hello)) = msg {
-                    if let Some(ext_bytes) = client_hello.ext {
-                        if let Ok((_, exts)) = tls_parser::parse_tls_extensions(ext_bytes) {
-                            for ext in exts {
-                                if let TlsExtension::SNI(sni_ext) = ext {
-                                    if let Some((_, name)) = sni_ext.first() {
-                                        if let Ok(name_str) = std::str::from_utf8(name) {
-                                            return Some(name_str.to_string());
+                if let tls_parser::TlsMessage::Handshake(handshake_msg) = msg {
+                    found_handshake = true;
+                    if let TlsMessageHandshake::ClientHello(client_hello) = handshake_msg {
+                        if let Some(ext_bytes) = client_hello.ext {
+                            if let Ok((_, exts)) = tls_parser::parse_tls_extensions(ext_bytes) {
+                                for ext in exts {
+                                    if let TlsExtension::SNI(sni_ext) = ext {
+                                        if let Some((_, name)) = sni_ext.first() {
+                                            if let Ok(name_str) = std::str::from_utf8(name) {
+                                                return Ok(name_str.to_string());
+                                            } else {
+                                                return Err("Invalid UTF-8 in SNI hostname");
+                                            }
+                                        } else {
+                                            return Err("SNI extension present but empty");
                                         }
                                     }
                                 }
+                                return Err("ClientHello has no SNI extension");
+                            } else {
+                                return Err("Failed to parse ClientHello extensions");
                             }
+                        } else {
+                            return Err("ClientHello has no extensions");
                         }
                     }
                 }
             }
-            None
+            if found_handshake {
+                Err("No ClientHello found in TLS Handshake")
+            } else {
+                Err("No TLS Handshake found")
+            }
         }
-        Err(_) => None,
+        Err(_) => Err("Not a valid TLS plaintext message"),
     }
 }
 
