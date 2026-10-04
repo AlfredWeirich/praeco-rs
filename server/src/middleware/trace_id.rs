@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use hyper::{Request, Response};
@@ -38,17 +36,15 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    // TraceIdMiddleware only modifies the request, not the response.
+    // Therefore, we can directly return the inner future without any wrapping!
+    type Future = S::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, mut req: Request<SrvBody>) -> Self::Future {
-        // Clone the inner service for 'static lifetime in the Future
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-
         // Extract or generate trace ID
         let trace_id = req
             .headers()
@@ -78,8 +74,8 @@ where
             }
         }
 
-        Box::pin(async move {
-            inner.call(req).await
-        })
+        // We avoid Box::pin entirely by simply passing the request down 
+        // and returning the inner future as is.
+        self.inner.call(req)
     }
 }

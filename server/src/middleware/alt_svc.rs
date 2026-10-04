@@ -10,6 +10,7 @@
 
 use hyper::header::{ALT_SVC, HeaderValue};
 use hyper::{Request, Response};
+use pin_project::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -76,6 +77,30 @@ pub struct AltSvcService<S> {
     header_value: HeaderValue,
 }
 
+#[pin_project]
+pub struct AltSvcFuture<F> {
+    #[pin]
+    inner: F,
+    header_value: HeaderValue,
+}
+
+impl<F, B, E> Future for AltSvcFuture<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<B>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+
+        // Inject the `Alt-Svc` header into the response headers.
+        response.headers_mut().insert(ALT_SVC, this.header_value.clone());
+
+        Poll::Ready(Ok(response))
+    }
+}
+
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AltSvcService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
@@ -83,9 +108,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    // We box the future because we need to await the response to modify its headers,
-    // and we want to keep the type signature clean (and `S::Future` might not be `Unpin`).
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = AltSvcFuture<S::Future>;
 
     /// Delegates back-pressure to the inner service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -98,21 +121,12 @@ where
     /// This informs the client that they can upgrade to HTTP/3 for future
     /// requests to this origin.
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        // Clone the header value to move it into the future.
-        // Performance Note: `HeaderValue` is backed by `Bytes` (Arc-like), so cloning is cheap (O(1)).
         let val = self.header_value.clone();
-        // Call the inner service to get the pending future.
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            // Await the response from the inner service.
-            let mut response = fut.await?;
-
-            // Inject the `Alt-Svc` header into the response headers.
-            // This informs the client that they can upgrade to HTTP/3 for future requests.
-            response.headers_mut().insert(ALT_SVC, val);
-
-            Ok(response)
-        })
+        AltSvcFuture {
+            inner: fut,
+            header_value: val,
+        }
     }
 }
