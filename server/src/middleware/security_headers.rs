@@ -7,6 +7,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
+use pin_project::pin_project;
 use tower::{Layer, Service};
 
 use crate::configuration::SecurityHeadersConfig;
@@ -41,6 +42,45 @@ pub struct SecurityHeadersMiddleware<S> {
     config: SecurityHeadersConfig,
 }
 
+#[pin_project]
+pub struct SecurityHeadersFuture<F> {
+    #[pin]
+    inner: F,
+    config: SecurityHeadersConfig,
+}
+
+impl<F, B, E> Future for SecurityHeadersFuture<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<B>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+
+        let headers = response.headers_mut();
+
+        if let Ok(csp) = HeaderValue::from_str(&this.config.content_security_policy) {
+            headers.insert(CONTENT_SECURITY_POLICY, csp);
+        }
+        if let Ok(hsts) = HeaderValue::from_str(&this.config.strict_transport_security) {
+            headers.insert(STRICT_TRANSPORT_SECURITY, hsts);
+        }
+        if let Ok(nosniff) = HeaderValue::from_str(&this.config.x_content_type_options) {
+            headers.insert(X_CONTENT_TYPE_OPTIONS, nosniff);
+        }
+        if let Ok(xframe) = HeaderValue::from_str(&this.config.x_frame_options) {
+            headers.insert(
+                hyper::header::HeaderName::from_static("x-frame-options"),
+                xframe,
+            );
+        }
+
+        Poll::Ready(Ok(response))
+    }
+}
+
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for SecurityHeadersMiddleware<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -50,38 +90,18 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = SecurityHeadersFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, clone);
-        let config = self.config.clone();
-
-        Box::pin(async move {
-            let mut response = inner.call(req).await?;
-            let headers = response.headers_mut();
-
-            if let Ok(csp) = HeaderValue::from_str(&config.content_security_policy) {
-                headers.insert(CONTENT_SECURITY_POLICY, csp);
-            }
-            if let Ok(hsts) = HeaderValue::from_str(&config.strict_transport_security) {
-                headers.insert(STRICT_TRANSPORT_SECURITY, hsts);
-            }
-            if let Ok(nosniff) = HeaderValue::from_str(&config.x_content_type_options) {
-                headers.insert(X_CONTENT_TYPE_OPTIONS, nosniff);
-            }
-            if let Ok(xframe) = HeaderValue::from_str(&config.x_frame_options) {
-                headers.insert(
-                    hyper::header::HeaderName::from_static("x-frame-options"),
-                    xframe,
-                );
-            }
-
-            Ok(response)
-        })
+        // Evaluate the inner future directly to avoid cloning `self.inner`
+        let fut = self.inner.call(req);
+        SecurityHeadersFuture {
+            inner: fut,
+            config: self.config.clone(),
+        }
     }
 }

@@ -15,6 +15,7 @@ use std::{
 
 // === External Crates ===
 use hyper::{Request, Response};
+use pin_project::pin_project;
 use tower::{Layer, Service};
 
 // === Internal Modules ===
@@ -69,17 +70,28 @@ pub struct TimingMiddleware<S> {
     server_name: &'static str,
 }
 
-// impl<S> TimingMiddleware<S> {
-//     pub fn get_s<ReqBody>(self) -> impl Service<Request<ReqBody>, Response = Response<ServiceRespBody>>+ Clone + Send + 'static
-//     where
-//         S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
-//         S::Future: Send + 'static,
-//         S::Error: Debug + Send + 'static,
-//         ReqBody: Send + 'static,
-//     {
-//         self
-//     }
-// }
+#[pin_project]
+pub struct TimingFuture<F> {
+    #[pin]
+    inner: F,
+    server_name: &'static str,
+    start: Instant,
+}
+
+impl<F, E> Future for TimingFuture<F>
+where
+    F: Future<Output = Result<Response<ServiceRespBody>, E>>,
+{
+    type Output = Result<Response<ServiceRespBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = std::task::ready!(this.inner.poll(cx));
+        let duration = this.start.elapsed();
+        tracing::info!("{}: == Took {:.2?}", this.server_name, duration);
+        Poll::Ready(result)
+    }
+}
 
 impl<S, ReqBody> Service<Request<ReqBody>> for TimingMiddleware<S>
 where
@@ -90,7 +102,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = TimingFuture<S::Future>;
 
     /// Delegates back-pressure to the wrapped inner service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -105,14 +117,12 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let server_name = self.server_name;
         let start = Instant::now();
-
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            let result = fut.await;
-            let duration = start.elapsed();
-            tracing::info!("{}: == Took {:.2?}", server_name, duration);
-            result
-        })
+        TimingFuture {
+            inner: fut,
+            server_name,
+            start,
+        }
     }
 }
