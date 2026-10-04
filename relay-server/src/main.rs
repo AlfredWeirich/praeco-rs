@@ -484,30 +484,63 @@ enum CopyResult {
     Error(std::io::Error),
 }
 
-/// Helper function that continuously copies data from `reader` to `writer`,
-/// signaling activity via `activity_tx` to reset the idle watchdog timer.
-async fn copy_one_way<R, W>(
-    mut reader: R,
-    mut writer: W,
-    activity_tx: tokio::sync::mpsc::Sender<()>,
-) -> std::io::Result<u64>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut buf = [0u8; 8192];
-    let mut total_bytes = 0u64;
-    loop {
-        let n = reader.read(&mut buf).await?;
-        if n == 0 {
-            let _ = writer.shutdown().await;
-            break;
-        }
-        writer.write_all(&buf[..n]).await?;
-        total_bytes += n as u64;
-        let _ = activity_tx.try_send(());
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::task::Poll;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+/// A wrapper around any AsyncRead + AsyncWrite that sets an atomic boolean flag on every I/O operation.
+struct ActivityTracker<S> {
+    inner: S,
+    had_activity: Arc<AtomicBool>,
+}
+
+impl<S> ActivityTracker<S> {
+    fn new(inner: S, had_activity: Arc<AtomicBool>) -> Self {
+        Self { inner, had_activity }
     }
-    Ok(total_bytes)
+    
+    #[inline(always)]
+    fn mark_active(&self) {
+        // Absolute Zero-Overhead: A single CPU instruction, no syscalls, no time calculations.
+        self.had_activity.store(true, Ordering::Relaxed);
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ActivityTracker<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(_)) = &res {
+            self.mark_active();
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ActivityTracker<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(_)) = &res {
+            self.mark_active();
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// Bidirectionally forwards traffic between two async streams with an optional idle timeout.
@@ -545,55 +578,38 @@ where
         };
     };
 
-    let (a_read, a_write) = tokio::io::split(a);
-    let (b_read, b_write) = tokio::io::split(b);
+    let had_activity = Arc::new(AtomicBool::new(true));
 
-    let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel(64);
+    let mut a_tracker = ActivityTracker::new(a, had_activity.clone());
+    let mut b_tracker = ActivityTracker::new(b, had_activity.clone());
 
-    let forward_a_to_b = copy_one_way(a_read, b_write, activity_tx.clone());
-    let forward_b_to_a = copy_one_way(b_read, a_write, activity_tx);
-
-    tokio::pin!(forward_a_to_b);
-    tokio::pin!(forward_b_to_a);
-
-    let mut sleep = std::pin::pin!(tokio::time::sleep(timeout));
-    let mut a_done = false;
-    let mut b_done = false;
-    let mut up_bytes = 0u64;
-    let mut down_bytes = 0u64;
-
-    loop {
-        tokio::select! {
-            res = &mut forward_a_to_b, if !a_done => {
-                match res {
-                    Ok(bytes) => {
-                        up_bytes = bytes;
-                        a_done = true;
-                        if b_done {
-                            return CopyResult::Clean(up_bytes, down_bytes);
-                        }
+    tokio::select! {
+        res = tokio::io::copy_bidirectional(&mut a_tracker, &mut b_tracker) => {
+            match res {
+                Ok((up, down)) => CopyResult::Clean(up, down),
+                Err(e) => CopyResult::Error(e),
+            }
+        }
+        _ = async {
+            let tick_interval_secs = 10;
+            let max_idle_ticks = timeout.as_secs() / tick_interval_secs;
+            let mut idle_ticks = 0;
+            
+            let mut interval = tokio::time::interval(Duration::from_secs(tick_interval_secs));
+            loop {
+                interval.tick().await;
+                // Swap the flag to false. If it was true, we had activity.
+                if had_activity.swap(false, Ordering::Relaxed) {
+                    idle_ticks = 0;
+                } else {
+                    idle_ticks += 1;
+                    if idle_ticks >= max_idle_ticks {
+                        break;
                     }
-                    Err(e) => return CopyResult::Error(e),
                 }
             }
-            res = &mut forward_b_to_a, if !b_done => {
-                match res {
-                    Ok(bytes) => {
-                        down_bytes = bytes;
-                        b_done = true;
-                        if a_done {
-                            return CopyResult::Clean(up_bytes, down_bytes);
-                        }
-                    }
-                    Err(e) => return CopyResult::Error(e),
-                }
-            }
-            Some(()) = activity_rx.recv() => {
-                sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
-            }
-            _ = &mut sleep => {
-                return CopyResult::IdleTimeout;
-            }
+        } => {
+            CopyResult::IdleTimeout
         }
     }
 }
