@@ -18,7 +18,7 @@
 
 // === Standard Library ===
 use std::{
-    future::{Future, ready},
+    future::Future,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -28,10 +28,11 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
+use pin_project::pin_project;
 use tower::{Layer, Service};
 
 // === Internal Modules ===
-use crate::{ServiceRespBody, SrvError, configuration::CompiledAllowedPathes};
+use crate::{configuration::CompiledAllowedPathes, ServiceRespBody, SrvError};
 
 /// A Tower [`Layer`] that inspects request paths against a set of regex rules.
 ///
@@ -83,6 +84,38 @@ pub struct InspectionService<S> {
     server_name: &'static str,
 }
 
+/// A custom future that either polls the inner service (if the request is allowed)
+/// or immediately resolves with a 403 Forbidden response (if blocked).
+#[pin_project(project = InspectionFutureProj)]
+pub enum InspectionFuture<F> {
+    /// The request was allowed, so we poll the inner future.
+    Allowed {
+        #[pin]
+        inner: F,
+    },
+    /// The request was blocked, returning the pre-built 403 response.
+    Blocked {
+        response: Option<Response<ServiceRespBody>>,
+    },
+}
+
+impl<F, E> Future for InspectionFuture<F>
+where
+    F: Future<Output = Result<Response<ServiceRespBody>, E>>,
+{
+    type Output = Result<Response<ServiceRespBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            InspectionFutureProj::Allowed { inner } => inner.poll(cx),
+            InspectionFutureProj::Blocked { response } => {
+                let res = response.take().expect("InspectionFuture polled after completion");
+                Poll::Ready(Ok(res))
+            }
+        }
+    }
+}
+
 impl<S, ReqBody> Service<Request<ReqBody>> for InspectionService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -92,7 +125,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = InspectionFuture<S::Future>;
 
     /// Delegates back-pressure to the inner service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -100,33 +133,22 @@ where
     }
 
     /// Checks the request against the allow-list, forwarding or rejecting it.
-    ///
-    /// ## Allowed requests
-    ///
-    /// Forwards the request to the inner service without cloning it.
-    ///
-    /// ## Blocked requests
-    ///
-    /// Logs a warning and returns an immediate 403 via [`std::future::ready`],
-    /// which is more efficient than spawning an `async` block for a value
-    /// that is already available.
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         // --- OPTIMIZATION: Avoid .to_string() and .clone() ---
         // We use &str directly from the request to avoid heap allocations.
         let server_name = self.server_name;
-        //tracing::trace!("{}: Inspection", server_name);
         let method = req.method().as_str();
         let path = req.uri().path();
         let query = req.uri().query().unwrap_or("");
 
-        // Pass references to your regex checker
         let allow = self.allowed_pathes.is_allowed(method, path, query);
 
         if allow {
+            // Request allowed: Return the 'Allowed' variant containing the inner future.
             let fut = self.inner.call(req);
-            Box::pin(async move { fut.await })
+            InspectionFuture::Allowed { inner: fut }
         } else {
-            // Log the failure (Captured variables for the log)
+            // Log the failure
             let method_owned = method.to_string(); // Only allocate if we actually block
             let path_owned = path.to_string();
             let query_owned = query.to_string();
@@ -137,18 +159,16 @@ where
                 server_name, method_owned, path_owned, query_owned
             );
 
-            // --- OPTIMIZATION: Use std::future::ready ---
-            // There is no need for an 'async move' block here.
-            // std::future::ready is more efficient for immediate values.
-            Box::pin(ready(Ok(self.build_forbidden_response())))
+            // Return the 'Blocked' variant containing the immediate response.
+            InspectionFuture::Blocked {
+                response: Some(self.build_forbidden_response()),
+            }
         }
     }
 }
 
 impl<S> InspectionService<S> {
     /// Constructs a **403 Forbidden** response with a short explanatory body.
-    ///
-    /// Separated into its own method to keep the `call` body concise and readable.
     fn build_forbidden_response(&self) -> Response<ServiceRespBody> {
         let body: ServiceRespBody = Full::new(Bytes::from_static(
             b"Request does not match allowed patterns",
