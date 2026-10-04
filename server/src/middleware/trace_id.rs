@@ -74,7 +74,7 @@ where
             }
         }
 
-        // We avoid Box::pin entirely by simply passing the request down 
+        // We avoid pinning and boxing entirely by simply passing the request down 
         // and returning the inner future as is.
         self.inner.call(req)
     }

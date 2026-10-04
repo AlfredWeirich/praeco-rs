@@ -33,6 +33,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use jsonwebtoken::DecodingKey;
+use pin_project::pin_project;
 use tower::{Layer, Service};
 #[allow(unused_imports)]
 use tracing::error;
@@ -143,6 +144,111 @@ pub struct JwtAuthService<S> {
     expected_audience: String,
 }
 
+#[pin_project(project = JwtAuthFutureProj)]
+pub enum JwtAuthFuture<S, ReqBody>
+where
+    S: Service<Request<ReqBody>>,
+{
+    /// Short-circuit response if token is missing or invalid.
+    Unauthorized {
+        response: Option<Response<ServiceRespBody>>,
+    },
+    /// The token is currently being verified asynchronously in a blocking thread.
+    Verifying {
+        verify_task: tokio::task::JoinHandle<Result<Claims, anyhow::Error>>,
+        req: Option<Request<ReqBody>>,
+        inner: S,
+        server_name: &'static str,
+        oid_mapping: Arc<Vec<(String, crate::configuration::UserRole)>>,
+        redirect: Option<String>,
+    },
+    /// Verification succeeded, the request was forwarded to the inner service.
+    Inner {
+        #[pin]
+        inner_fut: S::Future,
+    },
+}
+
+impl<S, ReqBody> Future for JwtAuthFuture<S, ReqBody>
+where
+    S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>>,
+{
+    type Output = Result<Response<ServiceRespBody>, S::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match self.as_mut().project() {
+                JwtAuthFutureProj::Unauthorized { response } => {
+                    let res = response.take().expect("polled after complete");
+                    return Poll::Ready(Ok(res));
+                }
+                JwtAuthFutureProj::Inner { inner_fut } => {
+                    return inner_fut.poll(cx);
+                }
+                JwtAuthFutureProj::Verifying {
+                    verify_task,
+                    req,
+                    inner,
+                    server_name,
+                    oid_mapping,
+                    redirect,
+                } => {
+                    // Wait for the blocking task to finish decoding the JWT
+                    let claims_result = std::task::ready!(Pin::new(verify_task).poll(cx));
+
+                    let claims_res = match claims_result {
+                        Ok(Ok(c)) => Ok(c),
+                        Ok(Err(e)) => Err(format!("{:?}", e)),
+                        Err(e) => Err(format!("Task error: {}", e)),
+                    };
+
+                    match claims_res {
+                        Ok(claims) => {
+                            // --- Role Mapping Logic ---
+                            let mut roles: Vec<crate::configuration::UserRole> = claims
+                                .oids
+                                .iter()
+                                .map(|suffix| {
+                                    oid_mapping
+                                        .iter()
+                                        .find(|(k, _)| k == suffix)
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or_else(crate::configuration::UserRole::guest)
+                                })
+                                .filter(|role| *role != crate::configuration::UserRole::guest())
+                                .collect();
+
+                            if roles.is_empty() {
+                                roles.push(crate::configuration::UserRole::guest());
+                            }
+
+                            tracing::trace!("{}: JWT Roles mapped: {:?}", server_name, roles);
+
+                            let mut request = req.take().unwrap();
+                            request.extensions_mut().insert::<Claims>(claims);
+                            request
+                                .extensions_mut()
+                                .insert::<Arc<Vec<crate::configuration::UserRole>>>(Arc::new(
+                                    roles,
+                                ));
+
+                            let fut = inner.call(request);
+                            self.set(JwtAuthFuture::Inner { inner_fut: fut });
+                            // Loop around to poll the newly created Inner future
+                        }
+                        Err(e) => {
+                            tracing::warn!("{}: Invalid JWT: {}", server_name, e);
+                            let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
+                            self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
+                            // Loop around to return the Unauthorized response
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<S, ReqBody> Service<Request<ReqBody>> for JwtAuthService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -152,7 +258,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = JwtAuthFuture<S, ReqBody>;
 
     /// Delegates back-pressure to the inner service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -183,11 +289,6 @@ where
         let server_name = self.server_name;
         let oid_mapping = Arc::clone(&self.oid_mapping);
 
-        //  // Bypass JWT for common browser icon requests
-        // let path = req.uri().path();
-        // if path == "/favicon.ico" || path.starts_with("/apple-touch-icon") {
-        //     return Box::pin(self.inner.call(req));
-        // }
         tracing::trace!("{}: Processing JWT Authentication for path: {}", server_name, req.uri().path());
 
         // Extract the token from the "Authorization: Bearer <token>" header.
@@ -219,70 +320,34 @@ where
             }
         }
 
-        let mut inner = self.inner.clone();
+        let inner = self.inner.clone();
         let redirect = self.redirect_on_failure.clone();
 
         let expected_iss = self.expected_issuer.clone();
         let expected_aud = self.expected_audience.clone();
 
-        Box::pin(async move {
-            match token {
-                Some(token_str) => {
-                    let claims_result =
-                        tokio::task::spawn_blocking(move || {
-                            verify_jwt(&token_str, &decoding_keys, expected_iss.as_str(), expected_aud.as_str())
-                        })
-                            .await;
+        match token {
+            Some(token_str) => {
+                let verify_task = tokio::task::spawn_blocking(move || {
+                    verify_jwt(&token_str, &decoding_keys, expected_iss.as_str(), expected_aud.as_str())
+                });
 
-                    let claims = match claims_result {
-                        Ok(Ok(c)) => Ok(c),
-                        Ok(Err(e)) => Err(format!("{:?}", e)),
-                        Err(e) => Err(format!("Task error: {}", e)),
-                    };
-
-                    match claims {
-                        Ok(claims) => {
-                            // --- Role Mapping Logic ---
-                            let mut roles: Vec<crate::configuration::UserRole> = claims
-                                .oids
-                                .iter()
-                                .map(|suffix| {
-                                    oid_mapping
-                                        .iter()
-                                        .find(|(k, _)| k == suffix)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or_else(crate::configuration::UserRole::guest)
-                                })
-                                .filter(|role| *role != crate::configuration::UserRole::guest())
-                                .collect();
-
-                            if roles.is_empty() {
-                                roles.push(crate::configuration::UserRole::guest());
-                            }
-
-                            tracing::trace!("{}: JWT Roles mapped: {:?}", server_name, roles);
-
-                            let mut req = req;
-                            req.extensions_mut().insert::<Claims>(claims);
-                            req.extensions_mut()
-                                .insert::<Arc<Vec<crate::configuration::UserRole>>>(Arc::new(
-                                    roles,
-                                ));
-
-                            inner.call(req).await
-                        }
-                        Err(e) => {
-                            tracing::warn!("{}: Invalid JWT: {}", server_name, e);
-                            unauthorized_response(redirect.as_deref())
-                        }
-                    }
-                }
-                None => {
-                    tracing::debug!("{}: Missing Authorization header or cookie", server_name);
-                    unauthorized_response(redirect.as_deref())
+                JwtAuthFuture::Verifying {
+                    verify_task,
+                    req: Some(req),
+                    inner,
+                    server_name,
+                    oid_mapping,
+                    redirect,
                 }
             }
-        })
+            None => {
+                tracing::debug!("{}: Missing Authorization header or cookie", server_name);
+                JwtAuthFuture::Unauthorized {
+                    response: Some(unauthorized_response::<()>(redirect.as_deref()).unwrap()),
+                }
+            }
+        }
     }
 }
 

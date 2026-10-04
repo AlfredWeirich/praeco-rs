@@ -77,7 +77,7 @@ pub struct LoggerService<S> {
 /// A custom future that awaits the inner service's future and logs the response.
 ///
 /// Using a concrete future type (via `pin_project`) avoids the overhead of
-/// `Box::pin` for every request.
+/// pinning and boxing for every request.
 #[pin_project]
 pub struct LoggerFuture<F> {
     #[pin]

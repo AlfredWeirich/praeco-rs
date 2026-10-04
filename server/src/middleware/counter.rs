@@ -91,7 +91,7 @@ impl<S> CountingService<S> {
 /// request counter upon completion.
 ///
 /// Using a concrete future type (via `pin_project`) avoids the overhead of
-/// `Box::pin` for every request.
+/// pinning and boxing for every request.
 #[pin_project]
 pub struct CountingFuture<F, ResBody, Error>
 where
