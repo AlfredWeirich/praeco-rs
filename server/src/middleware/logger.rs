@@ -16,7 +16,8 @@ use std::{
 };
 
 // === External Crates ===
-use hyper::{Request, Response};
+use hyper::{header::HeaderValue, Method, Request, Response};
+use pin_project::pin_project;
 use tower::{Layer, Service};
 
 // === Internal Modules ===
@@ -73,6 +74,87 @@ pub struct LoggerService<S> {
     server_name: &'static str,
 }
 
+/// A custom future that awaits the inner service's future and logs the response.
+///
+/// Using a concrete future type (via `pin_project`) avoids the overhead of
+/// `Box::pin` for every request.
+#[pin_project]
+pub struct LoggerFuture<F> {
+    #[pin]
+    inner: F,
+    server_name: &'static str,
+    req_method: Method,
+    req_origin: Option<HeaderValue>,
+}
+
+impl<F, E> Future for LoggerFuture<F>
+where
+    F: Future<Output = Result<Response<ServiceRespBody>, E>>,
+    E: Debug,
+{
+    type Output = Result<Response<ServiceRespBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+
+        let response = std::task::ready!(this.inner.poll(cx));
+
+        match &response {
+            Ok(res) => {
+                let status = res.status();
+                let is_cors_preflight_failed = *this.req_method == hyper::Method::OPTIONS
+                    && this.req_origin.is_some()
+                    && status == hyper::StatusCode::OK
+                    && res
+                        .headers()
+                        .get(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                        .is_none();
+
+                if is_cors_preflight_failed {
+                    let origin_str = this
+                        .req_origin
+                        .as_ref()
+                        .and_then(|h| h.to_str().ok())
+                        .unwrap_or("unknown");
+                    tracing::warn!(
+                        "{}: !! CORS Preflight Blocked: Origin '{}' is not allowed",
+                        this.server_name,
+                        origin_str
+                    );
+                }
+
+                if status.is_server_error() {
+                    tracing::error!(
+                        "{}: <-- Response: Status {} | Headers: {:?}",
+                        this.server_name,
+                        status,
+                        res.headers()
+                    );
+                } else if status.is_client_error() || is_cors_preflight_failed {
+                    tracing::warn!(
+                        "{}: <-- Response: Status {} | Headers: {:?}",
+                        this.server_name,
+                        status,
+                        res.headers()
+                    );
+                } else {
+                    tracing::info!(
+                        "{}: <-- Response: Status {} | Headers: {:?}",
+                        this.server_name,
+                        status,
+                        res.headers()
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!("{}: !! Error: {:?}", this.server_name, err);
+            }
+        }
+
+        Poll::Ready(response)
+    }
+}
+
 impl<S, ReqBody> Service<Request<ReqBody>> for LoggerService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -82,7 +164,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = LoggerFuture<S::Future>;
 
     /// Delegates back-pressure to the inner service.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -135,63 +217,13 @@ where
         );
         // === EXTENSION TRACING END ===
 
-        // Note: 'req' is moved into 'inner.call' here, so we had to inspect extensions BEFORE this line.
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            let response = fut.await;
-            match &response {
-                Ok(res) => {
-                    let status = res.status();
-
-                    let is_cors_preflight_failed = req_method == hyper::Method::OPTIONS
-                        && req_origin.is_some()
-                        && status == hyper::StatusCode::OK
-                        && res
-                            .headers()
-                            .get(hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN)
-                            .is_none();
-
-                    if is_cors_preflight_failed {
-                        let origin_str = req_origin
-                            .as_ref()
-                            .and_then(|h| h.to_str().ok())
-                            .unwrap_or("unknown");
-                        tracing::warn!(
-                            "{}: !! CORS Preflight Blocked: Origin '{}' is not allowed",
-                            server_name,
-                            origin_str
-                        );
-                    }
-
-                    if status.is_server_error() {
-                        tracing::error!(
-                            "{}: <-- Response: Status {} | Headers: {:?}",
-                            server_name,
-                            status,
-                            res.headers()
-                        );
-                    } else if status.is_client_error() || is_cors_preflight_failed {
-                        tracing::warn!(
-                            "{}: <-- Response: Status {} | Headers: {:?}",
-                            server_name,
-                            status,
-                            res.headers()
-                        );
-                    } else {
-                        tracing::info!(
-                            "{}: <-- Response: Status {} | Headers: {:?}",
-                            server_name,
-                            status,
-                            res.headers()
-                        );
-                    }
-                }
-                Err(err) => {
-                    tracing::error!("{}: !! Error: {:?}", server_name, err);
-                }
-            }
-            response
-        })
+        LoggerFuture {
+            inner: fut,
+            server_name,
+            req_method,
+            req_origin,
+        }
     }
 }
