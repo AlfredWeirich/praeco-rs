@@ -664,7 +664,23 @@ async fn run_data_plane(
             let sni = match extract_sni(&buf[..n]) {
                 Ok(s) => s,
                 Err(reason) => {
-                    warn!(target: "relay::data_plane", client_ip = %client_addr, reason = %reason, "Failed to extract SNI");
+                    let preview_len = std::cmp::min(n, 64);
+                    let preview = &buf[..preview_len];
+                    
+                    let is_ascii = preview.iter().all(|&b| b.is_ascii_graphic() || b.is_ascii_whitespace());
+                    let preview_str = if is_ascii {
+                        String::from_utf8_lossy(preview).replace('\r', "\\r").replace('\n', "\\n")
+                    } else {
+                        preview.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")
+                    };
+
+                    warn!(
+                        target: "relay::data_plane", 
+                        client_ip = %client_addr, 
+                        reason = %reason, 
+                        payload_preview = %preview_str,
+                        "Failed to extract SNI (possible port scanner or plaintext HTTP)"
+                    );
                     return;
                 }
             };
