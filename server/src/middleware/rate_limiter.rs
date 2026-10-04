@@ -29,6 +29,7 @@ use std::{
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
+use pin_project::pin_project;
 use std::sync::Mutex;
 use tower::{Layer, Service};
 #[allow(unused_imports)]
@@ -124,6 +125,34 @@ impl<S> SimpleRateLimiterService<S> {
     }
 }
 
+#[pin_project(project = SimpleRateLimitFutureProj)]
+pub enum SimpleRateLimitFuture<F> {
+    Allowed {
+        #[pin]
+        inner: F,
+    },
+    Blocked {
+        response: Option<Response<ServiceRespBody>>,
+    },
+}
+
+impl<F, E> Future for SimpleRateLimitFuture<F>
+where
+    F: Future<Output = Result<Response<ServiceRespBody>, E>>,
+{
+    type Output = Result<Response<ServiceRespBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            SimpleRateLimitFutureProj::Allowed { inner } => inner.poll(cx),
+            SimpleRateLimitFutureProj::Blocked { response } => {
+                let res = response.take().expect("polled after completion");
+                Poll::Ready(Ok(res))
+            }
+        }
+    }
+}
+
 impl<S, ReqBody> Service<Request<ReqBody>> for SimpleRateLimiterService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -132,7 +161,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = SimpleRateLimitFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -166,12 +195,14 @@ where
 
             let mut response = Response::new(body);
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            return Box::pin(async move { Ok(response) });
+            return SimpleRateLimitFuture::Blocked {
+                response: Some(response),
+            };
         }
 
         trace!("{}: Allowed request", server_name);
         let fut = self.inner.call(req);
-        Box::pin(async move { fut.await })
+        SimpleRateLimitFuture::Allowed { inner: fut }
     }
 }
 
@@ -336,6 +367,34 @@ impl<S> TokenBucketRateLimiterService<S> {
     }
 }
 
+#[pin_project(project = TokenBucketRateLimitFutureProj)]
+pub enum TokenBucketRateLimitFuture<F> {
+    Allowed {
+        #[pin]
+        inner: F,
+    },
+    Blocked {
+        response: Option<Response<ServiceRespBody>>,
+    },
+}
+
+impl<F, E> Future for TokenBucketRateLimitFuture<F>
+where
+    F: Future<Output = Result<Response<ServiceRespBody>, E>>,
+{
+    type Output = Result<Response<ServiceRespBody>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            TokenBucketRateLimitFutureProj::Allowed { inner } => inner.poll(cx),
+            TokenBucketRateLimitFutureProj::Blocked { response } => {
+                let res = response.take().expect("polled after completion");
+                Poll::Ready(Ok(res))
+            }
+        }
+    }
+}
+
 impl<S, ReqBody> Service<Request<ReqBody>> for TokenBucketRateLimiterService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -344,7 +403,7 @@ where
 {
     type Response = Response<ServiceRespBody>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = TokenBucketRateLimitFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -370,7 +429,7 @@ where
                 server_name, current_tokens
             );
             let fut = self.inner.call(req);
-            Box::pin(async move { fut.await })
+            TokenBucketRateLimitFuture::Allowed { inner: fut }
         } else {
             warn!(
                 "{}: Too Many Requests – no tokens available (bucket limiter).",
@@ -382,7 +441,9 @@ where
 
             let mut response = Response::new(body);
             *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            Box::pin(async move { Ok(response) })
+            TokenBucketRateLimitFuture::Blocked {
+                response: Some(response),
+            }
         }
     }
 }

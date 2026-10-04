@@ -14,6 +14,7 @@ use common::{sign_jwt, Claims};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode};
 use jsonwebtoken::EncodingKey;
+use pin_project::pin_project;
 use tower::Service;
 use tracing::{debug, error, info};
 use anyhow::Context as _;
@@ -134,12 +135,117 @@ impl IdpService {
             
         Ok(resp)
     }
+
+    fn handle_auth_confirm(&self, sid: &str, mut claims: Claims, dynamic_oids_res: Option<Result<Vec<String>, webhook::WebhookError>>) -> Response<ServiceRespBody> {
+        if let Some(res) = dynamic_oids_res {
+            match res {
+                Ok(dynamic_oids) => {
+                    info!("{}: Webhook returned OIDs: {:?}", self.server_name, dynamic_oids);
+                    claims.oids = dynamic_oids;
+                }
+                Err(e) => {
+                    error!("{}: Claims webhook failed: {}", self.server_name, e);
+                    if self.params.on_webhook_failure == "reject" {
+                        return Self::response_err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Claims resolution failed"
+                        );
+                    }
+                    // "fallback_to_cert" -> keep original OIDs
+                }
+            }
+        }
+
+        if self.session_store.confirm_session(sid, claims) {
+            Self::response_ok(r#"{"status":"confirmed"}"#)
+        } else {
+            Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
+        }
+    }
+
+    fn handle_auth_token(&self, mut claims: Claims, dynamic_oids_res: Option<Result<Vec<String>, webhook::WebhookError>>) -> Response<ServiceRespBody> {
+        if let Some(res) = dynamic_oids_res {
+            match res {
+                Ok(dynamic_oids) => {
+                    info!("{}: Webhook returned OIDs: {:?}", self.server_name, dynamic_oids);
+                    claims.oids = dynamic_oids;
+                }
+                Err(e) => {
+                    error!("{}: Claims webhook failed: {}", self.server_name, e);
+                    if self.params.on_webhook_failure == "reject" {
+                        return Self::response_err(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "Claims resolution failed"
+                        );
+                    }
+                    // "fallback_to_cert" -> keep original OIDs
+                }
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        claims.exp = now as usize + self.params.token_expiry_seconds as usize;
+
+        match sign_jwt(&claims, &self.encoding_key) {
+            Ok(token) => {
+                let body = format!(r#"{{"token":"{}"}}"#, token);
+                Self::response_ok(body)
+            }
+            Err(e) => {
+                error!("{}: JWT Generation failed: {}", self.server_name, e);
+                Self::response_err(StatusCode::INTERNAL_SERVER_ERROR, "JWT Error")
+            }
+        }
+    }
+}
+
+#[pin_project(project = IdpFutureProj)]
+pub enum IdpFuture {
+    Ready {
+        response: Option<Response<ServiceRespBody>>,
+    },
+    Webhook {
+        #[pin]
+        fetch_fut: webhook::WebhookFetchFuture,
+        claims: Claims,
+        sid: Option<String>,
+        idp: IdpService,
+        is_token_endpoint: bool,
+    }
+}
+
+impl Future for IdpFuture {
+    type Output = Result<Response<ServiceRespBody>, SrvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this {
+            IdpFutureProj::Ready { response } => {
+                Poll::Ready(Ok(response.take().unwrap()))
+            }
+            IdpFutureProj::Webhook { fetch_fut, claims, sid, idp, is_token_endpoint } => {
+                let dynamic_oids_res = std::task::ready!(fetch_fut.poll(cx));
+                
+                let claims_owned = claims.clone();
+                let resp = if *is_token_endpoint {
+                    idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
+                } else {
+                    let sid_str = sid.as_ref().unwrap();
+                    idp.handle_auth_confirm(sid_str, claims_owned, Some(dynamic_oids_res))
+                };
+                Poll::Ready(Ok(resp))
+            }
+        }
+    }
 }
 
 impl Service<Request<crate::SrvBody>> for IdpService {
     type Response = Response<ServiceRespBody>;
     type Error = SrvError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = IdpFuture;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
@@ -158,9 +264,9 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                     .header(hyper::header::CONTENT_TYPE, "application/jwk-set+json")
                     .body(Full::new(body_bytes).map_err(SrvError::from).boxed())
                     .unwrap();
-                return Box::pin(async move { Ok(resp) });
+                return IdpFuture::Ready { response: Some(resp) };
             } else {
-                return Box::pin(async move { Ok(Self::response_err(StatusCode::NOT_FOUND, "JWKS not configured")) });
+                return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::NOT_FOUND, "JWKS not configured")) };
             }
         }
 
@@ -190,21 +296,15 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             .or_else(|| self.params.allowed_audiences.first().cloned());
 
         // Determine if the request has a valid mTLS certificate.
-        // ConnectionHandler always injects PemCertExtension on successful mTLS.
-        // OidCertExtension carries the raw OID suffixes for JWT embedding.
-        // SanCertExtension is only present if the cert has a SAN.
         let mtls_claims = if req.extensions().get::<crate::PemCertExtension>().is_some() {
-            // 1. Subject: prefer SAN, then extract CN from PEM, then fallback "device"
             let sub = if let Some(san) = req.extensions().get::<crate::SanCertExtension>() {
                 san.0.clone()
             } else if let Some(pem_ext) = req.extensions().get::<crate::PemCertExtension>() {
-                // Parse the PEM to extract the Common Name (CN) from the Subject
                 extract_cn_from_pem(&pem_ext.0).unwrap_or_else(|| "device".to_string())
             } else {
                 "device".to_string()
             };
 
-            // 2. OIDs: use the raw OID suffixes, NOT the mapped UserRole names
             let oids = req.extensions().get::<crate::OidCertExtension>()
                 .map(|ext| ext.0.clone())
                 .unwrap_or_default();
@@ -213,7 +313,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 sub,
                 iss: self.params.issuer.clone(),
                 aud,
-                exp: 0, // Will be set before signing
+                exp: 0,
                 oids,
                 jti: None,
             })
@@ -221,149 +321,129 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             None
         };
 
-        let this = self.clone();
+        match (method, path.as_str()) {
+            // 0. Serve the generic HTML login page (Frontend UI)
+            (Method::GET, "/auth/login_page") => {
+                let mut html = include_str!("idp_login.html").to_string();
+                let debug_flag = if self.params.debug_show_session_id.unwrap_or(false) { "true" } else { "false" };
+                html = html.replace("{{DEBUG_SESSION_FLAG}}", debug_flag);
+                
+                let res = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "text/html")
+                    .header("Cache-Control", "no-store, no-cache, must-revalidate")
+                    .body(Full::new(Bytes::from(html)).map_err(SrvError::from).boxed())
+                    .unwrap();
+                IdpFuture::Ready { response: Some(res) }
+            }
 
-        Box::pin(async move {
-            match (method, path.as_str()) {
-                // 0. Serve the generic HTML login page (Frontend UI)
-                (Method::GET, "/auth/login_page") => {
-                    let mut html = include_str!("idp_login.html").to_string();
-                    let debug_flag = if this.params.debug_show_session_id.unwrap_or(false) { "true" } else { "false" };
-                    html = html.replace("{{DEBUG_SESSION_FLAG}}", debug_flag);
+            // 1. Start a new DeviceAuth login session (Frontend calls this)
+            (Method::POST, "/auth/login") => {
+                let sid = self.session_store.create_session();
+                debug!("{}: Created login session {}", self.server_name, sid);
+                let body = format!(r#"{{"session":"{sid}"}}"#);
+                IdpFuture::Ready { response: Some(Self::response_ok(body)) }
+            }
+
+            // 2. Poll the status of a login session (Frontend calls this)
+            (Method::GET, "/auth/status") => {
+                let sid = match session_id {
+                    Some(sid) => sid,
+                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")) },
+                };
+
+                let resp = match self.session_store.get_and_consume(&sid) {
+                    Some(SessionStatus::Pending) => {
+                        Self::response_ok(r#"{"status":"pending"}"#)
+                    }
+                    Some(SessionStatus::Confirmed(claims)) => {
+                        info!("{}: Session {} confirmed, issuing JWT.", self.server_name, sid);
+                        match self.generate_jwt_cookie_response(claims) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                error!("{}: JWT Generation failed: {}", self.server_name, e);
+                                Self::response_err(StatusCode::INTERNAL_SERVER_ERROR, "JWT Error")
+                            }
+                        }
+                    }
+                    None => {
+                        Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
+                    }
+                };
+                IdpFuture::Ready { response: Some(resp) }
+            }
+
+            // 3. Confirm a session (Device with mTLS calls this)
+            (Method::POST, "/auth/confirm") => {
+                let sid = match session_id {
+                    Some(sid) => sid,
+                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")) },
+                };
+
+                let claims = match mtls_claims {
+                    Some(c) => c,
+                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")) },
+                };
+
+                if let Some(wh) = &self.webhook_client {
+                    let sub = claims.sub.clone();
+                    let oids = claims.oids.clone();
                     
-                    let res = Response::builder()
-                        .status(StatusCode::OK)
-                        .header("Content-Type", "text/html")
-                        .header("Cache-Control", "no-store, no-cache, must-revalidate")
-                        .body(Full::new(Bytes::from(html)).map_err(SrvError::from).boxed())
-                        .unwrap();
-                    Ok(res)
-                }
-
-                // 1. Start a new DeviceAuth login session (Frontend calls this)
-                (Method::POST, "/auth/login") => {
-                    let sid = this.session_store.create_session();
-                    debug!("{}: Created login session {}", this.server_name, sid);
-                    let body = format!(r#"{{"session":"{sid}"}}"#);
-                    Ok(Self::response_ok(body))
-                }
-
-                // 2. Poll the status of a login session (Frontend calls this)
-                (Method::GET, "/auth/status") => {
-                    let sid = match session_id {
-                        Some(sid) => sid,
-                        None => return Ok(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
-                    };
-
-                    match this.session_store.get_and_consume(&sid) {
-                        Some(SessionStatus::Pending) => {
-                            Ok(Self::response_ok(r#"{"status":"pending"}"#))
-                        }
-                        Some(SessionStatus::Confirmed(claims)) => {
-                            info!("{}: Session {} confirmed, issuing JWT.", this.server_name, sid);
-                            match this.generate_jwt_cookie_response(claims) {
-                                Ok(resp) => Ok(resp),
-                                Err(e) => {
-                                    error!("{}: JWT Generation failed: {}", this.server_name, e);
-                                    Ok(Self::response_err(StatusCode::INTERNAL_SERVER_ERROR, "JWT Error"))
-                                }
-                            }
-                        }
-                        None => {
-                            Ok(Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired"))
-                        }
-                    }
-                }
-
-                // 3. Confirm a session (Device with mTLS calls this)
-                (Method::POST, "/auth/confirm") => {
-                    let sid = match session_id {
-                        Some(sid) => sid,
-                        None => return Ok(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
-                    };
-
-                    let mut claims = match mtls_claims {
-                        Some(c) => c,
-                        None => return Ok(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")),
-                    };
-
-                    // Webhook: dynamic role resolution
-                    if let Some(wh) = &this.webhook_client {
-                        match wh.fetch_claims(&claims.sub, &claims.oids).await {
-                            Ok(dynamic_oids) => {
-                                info!("{}: Webhook returned OIDs: {:?}", this.server_name, dynamic_oids);
-                                claims.oids = dynamic_oids;
-                            }
-                            Err(e) => {
-                                error!("{}: Claims webhook failed: {}", this.server_name, e);
-                                if this.params.on_webhook_failure == "reject" {
-                                    return Ok(Self::response_err(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "Claims resolution failed"
-                                    ));
-                                }
-                                // "fallback_to_cert" -> keep original OIDs
-                            }
-                        }
-                    }
-
-                    if this.session_store.confirm_session(&sid, claims) {
-                        Ok(Self::response_ok(r#"{"status":"confirmed"}"#))
-                    } else {
-                        Ok(Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired"))
-                    }
-                }
-
-                // 4. Direct JWT issuance via mTLS (for devices that don't need QR code)
-                (Method::POST, "/auth/token") => {
-                    let mut claims = match mtls_claims {
-                        Some(c) => c,
-                        None => return Ok(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required")),
-                    };
-
-                    // Webhook: dynamic role resolution
-                    if let Some(wh) = &this.webhook_client {
-                        match wh.fetch_claims(&claims.sub, &claims.oids).await {
-                            Ok(dynamic_oids) => {
-                                info!("{}: Webhook returned OIDs: {:?}", this.server_name, dynamic_oids);
-                                claims.oids = dynamic_oids;
-                            }
-                            Err(e) => {
-                                error!("{}: Claims webhook failed: {}", this.server_name, e);
-                                if this.params.on_webhook_failure == "reject" {
-                                    return Ok(Self::response_err(
-                                        StatusCode::SERVICE_UNAVAILABLE,
-                                        "Claims resolution failed"
-                                    ));
-                                }
-                                // "fallback_to_cert" -> keep original OIDs
-                            }
-                        }
-                    }
-
-                    // Here we could just return the JWT in JSON or set a cookie.
-                    // For now, let's return it as JSON so API clients can use it in headers.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    claims.exp = now as usize + this.params.token_expiry_seconds as usize;
-
-                    match sign_jwt(&claims, &this.encoding_key) {
-                        Ok(token) => {
-                            let body = format!(r#"{{"token":"{}"}}"#, token);
-                            Ok(Self::response_ok(body))
+                    match wh.fetch_claims(&sub, &oids) {
+                        Ok(fetch_fut) => {
+                            return IdpFuture::Webhook {
+                                fetch_fut,
+                                claims,
+                                sid: Some(sid),
+                                idp: self.clone(),
+                                is_token_endpoint: false,
+                            };
                         }
                         Err(e) => {
-                            error!("{}: JWT Generation failed: {}", this.server_name, e);
-                            Ok(Self::response_err(StatusCode::INTERNAL_SERVER_ERROR, "JWT Error"))
+                            let resp = self.handle_auth_confirm(&sid, claims, Some(Err(e)));
+                            return IdpFuture::Ready { response: Some(resp) };
                         }
                     }
                 }
 
-                _ => Ok(Self::response_err(StatusCode::NOT_FOUND, "Not Found")),
+                let resp = self.handle_auth_confirm(&sid, claims, None);
+                IdpFuture::Ready { response: Some(resp) }
             }
-        })
+
+            // 4. Direct JWT issuance via mTLS (for devices that don't need QR code)
+            (Method::POST, "/auth/token") => {
+                let claims = match mtls_claims {
+                    Some(c) => c,
+                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required")) },
+                };
+
+                if let Some(wh) = &self.webhook_client {
+                    let sub = claims.sub.clone();
+                    let oids = claims.oids.clone();
+                    
+                    match wh.fetch_claims(&sub, &oids) {
+                        Ok(fetch_fut) => {
+                            return IdpFuture::Webhook {
+                                fetch_fut,
+                                claims,
+                                sid: None,
+                                idp: self.clone(),
+                                is_token_endpoint: true,
+                            };
+                        }
+                        Err(e) => {
+                            let resp = self.handle_auth_token(claims, Some(Err(e)));
+                            return IdpFuture::Ready { response: Some(resp) };
+                        }
+                    }
+                }
+
+                let resp = self.handle_auth_token(claims, None);
+                IdpFuture::Ready { response: Some(resp) }
+            }
+
+            _ => IdpFuture::Ready { response: Some(Self::response_err(StatusCode::NOT_FOUND, "Not Found")) },
+        }
     }
 }
 

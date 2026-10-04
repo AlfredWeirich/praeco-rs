@@ -3,8 +3,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
+use pin_project::pin_project;
 
 use crate::configuration::IdpParams;
 
@@ -42,6 +46,59 @@ pub struct WebhookClient {
     timeout: Duration,
 }
 
+#[pin_project(project = WebhookFetchFutureProj)]
+pub enum WebhookFetchFuture {
+    WaitingForResponse {
+        #[pin]
+        timeout_fut: tokio::time::Timeout<hyper_util::client::legacy::ResponseFuture>,
+    },
+    ReadingBody {
+        #[pin]
+        collect_fut: http_body_util::combinators::Collect<hyper::body::Incoming>,
+    },
+}
+
+impl Future for WebhookFetchFuture {
+    type Output = Result<Vec<String>, WebhookError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            let this = self.as_mut().project();
+            match this {
+                WebhookFetchFutureProj::WaitingForResponse { timeout_fut } => {
+                    let res = std::task::ready!(timeout_fut.poll(cx));
+                    let response = match res {
+                        Ok(Ok(response)) => response,
+                        Ok(Err(e)) => return Poll::Ready(Err(WebhookError::Request(e))),
+                        Err(_) => return Poll::Ready(Err(WebhookError::Timeout)),
+                    };
+
+                    if !response.status().is_success() {
+                        return Poll::Ready(Err(WebhookError::Status(response.status())));
+                    }
+
+                    let collect_fut = response.into_body().collect();
+                    self.set(WebhookFetchFuture::ReadingBody { collect_fut });
+                    // Loop back to poll the new state
+                }
+                WebhookFetchFutureProj::ReadingBody { collect_fut } => {
+                    let body_res = std::task::ready!(collect_fut.poll(cx));
+                    let collected = match body_res {
+                        Ok(c) => c,
+                        Err(e) => return Poll::Ready(Err(WebhookError::Body(e.to_string()))),
+                    };
+
+                    let body_bytes = collected.to_bytes();
+                    match serde_json::from_slice::<WebhookResponse>(&body_bytes) {
+                        Ok(resp) => return Poll::Ready(Ok(resp.oids)),
+                        Err(e) => return Poll::Ready(Err(WebhookError::Json(e))),
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl WebhookClient {
     pub fn new(params: &IdpParams) -> Result<Option<Self>, anyhow::Error> {
         let url = match &params.claims_webhook_url {
@@ -72,11 +129,11 @@ impl WebhookClient {
         }))
     }
 
-    pub async fn fetch_claims(
+    pub fn fetch_claims(
         &self,
         sub: &str,
         cert_oids: &[String],
-    ) -> Result<Vec<String>, WebhookError> {
+    ) -> Result<WebhookFetchFuture, WebhookError> {
         let req_payload = WebhookRequest { sub, cert_oids };
         let body_bytes = serde_json::to_vec(&req_payload)?;
 
@@ -87,26 +144,8 @@ impl WebhookClient {
             .body(Full::new(Bytes::from(body_bytes)))?;
 
         let fetch_fut = self.client.request(req);
-        
-        let res = match tokio::time::timeout(self.timeout, fetch_fut).await {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => return Err(WebhookError::Request(e)),
-            Err(_) => return Err(WebhookError::Timeout),
-        };
+        let timeout_fut = tokio::time::timeout(self.timeout, fetch_fut);
 
-        if !res.status().is_success() {
-            return Err(WebhookError::Status(res.status()));
-        }
-
-        let body_bytes = res
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| WebhookError::Body(e.to_string()))?
-            .to_bytes();
-
-        let resp_payload: WebhookResponse = serde_json::from_slice(&body_bytes)?;
-
-        Ok(resp_payload.oids)
+        Ok(WebhookFetchFuture::WaitingForResponse { timeout_fut })
     }
 }

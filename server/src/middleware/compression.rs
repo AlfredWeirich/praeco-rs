@@ -112,6 +112,91 @@ pub struct SrvCompressionService<S> {
     server_name: &'static str,
 }
 
+#[pin_project]
+pub struct SrvCompressionFuture<F> {
+    #[pin]
+    inner: F,
+    server_name: &'static str,
+    accept_encoding: String,
+}
+
+impl<F, E> Future for SrvCompressionFuture<F>
+where
+    F: Future<Output = Result<Response<SrvBody>, E>>,
+    E: Into<SrvError>,
+{
+    type Output = Result<Response<SrvBody>, SrvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = std::task::ready!(this.inner.poll(cx));
+        
+        let mut resp = match result {
+            Ok(r) => r,
+            Err(e) => return Poll::Ready(Err(e.into())),
+        };
+
+        // Determine which compression algorithm to use (if any).
+        let accept_header = this.accept_encoding;
+        let server_name = *this.server_name;
+        
+        let algo = if accept_header.contains("gzip") {
+            Some("gzip")
+        } else if accept_header.contains("br") {
+            Some("br")
+        } else {
+            None
+        };
+
+        if let Some(encoding) = algo {
+            tracing::trace!("{}: Compressing body with {}", server_name, encoding);
+            // Content-Length is unknown for a streaming compressed body.
+            resp.headers_mut().remove(CONTENT_LENGTH);
+            resp.headers_mut().insert(
+                CONTENT_ENCODING,
+                hyper::header::HeaderValue::from_static(if encoding == "gzip" {
+                    "gzip"
+                } else {
+                    "br"
+                }),
+            );
+
+            let (parts, body) = resp.into_parts();
+
+            // 1. Prepare Reader: convert the body into an AsyncRead stream.
+            let body_stream = BodyStream::new(body);
+            let data_stream = body_stream.filter_map(|r| std::future::ready(
+                match r {
+                    Ok(frame) => frame.into_data().ok().map(Ok),
+                    Err(e) => Some(Err(io::Error::other(e))),
+                }
+            ));
+            let body_reader = StreamReader::new(data_stream);
+
+            // 2. Compress & Wrap in Frames
+            let new_body: SrvBody = if encoding == "gzip" {
+                let encoder = GzipEncoder::new(body_reader);
+                let stream = ReaderStream::new(encoder).map(|res| res.map(Frame::data));
+                tracing::trace!("{}: Compress response with GZip", server_name);
+                StreamBody::new(stream)
+                    .map_err(|e: io::Error| SrvError::Other(e.to_string()))
+                    .boxed()
+            } else {
+                let encoder = BrotliEncoder::new(body_reader);
+                let stream = ReaderStream::new(encoder).map(|res| res.map(Frame::data));
+                tracing::trace!("{}: Compress response with Brotli", server_name);
+                StreamBody::new(stream)
+                    .map_err(|e: io::Error| SrvError::Other(e.to_string()))
+                    .boxed()
+            };
+
+            Poll::Ready(Ok(Response::from_parts(parts, new_body)))
+        } else {
+            Poll::Ready(Ok(resp))
+        }
+    }
+}
+
 impl<S> Service<Request<SrvBody>> for SrvCompressionService<S>
 where
     S: Service<Request<SrvBody>, Response = Response<SrvBody>> + Send + 'static,
@@ -120,7 +205,7 @@ where
 {
     type Response = Response<SrvBody>;
     type Error = SrvError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = SrvCompressionFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -145,7 +230,7 @@ where
         let server_name = self.server_name;
 
         // Capture the Accept-Encoding header before moving the request.
-        let accept_header = req
+        let accept_encoding = req
             .headers()
             .get(ACCEPT_ENCODING)
             .and_then(|h| h.to_str().ok())
@@ -154,68 +239,11 @@ where
 
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            let mut resp = fut.await.map_err(Into::into)?;
-
-            // Determine which compression algorithm to use (if any).
-            let algo = if accept_header.contains("gzip") {
-                Some("gzip")
-            } else if accept_header.contains("br") {
-                Some("br")
-            } else {
-                None
-            };
-
-            if let Some(encoding) = algo {
-                tracing::trace!("{}: Compressing body with {}", server_name, encoding);
-                // Content-Length is unknown for a streaming compressed body.
-                resp.headers_mut().remove(CONTENT_LENGTH);
-                resp.headers_mut().insert(
-                    CONTENT_ENCODING,
-                    hyper::header::HeaderValue::from_static(if encoding == "gzip" {
-                        "gzip"
-                    } else {
-                        "br"
-                    }),
-                );
-
-                let (parts, body) = resp.into_parts();
-
-                // 1. Prepare Reader: convert the body into an AsyncRead stream.
-                let body_stream = BodyStream::new(body);
-                let data_stream = body_stream.filter_map(|r| async {
-                    match r {
-                        Ok(frame) => frame.into_data().ok().map(Ok),
-                        Err(e) => Some(Err(io::Error::other(e))),
-                    }
-                });
-                let body_reader = StreamReader::new(Box::pin(data_stream));
-
-                // 2. Compress & Wrap in Frames
-                let new_body: SrvBody = if encoding == "gzip" {
-                    let encoder = GzipEncoder::new(body_reader);
-                    let stream = ReaderStream::new(encoder).map(|res| res.map(Frame::data));
-                    tracing::trace!("{}: Compress response with GZip", server_name);
-                    StreamBody::new(stream)
-                        // FIX: Explicit type annotation for 'e'
-                        .map_err(|e: io::Error| SrvError::Other(e.to_string()))
-                        .boxed()
-                } else {
-                    let encoder = BrotliEncoder::new(body_reader);
-                    let stream = ReaderStream::new(encoder).map(|res| res.map(Frame::data));
-                    tracing::trace!("{}: Compress response with Brotli", server_name);
-                    StreamBody::new(stream)
-                        // FIX: Explicit type annotation for 'e'
-                        .map_err(|e: io::Error| SrvError::Other(e.to_string()))
-                        .boxed()
-                };
-
-                Ok(Response::from_parts(parts, new_body))
-            } else {
-                // No compression requested — pass the response through unchanged.
-                Ok(resp)
-            }
-        })
+        SrvCompressionFuture {
+            inner: fut,
+            server_name,
+            accept_encoding,
+        }
     }
 }
 
@@ -285,6 +313,26 @@ pub struct SrvDecompressionService<S> {
     max_decompressed_bytes: usize,
 }
 
+#[pin_project]
+pub struct SrvDecompressionFuture<F> {
+    #[pin]
+    inner: F,
+}
+
+impl<F, E> Future for SrvDecompressionFuture<F>
+where
+    F: Future<Output = Result<Response<SrvBody>, E>>,
+    E: Into<SrvError>,
+{
+    type Output = Result<Response<SrvBody>, SrvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let result = std::task::ready!(this.inner.poll(cx));
+        Poll::Ready(result.map_err(Into::into))
+    }
+}
+
 impl<S> Service<Request<SrvBody>> for SrvDecompressionService<S>
 where
     S: Service<Request<SrvBody>, Response = Response<SrvBody>> + Send + 'static,
@@ -293,7 +341,7 @@ where
 {
     type Response = Response<SrvBody>;
     type Error = SrvError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = SrvDecompressionFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -335,13 +383,13 @@ where
 
             // 1. Prepare Reader: convert body frames into an AsyncRead stream.
             let body_stream = BodyStream::new(body);
-            let data_stream = body_stream.filter_map(|r| async {
+            let data_stream = body_stream.filter_map(|r| std::future::ready(
                 match r {
                     Ok(frame) => frame.into_data().ok().map(Ok),
                     Err(e) => Some(Err(io::Error::other(e))),
                 }
-            });
-            let body_reader = StreamReader::new(Box::pin(data_stream));
+            ));
+            let body_reader = StreamReader::new(data_stream);
 
             // 2. Decompress & Wrap in LimitedReader for bomb protection
             let new_body: SrvBody = if encoding == "gzip" {
@@ -374,7 +422,7 @@ where
         }
 
         let fut = self.inner.call(req);
-        Box::pin(async move { fut.await.map_err(Into::into) })
+        SrvDecompressionFuture { inner: fut }
     }
 }
 

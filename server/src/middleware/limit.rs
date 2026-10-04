@@ -27,7 +27,7 @@ use std::{
 use bytes::Bytes;
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
-use hyper::{Request, Response, StatusCode, header::CONTENT_LENGTH};
+use hyper::{header::CONTENT_LENGTH, Request, Response, StatusCode};
 use pin_project::pin_project;
 use tower::{Layer, Service};
 
@@ -84,6 +84,62 @@ pub struct MaxPayloadService<S> {
     server_name: &'static str,
 }
 
+#[pin_project(project = MaxPayloadFutureProj)]
+pub enum MaxPayloadFuture<F> {
+    /// Stage 1 rejection: The Content-Length header was too large.
+    HeaderRejected {
+        response: Option<Response<SrvBody>>,
+    },
+    /// Stage 2 processing: Poll the inner future and map the error if it exceeds the limit.
+    Streaming {
+        #[pin]
+        inner: F,
+        server_name: &'static str,
+        max_bytes: usize,
+    },
+}
+
+impl<F, E> Future for MaxPayloadFuture<F>
+where
+    F: Future<Output = Result<Response<SrvBody>, E>>,
+    SrvError: From<E>,
+{
+    type Output = Result<Response<SrvBody>, SrvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.project() {
+            MaxPayloadFutureProj::HeaderRejected { response } => {
+                let res = response.take().expect("MaxPayloadFuture polled after completion");
+                Poll::Ready(Ok(res))
+            }
+            MaxPayloadFutureProj::Streaming {
+                inner,
+                server_name,
+                max_bytes,
+            } => {
+                let result = std::task::ready!(inner.poll(cx));
+                tracing::debug!("{}: End Max Payload: {}", server_name, max_bytes);
+
+                match result {
+                    Ok(resp) => Poll::Ready(Ok(resp)),
+                    Err(e) => {
+                        let srv_err: SrvError = e.into();
+
+                        // Check if the error was caused by our LimitedBody.
+                        if srv_err.to_string().contains("Payload Limit Exceeded") {
+                            let msg = "Payload too large (Streaming check)";
+                            tracing::warn!("{}: {}", server_name, msg);
+                            Poll::Ready(Ok(build_413_response(msg)))
+                        } else {
+                            Poll::Ready(Err(srv_err))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<S> Service<Request<SrvBody>> for MaxPayloadService<S>
 where
     S: Service<Request<SrvBody>, Response = Response<SrvBody>> + Clone + Send + 'static,
@@ -92,7 +148,7 @@ where
 {
     type Response = Response<SrvBody>;
     type Error = SrvError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = MaxPayloadFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -123,11 +179,14 @@ where
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<usize>().ok())
-            && content_length > max_bytes
         {
-            let msg = "Payload too large (Header check)";
-            tracing::warn!("{}: {}", server_name, msg);
-            return Box::pin(async move { Ok(build_413_response(msg)) });
+            if content_length > max_bytes {
+                let msg = "Payload too large (Header check)";
+                tracing::warn!("{}: {}", server_name, msg);
+                return MaxPayloadFuture::HeaderRejected {
+                    response: Some(build_413_response(msg)),
+                };
+            }
         }
 
         // ── Stage 2: Wrap body in LimitedBody for streaming enforcement ──
@@ -141,26 +200,11 @@ where
         let req = Request::from_parts(parts, limited_body.boxed());
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            let result = fut.await;
-            tracing::debug!("{}: End Max Payload: {}", server_name, max_bytes);
-
-            match result {
-                Ok(resp) => Ok(resp),
-                Err(e) => {
-                    let srv_err: SrvError = e.into();
-
-                    // Check if the error was caused by our LimitedBody.
-                    if srv_err.to_string().contains("Payload Limit Exceeded") {
-                        let msg = "Payload too large (Streaming check)";
-                        tracing::warn!("{}: {}", server_name, msg);
-                        Ok(build_413_response(msg))
-                    } else {
-                        Err(srv_err)
-                    }
-                }
-            }
-        })
+        MaxPayloadFuture::Streaming {
+            inner: fut,
+            server_name,
+            max_bytes,
+        }
     }
 }
 
