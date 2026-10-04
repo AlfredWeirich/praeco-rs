@@ -100,7 +100,7 @@ if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
     RUN_ARGS+=("${EXTRA_ARGS[@]}")
 fi
 
-export RUST_LOG="warn,praeco_relay_server=${LOG_LEVEL}"
+export RUST_LOG="warn,praeco_relay_server=${LOG_LEVEL},relay::data_plane=${LOG_LEVEL},relay::control_plane=${LOG_LEVEL}"
 
 echo "🚀 Starte Praeco Relay Server (Modus: ${BUILD_MODE}, Log-Level: ${LOG_LEVEL})..."
 if [[ -n "$CONFIG_FILE" ]]; then
