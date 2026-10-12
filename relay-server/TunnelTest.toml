@@ -68,4 +68,4 @@ backend_type = "rest"
 [Server.RouterParams]
 protocol = "https"
 authentication = "None"
-ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260501_ChatApp/rust_core/certs/ca.pem"
+ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260809_ChatApp/rust_core/certs/ca.pem"
