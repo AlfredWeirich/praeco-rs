@@ -59,6 +59,8 @@ pub mod security_headers;
 pub mod timing;
 /// Trace ID injection for observability.
 pub mod trace_id;
+/// Strict path sanitization and canonicalization (RFC 3986).
+pub mod path_sanitizer;
 
 // ── Convenience re-exports ───────────────────────────────────────────────────
 
@@ -70,6 +72,7 @@ pub use inspection::InspectionLayer;
 pub use jwt::JwtAuthLayer;
 pub use limit::MaxPayloadLayer;
 pub use logger::LoggerLayer;
+pub use path_sanitizer::PathSanitizerLayer;
 pub use rate_limiter::{SimpleRateLimiterLayer, TokenBucketRateLimiterLayer};
 pub use router::RouterService;
 pub use security_headers::SecurityHeadersLayer;

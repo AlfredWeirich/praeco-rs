@@ -141,7 +141,22 @@ where
         let path = req.uri().path();
         let query = req.uri().query().unwrap_or("");
 
-        let allow = self.allowed_pathes.is_allowed(method, path, query);
+        // Defense-in-depth: Canonicalize path for allow-list matching and block traversal attempts
+        let canonical_path = match crate::middleware::path_sanitizer::sanitize_and_normalize_path(path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "inspection",
+                    "{}: InspectionService blocked request due to invalid path: {} (path: '{}')",
+                    server_name, e, path
+                );
+                return InspectionFuture::Blocked {
+                    response: Some(self.build_forbidden_response()),
+                };
+            }
+        };
+
+        let allow = self.allowed_pathes.is_allowed(method, &canonical_path, query);
 
         if allow {
             // Request allowed: Return the 'Allowed' variant containing the inner future.

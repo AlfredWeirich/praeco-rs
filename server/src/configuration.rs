@@ -511,6 +511,8 @@ pub enum MiddlewareLayer {
     Cors(CorsConfig),
     /// Adds security headers to responses.
     SecurityHeaders(SecurityHeadersConfig),
+    /// Enforces RFC 3986 path canonicalization and rejects traversal / illegal encodings.
+    PathSanitizer,
 }
 
 /// Rate limiter algorithm selection.
@@ -1375,6 +1377,7 @@ impl Layers {
                 "Timing" => Ok(MiddlewareLayer::Timing),
                 "Counter" => Ok(MiddlewareLayer::Counter),
                 "Logger" => Ok(MiddlewareLayer::Logger),
+                "PathSanitizer" | "NormalizePath" => Ok(MiddlewareLayer::PathSanitizer),
                 "Inspection" => Ok(MiddlewareLayer::Inspection),
                 "Compression" => Ok(MiddlewareLayer::Compression),
                 "Decompression" => self
