@@ -13,7 +13,8 @@ set -e
 # === 1. Load Configuration ===
 # We read the Base-OID dynamically from the central Config.toml, 
 # ensuring proxy and generated certs always share the same root.
-CONFIG_FILE="/Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/Config.toml"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/../Config.toml"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "❌ Error: $CONFIG_FILE not found!"
