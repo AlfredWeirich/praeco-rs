@@ -91,7 +91,7 @@ use praeco_rs::{
         alt_svc::AltSvcLayer,
         compression::{SrvCompressionLayer, SrvDecompressionLayer},
     },
-    tls_conf::{extract_cert_san_and_pem, extract_oids_from_cert, tls_config},
+    tls_conf::{extract_client_metadata, tls_config},
 };
 
 use http_body_util::BodyExt;
@@ -1247,23 +1247,18 @@ async fn run_tcp_listener(
                                 Ok(Ok(tls_stream)) => {
                                     // --- TCP OID EXTRACTION ---
                                     let (_, session) = tls_stream.get_ref();
-                                    let certs = session.peer_certificates();
-
-                                    let mut client_cert_pem = None;
-                                    let mut client_cert_san = None;
-
-                                    let client_oids = if let Some(c) = certs.and_then(|c| c.first()) {
-                                        let (pem, san) = extract_cert_san_and_pem(c.as_ref());
-                                        client_cert_pem = pem;
-                                        client_cert_san = san;
-                                        extract_oids_from_cert(c.as_ref())
-                                    } else {
-                                        Vec::new()
-                                    };
+                                    let client_meta = extract_client_metadata(session.peer_certificates());
 
                                     let svc = (**dynamic_stack.load()).clone(); // fresh stack
                                     // Use the standard constructor which wraps Vec in Arc
-                                    let handler = ConnectionHandler::new(svc, peer_addr, client_oids, client_cert_pem, client_cert_san, oid_mapping.clone());
+                                    let handler = ConnectionHandler::new(
+                                        svc,
+                                        peer_addr,
+                                        client_meta.oids,
+                                        client_meta.pem,
+                                        client_meta.san,
+                                        oid_mapping.clone(),
+                                    );
 
                                     let mut builder = auto::Builder::new(TokioExecutor::new());
                                     // Timeout: drop clients that take too long to send HTTP/1 headers
@@ -1393,23 +1388,19 @@ async fn handle_h3_connection(
     let connection = connecting.await?;
     let peer_addr = connection.remote_address();
 
-    // 2. Extract OIDs (Strings)
-    let mut oids = Vec::new();
-    let mut client_cert_pem = None;
-    let mut client_cert_san = None;
-    if let Some(identity) = connection.peer_identity()
-        && let Some(certs) =
-            identity.downcast_ref::<Vec<rustls_pki_types::CertificateDer<'static>>>()
-    {
-        if let Some(first_cert) = certs.first() {
-            let (pem, san) = extract_cert_san_and_pem(first_cert.as_ref());
-            client_cert_pem = pem;
-            client_cert_san = san;
-        }
-        for c in certs {
-            oids.extend(extract_oids_from_cert(c.as_ref()));
-        }
-    }
+    // 2. Extract client identity metadata strictly from leaf certificate
+    let client_meta = {
+        let peer_identity = connection.peer_identity();
+        let client_certs = peer_identity.as_ref().and_then(|identity| {
+            identity
+                .downcast_ref::<Vec<rustls_pki_types::CertificateDer<'static>>>()
+                .map(|v| v.as_slice())
+        });
+        extract_client_metadata(client_certs)
+    };
+    let oids = client_meta.oids;
+    let client_cert_pem = client_meta.pem;
+    let client_cert_san = client_meta.san;
 
     // --- OPTIMIZATION START ---
     // Convert OIDs (Strings) to Roles (Enums) ONCE for the whole connection.
@@ -1834,20 +1825,17 @@ async fn run_tunnel(
                                 match tls_result {
                                     Ok(Ok(tls_stream)) => {
                                         let (_, session) = tls_stream.get_ref();
-                                        let certs = session.peer_certificates();
-                                        let mut client_cert_pem = None;
-                                        let mut client_cert_san = None;
-                                        let client_oids = if let Some(c) = certs.and_then(|c| c.first()) {
-                                            let (pem, san) = extract_cert_san_and_pem(c.as_ref());
-                                            client_cert_pem = pem;
-                                            client_cert_san = san;
-                                            extract_oids_from_cert(c.as_ref())
-                                        } else {
-                                            Vec::new()
-                                        };
+                                        let client_meta = extract_client_metadata(session.peer_certificates());
 
                                         let svc = (**dynamic_stack.load()).clone();
-                                        let handler = ConnectionHandler::new(svc, peer_addr, client_oids, client_cert_pem, client_cert_san, oid_mapping.clone());
+                                        let handler = ConnectionHandler::new(
+                                            svc,
+                                            peer_addr,
+                                            client_meta.oids,
+                                            client_meta.pem,
+                                            client_meta.san,
+                                            oid_mapping.clone(),
+                                        );
 
                                         let mut builder = auto::Builder::new(TokioExecutor::new());
                                         builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
