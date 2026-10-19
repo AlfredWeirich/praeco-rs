@@ -972,6 +972,7 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         }
     };
 
+    let has_sanitizer = layers.iter().any(|l| matches!(l, MiddlewareLayer::PathSanitizer));
     let applied = apply_layers(
         base_service, // The core service (Echo or Router) handling the request
         layers,
@@ -980,6 +981,13 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         server_config.port.unwrap_or(0),
         Arc::new(server_config.oid_mapping.clone()),
     )?;
+
+    // Security: Enforce RFC 3986 path canonicalization and reject traversal/illegal encodings across all servers
+    let sanitized = if has_sanitizer {
+        applied
+    } else {
+        praeco_rs::middleware::PathSanitizerLayer::new(static_name).layer(applied).boxed_clone_sync()
+    };
 
     use tower_http::trace::{DefaultOnResponse, TraceLayer};
     use tracing::{Level, info_span};
@@ -1006,7 +1014,7 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
                 })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
-        .service(applied);
+        .service(sanitized);
 
     Ok(traced.boxed_clone_sync())
 }
@@ -1043,6 +1051,11 @@ fn apply_layers(
             MiddlewareLayer::Timing => TimingLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Counter => CountingLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Logger => LoggerLayer::new(server_name).layer(svc).boxed_clone_sync(),
+            MiddlewareLayer::PathSanitizer => {
+                praeco_rs::middleware::PathSanitizerLayer::new(server_name)
+                    .layer(svc)
+                    .boxed_clone_sync()
+            }
             MiddlewareLayer::Inspection => {
                 InspectionLayer::new(compiled_allowed_pathes.clone(), server_name)
                     .layer(svc)

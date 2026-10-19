@@ -205,6 +205,7 @@ Each layer takes over a specific task in the request lifecycle:
 | `"Timing"` | Measures the processing duration of each request (useful for metrics). |
 | `"Counter"` | Counts the number of currently processed requests. |
 | `"Logger"` | Logs details about the request and response (e.g., path, status code, IP). |
+| `"PathSanitizer"` | Enforces RFC 3986 path canonicalization (Option A). Rejects traversal (`..`, `%2e%2e`), encoded slashes (`%2f`), null bytes (`%00`), and backslashes (`\`) with 400 Bad Request. Automatically active on all servers! |
 | `"Inspection"` | Checks the URL path of the request against a regex whitelist and blocks unauthorized calls. |
 | `"Cors"` | Adds CORS headers (Cross-Origin Resource Sharing) and handles preflight requests. |
 | `"SecurityHeaders"` | Adds HTTP security headers (like CSP, HSTS, anti-sniffing) to the server response. |

@@ -209,6 +209,26 @@ impl Service<Request<SrvBody>> for RouterService {
             let client_addr = parts.extensions.get::<std::net::SocketAddr>().copied();
             headers::inject_real_ip(&mut parts);
 
+            // Defense-in-depth: Validate and canonicalize URI path
+            match crate::middleware::path_sanitizer::sanitize_and_normalize_uri(&parts.uri) {
+                Ok(clean_uri) => {
+                    parts.uri = clean_uri;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "security",
+                        "{}: RouterService rejected invalid path '{}': {}",
+                        server_name,
+                        parts.uri.path(),
+                        e
+                    );
+                    return Ok(build_error_response(
+                        &format!("Bad Request: {}", e),
+                        StatusCode::BAD_REQUEST,
+                    ));
+                }
+            }
+
             let path = parts.uri.path();
             let matched = match router.at(path) {
                 Ok(m) => m,
