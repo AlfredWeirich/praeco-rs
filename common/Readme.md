@@ -26,24 +26,27 @@ Here is a quick example of how to build a shared hyper client using `praeco-comm
 
 ```rust
 use praeco_common::client::{build_hyper_client, ClientPoolConfig};
-use praeco_common::tls::build_tls_client_config;
+use praeco_common::{build_root_store, build_tls_client_config};
 use hyper::body::Bytes;
 use http_body_util::Full;
 
-fn main() {
-    // 1. Build TLS config (with custom certs if needed)
-    // In a real scenario, you'd pass paths to your actual certs.
-    let tls_config = build_tls_client_config(None, None, None).unwrap();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Build Root Certificate Store (with optional custom CA)
+    let root_store = build_root_store(&None)?;
 
-    // 2. Define pool configuration
+    // 2. Build TLS config (with optional client certificates for mTLS)
+    let tls_config = build_tls_client_config(root_store, None, None)?;
+
+    // 3. Define connection pool configuration
     let pool_config = ClientPoolConfig {
-        pool_idle_timeout: std::time::Duration::from_secs(90),
-        pool_max_idle_per_host: 1024,
-        http2_only: false, // Set true to enforce HTTP/2
+        idle_timeout: Some(std::time::Duration::from_secs(90)),
+        max_idle_per_host: Some(1024),
+        http2_only: false, // Set true to enforce HTTP/2 (e.g. for gRPC)
     };
 
-    // 3. Build the highly optimized client
+    // 4. Build the highly optimized client
     let _client = build_hyper_client::<Full<Bytes>>(tls_config, pool_config);
     println!("Hyper client successfully configured!");
+    Ok(())
 }
 ```

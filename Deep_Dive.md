@@ -176,13 +176,13 @@ Wenn die Relay-Konfiguration fehlt, werden Bindings auf öffentlichen Adressen u
 
 **Verbesserung:** Relative oder deploymentseitig injizierte Pfade verwenden, Include-Verzeichnisse whitelisten und alle zusammengeführten Serverdefinitionen vor Aktivierung validieren.
 
-### Panics statt kontrollierter Start- und Laufzeitfehler
+### Panics statt kontrollierter Start- und Laufzeitfehler (Behoben)
 
-**Schweregrad: Mittel**
+**Schweregrad: Mittel (Behoben)**
 
-Mehrere Pfade verwenden `unwrap`, `expect` oder `panic!` beim Laden von Zertifikaten, Schlüsseln, JWT-Parametern und Router-Konfiguration. Ein fehlerhaftes Secret oder Hot-Reload-Input beendet dann den Prozess statt einen diagnostizierbaren Fehler zurückzugeben.
+Zuvor verwendeten mehrere Pfade `unwrap`, `expect` oder `panic!` beim Laden von Zertifikaten, Schlüsseln, JWT-Parametern und Router-Konfiguration. Ein fehlerhaftes Secret oder Hot-Reload-Input beendete dann den Prozess statt einen diagnostizierbaren Fehler zurückzugeben.
 
-**Verbesserung:** Öffentliche Lade-/Validierungsfunktionen auf `Result` umstellen, Fehler mit Kontext versehen und Panics auf unveränderliche Programm-Invarianten beschränken.
+**Behebung:** Alle Lade- und Konfigurationsfunktionen (`load_certs`, `load_single_key`, `load_decoding_keys`, `load_encoding_key`, `build_tls_client_config`, `build_root_store`, `RouterService::new`, `IdpService::new`) wurden vollständig auf `Result` umgestellt. `Config::init` wurde in `Config::load` und `Config::update_global` getrennt. SIGHUP führt einen vollständigen Dry-Run durch und tauscht den globalen Zustand erst nach erfolgreicher Validierung aller Stacks und TLS-Kontexte atomar aus. Invalidierungstests sichern die Invarianten ab.
 
 ### Beobachtbarkeit kann Geheimnisse und Ursachen gleichzeitig verfehlen
 

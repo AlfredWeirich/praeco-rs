@@ -252,6 +252,10 @@ pub fn sign_jwt(claims: &Claims, encoding_key: &EncodingKey) -> Result<String, E
 ///
 /// If **both** `cert` and `key` are `Some`, mTLS client authentication is
 /// configured. Otherwise, the client connects without presenting a certificate.
+///
+/// # Errors
+///
+/// Returns an error if client certificates or private keys cannot be loaded or parsed.
 pub fn build_tls_client_config(
     root_store: RootCertStore,
     cert: Option<&str>,
@@ -281,6 +285,10 @@ pub fn build_tls_client_config(
 ///
 /// * `ca_path` – Optional path to a PEM file with additional trusted CA
 ///   certificates (e.g. self-signed CAs used in internal environments).
+///
+/// # Errors
+///
+/// Returns an error if the custom CA certificate file cannot be read or parsed.
 pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
     // Start with the well-known WebPKI root certificates (Let's Encrypt, etc.)
