@@ -33,6 +33,7 @@ Incoming HTTP requests are matched against prefix-based routes and forwarded to 
 | Feature | Description |
 |---------|-------------|
 | **Prefix Routing** | Uses [`matchit`](https://docs.rs/matchit) radix-tree router for efficient O(1)-ish path matching with wildcard support (`{*rest}`). |
+| **Path Canonicalization** | Enforces RFC 3986 path canonicalization, rejecting traversal (`..`, `%2e%2e`), encoded slashes (`%2f`), and null bytes with `400 Bad Request`. |
 | **Specialized Handlers** | Dynamically dispatches requests to standard HTTP proxies, transparent gRPC passthroughs, or JSON-to-gRPC transcoding backends. |
 | **RBAC** | Routes can restrict access to specific `UserRole`s (`Admin`, `Operator`, `Viewer`, `Guest`). Roles are injected by earlier middleware. |
 | **Hop-by-Hop Header Stripping** | Removes connection-level headers (`Connection`, `Transfer-Encoding`, `Upgrade`, etc.) per RFC 7230 §6.1. |
@@ -45,11 +46,12 @@ Each incoming request passes through the `call()` method:
 
 1. **Health Check** — Intercepts `GET /health` to verify upstream availability based on active background probes.
 2. **IP Address Management** — Extracts the client socket address and sets `X-Real-IP`.
-3. **Route Lookup** — Matches the request path against the radix-tree router. Returns `404 Not Found` on miss.
-4. **RBAC Enforcement** — Delegates to `rbac::enforce_rbac()`. Returns `403 Forbidden` on denial.
-5. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers and inject tokens.
-6. **Buffering Decision** — Determines if the request body should be streamed or buffered in memory (required for retries or transcoding).
-7. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, or `grpc_web` based on the configured `RouteBackendType`.
+3. **Path Canonicalization** — Validates and canonicalizes the request path (RFC 3986), rejecting traversal attempts and illegal encodings before routing.
+4. **Route Lookup** — Matches the canonical request path against the radix-tree router. Returns `404 Not Found` on miss.
+5. **RBAC Enforcement** — Delegates to `rbac::enforce_rbac()`. Returns `403 Forbidden` on denial.
+6. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers and inject tokens.
+7. **Buffering Decision** — Determines if the request body should be streamed or buffered in memory (required for retries or transcoding).
+8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, or `grpc_web` based on the configured `RouteBackendType`.
 
 ## Struct & API Reference
 

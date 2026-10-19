@@ -22,6 +22,7 @@
 //! | [`jwt`] | [`JwtAuthLayer`] | JWT bearer-token authentication and role mapping. |
 //! | [`limit`] | [`MaxPayloadLayer`] | Request body size enforcement (header + streaming). |
 //! | [`logger`] | [`LoggerLayer`] | Request/response logging with client IP and role info. |
+//! | [`path_sanitizer`] | [`PathSanitizerLayer`] | RFC 3986 path canonicalization and directory traversal protection. |
 //! | [`rate_limiter`] | [`SimpleRateLimiterLayer`] / [`TokenBucketRateLimiterLayer`] | Fixed-window and token-bucket rate limiting. |
 //! | [`router`] | — | Reverse-proxy routing service (no layer; used as a base service). |
 //! | [`timing`] | [`TimingLayer`] | Request duration measurement and logging. |

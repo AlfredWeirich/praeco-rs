@@ -184,6 +184,14 @@ Zuvor verwendeten mehrere Pfade `unwrap`, `expect` oder `panic!` beim Laden von 
 
 **Behebung:** Alle Lade- und Konfigurationsfunktionen (`load_certs`, `load_single_key`, `load_decoding_keys`, `load_encoding_key`, `build_tls_client_config`, `build_root_store`, `RouterService::new`, `IdpService::new`) wurden vollständig auf `Result` umgestellt. `Config::init` wurde in `Config::load` und `Config::update_global` getrennt. SIGHUP führt einen vollständigen Dry-Run durch und tauscht den globalen Zustand erst nach erfolgreicher Validierung aller Stacks und TLS-Kontexte atomar aus. Invalidierungstests sichern die Invarianten ab.
 
+### Pfad-Normalisierung fehlt (Route-/RBAC-/Inspection-Bypass) (Behoben)
+
+**Schweregrad: Hoch (Behoben)**
+
+Routing, Inspection und RBAC arbeiteten zuvor auf dem rohen Pfad (nicht dekodiert, nicht normalisiert). Nach Prefix-Strip wurde der Rest unverändert weitergeleitet (`..`, `%2e%2e`, `%2f`, `//`), was zu Pfad-Confusion, RBAC-Bypasses und WAF-Umgehungen auf Upstreams führen konnte.
+
+**Behebung:** Einführung von `PathSanitizerLayer` mit strikter RFC-3986-Kanonisierung (Option A). Requests mit Traversal-Mustern (`..`, `%2e%2e`, `.%2e`, `%2e.`), kodierten Slashes (`%2f`), Null-Bytes (`\0`, `%00`), Backslashes (`\`, `%5c`) oder verdächtigem Doppel-Encoding (`%252e`) werden sofort mit `400 Bad Request` abgewiesen. Mehrfache Slashes (`//`) und `/./`-Segmente werden zusammengeführt/entfernt. Der bereinigte Pfad wird in `req.uri()` zurückgeschrieben, sodass Tracing, Inspection, Router, RBAC und Upstreams dieselbe kanonische Sicht teilen. Redundante Absicherungen in `RouterService::call` und `build_upstream_uri` bieten Defense-in-Depth.
+
 ### Beobachtbarkeit kann Geheimnisse und Ursachen gleichzeitig verfehlen
 
 **Schweregrad: Niedrig bis mittel**
