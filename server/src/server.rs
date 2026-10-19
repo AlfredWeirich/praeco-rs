@@ -62,7 +62,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 // === External Crates ===
-use anyhow::{Context, Error};
+use anyhow::{Context, Error, anyhow};
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, runtime::Builder};
@@ -147,7 +147,7 @@ fn main() -> Result<(), Error> {
     trace!("Full Config: {:#?}", config);
 
     // Block the main thread on the execution of the asynchronous server loop.
-    let res = runtime.block_on(main_async(config));
+    let res = runtime.block_on(main_async(config, arg));
     if let Some(provider) = _tracer_provider {
         let _ = provider.shutdown();
     }
@@ -161,7 +161,7 @@ fn main() -> Result<(), Error> {
 /// - For each enabled server, it launches a separate, independent task (green thread).
 /// - It listens for a "Shutdown Signal" (like pressing Ctrl+C).
 /// - It ensures all servers stop gracefully before the program exits.
-async fn main_async(config: Arc<Config>) -> Result<(), Error> {
+async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Error> {
     let mut server_join_set = tokio::task::JoinSet::new();
 
     // Map: name -> (CancellationToken, Arc<ServerConfig>, Arc<ArcSwap<BoxedCloneService>>)
@@ -221,13 +221,12 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                 break;
             }
             _ = sighup.recv() => {
-                info!("Received SIGHUP, initiating hot-reload...");
+                info!("Received SIGHUP, initiating hot-reload from '{}'...", config_path);
 
-                // 1. Reload configuration from disk
-                // Config::init reads the file and returns the new Arc<Config>.
-                // It also updates the globally available rustls CertifiedKeys (via ArcSwap)
-                // so that DynamicCertResolver instantly gets the new certificates.
-                let new_config = match Config::init("Config.toml") {
+                // 1. Reload configuration from disk into a fresh Config instance
+                // We use Config::load instead of Config::init so that the global CONFIG
+                // is NOT updated if validation or dry-run fails.
+                let new_config = match Config::load(&config_path) {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to reload config on SIGHUP, ignoring: {:?}", e);
@@ -235,15 +234,25 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                     }
                 };
 
-                info!("Successfully parsed new Config.toml");
+                info!("Successfully parsed and validated new config from '{}'", config_path);
 
-                // 2. DRY-RUN PASS: Build all service stacks first
+                // 2. DRY-RUN PASS: Build all service stacks and TLS configurations first
                 let mut reload_errors = Vec::new();
                 let mut built_stacks = std::collections::HashMap::new();
 
                 for new_server in &new_config.servers {
                     if !new_server.enabled { continue; }
                     let server_config_arc = Arc::new(new_server.clone());
+
+                    // Validate TLS configuration if https or tunnel
+                    if new_server.protocol == Protocol::Https || new_server.tunnel.is_some() {
+                        if let Err(e) = build_rustls_config(new_server) {
+                            error!("{}: FAILED to build TLS config (dry-run): {:?}", new_server.name, e);
+                            reload_errors.push((new_server.name.clone(), format!("TLS config error: {e}")));
+                            continue;
+                        }
+                    }
+
                     match build_service_stack(&server_config_arc) {
                         Ok(svc) => {
                             built_stacks.insert(new_server.name.clone(), (server_config_arc, svc));
@@ -261,11 +270,12 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                         error!(" - {}: {}", name, err);
                     }
                     error!("Keeping previous configuration completely intact.");
-                    continue; // Abort SIGHUP handling, leave `active_servers` unmodified
+                    continue; // Abort SIGHUP handling, leave `active_servers` and `CONFIG` unmodified
                 }
 
-                // 3. APPLY PASS: Diff and manage listeners
+                // 3. APPLY PASS: Atomic config swap and diff/manage listeners
                 info!("Dry-run passed. Applying new configuration...");
+                Config::update_global(new_config.clone());
                 let mut next_active_servers = std::collections::HashMap::new();
 
                 for (name, (server_config_arc, service_stack)) in built_stacks {
@@ -514,13 +524,19 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
     if let Some(router_params) = &server_config.router_params {
         // --- 1. TLS Context Initialization for Upstreams ---
         // If the router needs to speak HTTPS/mTLS to its backends, we build a trusted root store.
-        let root_store = common::build_root_store(&router_params.ssl_root_certificate);
+        let root_store = match common::build_root_store(&router_params.ssl_root_certificate) {
+            Ok(store) => store,
+            Err(e) => {
+                error!("{}: Failed to build root store for health checks: {}", server_config.name, e);
+                return;
+            }
+        };
 
         // Check if mutual TLS (mTLS) is required (i.e., the proxy must present its own certificate)
         let is_mtls = router_params.authentication == AuthenticationMethod::ClientCert;
 
         // Build the exact TLS handshake instructions this proxy will use when calling upstream nodes.
-        let tls_client_config = if is_mtls {
+        let tls_client_config = match if is_mtls {
             common::build_tls_client_config(
                 root_store,
                 router_params.ssl_client_certificate.as_deref(), // The proxy's own client cert
@@ -529,6 +545,12 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
         } else {
             // Standard TLS (only verifying the server, no client certificate provided)
             common::build_tls_client_config(root_store, None, None)
+        } {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                error!("{}: Failed to build TLS client config for health checks: {}", server_config.name, e);
+                return;
+            }
         };
 
         // --- 2. Connection Pool Setup ---
@@ -905,18 +927,30 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
                 server_config.name
             ))?;
 
+    let static_name = server_config
+        .static_name
+        .ok_or_else(|| anyhow!("{}: static_name missing", server_config.name))?;
+
     let base_service = match server_config.service {
         ServiceType::Echo => {
-            EchoService::new(server_config.static_name.expect("static_name missing")).boxed_clone_sync()
+            EchoService::new(static_name).boxed_clone_sync()
         }
-        ServiceType::Router => RouterService::new(server_config.clone()).boxed_clone_sync(),
+        ServiceType::Router => RouterService::new(server_config.clone())?.boxed_clone_sync(),
         ServiceType::Idp => {
-            let params = server_config.idp_params.as_ref().expect("IdpParams missing").clone();
-            let idp_service = praeco_rs::middleware::idp::IdpService::new(params, server_config.static_name.expect("static_name missing")).expect("Failed to init IdP Service");
+            let params = server_config
+                .idp_params
+                .as_ref()
+                .ok_or_else(|| anyhow!("{}: IdpParams missing", server_config.name))?
+                .clone();
+            let idp_service = praeco_rs::middleware::idp::IdpService::new(params, static_name)?;
             praeco_rs::BoxCloneSyncService::new(idp_service)
         }
         ServiceType::StaticFiles => {
-            let params = server_config.static_files_params.as_ref().expect("StaticFilesParams missing").clone();
+            let params = server_config
+                .static_files_params
+                .as_ref()
+                .ok_or_else(|| anyhow!("{}: StaticFilesParams missing", server_config.name))?
+                .clone();
             
             let abs_root = std::fs::canonicalize(&params.root)
                 .unwrap_or_else(|_| std::path::PathBuf::from(&params.root));
@@ -941,11 +975,11 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
     let applied = apply_layers(
         base_service, // The core service (Echo or Router) handling the request
         layers,
-        server_config.static_name.expect("static_name missing"),
+        static_name,
         compiled_allowed_pathes.clone(),
         server_config.port.unwrap_or(0),
         Arc::new(server_config.oid_mapping.clone()),
-    );
+    )?;
 
     use tower_http::trace::{DefaultOnResponse, TraceLayer};
     use tracing::{Level, info_span};
@@ -999,13 +1033,12 @@ fn apply_layers(
     layers: Vec<MiddlewareLayer>,
     server_name: &'static str,
     compiled_allowed_pathes: Arc<CompiledAllowedPathes>,
-    server_port: u16, // <--- Add this argument
+    server_port: u16,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
-) -> BoxedCloneService {
-    layers
-        .into_iter()
-        .rev()
-        .fold(service, |svc, layer| match layer {
+) -> Result<BoxedCloneService, Error> {
+    let mut svc = service;
+    for layer in layers.into_iter().rev() {
+        svc = match layer {
             MiddlewareLayer::TraceId => praeco_rs::middleware::TraceIdLayer::new().layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Timing => TimingLayer::new(server_name).layer(svc).boxed_clone_sync(),
             MiddlewareLayer::Counter => CountingLayer::new(server_name).layer(svc).boxed_clone_sync(),
@@ -1021,7 +1054,7 @@ fn apply_layers(
                     .boxed_clone_sync()
             }
             MiddlewareLayer::JwtAuth(cfg) => {
-                JwtAuthLayer::new(
+                let layer = JwtAuthLayer::new(
                     cfg.jwt_public_keys.clone(),
                     server_name,
                     oid_mapping.clone(),
@@ -1029,11 +1062,13 @@ fn apply_layers(
                     cfg.redirect_on_failure.clone(),
                     cfg.expected_issuer.clone(),
                     cfg.expected_audience.clone(),
-                )
-                .layer(svc)
-                .boxed_clone_sync()
+                )?;
+                layer.layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(praeco_rs::configuration::RateLimiter::Simple(cfg)) => {
+                if cfg.requests_per_second == 0 {
+                    return Err(anyhow!("{server_name}: RateLimiter requests_per_second must be > 0"));
+                }
                 let dur = Duration::from_secs_f32(1.0 / cfg.requests_per_second as f32);
                 SimpleRateLimiterLayer::new(dur, server_name)
                     .layer(svc)
@@ -1041,16 +1076,23 @@ fn apply_layers(
             }
             MiddlewareLayer::RateLimiter(
                 praeco_rs::configuration::RateLimiter::TokenBucket(cfg),
-            ) => TokenBucketRateLimiterLayer::new(
-                cfg.max_capacity,
-                cfg.refill,
-                Duration::from_micros(cfg.duration_micros),
-                server_name,
-            )
-            .layer(svc)
-            .boxed_clone_sync(),
+            ) => {
+                if cfg.max_capacity == 0 || cfg.refill == 0 || cfg.duration_micros == 0 {
+                    return Err(anyhow!("{server_name}: TokenBucketRateLimiter parameters must all be > 0"));
+                }
+                TokenBucketRateLimiterLayer::new(
+                    cfg.max_capacity,
+                    cfg.refill,
+                    Duration::from_micros(cfg.duration_micros),
+                    server_name,
+                )
+                .layer(svc)
+                .boxed_clone_sync()
+            }
             MiddlewareLayer::ConcurrencyLimit(max_requests) => {
-                // Here we directly use the extracted usize value
+                if max_requests == 0 {
+                    return Err(anyhow!("{server_name}: ConcurrencyLimit max_requests must be > 0"));
+                }
                 ConcurrencyLimit::new(svc, max_requests).boxed_clone_sync()
             }
             MiddlewareLayer::Compression => SrvCompressionLayer::new(server_name)
@@ -1065,7 +1107,6 @@ fn apply_layers(
                 .layer(svc)
                 .boxed_clone_sync(),
             MiddlewareLayer::AltSvc => {
-                // We use the actual running port of the server
                 AltSvcLayer::new(server_port).layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::Cors(cfg) => {
@@ -1088,6 +1129,10 @@ fn apply_layers(
                 let is_any_origin = cfg.allowed_origins.iter().any(|o| o == "*");
                 let is_any_method = cfg.allowed_methods.iter().any(|m| m == "*");
                 let is_any_header = cfg.allowed_headers.iter().any(|h| h == "*");
+
+                if cfg.allow_credentials && is_any_origin {
+                    return Err(anyhow!("{server_name}: CORS allow_credentials cannot be true when allowed_origins contains '*'"));
+                }
 
                 macro_rules! apply_cors {
                     ($cors:expr) => {
@@ -1152,7 +1197,9 @@ fn apply_layers(
             MiddlewareLayer::SecurityHeaders(cfg) => {
                 SecurityHeadersLayer::new(cfg).layer(svc).boxed_clone_sync()
             }
-        })
+        };
+    }
+    Ok(svc)
 }
 
 // === Refactored run_dual_stack ===

@@ -79,8 +79,8 @@ impl JwtAuthLayer {
         redirect_on_failure: Option<String>,
         expected_issuer: String,
         expected_audience: String,
-    ) -> Self {
-        let decoding_keys = load_decoding_keys(&key_files);
+    ) -> Result<Self, anyhow::Error> {
+        let decoding_keys = load_decoding_keys(&key_files)?;
 
         // Convert HashMap to Vec for faster linear search (avoids SipHash overhead on small sets)
         let oid_mapping: Vec<_> = oid_mapping_hash
@@ -88,7 +88,7 @@ impl JwtAuthLayer {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
-        Self {
+        Ok(Self {
             decoding_keys: Arc::new(decoding_keys),
             server_name,
             oid_mapping: Arc::new(oid_mapping),
@@ -96,7 +96,7 @@ impl JwtAuthLayer {
             redirect_on_failure,
             expected_issuer,
             expected_audience,
-        }
+        })
     }
 }
 

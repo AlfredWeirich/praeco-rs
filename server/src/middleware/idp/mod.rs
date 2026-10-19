@@ -45,7 +45,7 @@ impl IdpService {
         
         let webhook_client = WebhookClient::new(&params).context("Failed to init webhook client")?;
 
-        let encoding_key = common::load_encoding_key(&params.jwt_private_key);
+        let encoding_key = common::load_encoding_key(&params.jwt_private_key)?;
 
         let mut jwks_payload = None;
         if let Some(pub_key_path) = &params.jwt_public_key {

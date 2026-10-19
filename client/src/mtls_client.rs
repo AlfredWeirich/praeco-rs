@@ -142,7 +142,7 @@ async fn run_h2(cli: &Cli) -> Result<(), Error> {
     let jwt_token = read_jwt(cli);
 
     // Construct the hyper HTTP client (with TLS connector) and target URI
-    let client = build_h2_client(cli);
+    let client = build_h2_client(cli)?;
     let uri = build_uri(cli);
 
     let concurrency = cli.num_parallel as usize;
@@ -318,16 +318,16 @@ fn validate_cli(cli: &Cli) {
 /// best version with the server via ALPN.
 fn build_h2_client(
     cli: &Cli,
-) -> Client<common::client::HttpsConnector<HttpConnector>, Full<Bytes>> {
-    let root_store = common::build_root_store(&cli.ca);
+) -> Result<Client<common::client::HttpsConnector<HttpConnector>, Full<Bytes>>, Error> {
+    let root_store = common::build_root_store(&cli.ca)?;
 
     // Create the appropriate TLS config based on the security protocol.
     let tls_client_config = match cli.security {
         Protocol::Http | Protocol::Https | Protocol::Jwt => {
-            common::build_tls_client_config(root_store, None, None)
+            common::build_tls_client_config(root_store, None, None)?
         }
         Protocol::Mtls => {
-            common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref())
+            common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref())?
         }
     };
 
@@ -338,7 +338,7 @@ fn build_h2_client(
         http2_only: false,
     };
 
-    common::client::build_hyper_client(tls_client_config, pool_config)
+    Ok(common::client::build_hyper_client(tls_client_config, pool_config))
 }
 
 // =============================================================================
@@ -500,9 +500,9 @@ async fn do_request_h2(
 /// (cheap, reference-counted) and opens a new QUIC stream.
 async fn run_h3(cli: &Cli) -> Result<(), Error> {
     // ---- Step 1: Build TLS config with "h3" ALPN ----
-    let root_store = common::build_root_store(&cli.ca);
+    let root_store = common::build_root_store(&cli.ca)?;
     let mut tls_config =
-        common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref());
+        common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref())?;
     // QUIC mandates the "h3" ALPN to negotiate HTTP/3 during the handshake
     tls_config.alpn_protocols = vec![b"h3".to_vec()];
 

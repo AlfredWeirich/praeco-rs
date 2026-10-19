@@ -17,7 +17,7 @@
 //! | [`build_root_store`] | Build a `RootCertStore` from system + custom CAs. |
 
 // === External Crates ===
-use anyhow::Error;
+use anyhow::{Context, Error, anyhow};
 #[allow(unused_imports)]
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use rustls::{
@@ -25,7 +25,6 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use serde::{Deserialize, Serialize};
-use tracing::error;
 
 // Note: tracing 'info' was unused, so it was removed.
 
@@ -37,25 +36,25 @@ use tracing::error;
 /// # Arguments
 ///
 /// * `path` – File path to a PEM-encoded certificate chain.
-/// * `server_name` – Label for error/panic messages.
+/// * `server_name` – Label for error context.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the file cannot be read or contains invalid PEM data.
-pub fn load_certs(path: &str, server_name: &str) -> Vec<CertificateDer<'static>> {
-    // Attempt to read the entire certificate file
-    let data = std::fs::read(path).unwrap_or_else(|_| {
-        error!("{server_name}: Failed to read {path}");
-        panic!("{server_name}: Failed to read {path}");
-    });
+/// Returns an error if the file cannot be read, contains invalid PEM data,
+/// or contains no certificates.
+pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'static>>, Error> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("{server_name}: Failed to read certificate file '{path}'"))?;
 
-    // Parse the certificates from PEM-encoded input and collect them into a vector
-    rustls_pemfile::certs(&mut &data[..])
+    let certs = rustls_pemfile::certs(&mut &data[..])
         .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|_| {
-            error!("{server_name}: Invalid cert in {path}");
-            panic!("{server_name}: Invalid cert in {path}");
-        })
+        .with_context(|| format!("{server_name}: Invalid certificate in '{path}'"))?;
+
+    if certs.is_empty() {
+        return Err(anyhow!("{server_name}: No certificates found in '{path}'"));
+    }
+
+    Ok(certs)
 }
 
 /// Loads a single private key from a PEM file.
@@ -104,21 +103,23 @@ pub fn load_certs(path: &str, server_name: &str) -> Vec<CertificateDer<'static>>
 //     // Return the first parsed key
 //     keys.remove(0)
 // }
-pub fn load_single_key(path: &str, _server_name: &str) -> PrivateKeyDer<'static> {
-    let file = std::fs::File::open(path).expect("Cannot open key file");
+pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'static>, Error> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("{server_name}: Cannot open key file '{path}'"))?;
     let mut reader = std::io::BufReader::new(file);
 
     // Use read_all to catch PKCS1, PKCS8, or SEC1 automatically.
     // This is more robust than parsing only PKCS#8.
     for item in rustls_pemfile::read_all(&mut reader) {
-        match item.expect("PEM parse error") {
-            rustls_pemfile::Item::Pkcs1Key(key) => return PrivateKeyDer::Pkcs1(key),
-            rustls_pemfile::Item::Pkcs8Key(key) => return PrivateKeyDer::Pkcs8(key),
-            rustls_pemfile::Item::Sec1Key(key) => return PrivateKeyDer::Sec1(key),
+        let item = item.with_context(|| format!("{server_name}: PEM parse error in '{path}'"))?;
+        match item {
+            rustls_pemfile::Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::Pkcs1(key)),
+            rustls_pemfile::Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::Pkcs8(key)),
+            rustls_pemfile::Item::Sec1Key(key) => return Ok(PrivateKeyDer::Sec1(key)),
             _ => continue, // Skip non-key items (certificates, etc.)
         }
     }
-    panic!("No private key found in {}", path);
+    Err(anyhow!("{server_name}: No private key found in '{path}'"))
 }
 
 /// JWT Claims payload for authentication and authorization.
@@ -156,20 +157,19 @@ pub struct Claims {
 /// * `key_paths` – Slice of PEM file paths, each containing an Ed25519
 ///   public key.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if any file cannot be read or is not a valid Ed25519 PEM.
-pub fn load_decoding_keys(key_paths: &[String]) -> Vec<DecodingKey> {
-    key_paths
-        .iter()
-        .map(|path| {
-            let pem = std::fs::read_to_string(path).unwrap_or_else(|_| {
-                error!("Failed to read key file: {}", path);
-                panic!("Failed to read key file: {}", path);
-            });
-            DecodingKey::from_ed_pem(pem.as_bytes()).expect("Failed to parse key")
-        })
-        .collect()
+/// Returns an error if any file cannot be read or is not a valid Ed25519 PEM.
+pub fn load_decoding_keys(key_paths: &[String]) -> Result<Vec<DecodingKey>, Error> {
+    let mut keys = Vec::with_capacity(key_paths.len());
+    for path in key_paths {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read JWT public key file: '{path}'"))?;
+        let key = DecodingKey::from_ed_pem(pem.as_bytes())
+            .with_context(|| format!("Failed to parse JWT public key in '{path}'"))?;
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 /// Loads an Ed25519 private key file and converts it into an [`EncodingKey`].
@@ -180,15 +180,15 @@ pub fn load_decoding_keys(key_paths: &[String]) -> Vec<DecodingKey> {
 ///
 /// * `path` – PEM file path containing an Ed25519 private key.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the file cannot be read or is not a valid Ed25519 PEM.
-pub fn load_encoding_key(path: &str) -> EncodingKey {
-    let pem = std::fs::read_to_string(path).unwrap_or_else(|_| {
-        error!("Failed to read private key file: {}", path);
-        panic!("Failed to read private key file: {}", path);
-    });
-    EncodingKey::from_ed_pem(pem.as_bytes()).expect("Failed to parse private key")
+/// Returns an error if the file cannot be read or is not a valid Ed25519 PEM.
+pub fn load_encoding_key(path: &str) -> Result<EncodingKey, Error> {
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read private key file: '{path}'"))?;
+    let key = EncodingKey::from_ed_pem(pem.as_bytes())
+        .with_context(|| format!("Failed to parse private key in '{path}'"))?;
+    Ok(key)
 }
 
 /// Verifies a JWT token against a set of decoding keys.
@@ -256,21 +256,21 @@ pub fn build_tls_client_config(
     root_store: RootCertStore,
     cert: Option<&str>,
     key: Option<&str>,
-) -> ClientConfig {
+) -> Result<ClientConfig, Error> {
     match (cert, key) {
         (Some(cert_path), Some(key_path)) => {
             // mTLS: load client cert chain + private key
-            let certs = load_certs(cert_path, "mtlsclient");
-            let key = load_single_key(key_path, "mtlsclient");
+            let certs = load_certs(cert_path, "mtlsclient")?;
+            let key = load_single_key(key_path, "mtlsclient")?;
             ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_client_auth_cert(certs, key)
-                .expect("Failed to build client config")
+                .map_err(|e| anyhow!("Failed to build client TLS config: {e}"))
         }
         // No client auth — standard TLS
-        _ => ClientConfig::builder()
+        _ => Ok(ClientConfig::builder()
             .with_root_certificates(root_store)
-            .with_no_client_auth(),
+            .with_no_client_auth()),
     }
 }
 
@@ -281,15 +281,44 @@ pub fn build_tls_client_config(
 ///
 /// * `ca_path` – Optional path to a PEM file with additional trusted CA
 ///   certificates (e.g. self-signed CAs used in internal environments).
-pub fn build_root_store(ca_path: &Option<String>) -> RootCertStore {
+pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
     // Start with the well-known WebPKI root certificates (Let's Encrypt, etc.)
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     // Optionally add a custom CA (e.g. self-signed for internal environments)
     if let Some(path) = ca_path {
-        let root_cert = load_certs(path, "mtlsclient");
+        let root_cert = load_certs(path, "root_store")?;
         root_store.add_parsable_certificates(root_cert);
     }
-    root_store
+    Ok(root_store)
 }
 pub mod client;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_certs_nonexistent_file_returns_err() {
+        let res = load_certs("nonexistent_cert_path_12345.pem", "test_server");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_load_single_key_nonexistent_file_returns_err() {
+        let res = load_single_key("nonexistent_key_path_12345.pem", "test_server");
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_load_decoding_keys_nonexistent_file_returns_err() {
+        let res = load_decoding_keys(&["nonexistent_jwt_key_12345.pem".to_string()]);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_load_encoding_key_nonexistent_file_returns_err() {
+        let res = load_encoding_key("nonexistent_jwt_priv_12345.pem");
+        assert!(res.is_err());
+    }
+}

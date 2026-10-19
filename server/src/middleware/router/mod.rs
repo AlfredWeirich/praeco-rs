@@ -68,11 +68,11 @@ pub struct RouterService {
 }
 
 impl RouterService {
-    pub fn new(config: Arc<ServerConfig>) -> Self {
+    pub fn new(config: Arc<ServerConfig>) -> Result<Self, anyhow::Error> {
         let router_params = config
             .router_params
             .as_ref()
-            .expect("Router params missing");
+            .ok_or_else(|| anyhow::anyhow!("{}: Router params missing", config.name))?;
 
         let mut router = Router::new();
         for route_data in &config.parsed_routes {
@@ -101,7 +101,7 @@ impl RouterService {
         }
         let router = Arc::new(router);
 
-        let root_store = build_root_store(&router_params.ssl_root_certificate);
+        let root_store = build_root_store(&router_params.ssl_root_certificate)?;
         let is_mtls = router_params.authentication == AuthenticationMethod::ClientCert;
 
         let tls_client_config = if is_mtls {
@@ -109,9 +109,9 @@ impl RouterService {
                 root_store,
                 router_params.ssl_client_certificate.as_deref(),
                 router_params.ssl_client_key.as_deref(),
-            )
+            )?
         } else {
-            build_tls_client_config(root_store, None, None)
+            build_tls_client_config(root_store, None, None)?
         };
 
         let client = {
@@ -137,13 +137,13 @@ impl RouterService {
             .as_ref()
             .and_then(|t| header::HeaderValue::from_str(&format!("Bearer {}", t)).ok());
 
-        RouterService {
+        Ok(RouterService {
             client,
             grpc_client,
             router,
             config,
             jwt_token,
-        }
+        })
     }
 
     fn handle_health_check(&self) -> Result<Response<ServiceRespBody>, SrvError> {

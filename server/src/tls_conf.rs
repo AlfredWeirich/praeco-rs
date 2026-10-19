@@ -36,10 +36,10 @@ pub fn load_certified_key(
     server_name: &str,
     server_cert_config: &ServerCertConfig,
 ) -> Result<Arc<CertifiedKey>, Error> {
-    let server_certs = load_certs(&server_cert_config.ssl_certificate, server_name);
+    let server_certs = load_certs(&server_cert_config.ssl_certificate, server_name)?;
     trace!("{}: Server certificates loaded successfully.", server_name);
 
-    let server_key = load_single_key(&server_cert_config.ssl_certificate_key, server_name);
+    let server_key = load_single_key(&server_cert_config.ssl_certificate_key, server_name)?;
     trace!("{}: Server private key loaded successfully.", server_name);
 
     let provider = CryptoProvider::get_default()
@@ -140,7 +140,7 @@ pub fn tls_config(
         let mut crls: Vec<CertificateRevocationListDer<'_>> = Vec::with_capacity(20);
         for config in client_certs {
             // Load one or more CA certs for this config
-            let ca_certs = load_certs(&config.ssl_client_ca, server_name);
+            let ca_certs = load_certs(&config.ssl_client_ca, server_name)?;
             for ca in ca_certs {
                 // Add each CA cert to the root store for client verification
                 root_store

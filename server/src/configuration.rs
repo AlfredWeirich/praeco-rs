@@ -832,10 +832,11 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read, TOML parsing fails, or
-    /// any server's [`finalize`](ServerConfig::finalize) step detects invalid
-    /// configuration.
-    pub fn init(config_file: &str) -> Result<Arc<Config>, Error> {
+    /// Loads and parses the configuration from disk, merges includes, parses OID,
+    /// and finalizes all servers (including eagerly loading certificates/keys and validating layers).
+    ///
+    /// This method does NOT modify the global configuration singleton.
+    pub fn load(config_file: &str) -> Result<Arc<Config>, Error> {
         // 1. Read the raw TOML string
         let toml_str = fs::read_to_string(config_file)
             .with_context(|| format!("Failed to read config file: {}", config_file))?;
@@ -906,22 +907,34 @@ impl Config {
             config.parsed_pki_base_oid = Some(parsed);
         }
 
-        // 4. Finalize individual server settings (e.g. compile regexes)
+        // 4. Finalize individual server settings (e.g. compile regexes, load certs, validate layers)
         for server in config.servers.iter_mut() {
             server.finalize()?;
         }
 
-        let arc_config = Arc::new(config);
+        Ok(Arc::new(config))
+    }
 
-        // 5. Store in global OnceLock or update ArcSwap
+    /// Atomically updates the global configuration singleton.
+    pub fn update_global(arc_config: Arc<Config>) {
         if let Some(existing) = CONFIG.get() {
             existing.store(arc_config);
-        } else if CONFIG.set(ArcSwap::new(arc_config.clone())).is_err() {
-            tracing::warn!("Config::init called multiple times concurrently.");
+        } else if CONFIG.set(ArcSwap::new(arc_config)).is_err() {
+            tracing::warn!("Config::update_global called concurrently during init.");
         }
+    }
 
-        // 6. Return reference to the global singleton
-        Ok(Self::global())
+    /// Initializes the global configuration singleton from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, TOML parsing fails, or
+    /// any server's [`finalize`](ServerConfig::finalize) step detects invalid
+    /// configuration.
+    pub fn init(config_file: &str) -> Result<Arc<Config>, Error> {
+        let arc_config = Self::load(config_file)?;
+        Self::update_global(arc_config.clone());
+        Ok(arc_config)
     }
 
     /// Returns a cloned `Arc<Config>` from the global configuration singleton if initialized.
@@ -1075,6 +1088,10 @@ impl ServerConfig {
                 ))
             })?;
             
+            // Validate that IdP private key can be loaded
+            common::load_encoding_key(&idp_params.jwt_private_key)
+                .with_context(|| format!("{}: Failed to load IdP private key", self.name))?;
+
             if idp_params.cookie_name.starts_with("__Host-") && self.protocol != Protocol::Https {
                 return Err(Error::msg(format!(
                     "Configuration error in Server '{}': Service is 'Idp' using '__Host-' cookie, but Protocol is not 'Https'. This will be rejected by browsers.",
@@ -1370,41 +1387,77 @@ impl Layers {
                     .as_ref()
                     .map(|c| MiddlewareLayer::Delay(c.delay_micros))
                     .context("Missing [Layers.Delay]"),
-                "JwtAuth" | "JWT" => self
-                    .jwt_config
-                    .as_ref()
-                    .map(|c| MiddlewareLayer::JwtAuth(c.clone()))
-                    .ok_or_else(|| {
-                        Error::msg(format!(
-                            "{}: Missing [Server.Layers.JWT] section for JwtAuth layer",
+                "JwtAuth" | "JWT" => {
+                    let c = self
+                        .jwt_config
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::msg(format!(
+                                "{}: Missing [Server.Layers.JWT] section for JwtAuth layer",
+                                server_name
+                            ))
+                        })?;
+                    // Validate decoding keys can actually be loaded
+                    common::load_decoding_keys(&c.jwt_public_keys)?;
+                    Ok(MiddlewareLayer::JwtAuth(c.clone()))
+                }
+                "ConcurrencyLimit" => {
+                    let c = self
+                        .concurrency_limit_config
+                        .as_ref()
+                        .context("Missing [Layers.ConcurrencyLimit]")?;
+                    if c.max_concurrent_requests == 0 {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'ConcurrencyLimit': max_concurrent_requests must be greater than 0",
                             server_name
-                        ))
-                    }),
-                "ConcurrencyLimit" => self
-                    .concurrency_limit_config
-                    .as_ref()
-                    .map(|c| MiddlewareLayer::ConcurrencyLimit(c.max_concurrent_requests))
-                    .context("Missing [Layers.ConcurrencyLimit]"),
-                "Cors" => self
-                    .cors_config
-                    .as_ref()
-                    .map(|c| MiddlewareLayer::Cors(c.clone()))
-                    .context("Missing [Layers.Cors]"),
+                        )));
+                    }
+                    Ok(MiddlewareLayer::ConcurrencyLimit(c.max_concurrent_requests))
+                }
+                "Cors" => {
+                    let c = self
+                        .cors_config
+                        .as_ref()
+                        .context("Missing [Layers.Cors]")?;
+                    if c.allow_credentials && c.allowed_origins.iter().any(|o| o == "*") {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'Cors': allow_credentials cannot be true when allowed_origins contains wildcard '*' (violates CORS specification and causes panic in tower-http)",
+                            server_name
+                        )));
+                    }
+                    Ok(MiddlewareLayer::Cors(c.clone()))
+                }
                 "SecurityHeaders" => self
                     .security_headers_config
                     .as_ref()
                     .map(|c| MiddlewareLayer::SecurityHeaders(c.clone()))
                     .context("Layer 'SecurityHeaders' enabled but [Server.Layers.SecurityHeaders] section is missing"),
-                "RateLimiter:Simple" => self
-                    .rate_limiter_config
-                    .as_ref()
-                    .map(|c| MiddlewareLayer::RateLimiter(RateLimiter::Simple(c.clone())))
-                    .context("Missing [Layers.RateLimiter]"),
-                "RateLimiter:TokenBucket" => self
-                    .token_bucket_config
-                    .as_ref()
-                    .map(|c| MiddlewareLayer::RateLimiter(RateLimiter::TokenBucket(c.clone())))
-                    .context("Missing [Layers.TokenBucketRateLimiter]"),
+                "RateLimiter:Simple" => {
+                    let c = self
+                        .rate_limiter_config
+                        .as_ref()
+                        .context("Missing [Layers.RateLimiter]")?;
+                    if c.requests_per_second == 0 {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'RateLimiter:Simple': requests_per_second must be greater than 0",
+                            server_name
+                        )));
+                    }
+                    Ok(MiddlewareLayer::RateLimiter(RateLimiter::Simple(c.clone())))
+                }
+                "RateLimiter:TokenBucket" => {
+                    let c = self
+                        .token_bucket_config
+                        .as_ref()
+                        .context("Missing [Layers.TokenBucketRateLimiter]")?;
+                    if c.max_capacity == 0 || c.refill == 0 || c.duration_micros == 0 {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'RateLimiter:TokenBucket': max_capacity, refill, and duration_micros must all be greater than 0",
+                            server_name
+                        )));
+                    }
+                    Ok(MiddlewareLayer::RateLimiter(RateLimiter::TokenBucket(c.clone())))
+                }
                 "AltSvc" => Ok(MiddlewareLayer::AltSvc),
                 other => Err(Error::msg(format!("Unknown layer type: {}", other))),
             })
@@ -1492,5 +1545,77 @@ mod tests {
         assert!(res.is_err());
         let err_msg = res.unwrap_err().to_string();
         assert!(err_msg.contains("'ip' is required"));
+    }
+
+    #[test]
+    fn test_cors_wildcard_with_credentials_rejected() {
+        let toml_str = r#"
+            name = "cors_test"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = ["Cors"]
+
+            [Layers.Cors]
+            allowed_origins = ["*"]
+            allow_credentials = true
+            allowed_methods = ["GET"]
+            allowed_headers = ["*"]
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        let res = server.finalize();
+        assert!(res.is_err());
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("Cors") && err_msg.contains("allow_credentials"));
+    }
+
+    #[test]
+    fn test_rate_limiter_zero_rps_rejected() {
+        let toml_str = r#"
+            name = "rate_limit_test"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = ["RateLimiter:Simple"]
+
+            [Layers.RateLimiter]
+            requests_per_second = 0
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        let res = server.finalize();
+        assert!(res.is_err());
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("requests_per_second must be greater than 0"));
+    }
+
+    #[test]
+    fn test_concurrency_limit_zero_rejected() {
+        let toml_str = r#"
+            name = "concurrency_test"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = ["ConcurrencyLimit"]
+
+            [Layers.ConcurrencyLimit]
+            max_concurrent_requests = 0
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        let res = server.finalize();
+        assert!(res.is_err());
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("max_concurrent_requests must be greater than 0"));
     }
 }
