@@ -77,3 +77,23 @@ cargo run --bin=relay-server
 ```
 
 > **Wichtig:** Auf Linux/Mac-Systemen benötigt der Prozess Root-Rechte (bzw. `CAP_NET_BIND_SERVICE`), wenn er wie im Standard konfiguriert auf Port 443 (Data Plane) lauscht. Durch Anpassen der `data_plane_addr` in der Config kann dies bei Bedarf auf unprivilegierte Ports verlegt werden.
+
+## Praeco-Client-Konfiguration (`[Server.tunnel]`)
+
+Auf Seiten der Praeco-Instanz wird der Tunnel im entsprechenden `[[Server]]`-Block definiert. Da Praeco in diesem Modus keinen lokalen Port öffnet, sind `ip` und `port` im Praeco-Konfigurationsblock **optional**:
+
+```toml
+[[Server]]
+name = "api_gateway"
+enabled = true
+protocol = "https"
+authentication = "ClientCert"
+service = "Router"
+
+[Server.tunnel]
+target_url = "tls://relay.example.com:7001"
+sni_domain = "api.example.com"
+client_cert_path = "server_certs/praeco_client.pem"
+client_key_path = "server_certs/praeco_client.key"
+ca_cert_path = "server_certs/relay_ca.pem"
+```

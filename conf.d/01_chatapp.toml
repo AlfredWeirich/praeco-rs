@@ -9,8 +9,6 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 # Main API Gateway (Internal - mTLS Required)
 # =============================================================================
     name = "wurzelwerk" 
-    ip = "0.0.0.0"
-    port = 1336
     enabled = true
     protocol = "https"
     authentication = "ClientCert"
@@ -129,8 +127,6 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 # Onboarding Server (Public - no mTLS)
 # =============================================================================
     name = "wurzelwerk_onboarding"
-    ip = "0.0.0.0"
-    port = 1337
     protocol = "https"
     service = "Router"
     enabled = true
@@ -182,8 +178,6 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 # Management & Admin Server (Port 1338 /admin & gRPC-Web)
 # =============================================================================
     name = "wurzelwerk_admin"
-    ip = "0.0.0.0"
-    port = 1338
     protocol = "https"
     authentication = "None"
     service = "Router"
@@ -300,8 +294,6 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 # Identity Provider (IdP) for Admin Dashboard (Port 1339)
 # =============================================================================
     name = "wurzelwerk_idp"
-    ip = "0.0.0.0"
-    port = 1339
     protocol = "https"
     authentication = "OptionalClientCert"
     service = "Idp"

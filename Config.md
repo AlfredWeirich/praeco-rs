@@ -84,8 +84,8 @@ You can define multiple `[[Server]]` blocks to run multiple listeners simultaneo
 | Parameter | Data Type | Description | Possible Values |
 | :--- | :--- | :--- | :--- |
 | `name` | String | Unique name of the instance (for logs and metrics). | **Example:** `"first_server"` |
-| `ip` | String | The IP address to bind to. | `"0.0.0.0"` (all), `"192.168.x.x"`, `"local"` (automatic local IP) |
-| `port` | Integer | The TCP port of the listener. | **Example:** `1336` |
+| `ip` | String *(optional with tunnel)* | The IP address to bind to. Mandatory if no `[Server.tunnel]` is defined. | `"0.0.0.0"` (all), `"192.168.x.x"`, `"local"` (automatic local IP) |
+| `port` | Integer *(optional with tunnel)* | The TCP port of the listener. Mandatory if no `[Server.tunnel]` is defined. | **Example:** `1336` |
 | `enabled` | Boolean | Main switch to turn the server on or off. | `true`, `false` (**Default:** `true`) |
 | `protocol` | String | Transport protocol. (If `https`, `[Server.server_certs]` must be configured). | `"http"`, `"https"` (**Default:** `"http"`) |
 | `authentication` | String | Authentication method for incoming connections. | `"None"` (Public)<br>`"ClientCert"` or `"mTLS"` (Strict Certificate-based)<br>`"OptionalClientCert"` (Client cert requested but not required, useful for IdP device auth)<br>`"JWT"` (Token-based) |
@@ -161,13 +161,30 @@ Configures the built-in Static File Server. This is highly optimized for serving
 #### `[Server.tunnel]` (Optional)
 Configures this server instance to bypass opening a local listening port (ignores `ip` and `port`), and instead establish an outbound, multiplexed mTLS connection to a standalone Relay Server. The Relay Server handles incoming internet traffic and routes it back to this instance based on SNI (Server Name Indication).
 
-> **Note on `ip` and `port`:** Even when the tunnel is active and Praeco does not open a local port, the `ip` and `port` fields **must** still be provided in the `[[Server]]` block due to the strict typing of the TOML parser. You can set them to dummy values in this case (e.g., `ip = "0.0.0.0"` and `port = 0`).
+> **Note on `ip` and `port`:** When a `[Server.tunnel]` is configured, `ip` and `port` are completely optional and can be omitted. They are only mandatory for standalone servers that open a local TCP/UDP listener.
 
 * `target_url`: String. The URL of the relay server control plane (e.g., `"tls://relay.example.com:7001"`).
 * `sni_domain`: String. The domain name this server is responsible for. The relay server routes traffic for this SNI to this tunnel. (e.g., `"api.example.com"`).
 * `client_cert_path`: String. Path to the client certificate (PEM) used to authenticate against the relay.
 * `client_key_path`: String. Path to the client private key (PEM).
 * `ca_cert_path`: String. Path to the CA certificate (PEM) that signed the relay server's certificate.
+
+**Example without `ip` and `port`:**
+```toml
+[[Server]]
+name = "api_gateway"
+enabled = true
+protocol = "https"
+authentication = "ClientCert"
+service = "Router"
+
+[Server.tunnel]
+target_url = "tls://relay.example.com:7001"
+sni_domain = "api.example.com"
+client_cert_path = "certs/praeco_client.pem"
+client_key_path = "certs/praeco_client.key"
+ca_cert_path = "certs/relay_ca.pem"
+```
 
 ---
 

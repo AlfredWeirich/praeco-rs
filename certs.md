@@ -66,6 +66,7 @@ Wenn die Domäne `*.aweirich.eu` mit offiziellen Let's Encrypt Zertifikaten betr
    Im ChatApp-Stack wird die Datei `conf.d/01_chatapp.toml` automatisiert aus Templates (`01_chatapp.toml.template` für Remote bzw. `01_chatapp.toml.local.template` für Lokal) durch das Skript `./switch_env.sh` im ChatApp-Verzeichnis erzeugt.
    - **Interne Zertifikate (`ca.pem`, `proxy-client.pem`, `idp_*.pem`):** Werden im Template über den Platzhalter `{{CHATAPP_CERTS_DIR}}` referenziert und beim Umschalten automatisch auf das Zertifikatsverzeichnis des aktuellen Rechners aufgelöst.
    - **Öffentliche Server-Zertifikate (Data Plane):** Werden über `{{CERT_*}}` substituiert (im Remote-Modus relativ unter `server_certs/api/fullchain.pem` etc., im Local-Modus auf die neu generierten IP-Zertifikate).
+   - **Tunnel-Modus vs. Lokal:** Im Remote-Modus (`01_chatapp.toml.template`) ist pro Server ein `[Server.tunnel]` konfiguriert; Praeco benötigt hier keine lokalen `ip`- und `port`-Angaben. Im lokalen Modus (`01_chatapp.toml.local.template`) lauscht Praeco direkt auf den lokalen Ports (1336–1339).
    
    **Wichtig:** Weder der Relay-Server (`RelayConfig.toml`) noch das ChatApp Backend (`Config.toml`) bekommen diese Let's Encrypt Zertifikate! Sie werden **ausschließlich** im Praeco Gateway für den Kontakt nach außen (die "Data Plane") konfiguriert.
 
