@@ -22,7 +22,7 @@ use anyhow::Context as _;
 use crate::{configuration::IdpParams, SrvError, ServiceRespBody};
 
 mod session;
-use session::{SessionStore, SessionStatus};
+use session::{SessionStore, SessionStatus, ConfirmError, CreateSessionError, PollError};
 
 pub mod webhook;
 use webhook::WebhookClient;
@@ -121,7 +121,14 @@ impl IdpService {
             self.params.cookie_name, token, self.params.token_expiry_seconds
         );
         if let Some(domain) = &self.params.cookie_domain {
-            cookie_val.push_str(&format!("; Domain={}", domain));
+            if self.params.cookie_name.starts_with("__Host-") {
+                tracing::warn!(
+                    "{}: cookie_domain '{}' ignored because cookie name '{}' uses __Host- prefix (RFC 6265bis mandates no Domain attribute)",
+                    self.server_name, domain, self.params.cookie_name
+                );
+            } else {
+                cookie_val.push_str(&format!("; Domain={}", domain));
+            }
         }
 
         let body = format!(r#"{{"status":"confirmed","redirect":"{}"}}"#, self.params.redirect_after_login);
@@ -136,7 +143,13 @@ impl IdpService {
         Ok(resp)
     }
 
-    fn handle_auth_confirm(&self, sid: &str, mut claims: Claims, dynamic_oids_res: Option<Result<Vec<String>, webhook::WebhookError>>) -> Response<ServiceRespBody> {
+    fn handle_auth_confirm(
+        &self,
+        sid: &str,
+        user_code: Option<&str>,
+        mut claims: Claims,
+        dynamic_oids_res: Option<Result<Vec<String>, webhook::WebhookError>>,
+    ) -> Response<ServiceRespBody> {
         if let Some(res) = dynamic_oids_res {
             match res {
                 Ok(dynamic_oids) => {
@@ -148,7 +161,7 @@ impl IdpService {
                     if self.params.on_webhook_failure == "reject" {
                         return Self::response_err(
                             StatusCode::SERVICE_UNAVAILABLE,
-                            "Claims resolution failed"
+                            "Claims resolution failed",
                         );
                     }
                     // "fallback_to_cert" -> keep original OIDs
@@ -156,10 +169,17 @@ impl IdpService {
             }
         }
 
-        if self.session_store.confirm_session(sid, claims) {
-            Self::response_ok(r#"{"status":"confirmed"}"#)
-        } else {
-            Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
+        match self.session_store.confirm_session(sid, user_code, claims) {
+            Ok(()) => Self::response_ok(r#"{"status":"confirmed"}"#),
+            Err(ConfirmError::InvalidUserCode) => {
+                Self::response_err(StatusCode::BAD_REQUEST, "Invalid confirmation user code")
+            }
+            Err(ConfirmError::AlreadyConfirmed) => {
+                Self::response_err(StatusCode::CONFLICT, "Session already confirmed")
+            }
+            Err(ConfirmError::NotFound | ConfirmError::Expired) => {
+                Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
+            }
         }
     }
 
@@ -212,9 +232,10 @@ pub enum IdpFuture {
         fetch_fut: webhook::WebhookFetchFuture,
         claims: Claims,
         sid: Option<String>,
+        code: Option<String>,
         idp: IdpService,
         is_token_endpoint: bool,
-    }
+    },
 }
 
 impl Future for IdpFuture {
@@ -226,7 +247,7 @@ impl Future for IdpFuture {
             IdpFutureProj::Ready { response } => {
                 Poll::Ready(Ok(response.take().unwrap()))
             }
-            IdpFutureProj::Webhook { fetch_fut, claims, sid, idp, is_token_endpoint } => {
+            IdpFutureProj::Webhook { fetch_fut, claims, sid, code, idp, is_token_endpoint } => {
                 let dynamic_oids_res = std::task::ready!(fetch_fut.poll(cx));
                 
                 let claims_owned = claims.clone();
@@ -234,7 +255,7 @@ impl Future for IdpFuture {
                     idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
                 } else {
                     let sid_str = sid.as_ref().unwrap();
-                    idp.handle_auth_confirm(sid_str, claims_owned, Some(dynamic_oids_res))
+                    idp.handle_auth_confirm(sid_str, code.as_deref(), claims_owned, Some(dynamic_oids_res))
                 };
                 Poll::Ready(Ok(resp))
             }
@@ -270,7 +291,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             }
         }
 
-        // Extract query parameters manually
+        // Extract query parameters and headers manually
         let query = req.uri().query().unwrap_or("").to_string();
         let session_id = query.split('&')
             .find_map(|kv| {
@@ -280,6 +301,36 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 } else {
                     None
                 }
+            });
+
+        let poll_secret = query.split('&')
+            .find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == "poll_secret" {
+                    parts.next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                req.headers()
+                    .get("x-poll-secret")
+                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+            });
+
+        let user_code = query.split('&')
+            .find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == "code" {
+                    parts.next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                req.headers()
+                    .get("x-user-code")
+                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
             });
 
         let requested_aud = query.split('&')
@@ -292,7 +343,11 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 }
             });
 
-        let aud = requested_aud.filter(|a| self.params.allowed_audiences.contains(a))
+        let client_ip = req.extensions().get::<std::net::SocketAddr>().map(|a| a.ip());
+
+        let aud = requested_aud.as_ref()
+            .filter(|a| self.params.allowed_audiences.contains(a))
+            .cloned()
             .or_else(|| self.params.allowed_audiences.first().cloned());
 
         // Determine if the request has a valid mTLS certificate.
@@ -324,13 +379,10 @@ impl Service<Request<crate::SrvBody>> for IdpService {
         match (method, path.as_str()) {
             // 0. Serve the generic HTML login page (Frontend UI)
             (Method::GET, "/auth/login_page") => {
-                let mut html = include_str!("idp_login.html").to_string();
-                let debug_flag = if self.params.debug_show_session_id.unwrap_or(false) { "true" } else { "false" };
-                html = html.replace("{{DEBUG_SESSION_FLAG}}", debug_flag);
-                
+                let html = include_str!("idp_login.html");
                 let res = Response::builder()
                     .status(StatusCode::OK)
-                    .header("Content-Type", "text/html")
+                    .header("Content-Type", "text/html; charset=utf-8")
                     .header("Cache-Control", "no-store, no-cache, must-revalidate")
                     .body(Full::new(Bytes::from(html)).map_err(SrvError::from).boxed())
                     .unwrap();
@@ -339,24 +391,70 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 1. Start a new DeviceAuth login session (Frontend calls this)
             (Method::POST, "/auth/login") => {
-                let sid = self.session_store.create_session();
-                debug!("{}: Created login session {}", self.server_name, sid);
-                let body = format!(r#"{{"session":"{sid}"}}"#);
-                IdpFuture::Ready { response: Some(Self::response_ok(body)) }
+                if let Some(ref a) = requested_aud {
+                    if !self.params.allowed_audiences.is_empty() && !self.params.allowed_audiences.contains(a) {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::BAD_REQUEST,
+                                "Requested audience is not in allowed_audiences",
+                            )),
+                        };
+                    }
+                }
+                let target_aud = requested_aud.or_else(|| self.params.allowed_audiences.first().cloned());
+
+                match self.session_store.create_session(client_ip, target_aud) {
+                    Ok(info) => {
+                        debug!("{}: Created login session {}", self.server_name, info.session_id);
+                        let body = format!(
+                            r#"{{"session":"{}","poll_secret":"{}","user_code":"{}"}}"#,
+                            info.session_id, info.poll_secret, info.user_code
+                        );
+                        IdpFuture::Ready { response: Some(Self::response_ok(body)) }
+                    }
+                    Err(CreateSessionError::RateLimited) => {
+                        IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "Rate limit exceeded. Please wait before creating a new login session.",
+                            )),
+                        }
+                    }
+                    Err(CreateSessionError::CapacityExceeded) => {
+                        IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Server busy: maximum active sessions reached.",
+                            )),
+                        }
+                    }
+                }
             }
 
-            // 2. Poll the status of a login session (Frontend calls this)
+            // 2. Poll the status of a login session (Frontend calls this, requires poll_secret)
             (Method::GET, "/auth/status") => {
                 let sid = match session_id {
                     Some(sid) => sid,
-                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")) },
+                    None => return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
+                    },
                 };
 
-                let resp = match self.session_store.get_and_consume(&sid) {
-                    Some(SessionStatus::Pending) => {
+                let secret = match poll_secret {
+                    Some(s) => s,
+                    None => return IdpFuture::Ready {
+                        response: Some(Self::response_err(
+                            StatusCode::UNAUTHORIZED,
+                            "Missing poll_secret parameter or X-Poll-Secret header",
+                        )),
+                    },
+                };
+
+                let resp = match self.session_store.get_and_consume(&sid, &secret) {
+                    Ok(SessionStatus::Pending) => {
                         Self::response_ok(r#"{"status":"pending"}"#)
                     }
-                    Some(SessionStatus::Confirmed(claims)) => {
+                    Ok(SessionStatus::Confirmed(claims)) => {
                         info!("{}: Session {} confirmed, issuing JWT.", self.server_name, sid);
                         match self.generate_jwt_cookie_response(claims) {
                             Ok(r) => r,
@@ -366,9 +464,30 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             }
                         }
                     }
-                    None => {
+                    Err(PollError::Unauthorized) => {
+                        Self::response_err(StatusCode::UNAUTHORIZED, "Invalid poll secret")
+                    }
+                    Err(PollError::NotFound) => {
                         Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
                     }
+                };
+                IdpFuture::Ready { response: Some(resp) }
+            }
+
+            // 2b. View session user_code on device (for Quishing verification)
+            (Method::GET, "/auth/session_info") => {
+                let sid = match session_id {
+                    Some(sid) => sid,
+                    None => return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
+                    },
+                };
+                let resp = match self.session_store.get_session_user_code(&sid) {
+                    Some(code) => {
+                        let body = format!(r#"{{"user_code":"{}"}}"#, code);
+                        Self::response_ok(body)
+                    }
+                    None => Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired"),
                 };
                 IdpFuture::Ready { response: Some(resp) }
             }
@@ -377,12 +496,16 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             (Method::POST, "/auth/confirm") => {
                 let sid = match session_id {
                     Some(sid) => sid,
-                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")) },
+                    None => return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
+                    },
                 };
 
                 let claims = match mtls_claims {
                     Some(c) => c,
-                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")) },
+                    None => return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")),
+                    },
                 };
 
                 if let Some(wh) = &self.webhook_client {
@@ -395,18 +518,19 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                 fetch_fut,
                                 claims,
                                 sid: Some(sid),
+                                code: user_code,
                                 idp: self.clone(),
                                 is_token_endpoint: false,
                             };
                         }
                         Err(e) => {
-                            let resp = self.handle_auth_confirm(&sid, claims, Some(Err(e)));
+                            let resp = self.handle_auth_confirm(&sid, user_code.as_deref(), claims, Some(Err(e)));
                             return IdpFuture::Ready { response: Some(resp) };
                         }
                     }
                 }
 
-                let resp = self.handle_auth_confirm(&sid, claims, None);
+                let resp = self.handle_auth_confirm(&sid, user_code.as_deref(), claims, None);
                 IdpFuture::Ready { response: Some(resp) }
             }
 
@@ -427,6 +551,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                 fetch_fut,
                                 claims,
                                 sid: None,
+                                code: None,
                                 idp: self.clone(),
                                 is_token_endpoint: true,
                             };
