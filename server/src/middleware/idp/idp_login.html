@@ -32,10 +32,10 @@
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
             border-radius: 12px;
-            padding: 40px;
+            padding: 36px;
             text-align: center;
             box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
-            max-width: 420px;
+            max-width: 440px;
             width: 100%;
             box-sizing: border-box;
         }
@@ -43,14 +43,14 @@
         h1 {
             font-size: 1.5rem;
             margin-top: 0;
-            margin-bottom: 10px;
+            margin-bottom: 8px;
             color: var(--text-color);
         }
 
         p {
             font-size: 0.95rem;
             color: #94a3b8;
-            margin-bottom: 24px;
+            margin-bottom: 20px;
             line-height: 1.5;
         }
 
@@ -59,37 +59,86 @@
             padding: 16px;
             border-radius: 8px;
             display: inline-block;
-            margin-bottom: 20px;
+            margin-bottom: 18px;
+        }
+
+        .session-box {
+            background-color: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px 14px;
+            margin-bottom: 14px;
+            text-align: left;
+        }
+
+        .session-title {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            margin-bottom: 6px;
+        }
+
+        .session-id-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .session-id-row code {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 0.8rem;
+            color: #38bdf8;
+            word-break: break-all;
+            user-select: all;
+        }
+
+        .copy-btn {
+            background-color: #334155;
+            color: #f8fafc;
+            border: 1px solid #475569;
+            border-radius: 6px;
+            padding: 4px 10px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background-color 0.2s;
+            flex-shrink: 0;
+        }
+
+        .copy-btn:hover {
+            background-color: #475569;
         }
 
         .user-code-box {
             background-color: #0f172a;
             border: 1px solid var(--border-color);
             border-radius: 8px;
-            padding: 12px 16px;
-            margin-bottom: 24px;
+            padding: 10px 14px;
+            margin-bottom: 20px;
         }
 
         .user-code-title {
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             text-transform: uppercase;
             letter-spacing: 0.08em;
             color: #94a3b8;
-            margin-bottom: 4px;
+            margin-bottom: 2px;
         }
 
         .user-code-digits {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            font-size: 1.6rem;
+            font-size: 1.4rem;
             font-weight: 700;
             letter-spacing: 0.15em;
             color: var(--code-color);
         }
 
         .user-code-note {
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             color: #64748b;
-            margin-top: 4px;
+            margin-top: 2px;
         }
 
         .status {
@@ -126,27 +175,46 @@
 <body>
     <div class="container">
         <h1>Device Authentication</h1>
-        <p>Scan this QR code with your trusted mobile app to securely log in to the dashboard.</p>
+        <p>Scanne den QR-Code mit der ChatApp oder gib die Session-ID manuell ein.</p>
         
         <div class="qr-container">
             <canvas id="qr-code"></canvas>
         </div>
 
+        <div class="session-box" id="session-box">
+            <div class="session-title">Session ID (für manuelle Eingabe / Simulator)</div>
+            <div class="session-id-row">
+                <code id="session-id-text">Lade Session...</code>
+                <button type="button" class="copy-btn" id="copy-btn" onclick="copySessionId()">Kopieren</button>
+            </div>
+        </div>
+
         <div class="user-code-box" id="user-code-box" style="display: none;">
             <div class="user-code-title">Verification Code</div>
             <div class="user-code-digits" id="user-code-digits">---</div>
-            <div class="user-code-note">Verify this code matches on your mobile device</div>
+            <div class="user-code-note">Optionaler Bestätigungscode (Quishing-Schutz)</div>
         </div>
 
         <div class="status" id="status-container">
             <div class="spinner"></div>
-            <span id="status-text">Waiting for device confirmation...</span>
+            <span id="status-text">Warte auf Bestätigung...</span>
         </div>
 
         <div class="error" id="error-message"></div>
     </div>
 
     <script>
+        function copySessionId() {
+            const sid = document.getElementById('session-id-text').textContent;
+            if (!sid || sid === 'Lade Session...') return;
+            navigator.clipboard.writeText(sid).then(() => {
+                const btn = document.getElementById('copy-btn');
+                const orig = btn.textContent;
+                btn.textContent = 'Kopiert!';
+                setTimeout(() => btn.textContent = orig, 1500);
+            });
+        }
+
         document.addEventListener('DOMContentLoaded', async () => {
             const errorEl = document.getElementById('error-message');
             const statusEl = document.getElementById('status-container');
@@ -160,9 +228,9 @@
                 });
                 if (!loginRes.ok) {
                     if (loginRes.status === 429) {
-                        throw new Error("Rate limit exceeded. Please wait a moment before trying again.");
+                        throw new Error("Rate-Limit erreicht. Bitte warte kurz vor einem erneuten Versuch.");
                     }
-                    throw new Error("Failed to initialize login session");
+                    throw new Error("Fehler beim Initialisieren der Login-Sitzung.");
                 }
                 const data = await loginRes.json();
                 const sessionId = data.session;
@@ -177,7 +245,10 @@
                     level: 'H'
                 });
 
-                // Display verification code for Quishing protection
+                // Display Session ID for manual input / Simulator
+                document.getElementById('session-id-text').textContent = sessionId;
+
+                // Display verification code
                 if (userCode) {
                     const codeBox = document.getElementById('user-code-box');
                     const codeDigits = document.getElementById('user-code-digits');
@@ -200,16 +271,16 @@
                         if (!statusRes.ok) {
                             if (statusRes.status === 404) {
                                 clearInterval(pollInterval);
-                                throw new Error("Session expired. Please refresh the page.");
+                                throw new Error("Sitzung abgelaufen. Bitte Seite neu laden.");
                             } else if (statusRes.status === 401) {
                                 clearInterval(pollInterval);
-                                throw new Error("Authentication failed: unauthorized poll request.");
+                                throw new Error("Nicht autorisierte Statusabfrage.");
                             }
                         } else {
                             const data = await statusRes.json();
                             if (data.status === 'confirmed' && data.redirect) {
                                 clearInterval(pollInterval);
-                                statusText.textContent = "Login confirmed!";
+                                statusText.textContent = "Login bestätigt!";
                                 statusEl.querySelector('.spinner').style.display = 'none';
                                 window.location.href = data.redirect;
                                 return;
