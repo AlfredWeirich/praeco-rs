@@ -23,7 +23,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 use rustls::crypto::CryptoProvider;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls_pki_types::{CertificateRevocationListDer, pem::PemObject};
+use rustls_pki_types::{CertificateDer, CertificateRevocationListDer, pem::PemObject};
 use std::fmt::Debug;
 use tracing::trace;
 use x509_parser::prelude::*;
@@ -236,7 +236,10 @@ pub fn tls_config(
 /// matching extensions are found or if `pki_base_oid` is not configured.
 pub fn extract_oids_from_cert(cert_der: &[u8]) -> Vec<String> {
     let mut oids = Vec::new();
-    let config = crate::configuration::Config::global();
+    let config = match crate::configuration::Config::try_global() {
+        Some(c) => c,
+        None => return oids,
+    };
 
     // 1. Get the pre-computed base OID (Vec<u64>).
     //    If not configured or empty, there's nothing to match against.
@@ -326,4 +329,72 @@ pub fn extract_cert_san_and_pem(cert_der: &[u8]) -> (Option<String>, Option<Stri
         }
     }
     (Some(pem), san_dns)
+}
+
+/// Identity metadata extracted from a client certificate presented during mTLS.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientIdentityMetadata {
+    /// OID suffixes matching the configured `pki_base_oid` (used to determine roles).
+    pub oids: Vec<String>,
+    /// Full PEM-encoded certificate string, if available.
+    pub pem: Option<String>,
+    /// Subject Alternative Name (DNS), if present in the certificate.
+    pub san: Option<String>,
+}
+
+/// Extracts identity metadata strictly from the client's **leaf** certificate
+/// (the first certificate in the provided chain).
+///
+/// Any subsequent intermediate or extra certificates in the chain are intentionally
+/// ignored to prevent privilege escalation via injected certificates.
+pub fn extract_client_metadata(
+    certs: Option<&[CertificateDer<'_>]>,
+) -> ClientIdentityMetadata {
+    if let Some(leaf) = certs.and_then(|c| c.first()) {
+        let (pem, san) = extract_cert_san_and_pem(leaf.as_ref());
+        let oids = extract_oids_from_cert(leaf.as_ref());
+        ClientIdentityMetadata { oids, pem, san }
+    } else {
+        ClientIdentityMetadata::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_client_metadata_none() {
+        let meta = extract_client_metadata(None);
+        assert_eq!(meta, ClientIdentityMetadata::default());
+        assert!(meta.oids.is_empty());
+        assert!(meta.pem.is_none());
+        assert!(meta.san.is_none());
+    }
+
+    #[test]
+    fn test_extract_client_metadata_empty_slice() {
+        let meta = extract_client_metadata(Some(&[]));
+        assert_eq!(meta, ClientIdentityMetadata::default());
+        assert!(meta.oids.is_empty());
+        assert!(meta.pem.is_none());
+        assert!(meta.san.is_none());
+    }
+
+    #[test]
+    fn test_extract_client_metadata_only_uses_first_leaf_cert() {
+        let leaf_bytes = b"leaf_certificate_dummy_payload";
+        let extra_bytes = b"injected_intermediate_or_admin_payload";
+
+        let leaf_cert = CertificateDer::from(leaf_bytes.as_slice());
+        let extra_cert = CertificateDer::from(extra_bytes.as_slice());
+
+        let chain = [leaf_cert, extra_cert];
+        let meta = extract_client_metadata(Some(&chain));
+
+        // PEM must belong solely to the leaf certificate (first in chain)
+        let pem = meta.pem.expect("PEM should be present");
+        assert!(pem.contains("bGVhZl9jZXJ0aWZpY2F0ZV9kdW1teV9wYXlsb2Fk"));
+        assert!(!pem.contains("aW5qZWN0ZWRfaW50ZXJtZWRpYXRl"));
+    }
 }

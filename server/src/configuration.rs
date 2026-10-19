@@ -924,6 +924,11 @@ impl Config {
         Ok(Self::global())
     }
 
+    /// Returns a cloned `Arc<Config>` from the global configuration singleton if initialized.
+    pub fn try_global() -> Option<Arc<Config>> {
+        CONFIG.get().map(|c| c.load_full())
+    }
+
     /// Returns a cloned `Arc<Config>` from the global configuration singleton.
     ///
     /// # Panics
