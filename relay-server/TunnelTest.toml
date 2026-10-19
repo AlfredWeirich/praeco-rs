@@ -10,10 +10,6 @@ otel_log_level = "info"
 [[Server]]
 name = "tunnel_api"
 
-###### IGNORED in TUNNEL MODE######
-ip = "0.0.0.0" # Ignored because tunnel is active
-port = 0 # Ignored because tunnel is active
-###### IGNORED in TUNNEL MODE######
 
 enabled = true
 protocol = "https"

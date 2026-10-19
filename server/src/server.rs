@@ -164,9 +164,9 @@ fn main() -> Result<(), Error> {
 async fn main_async(config: Arc<Config>) -> Result<(), Error> {
     let mut server_join_set = tokio::task::JoinSet::new();
 
-    // Map: port -> (CancellationToken, Arc<ServerConfig>, Arc<ArcSwap<BoxedCloneService>>)
+    // Map: name -> (CancellationToken, Arc<ServerConfig>, Arc<ArcSwap<BoxedCloneService>>)
     let mut active_servers: HashMap<
-        u16,
+        String,
         (
             CancellationToken,
             Arc<ServerConfig>,
@@ -198,7 +198,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
         active_servers.insert(
-            server_config.port,
+            server_config.name.clone(),
             (
                 cancel_token.clone(),
                 server_config_arc.clone(),
@@ -246,7 +246,7 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                     let server_config_arc = Arc::new(new_server.clone());
                     match build_service_stack(&server_config_arc) {
                         Ok(svc) => {
-                            built_stacks.insert(new_server.port, (server_config_arc, svc));
+                            built_stacks.insert(new_server.name.clone(), (server_config_arc, svc));
                         }
                         Err(e) => {
                             error!("{}: FAILED to build service stack (dry-run): {:?}", new_server.name, e);
@@ -268,23 +268,26 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                 info!("Dry-run passed. Applying new configuration...");
                 let mut next_active_servers = std::collections::HashMap::new();
 
-                for (port, (server_config_arc, service_stack)) in built_stacks {
+                for (name, (server_config_arc, service_stack)) in built_stacks {
                     let new_server = &server_config_arc;
-                    let needs_restart = match active_servers.get(&port) {
-                        None => true, // New listener on this port
+                    let needs_restart = match active_servers.get(&name) {
+                        None => true, // New server with this name
                         Some((_, old_server, _)) => {
-                            // Restart listener if fundamental binding parameters changed
-                            old_server.ip != new_server.ip || old_server.protocol != new_server.protocol
+                            // Restart listener if fundamental binding parameters or tunnel changed
+                            old_server.ip != new_server.ip
+                                || old_server.port != new_server.port
+                                || old_server.protocol != new_server.protocol
+                                || old_server.tunnel != new_server.tunnel
                         }
                     };
 
                     if needs_restart {
-                        info!("Starting new listener for '{}' on port {}", new_server.name, port);
+                        info!("Starting server '{}'...", new_server.name);
                         let cancel_token = CancellationToken::new();
                         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
                         next_active_servers.insert(
-                            port,
+                            name,
                             (cancel_token.clone(), server_config_arc.clone(), dynamic_stack.clone()),
                         );
 
@@ -295,19 +298,19 @@ async fn main_async(config: Arc<Config>) -> Result<(), Error> {
                     } else {
                         // Keep listener alive!
                         // Removing from active_servers so we know which ones to drop later
-                        let (old_token, _, dynamic_stack) = active_servers.remove(&port).unwrap();
+                        let (old_token, _, dynamic_stack) = active_servers.remove(&name).unwrap();
                         
                         // Hot-swap service stack for new config
                         dynamic_stack.store(Arc::new(service_stack));
-                        info!("Hot-swapped service stack for '{}' on port {}", new_server.name, port);
+                        info!("Hot-swapped service stack for '{}'", new_server.name);
 
-                        next_active_servers.insert(port, (old_token, server_config_arc.clone(), dynamic_stack));
+                        next_active_servers.insert(name, (old_token, server_config_arc.clone(), dynamic_stack));
                     }
                 }
 
                 // 4. Stop drained/removed listeners
-                for (port, (token, old_server, _)) in active_servers.drain() {
-                    info!("Stopping listener for '{}' on port {}", old_server.name, port);
+                for (_name, (token, old_server, _)) in active_servers.drain() {
+                    info!("Stopping server '{}'", old_server.name);
                     token.cancel();
                 }
 
@@ -358,20 +361,6 @@ async fn start_single_server(
         spawn_router_health_checks(&server_config, cancel_token.clone());
     }
 
-    let server_addr = match server_config.get_server_ip() {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!("{}: Failed to resolve IP: {:?}", server_config.name, e);
-            return;
-        }
-    };
-
-    info!(
-        "{}: Listening on {} ({:?})",
-        server_config.name, server_addr, server_config.protocol
-    );
-
-    // === HTTPS / DUAL STACK PATH ===
     let oid_mapping = Arc::new(server_config.oid_mapping.clone());
 
     if let Some(tunnel) = &server_config.tunnel {
@@ -418,6 +407,21 @@ async fn start_single_server(
         }
         return;
     }
+
+    let server_addr = match server_config.get_server_ip() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("{}: Failed to resolve IP: {:?}", server_config.name, e);
+            return;
+        }
+    };
+
+    info!(
+        "{}: Listening on {} ({:?})",
+        server_config.name, server_addr, server_config.protocol
+    );
+
+    // === HTTPS / DUAL STACK PATH ===
 
     if server_config.protocol == Protocol::Https {
         let tls_config: RustlsServerConfig = match build_rustls_config(server_config.as_ref()) {
@@ -939,7 +943,7 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         layers,
         server_config.static_name.expect("static_name missing"),
         compiled_allowed_pathes.clone(),
-        server_config.port,
+        server_config.port.unwrap_or(0),
         Arc::new(server_config.oid_mapping.clone()),
     );
 

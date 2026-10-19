@@ -143,7 +143,7 @@ pub struct Config {
 //  Per-Server Configuration
 // ============================================================================
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct TunnelConfig {
     pub target_url: String,
     pub sni_domain: String,
@@ -167,10 +167,12 @@ pub struct ServerConfig {
     pub static_name: Option<&'static str>,
 
     /// IP address to bind to. The special value `"local"` resolves to the
-    /// machine's primary local IP at startup.
-    pub ip: String,
-    /// TCP/UDP port to listen on.
-    pub port: u16,
+    /// machine's primary local IP at startup. Optional if a `tunnel` is configured.
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// TCP/UDP port to listen on. Optional if a `tunnel` is configured.
+    #[serde(default)]
+    pub port: Option<u16>,
     
     /// Optional Tunnel configuration for Outbound Zero-Trust connections (SNI Relay)
     #[serde(default)]
@@ -968,6 +970,22 @@ impl ServerConfig {
             }
         }
 
+        // Validate network binding requirements: if no tunnel is configured, ip and port are mandatory
+        if self.tunnel.is_none() {
+            if self.ip.is_none() {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{}': 'ip' is required when no [Server.tunnel] is configured.",
+                    self.name
+                )));
+            }
+            if self.port.is_none() {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{}': 'port' is required when no [Server.tunnel] is configured.",
+                    self.name
+                )));
+            }
+        }
+
         self.init_parsed_routes()?;
         self.init_compiled_allowed_pathes()?;
         // === VALIDATION STEP ===
@@ -1082,14 +1100,21 @@ impl ServerConfig {
     /// The special IP value `"local"` resolves to the machine's primary
     /// local IP address at runtime.
     pub fn get_server_ip(&self) -> Result<SocketAddr, Error> {
-        let ip_str = if self.ip == "local" {
+        let ip = self.ip.as_deref().ok_or_else(|| {
+            Error::msg(format!("Configuration error in Server '{}': 'ip' is not configured", self.name))
+        })?;
+        let port = self.port.ok_or_else(|| {
+            Error::msg(format!("Configuration error in Server '{}': 'port' is not configured", self.name))
+        })?;
+
+        let ip_str = if ip == "local" {
             local_ip_address::local_ip()?.to_string()
         } else {
-            self.ip.clone()
+            ip.to_string()
         };
-        format!("{}:{}", ip_str, self.port)
+        format!("{}:{}", ip_str, port)
             .parse()
-            .with_context(|| format!("Invalid address: {}:{}", ip_str, self.port))
+            .with_context(|| format!("Invalid address: {}:{}", ip_str, port))
     }
 
     /// Parses the raw reverse route configuration into structured [`ParsedRoute`] objects.
@@ -1414,4 +1439,53 @@ impl ServerConfig {
 /// Provided for backward compatibility with older calling code in `main()`.
 pub fn get_configuration(config_file: &str) -> Result<Arc<Config>, Error> {
     Config::init(config_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_with_tunnel_optional_ip_port() {
+        let toml_str = r#"
+            name = "tunnel_server"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+
+            [tunnel]
+            target_url = "tls://localhost:7001"
+            sni_domain = "example.com"
+            client_cert_path = "dummy.pem"
+            client_key_path = "dummy.key"
+            ca_cert_path = "dummy_ca.pem"
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(server.ip.is_none());
+        assert!(server.port.is_none());
+        assert!(server.finalize().is_ok());
+    }
+
+    #[test]
+    fn test_server_without_tunnel_requires_ip_and_port() {
+        let toml_str = r#"
+            name = "listen_server"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(server.ip.is_none());
+        assert!(server.port.is_none());
+        let res = server.finalize();
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("'ip' is required"));
+    }
 }
