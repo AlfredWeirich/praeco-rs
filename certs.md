@@ -62,13 +62,11 @@ Wenn die Domäne `*.aweirich.eu` mit offiziellen Let's Encrypt Zertifikaten betr
 3. **Dynamische IP (Fritzbox):**
    Wenn sich die öffentliche IP deiner Fritzbox ändert, muss lediglich der DynDNS-Eintrag für `aweirich.eu` aktualisiert werden. Praeco selbst ist die IP-Adresse egal (es bindet sich an `0.0.0.0`). 
 
-4. **Wo werden die Let's Encrypt Zertifikate eingetragen?**
-   Die neuen Let's Encrypt Zertifikate (meistens `fullchain.pem` und `privkey.pem` genannt) ersetzen deine bisherigen Self-Signed-Zertifikate `praeco_public.pem` und `praeco_public.key`. Du trägst die Dateipfade dazu einfach in der Praeco-Konfiguration (`01_chatapp.toml`) bei *jedem* `[[Server]]` Block im Abschnitt `[Server.server_certs]` ein:
-   ```toml
-   [Server.server_certs]
-   ssl_certificate = "/pfad/zu/letsencrypt/fullchain.pem"
-   ssl_certificate_key = "/pfad/zu/letsencrypt/privkey.pem"
-   ```
+4. **Wo werden die Zertifikate eingetragen? (Automatisierte Generierung)**
+   Im ChatApp-Stack wird die Datei `conf.d/01_chatapp.toml` automatisiert aus Templates (`01_chatapp.toml.template` für Remote bzw. `01_chatapp.toml.local.template` für Lokal) durch das Skript `./switch_env.sh` im ChatApp-Verzeichnis erzeugt.
+   - **Interne Zertifikate (`ca.pem`, `proxy-client.pem`, `idp_*.pem`):** Werden im Template über den Platzhalter `{{CHATAPP_CERTS_DIR}}` referenziert und beim Umschalten automatisch auf das Zertifikatsverzeichnis des aktuellen Rechners aufgelöst.
+   - **Öffentliche Server-Zertifikate (Data Plane):** Werden über `{{CERT_*}}` substituiert (im Remote-Modus relativ unter `server_certs/api/fullchain.pem` etc., im Local-Modus auf die neu generierten IP-Zertifikate).
+   
    **Wichtig:** Weder der Relay-Server (`RelayConfig.toml`) noch das ChatApp Backend (`Config.toml`) bekommen diese Let's Encrypt Zertifikate! Sie werden **ausschließlich** im Praeco Gateway für den Kontakt nach außen (die "Data Plane") konfiguriert.
 
 ---
