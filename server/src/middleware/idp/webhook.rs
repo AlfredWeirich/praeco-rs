@@ -107,12 +107,12 @@ impl WebhookClient {
         };
 
         // If webhook uses HTTPS, load mTLS configs if provided
-        let root_store = common::build_root_store(&params.claims_webhook_ca_cert);
+        let root_store = common::build_root_store(&params.claims_webhook_ca_cert)?;
         let tls_config = common::build_tls_client_config(
             root_store,
             params.claims_webhook_client_cert.as_deref(),
             params.claims_webhook_client_key.as_deref(),
-        );
+        )?;
 
         let pool_config = common::client::ClientPoolConfig {
             idle_timeout: Some(Duration::from_secs(60)),

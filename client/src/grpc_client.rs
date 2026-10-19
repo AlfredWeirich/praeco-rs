@@ -50,7 +50,7 @@ async fn main() -> Result<(), Error> {
     let _jwt_token = read_jwt(&cli);
 
     // Construct the networking client (Hyper-based) with appropriate TLS/Auth settings
-    let client = build_client(&cli);
+    let client = build_client(&cli)?;
 
     // Build the URI from the CLI parameters
     let scheme = match cli.security {
@@ -162,14 +162,16 @@ fn validate_cli(cli: &Cli) {
     }
 }
 
-fn build_client(cli: &Cli) -> Client<common::client::HttpsConnector<HttpConnector>, Full<Bytes>> {
-    let root_store = common::build_root_store(&cli.ca);
+fn build_client(
+    cli: &Cli,
+) -> Result<Client<common::client::HttpsConnector<HttpConnector>, Full<Bytes>>, Error> {
+    let root_store = common::build_root_store(&cli.ca)?;
     let tls_client_config = match cli.security {
         Protocol::Http | Protocol::Https | Protocol::Jwt => {
-            common::build_tls_client_config(root_store, None, None)
+            common::build_tls_client_config(root_store, None, None)?
         }
         Protocol::Mtls => {
-            common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref())
+            common::build_tls_client_config(root_store, cli.cert.as_deref(), cli.key.as_deref())?
         }
     };
 
@@ -179,7 +181,7 @@ fn build_client(cli: &Cli) -> Client<common::client::HttpsConnector<HttpConnecto
         http2_only: false,
     };
 
-    common::client::build_hyper_client(tls_client_config, pool_config)
+    Ok(common::client::build_hyper_client(tls_client_config, pool_config))
 }
 
 /// Reads a JWT token from the provided file, if applicable.
