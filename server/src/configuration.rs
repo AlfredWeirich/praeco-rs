@@ -526,7 +526,7 @@ pub enum RateLimiter {
 
 /// Container for the ordered list of enabled layers and their per-layer
 /// configuration sections.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct Layers {
     /// Ordered list of layer names. The order defines the middleware
     /// wrapping order (first entry = outermost layer).

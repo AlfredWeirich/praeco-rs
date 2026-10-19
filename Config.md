@@ -118,14 +118,16 @@ Array of tables (multiple CAs can be trusted).
 * `ssl_client_crl`: String (Optional). Path to the Certificate Revocation List.
 
 #### `[Server.client_cert_forwarding]` (Optional)
-This configuration controls the secure passing of client identities to backend servers. It fulfills two essential tasks:
-1. **Security / Header Sanitizing (Protection against Spoofing):** Before the request goes to the backend, the proxy strictly removes all incoming headers that match these configured names. This prevents an attacker from manually sending headers (e.g., `x-client-san: <foreign-id>`) on a public port and impersonating someone else (Identity Spoofing).
-2. **Injection:** If the client has successfully authenticated via mTLS, the proxy extracts the certificate and the SAN (Subject Alternative Name) and re-injects these trusted values under the specified header names into the request to the backend.
+This configuration controls the passing of verified client identities to backend servers.
+1. **Global Identity Header Sanitizing (Protection against Spoofing):**
+   Unconditionally — across **all** servers and routes, regardless of whether `client_cert_forwarding` is enabled — Praeco-rs removes all incoming client-supplied identity headers (`x-client-cert`, `x-client-san`, `x-client-roles`, `x-ssl-*`, etc.) as well as untrusted `Forwarded` headers. Hop-by-hop headers per RFC 7230 §6.1 are removed, `X-Real-IP` and `X-Forwarded-*` are safely managed, and backend `Server` headers are stripped from responses.
+2. **Verified Injection:**
+   If the client has successfully authenticated via mTLS, this section allows injecting the verified certificate, SAN, roles, or client IP under the specified header names into the request forwarded to the backend.
 
 * `header_cert`: String. HTTP header name for the URL-encoded client certificate.
 * `header_san`: String. HTTP header name for the SAN (Subject Alternative Name).
 * `header_roles`: String. HTTP header name for the forwarded user roles (e.g., `x-user-roles`).
-* `header_client_ip`: String. HTTP header name for the client IP address (e.g., `x-forwarded-for`).
+* `header_client_ip`: String. HTTP header name for the client IP address (e.g., `x-client-ip`).
 
 ### Identity Provider (IdP) Configuration
 
