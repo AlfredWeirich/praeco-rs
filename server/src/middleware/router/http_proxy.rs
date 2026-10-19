@@ -106,7 +106,8 @@ pub async fn handle_http_proxy(
 
         match client.request(proxy_req).await {
             Ok(res) => {
-                let (res_parts, res_body) = res.into_parts();
+                let (mut res_parts, res_body) = res.into_parts();
+                super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
                     res_parts,
                     res_body.map_err(SrvError::from).boxed(),

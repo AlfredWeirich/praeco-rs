@@ -49,7 +49,7 @@ Each incoming request passes through the `call()` method:
 3. **Path Canonicalization** — Validates and canonicalizes the request path (RFC 3986), rejecting traversal attempts and illegal encodings before routing.
 4. **Route Lookup** — Matches the canonical request path against the radix-tree router. Returns `404 Not Found` on miss.
 5. **RBAC Enforcement** — Delegates to `rbac::enforce_rbac()`. Returns `403 Forbidden` on denial.
-6. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers and inject tokens.
+6. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers, unconditionally strip untrusted client identity headers (`x-client-cert`, `x-client-roles`, etc.), sanitize `X-Forwarded-*` / `Forwarded`, and inject verified identity tokens.
 7. **Buffering Decision** — Determines if the request body should be streamed or buffered in memory (required for retries or transcoding).
 8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, or `grpc_web` based on the configured `RouteBackendType`.
 
@@ -84,7 +84,7 @@ pub struct RouterService {
 | `grpc_passthrough` | Proxies pure gRPC traffic, fixing `te: trailers` and managing streaming. |
 | `grpc_web` | Handles dynamic JSON-to-Protobuf transcoding using reflection. |
 | `rbac` | Enforces Role-Based Access Control logic based on configured OIDs. |
-| `headers` | Prepares proxy headers and strips restricted hop-by-hop HTTP headers. |
+| `headers` | Prepares proxy headers, unconditionally strips client identity headers, strips hop-by-hop headers, manages `X-Forwarded-*`, and cleans upstream responses. |
 | `upstreams` | Upstream management and target evaluation logic. |
 
 ## Cloning & Performance
