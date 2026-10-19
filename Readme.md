@@ -55,7 +55,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
   * **Identity Forwarding**: If the upstream server needs to know who the caller is (e.g., for detailed logs or resource-based authorization), the proxy can forward the extracted roles (from the OID), the SAN, or even the entire client certificate as secure HTTP headers (`client_cert_forwarding`) to the upstream.
 - **Advanced Upstream Management**: Built-in support for multiple load-balancing strategies (`RoundRobin`, `Random`, `LeastConnections`, `Sticky`, `HighestScore`) combined with **Active Health Checking** ensures traffic is only routed to healthy nodes.
 - **Built-in Rate Limiting & Traffic Shaping**: Includes flexible token-bucket/window rate limiting strategies, global concurrency limits, and request timeouts to prevent abuse and cascaded failures, right out of the box.
-- **Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload the `Config.toml` and rebuild its routing tables on the fly using `ArcSwap`, without dropping active connections.
+- **Crash-Safe Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload `Config.toml` and rebuild its routing tables and TLS contexts on the fly using `ArcSwap`, without dropping active connections. Reloads run through an isolated validation and dry-run phase: if a syntax, route, or certificate error is detected, the old working configuration is preserved and the process continues safely without crashing.
 - **End-to-End mTLS Bridging**: In addition to mTLS termination at the gateway, the proxy can establish a completely **new mTLS connection to the upstream servers** (including its own client certificate). This guarantees a fully encrypted and authenticated zero-trust chain deep into the internal backend.
 - **Built-in Identity Provider (IdP)**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support advanced authentication flows like QR-code-based cross-device logins.
 - **Built-in Static File Server**: Beyond proxying and Identity Provider functions, Praeco can act as a highly performant static file server. It supports SPA-Routing (fallback to `index.html`) out of the box, completely eliminating the need for Nginx when serving React, Vue, or WebAssembly (e.g. Iced) frontends alongside your APIs.
@@ -156,7 +156,7 @@ cargo run -p praeco-rs --release
 ./start_server.sh
 ```
 
-By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process.
+By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process. Reloads are crash-safe: the new configuration and TLS certificates are fully validated in an isolated dry-run before activating, keeping the existing configuration intact if errors are found.
 
 
 ### Attachment:

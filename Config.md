@@ -3,9 +3,9 @@
 This manual describes all available parameters of the `Config.toml` and their possible values. The configuration controls the global behavior of the gateway as well as the detailed settings of individual server instances (listeners, routes, middleware).
 
 ## Starting with an Alternative Configuration File
-
+ 
 By default, the server looks for a file named `Config.toml` in the current directory upon startup. However, you can pass an alternative configuration file to the server by specifying the path as the first command-line argument:
-
+ 
 ```bash
 # When running the compiled binary
 ./server /path/to/another_config.toml
@@ -13,6 +13,8 @@ By default, the server looks for a file named `Config.toml` in the current direc
 # When running via Cargo (during development)
 cargo run --bin server -- /path/to/another_config.toml
 ```
+
+When receiving a `SIGHUP` signal, `praeco-rs` dynamically hot-reloads from the exact configuration file specified at startup. The reload process runs an atomic, crash-safe dry-run: all service stacks and TLS contexts are validated in memory before any live listeners or global state are swapped. If validation fails, the running configuration remains completely untouched.
 
 ---
 
@@ -246,6 +248,9 @@ Here is an overview of the most useful values for configuration:
 * `allowed_headers`: Array of strings. Allowed HTTP headers (e.g., `["content-type", "authorization", "x-client-cert"]`).
 * `allow_credentials`: Boolean. Indicates whether credentials (e.g., cookies or mTLS headers) are allowed.
 
+> [!IMPORTANT]
+> **CORS Security Constraint:** In accordance with the W3C CORS specification, `allow_credentials = true` **cannot** be combined with a wildcard origin `allowed_origins = ["*"]`. Praeco validates this constraint during configuration finalization and rejects invalid combinations with a configuration error before any traffic or reload occurs.
+
 #### `[Server.Layers.Decompression]`
 * `max_decompressed_bytes`: Integer. Maximum size of the decompressed body in bytes (protection against Decompression Bombs).
 
@@ -253,22 +258,22 @@ Here is an overview of the most useful values for configuration:
 * `max_bytes`: Integer. Maximum allowed payload size in bytes.
 
 #### `[Server.Layers.ConcurrencyLimit]`
-* `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing.
+* `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing. Must be strictly greater than `0`.
 
 #### `[Server.Layers.JWT]`
-* `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures.
+* `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures. Keys are validated and parsed eagerly during startup and hot-reload.
 * `cookie_fallback`: String *(optional)*. The name of the HTTP cookie to read the JWT from if the `Authorization: Bearer <token>` header is absent (e.g. `"admin-jwt"`).
 * `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
 * `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that exactly matches this string. This prevents the "Confused Deputy" problem by ensuring tokens from other Identity Providers using the same key cannot be used.
 * `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that exactly matches this string. Ensures the token was specifically issued for this gateway/application.
 
 #### `[Server.Layers.RateLimiter]` (Simple)
-* `requests_per_second`: Integer. Strict limit of requests per second.
+* `requests_per_second`: Integer. Strict limit of requests per second. Must be strictly greater than `0`.
 
 #### `[Server.Layers.TokenBucketRateLimiter]`
-* `max_capacity`: Integer. Maximum burst size (number of tokens).
-* `refill`: Integer. Number of added tokens per interval.
-* `duration_micros`: Integer. Refill interval in microseconds.
+* `max_capacity`: Integer. Maximum burst size (number of tokens). Must be strictly greater than `0`.
+* `refill`: Integer. Number of added tokens per interval. Must be strictly greater than `0`.
+* `duration_micros`: Integer. Refill interval in microseconds. Must be strictly greater than `0`.
 
 #### `[Server.Layers.Delay]`
 * `delay_micros`: Integer. Artificially delays each request (for debugging).
