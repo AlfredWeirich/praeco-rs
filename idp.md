@@ -53,21 +53,24 @@ This flow allows a user on an untrusted device (like a desktop web browser) to s
 
 **Procedure:**
 1. **Session Initiation:** 
-   The untrusted client (browser) makes a `POST` request to `/auth/login`. The IdP creates a temporary, short-lived session and returns a unique `session_id`.
+   The untrusted client (browser) makes a `POST` request to `/auth/login`. The IdP creates a temporary, short-lived session and returns:
+   - `session_id`: Public ID encoded in the QR code.
+   - `poll_secret`: High-entropy secret retained by the browser to bind subsequent polling requests.
+   - `user_code`: 6-character verification code displayed on the screen for visual confirmation.
    
 2. **Display & Polling:** 
-   The browser displays this `session_id` (typically rendered as a QR Code) and continuously polls the IdP via `GET /auth/status?session=<session_id>`. While unconfirmed, the IdP returns `{"status":"pending"}`.
+   The browser displays the QR Code and the visual `user_code`. It continuously polls the IdP via `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>` (or `X-Poll-Secret` header). Without this secret, polling is rejected with `401 Unauthorized`. While unconfirmed, the IdP returns `{"status":"pending"}`.
    
-3. **Session Confirmation:** 
-   The user scans the QR code with their trusted mobile app. The mobile app makes a `POST` request to `/auth/confirm?session=<session_id>`. 
-   Crucially, the mobile app performs this request over an **mTLS connection** using its client certificate. The IdP extracts the identity claims (Subject and OIDs) from the mobile app's certificate and attaches them to the pending session, marking it as "confirmed".
+3. **Session Confirmation (with Quishing Protection):** 
+   The user scans the QR code with their trusted mobile app. The mobile app can display the code for user verification and makes a `POST` request to `/auth/confirm?session=<session_id>&code=<user_code>`. 
+   Crucially, the mobile app performs this request over an **mTLS connection** using its client certificate. The IdP verifies that `code` matches the session's `user_code`, extracts the identity claims (Subject and OIDs) from the mobile certificate, and marks the session as "confirmed".
    
-4. **Token Issuance:** 
-   On the browser's next polling request to `GET /auth/status?session=<session_id>`, the IdP sees the session is confirmed. It generates a signed JWT containing the claims of the trusted device.
-   The IdP returns the JWT to the browser in a secure `Set-Cookie` header (`HttpOnly; Secure; SameSite=Lax`) along with a redirect URL.
+4. **Token Issuance & Single Use Consumption:** 
+   On the browser's next polling request to `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>`, the IdP sees the session is confirmed. It generates a signed JWT and atomically consumes (removes) the session to prevent replay.
+   The IdP returns the JWT in a secure `Set-Cookie` header (`HttpOnly; Secure; SameSite=Lax`) along with a redirect URL.
    
 5. **Authenticated Access:** 
-   The browser is now authenticated. Subsequent requests from the browser will automatically include the JWT cookie, which the gateway can validate.
+   The browser is now authenticated. Subsequent requests from the browser will automatically include the JWT cookie, which the gateway validates.
 
 ### Sequence Diagram
 ```mermaid
@@ -80,22 +83,22 @@ sequenceDiagram
 
     %% Step 1: Session Initiation
     Browser->>IdP: 1. POST /auth/login (Standard TLS)
-    IdP-->>Browser: 200 OK {"session": "abc123xyz"}
-    Note over Browser: Generates & Displays QR Code
+    IdP-->>Browser: 200 OK {"session": "abc123xyz", "poll_secret": "sec...", "user_code": "K7X-9P2"}
+    Note over Browser: Displays QR Code & User Code K7X-9P2
 
     %% Step 2: Polling begins
-    Browser->>IdP: 2. GET /auth/status?session=abc123xyz
+    Browser->>IdP: 2. GET /auth/status?session=abc123xyz&poll_secret=sec...
     IdP-->>Browser: 200 OK {"status": "pending"}
 
     %% Step 3: Mobile scan & confirmation
-    Note over Mobile: User scans QR Code
-    Mobile->>IdP: 3. POST /auth/confirm?session=abc123xyz (mTLS)
-    Note over IdP: Validates mTLS Certificate<br/>Extracts UUID & Role OIDs<br/>Marks session "confirmed"
+    Note over Mobile: User scans QR Code & confirms code K7X-9P2
+    Mobile->>IdP: 3. POST /auth/confirm?session=abc123xyz&code=K7X-9P2 (mTLS)
+    Note over IdP: Validates mTLS Certificate & User Code<br/>Extracts UUID & Role OIDs<br/>Marks session "confirmed"
     IdP-->>Mobile: 200 OK {"status": "confirmed"}
 
     %% Step 4: Token Issuance
-    Browser->>IdP: 4. GET /auth/status?session=abc123xyz (Next Poll)
-    Note over IdP: Session Confirmed!<br/>Issues signed JWT with Mobile claims
+    Browser->>IdP: 4. GET /auth/status?session=abc123xyz&poll_secret=sec... (Next Poll)
+    Note over IdP: Session Confirmed!<br/>Atomically consumes session & issues signed JWT
     IdP-->>Browser: 200 OK Set-Cookie: praeco_jwt=... (HttpOnly, Secure, SameSite=Lax)<br/>{"status": "confirmed", "redirect": "/admin"}
 
     %% Step 5: Authenticated Dashboard Access
@@ -108,22 +111,22 @@ sequenceDiagram
 
 **Step 1: Initiate Session (Untrusted Client)**
 ```bash
-# Returns a new session_id
+# Returns session_id, poll_secret, and user_code
 curl -s -X POST https://localhost:1339/auth/login
 ```
-*Example Response:* `{"session":"abc123xyz"}`
+*Example Response:* `{"session":"abc123xyz","poll_secret":"4sK...","user_code":"K7X-9P2"}`
 
 **Step 2: Poll Session Status (Untrusted Client)**
 ```bash
-# Polling while waiting for confirmation
-curl -s "https://localhost:1339/auth/status?session=abc123xyz"
+# Polling while waiting for confirmation (requires poll_secret)
+curl -s "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK..."
 ```
 *Example Response:* `{"status":"pending"}`
 
 **Step 3: Confirm Session via mTLS (Trusted Device)**
 ```bash
-# The trusted device uses its certificate to confirm the session
-curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz" \
+# The trusted device uses its certificate and optional user_code to confirm
+curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz&code=K7X-9P2" \
   --cert client_certs/device.crt \
   --key client_certs/device.key \
   --cacert server_certs/ca.crt
@@ -132,8 +135,8 @@ curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz" \
 
 **Step 4: Retrieve JWT (Untrusted Client)**
 ```bash
-# The browser polls again and receives the JWT as a Set-Cookie header
-curl -s -v "https://localhost:1339/auth/status?session=abc123xyz"
+# The browser polls with poll_secret and receives the JWT as a Set-Cookie header
+curl -s -v "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK..."
 ```
 *Example Response Headers (excerpt):*
 ```http

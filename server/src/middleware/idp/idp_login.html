@@ -4,9 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Secure Device Authentication</title>
-    <!-- We use qrious from CDN for now. In a fully air-gapped environment, 
-         you can download this file and host it alongside this HTML. -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js"></script>
+    <!-- Subresource Integrity (SRI) verified library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrious/4.0.2/qrious.min.js" integrity="sha384-Dr98ddmUw2QkdCarNQ+OL7xLty7cSxgR0T7v1tq4UErS/qLV0132sBYTolRAFuOV" crossorigin="anonymous"></script>
     <style>
         :root {
             --bg-color: #0f172a;
@@ -14,6 +13,7 @@
             --card-bg: #1e293b;
             --border-color: #334155;
             --accent-color: #3b82f6;
+            --code-color: #38bdf8;
         }
 
         body {
@@ -25,7 +25,7 @@
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 100vh;
+            min-height: 100vh;
         }
 
         .container {
@@ -35,8 +35,9 @@
             padding: 40px;
             text-align: center;
             box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
-            max-width: 400px;
+            max-width: 420px;
             width: 100%;
+            box-sizing: border-box;
         }
 
         h1 {
@@ -49,16 +50,46 @@
         p {
             font-size: 0.95rem;
             color: #94a3b8;
-            margin-bottom: 30px;
+            margin-bottom: 24px;
             line-height: 1.5;
         }
 
         .qr-container {
             background-color: white;
-            padding: 20px;
+            padding: 16px;
             border-radius: 8px;
             display: inline-block;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
+        }
+
+        .user-code-box {
+            background-color: #0f172a;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 24px;
+        }
+
+        .user-code-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            margin-bottom: 4px;
+        }
+
+        .user-code-digits {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            font-size: 1.6rem;
+            font-weight: 700;
+            letter-spacing: 0.15em;
+            color: var(--code-color);
+        }
+
+        .user-code-note {
+            font-size: 0.75rem;
+            color: #64748b;
+            margin-top: 4px;
         }
 
         .status {
@@ -87,6 +118,8 @@
             color: #ef4444;
             display: none;
             margin-top: 20px;
+            font-size: 0.9rem;
+            line-height: 1.4;
         }
     </style>
 </head>
@@ -97,12 +130,17 @@
         
         <div class="qr-container">
             <canvas id="qr-code"></canvas>
-            <div id="debug-session" style="display: none; margin-top: 15px; font-family: monospace; color: #3b82f6; font-size: 0.8rem; word-break: break-all;"></div>
+        </div>
+
+        <div class="user-code-box" id="user-code-box" style="display: none;">
+            <div class="user-code-title">Verification Code</div>
+            <div class="user-code-digits" id="user-code-digits">---</div>
+            <div class="user-code-note">Verify this code matches on your mobile device</div>
         </div>
 
         <div class="status" id="status-container">
             <div class="spinner"></div>
-            <span id="status-text">Waiting for device...</span>
+            <span id="status-text">Waiting for device confirmation...</span>
         </div>
 
         <div class="error" id="error-message"></div>
@@ -115,43 +153,57 @@
             const statusText = document.getElementById('status-text');
 
             try {
-                // 1. Fetch a new session from the IdP
+                // 1. Fetch a new session and cryptographic poll secret from the IdP
                 const loginRes = await fetch('/auth/login', { 
                     method: 'POST',
                     credentials: 'include'
                 });
                 if (!loginRes.ok) {
+                    if (loginRes.status === 429) {
+                        throw new Error("Rate limit exceeded. Please wait a moment before trying again.");
+                    }
                     throw new Error("Failed to initialize login session");
                 }
                 const data = await loginRes.json();
                 const sessionId = data.session;
+                const pollSecret = data.poll_secret;
+                const userCode = data.user_code;
 
                 // 2. Render the QR code using the session ID
                 new QRious({
                     element: document.getElementById('qr-code'),
                     value: sessionId,
-                    size: 250,
+                    size: 240,
                     level: 'H'
                 });
 
-                const showDebug = {{DEBUG_SESSION_FLAG}};
-                if (showDebug) {
-                    const debugEl = document.getElementById('debug-session');
-                    debugEl.style.display = 'block';
-                    debugEl.textContent = 'Session ID: ' + sessionId;
+                // Display verification code for Quishing protection
+                if (userCode) {
+                    const codeBox = document.getElementById('user-code-box');
+                    const codeDigits = document.getElementById('user-code-digits');
+                    codeDigits.textContent = userCode;
+                    codeBox.style.display = 'block';
                 }
 
-                // 3. Poll for status confirmation
+                // 3. Poll for status confirmation using poll_secret binding
                 const pollInterval = setInterval(async () => {
                     try {
-                        const statusRes = await fetch('/auth/status?session=' + encodeURIComponent(sessionId), {
-                            credentials: 'include'
+                        const statusUrl = '/auth/status?session=' + encodeURIComponent(sessionId) +
+                            '&poll_secret=' + encodeURIComponent(pollSecret);
+                        const statusRes = await fetch(statusUrl, {
+                            credentials: 'include',
+                            headers: {
+                                'X-Poll-Secret': pollSecret
+                            }
                         });
                         
                         if (!statusRes.ok) {
                             if (statusRes.status === 404) {
                                 clearInterval(pollInterval);
                                 throw new Error("Session expired. Please refresh the page.");
+                            } else if (statusRes.status === 401) {
+                                clearInterval(pollInterval);
+                                throw new Error("Authentication failed: unauthorized poll request.");
                             }
                         } else {
                             const data = await statusRes.json();

@@ -128,7 +128,7 @@ pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'s
 /// The `oids` field carries custom OID suffixes extracted from the
 /// signing identity, which are later mapped to [`UserRole`](crate)
 /// values by the server.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Claims {
     /// Subject identifier (usually user ID or account ID).
     pub sub: String,
