@@ -2,11 +2,11 @@ use hyper::body::Body;
 pub use hyper_rustls::HttpsConnector;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use rustls::ClientConfig;
 use std::time::Duration;
 
-/// Configuration options for the hyper connection pool.
+/// Configuration options for the hyper connection pool and transport.
 #[derive(Debug, Clone)]
 pub struct ClientPoolConfig {
     /// Closes idle connections in the pool after this duration.
@@ -15,6 +15,20 @@ pub struct ClientPoolConfig {
     pub max_idle_per_host: Option<usize>,
     /// If true, HTTP/1.1 is omitted from the ALPN negotiation and only HTTP/2 is used.
     pub http2_only: bool,
+    /// TCP connection establishment timeout (default: 5s).
+    pub connect_timeout: Option<Duration>,
+    /// TCP keep-alive probe interval (default: 60s).
+    pub tcp_keepalive: Option<Duration>,
+    /// Whether to enable TCP_NODELAY (default: true).
+    pub tcp_nodelay: bool,
+    /// HTTP/2 PING interval to detect dead connections (default: 30s).
+    pub http2_keep_alive_interval: Option<Duration>,
+    /// Timeout for HTTP/2 PING response before dropping connection (default: 10s).
+    pub http2_keep_alive_timeout: Option<Duration>,
+    /// Whether to send HTTP/2 PING probes even when connection is idle (default: true).
+    pub http2_keep_alive_while_idle: bool,
+    /// Automatically adjust HTTP/2 flow control window size based on throughput (default: true).
+    pub http2_adaptive_window: bool,
 }
 
 impl Default for ClientPoolConfig {
@@ -23,6 +37,13 @@ impl Default for ClientPoolConfig {
             idle_timeout: Some(Duration::from_secs(90)),
             max_idle_per_host: Some(1024),
             http2_only: false,
+            connect_timeout: Some(Duration::from_secs(5)),
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            tcp_nodelay: true,
+            http2_keep_alive_interval: Some(Duration::from_secs(30)),
+            http2_keep_alive_timeout: Some(Duration::from_secs(10)),
+            http2_keep_alive_while_idle: true,
+            http2_adaptive_window: true,
         }
     }
 }
@@ -50,20 +71,35 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    // Build the underlying TLS connector.
+    // Build and configure the underlying TCP connector
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
+    if let Some(ct) = pool_config.connect_timeout {
+        http_connector.set_connect_timeout(Some(ct));
+    }
+    http_connector.set_keepalive(pool_config.tcp_keepalive);
+    http_connector.set_nodelay(pool_config.tcp_nodelay);
+
+    // Build the underlying TLS connector wrapping our configured TCP connector.
     // It is configured to accept both `http://` and `https://` schemes.
     let https_builder = HttpsConnectorBuilder::new()
         .with_tls_config(tls_config)
         .https_or_http();
 
     let https_connector = if pool_config.http2_only {
-        https_builder.enable_http2().build()
+        https_builder.enable_http2().wrap_connector(http_connector)
     } else {
-        https_builder.enable_http1().enable_http2().build()
+        https_builder
+            .enable_http1()
+            .enable_http2()
+            .wrap_connector(http_connector)
     };
 
     // Configure the connection builder on top of Tokio logic.
     let mut builder = Client::builder(TokioExecutor::new());
+
+    // Register Tokio timer so pool_idle_timeout and HTTP/2 keep-alive are actively scheduled
+    builder.pool_timer(TokioTimer::new());
 
     if let Some(timeout) = pool_config.idle_timeout {
         builder.pool_idle_timeout(timeout);
@@ -77,8 +113,19 @@ where
         builder.http2_only(true);
     }
 
-    // You can add further generic options here (e.g. keeping TCP_NODELAY sync)
-    // builder.http2_initial_stream_window_size(1024 * 1024);
+    if let Some(interval) = pool_config.http2_keep_alive_interval {
+        builder.http2_keep_alive_interval(interval);
+    }
+
+    if let Some(timeout) = pool_config.http2_keep_alive_timeout {
+        builder.http2_keep_alive_timeout(timeout);
+    }
+
+    builder.http2_keep_alive_while_idle(pool_config.http2_keep_alive_while_idle);
+
+    if pool_config.http2_adaptive_window {
+        builder.http2_adaptive_window(true);
+    }
 
     builder.build(https_connector)
 }
