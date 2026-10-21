@@ -398,8 +398,14 @@ where
                 let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
 
                 StreamBody::new(stream)
-                    // FIX: Explicit type annotation for 'e'
-                    .map_err(|e: io::Error| SrvError::Other(e.to_string()))
+                    .map_err(move |e: io::Error| {
+                        let msg = e.to_string();
+                        if msg.contains("Decompressed payload exceeds maximum allowed size") {
+                            SrvError::DecompressionLimitExceeded { max: max_bytes }
+                        } else {
+                            SrvError::Other(msg)
+                        }
+                    })
                     .boxed()
             } else {
                 let decoder = BrotliDecoder::new(body_reader);
@@ -407,8 +413,14 @@ where
                 let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
 
                 StreamBody::new(stream)
-                    // FIX: Explicit type annotation for 'e'
-                    .map_err(|e: io::Error| SrvError::Other(e.to_string()))
+                    .map_err(move |e: io::Error| {
+                        let msg = e.to_string();
+                        if msg.contains("Decompressed payload exceeds maximum allowed size") {
+                            SrvError::DecompressionLimitExceeded { max: max_bytes }
+                        } else {
+                            SrvError::Other(msg)
+                        }
+                    })
                     .boxed()
             };
 

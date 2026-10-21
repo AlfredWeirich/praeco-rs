@@ -74,12 +74,17 @@ pub async fn handle_grpc_passthrough(
             }
         }
 
+        let body_error = Arc::new(std::sync::Mutex::new(None));
         let boxed_body: ServiceRespBody = match &mut request_body {
             RequestBody::Stream(_b) => {
                 let mut temp_body = RequestBody::Buffered(bytes::Bytes::new());
                 std::mem::swap(&mut temp_body, &mut request_body);
                 if let RequestBody::Stream(taken_body) = temp_body {
-                    taken_body
+                    super::http_proxy::BodyErrorTracker {
+                        inner: taken_body,
+                        last_error: body_error.clone(),
+                    }
+                    .boxed()
                 } else {
                     unreachable!()
                 }
@@ -152,25 +157,72 @@ pub async fn handle_grpc_passthrough(
                 ));
             }
             Err(e) => {
-                error!(
-                    "{}: Backend connection failed to {}: {}",
-                    server_name, backend_base_uri, e
-                );
-                route_info.target.mark_dead(backend_base_uri);
-                failed_nodes.push(backend_base_uri.clone());
-
-                if attempts <= max_retries {
-                    warn!(
-                        "{}: Retrying request... (Attempt {}/{})",
-                        server_name, attempts, max_retries
-                    );
-                    continue;
+                let client_error = body_error.lock().ok().and_then(|mut g| g.take());
+                let error_kind = if let Some(srv_err) = client_error {
+                    match srv_err {
+                        SrvError::PayloadTooLarge { .. } => super::http_proxy::ProxyErrorKind::PayloadTooLarge,
+                        SrvError::DecompressionLimitExceeded { .. } => {
+                            super::http_proxy::ProxyErrorKind::DecompressionLimitExceeded
+                        }
+                        SrvError::ClientAborted(reason) => super::http_proxy::ProxyErrorKind::ClientAborted(reason),
+                        _ => super::http_proxy::ProxyErrorKind::ClientAborted("Client stream error".to_string()),
+                    }
                 } else {
-                    error!(
-                        "{}: Max retries reached. Returning 502 Bad Gateway.",
-                        server_name
-                    );
-                    return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));
+                    super::http_proxy::classify_proxy_error(&e)
+                };
+                match error_kind {
+                    super::http_proxy::ProxyErrorKind::PayloadTooLarge => {
+                        warn!(
+                            "{}: Client gRPC request payload exceeded limit during proxying to {}",
+                            server_name, backend_base_uri
+                        );
+                        return Ok(build_error_response(
+                            "Payload Too Large",
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                        ));
+                    }
+                    super::http_proxy::ProxyErrorKind::DecompressionLimitExceeded => {
+                        warn!(
+                            "{}: Client gRPC request decompressed payload exceeded limit during proxying to {}",
+                            server_name, backend_base_uri
+                        );
+                        return Ok(build_error_response(
+                            "Payload Too Large",
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                        ));
+                    }
+                    super::http_proxy::ProxyErrorKind::ClientAborted(ref reason) => {
+                        warn!(
+                            "{}: Client aborted gRPC request stream during proxying to {}: {}",
+                            server_name, backend_base_uri, reason
+                        );
+                        return Ok(build_error_response(
+                            "Client Closed Request",
+                            StatusCode::BAD_REQUEST,
+                        ));
+                    }
+                    super::http_proxy::ProxyErrorKind::UpstreamFailure => {
+                        error!(
+                            "{}: Backend connection failed to {}: {}",
+                            server_name, backend_base_uri, e
+                        );
+                        route_info.target.mark_dead(backend_base_uri);
+                        failed_nodes.push(backend_base_uri.clone());
+
+                        if attempts <= max_retries {
+                            warn!(
+                                "{}: Retrying request... (Attempt {}/{})",
+                                server_name, attempts, max_retries
+                            );
+                            continue;
+                        } else {
+                            error!(
+                                "{}: Max retries reached. Returning 502 Bad Gateway.",
+                                server_name
+                            );
+                            return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));
+                        }
+                    }
                 }
             }
         }
@@ -258,5 +310,101 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "Timed out gRPC node must be marked dead");
     }
+
+    #[tokio::test]
+    async fn test_grpc_passthrough_streaming_payload_too_large_returns_413_and_node_remains_alive() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn mock HTTP/2 upstream that accepts connection and reads body
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let io = hyper_util::rt::TokioIo::new(socket);
+                let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|mut req: hyper::Request<hyper::body::Incoming>| async move {
+                            use http_body_util::BodyExt;
+                            while let Some(_) = req.frame().await {}
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new()))
+                        }),
+                    )
+                    .await;
+            }
+        });
+
+        let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
+        let node = UpstreamNode {
+            uri: upstream_uri.clone(),
+            active_connections: AtomicUsize::new(0),
+            is_alive: AtomicBool::new(true),
+            last_failure_time: AtomicU64::new(0),
+            current_score: AtomicUsize::new(0),
+        };
+
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 60,
+            max_retries: 0,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let route_info = ParsedRoute {
+            prefix: "/chat.ChatService".to_string(),
+            target: target.clone(),
+            allowed_roles: Vec::new(),
+            backend_type: RouteBackendType::GrpcPassthrough,
+        };
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let pool_config = common::client::ClientPoolConfig {
+            http2_only: true,
+            ..Default::default()
+        };
+        let client = common::client::build_hyper_client(tls_config, pool_config);
+
+        let req_uri: Uri = "http://localhost/chat.ChatService/SendMessage".parse().unwrap();
+        let prepared_headers = hyper::HeaderMap::new();
+        let matched_params = matchit::Params::new();
+
+        // Create a streaming body that errors out with PayloadTooLarge
+        let err_stream = futures_util::stream::iter(vec![
+            Ok(http_body::Frame::data(bytes::Bytes::from("grpc message chunk"))),
+            Err(SrvError::PayloadTooLarge { current: 15, max: 10 }),
+        ]);
+        let body: ServiceRespBody = http_body_util::StreamBody::new(err_stream).boxed();
+
+        let response = handle_grpc_passthrough(
+            &route_info,
+            RequestBody::Stream(body),
+            Method::POST,
+            prepared_headers,
+            &req_uri,
+            &matched_params,
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            target.upstreams[0].is_alive.load(Ordering::Relaxed),
+            "Upstream gRPC node must NOT be marked dead on client payload limit error"
+        );
+    }
 }
+
 

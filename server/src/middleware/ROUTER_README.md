@@ -39,6 +39,7 @@ Incoming HTTP requests are matched against prefix-based routes and forwarded to 
 | **Hop-by-Hop Header Stripping** | Removes connection-level headers (`Connection`, `Transfer-Encoding`, `Upgrade`, etc.) per RFC 7230 §6.1. |
 | **Upstream Authentication** | Supports **mTLS** (client certificate) or **JWT bearer token** injection toward backends. |
 | **Dual Connection Pooling** | Maintains separate optimized connection pools for standard REST (`client`) and HTTP/2-only gRPC traffic (`grpc_client`). |
+| **Client Fault Isolation** | Isolates client payload limits (`413`) and client aborts (`400`) so healthy upstreams are never blacklisted (`mark_dead`). |
 
 ## Request Processing Pipeline
 
@@ -86,6 +87,16 @@ pub struct RouterService {
 | `rbac` | Enforces Role-Based Access Control logic based on configured OIDs. |
 | `headers` | Prepares proxy headers, unconditionally strips client identity headers, strips hop-by-hop headers, manages `X-Forwarded-*`, and cleans upstream responses. |
 | `upstreams` | Upstream management and target evaluation logic. |
+| `error` | Upstream error classification and body error tracking. |
+
+## Error Classification & Upstream Protection
+
+To prevent client-induced Denial of Service (where client-side errors like oversized payloads or early socket disconnects trip upstream health failovers):
+
+- **`BodyErrorTracker`**: Wraps streaming request bodies (`RequestBody::Stream`) to capture and preserve client-side stream errors (`SrvError::PayloadTooLarge`, `SrvError::DecompressionLimitExceeded`, `SrvError::ClientAborted`) before Hyper or H2 can translate them into generic transport resets.
+- **`classify_proxy_error`**: Distinguishes between:
+  - **Client Faults**: `PayloadTooLarge` (`413 Payload Too Large`), `DecompressionLimitExceeded` (`413 Payload Too Large`), and `ClientAborted` (`400 Bad Request`). Upstream nodes are **never** marked dead, and retries are bypassed.
+  - **Upstream Failures**: Connect timeouts, connection refused, or unexpected broken pipes during upstream response receipt (`502 Bad Gateway`). The target node is marked dead (`mark_dead`), and remaining healthy nodes are tried if retries are configured.
 
 ## Cloning & Performance
 
