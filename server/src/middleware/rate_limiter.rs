@@ -18,6 +18,18 @@
 //! - **Floating-point token precision**: Refills track fractional tokens without truncating elapsed intervals,
 //!   preventing token drift.
 //! - **RFC 6585 compliance**: All 429 Too Many Requests responses include a standardized `Retry-After` header.
+//! 
+//! TEST:
+//! 
+//! ```bash
+//! fredi@AlfredsMacBookM4 260225_Tower_Hyper_Rustls_refactor_client_gprc % for i in {1..70}; do
+//!  printf "A-%02d: " "$i" && sleep 0.05
+//!  curl -s -o /dev/null -w "%{http_code}\n" -k --resolve "wurzelwerk.onboarding.aweirich.eu:443:127.0.0.1" -H "X-Forwarded-For: 198.51.100.10" -X POST "https://wurzelwerk.onboarding.aweirich.eu/chat.OnboardingService/RequestOnboarding"
+//! done
+//! echo -n "Client B (andere IP): "
+//! curl -s -o /dev/null -w "%{http_code}\n" -k --resolve "wurzelwerk.onboarding.aweirich.eu:443:127.0.0.1" -H "X-Forwarded-For: 203.0.113.50" -X POST "https://wurzelwerk.onboarding.aweirich.eu/chat.OnboardingService/RequestOnboarding"
+//! ```
+//! 
 
 // === Standard Library ===
 use std::{
