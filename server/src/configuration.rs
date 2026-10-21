@@ -655,7 +655,7 @@ fn default_cookie_name() -> String { "__Host-jwt".to_string() }
 fn default_redirect() -> String { "/".to_string() }
 fn default_issuer() -> String { "praeco-idp".to_string() }
 fn default_webhook_timeout() -> u64 { 3000 }
-fn default_on_webhook_failure() -> String { "fallback_to_cert".to_string() }
+fn default_on_webhook_failure() -> String { "reject".to_string() }
 
 
 /// Server TLS certificate and key paths.

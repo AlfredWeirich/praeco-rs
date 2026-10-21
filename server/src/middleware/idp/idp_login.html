@@ -222,7 +222,8 @@
 
             try {
                 // 1. Fetch a new session and cryptographic poll secret from the IdP
-                const loginRes = await fetch('/auth/login', { 
+                const loginUrl = '/auth/login' + (window.location.search || '');
+                const loginRes = await fetch(loginUrl, { 
                     method: 'POST',
                     credentials: 'include'
                 });

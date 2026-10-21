@@ -214,8 +214,25 @@ pub fn verify_jwt(
 ) -> Result<Claims, Error> {
     let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
     
-    validation.set_issuer(&[expected_issuer]);
-    validation.set_audience(&[expected_audience]);
+    let iss_list: Vec<&str> = expected_issuer
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !iss_list.is_empty() {
+        validation.set_issuer(&iss_list);
+    }
+
+    let aud_list: Vec<&str> = expected_audience
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !aud_list.is_empty() {
+        validation.set_audience(&aud_list);
+    } else {
+        validation.validate_aud = false;
+    }
 
     // Try verifying the JWT with each decoding key
     for key in decoding_keys {
@@ -227,16 +244,27 @@ pub fn verify_jwt(
 }
 
 /// Signs a JWT token with the given `Claims` and `EncodingKey`.
+/// Signs a JWT token with the given `Claims` and `EncodingKey`.
 ///
 /// # Algorithm
 ///
-/// Hard-coded to **EdDSA** (Ed25519).
+/// Hard-coded to **EdDSA** (Ed25519) with `kid: "praeco-key-1"`.
 ///
 /// # Errors
 ///
 /// Returns an error if token signing fails.
 pub fn sign_jwt(claims: &Claims, encoding_key: &EncodingKey) -> Result<String, Error> {
-    let header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+    sign_jwt_with_kid(claims, encoding_key, Some("praeco-key-1"))
+}
+
+/// Signs a JWT token with the given `Claims`, `EncodingKey`, and optional Key ID (`kid`).
+pub fn sign_jwt_with_kid(
+    claims: &Claims,
+    encoding_key: &EncodingKey,
+    kid: Option<&str>,
+) -> Result<String, Error> {
+    let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = kid.map(|s| s.to_string());
     let token = encode(&header, claims, encoding_key)
         .map_err(|e| Error::msg(format!("Failed to sign JWT: {}", e)))?;
     Ok(token)
@@ -328,5 +356,34 @@ mod tests {
     fn test_load_encoding_key_nonexistent_file_returns_err() {
         let res = load_encoding_key("nonexistent_jwt_priv_12345.pem");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_verify_jwt_multiple_audiences() {
+        let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+        let pub_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+
+        let enc_key = EncodingKey::from_ed_pem(priv_pem.as_bytes()).unwrap();
+        let dec_key = DecodingKey::from_ed_pem(pub_pem.as_bytes()).unwrap();
+
+        let claims = Claims {
+            sub: "user-1".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("admin-dashboard".to_string()),
+            exp: 9999999999,
+            oids: vec!["1".to_string()],
+            jti: Some("jti-123".to_string()),
+        };
+
+        let token = sign_jwt(&claims, &enc_key).unwrap();
+
+        // 1. Single matching audience
+        assert!(verify_jwt(&token, &[dec_key.clone()], "praeco-idp", "admin-dashboard").is_ok());
+
+        // 2. Comma-separated audience list including admin-dashboard
+        assert!(verify_jwt(&token, &[dec_key.clone()], "praeco-idp", "praeco-admin, admin-dashboard").is_ok());
+
+        // 3. Mismatched audience fails
+        assert!(verify_jwt(&token, &[dec_key], "praeco-idp", "wrong-aud").is_err());
     }
 }

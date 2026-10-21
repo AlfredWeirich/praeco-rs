@@ -145,9 +145,12 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `allowed_audiences`: Array of strings. A list of allowed target audiences (`aud`). If a client requests a specific audience via the `?aud=` query parameter, it must match one of the entries in this list. Any unlisted audience request is rejected with `400 Bad Request`.
 
 **Claims Webhook (Dynamic Role Resolution)**
-* `claims_webhook_url`: String *(optional)*. The HTTP endpoint to POST to for dynamic claims resolution. If set, Praeco calls this endpoint during login to fetch the current user roles from the backend database, replacing the OIDs baked into the certificate.
-* `claims_webhook_timeout_ms`: Integer. Timeout for the webhook HTTP call in milliseconds (default: `3000`).
-* `on_webhook_failure`: String. Behavior if the webhook fails. Options: `"fallback_to_cert"` (default: use OIDs from the mTLS certificate) or `"reject"` (deny the login).
+* `claims_webhook_url`: String *(optional)*. The HTTPS endpoint to POST to for dynamic claims resolution. Plain HTTP is strictly forbidden for remote endpoints to prevent credential/role tampering and is only permitted for local loopback (`http://127.0.0.1:...` or `http://localhost:...`). If set, Praeco calls this endpoint during login to fetch the current user roles from the backend database, replacing the OIDs baked into the certificate.
+* `claims_webhook_timeout_ms`: Integer. Overall timeout for the webhook HTTP call in milliseconds including connection, headers, and body collection (default: `3000`). Maximum allowed response body size is 64 KB.
+* `on_webhook_failure`: String. Behavior if the webhook fails, times out, or returns a non-200 status. Options: `"reject"` (default, fail-closed: denies the login with 503) or `"fallback_to_cert"` (fail-open: fallback to OIDs from the mTLS certificate).
+* `claims_webhook_client_cert`: String *(optional)*. Path to client certificate PEM for mTLS authentication against the webhook.
+* `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
+* `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
 
 ### Static File Server Configuration
 
@@ -156,9 +159,6 @@ Configures the built-in Static File Server. This is highly optimized for serving
 
 * `root`: String. The local directory path from which files should be served (e.g., `"./www"` or `"/var/www/frontend"`).
 * `fallback_to_index`: Boolean. If set to `true`, any request for a file that does not exist on disk will instead return the `index.html` file from the root directory. This is mandatory for Client-Side SPA Routing to work properly. (Default: `false`).
-* `claims_webhook_client_cert`: String *(optional)*. Path to client certificate PEM for mTLS authentication against the webhook.
-* `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
-* `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
 
 ### Outbound Zero-Trust Tunneling (SNI Relay)
 
