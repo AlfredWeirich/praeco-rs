@@ -70,7 +70,7 @@ pub use counter::CountingLayer;
 pub use delay::DelayLayer;
 pub use echo::EchoService;
 pub use inspection::InspectionLayer;
-pub use jwt::JwtAuthLayer;
+pub use jwt::{JwtAuthLayer, JwtRevocationStore, get_jwt_revocation_store};
 pub use limit::MaxPayloadLayer;
 pub use logger::LoggerLayer;
 pub use path_sanitizer::PathSanitizerLayer;

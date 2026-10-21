@@ -8,9 +8,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
-use pin_project::pin_project;
 
 use crate::configuration::IdpParams;
+
+/// Maximum allowed response body size from the claims webhook (64 KB).
+const MAX_WEBHOOK_BODY_SIZE: usize = 65_536;
 
 #[derive(Debug, Error)]
 pub enum WebhookError {
@@ -46,56 +48,15 @@ pub struct WebhookClient {
     timeout: Duration,
 }
 
-#[pin_project(project = WebhookFetchFutureProj)]
-pub enum WebhookFetchFuture {
-    WaitingForResponse {
-        #[pin]
-        timeout_fut: tokio::time::Timeout<hyper_util::client::legacy::ResponseFuture>,
-    },
-    ReadingBody {
-        #[pin]
-        collect_fut: http_body_util::combinators::Collect<hyper::body::Incoming>,
-    },
+pub struct WebhookFetchFuture {
+    inner: Pin<Box<dyn Future<Output = Result<Vec<String>, WebhookError>> + Send>>,
 }
 
 impl Future for WebhookFetchFuture {
     type Output = Result<Vec<String>, WebhookError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            let this = self.as_mut().project();
-            match this {
-                WebhookFetchFutureProj::WaitingForResponse { timeout_fut } => {
-                    let res = std::task::ready!(timeout_fut.poll(cx));
-                    let response = match res {
-                        Ok(Ok(response)) => response,
-                        Ok(Err(e)) => return Poll::Ready(Err(WebhookError::Request(e))),
-                        Err(_) => return Poll::Ready(Err(WebhookError::Timeout)),
-                    };
-
-                    if !response.status().is_success() {
-                        return Poll::Ready(Err(WebhookError::Status(response.status())));
-                    }
-
-                    let collect_fut = response.into_body().collect();
-                    self.set(WebhookFetchFuture::ReadingBody { collect_fut });
-                    // Loop back to poll the new state
-                }
-                WebhookFetchFutureProj::ReadingBody { collect_fut } => {
-                    let body_res = std::task::ready!(collect_fut.poll(cx));
-                    let collected = match body_res {
-                        Ok(c) => c,
-                        Err(e) => return Poll::Ready(Err(WebhookError::Body(e.to_string()))),
-                    };
-
-                    let body_bytes = collected.to_bytes();
-                    match serde_json::from_slice::<WebhookResponse>(&body_bytes) {
-                        Ok(resp) => return Poll::Ready(Ok(resp.oids)),
-                        Err(e) => return Poll::Ready(Err(WebhookError::Json(e))),
-                    }
-                }
-            }
-        }
+        self.inner.as_mut().poll(cx)
     }
 }
 
@@ -105,6 +66,13 @@ impl WebhookClient {
             Some(u) => u.clone(),
             None => return Ok(None),
         };
+
+        // Enforce HTTPS for non-localhost endpoints to prevent token/claims interception
+        if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
+            return Err(anyhow::anyhow!(
+                "claims_webhook_url must use HTTPS for secure claims transport (plain HTTP is only allowed for localhost / 127.0.0.1)"
+            ));
+        }
 
         // If webhook uses HTTPS, load mTLS configs if provided
         let root_store = common::build_root_store(&params.claims_webhook_ca_cert)?;
@@ -143,9 +111,87 @@ impl WebhookClient {
             .header("Content-Type", "application/json")
             .body(Full::new(Bytes::from(body_bytes)))?;
 
-        let fetch_fut = self.client.request(req);
-        let timeout_fut = tokio::time::timeout(self.timeout, fetch_fut);
+        let client = self.client.clone();
+        let timeout = self.timeout;
 
-        Ok(WebhookFetchFuture::WaitingForResponse { timeout_fut })
+        let work_fut = async move {
+            let response = client.request(req).await.map_err(WebhookError::Request)?;
+            if !response.status().is_success() {
+                return Err(WebhookError::Status(response.status()));
+            }
+
+            // Enforce maximum body size to protect against memory exhaustion / slowloris
+            let limited = http_body_util::Limited::new(response.into_body(), MAX_WEBHOOK_BODY_SIZE);
+            let collected = limited.collect().await.map_err(|e| WebhookError::Body(e.to_string()))?;
+            let body_bytes = collected.to_bytes();
+            let resp: WebhookResponse = serde_json::from_slice(&body_bytes)?;
+            Ok(resp.oids)
+        };
+
+        let timed_fut = async move {
+            match tokio::time::timeout(timeout, work_fut).await {
+                Ok(res) => res,
+                Err(_) => Err(WebhookError::Timeout),
+            }
+        };
+
+        Ok(WebhookFetchFuture {
+            inner: Box::pin(timed_fut),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_idp_params(url: Option<String>) -> IdpParams {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        IdpParams {
+            jwt_private_key: "".to_string(),
+            jwt_public_key: None,
+            token_expiry_seconds: 3600,
+            session_ttl_seconds: 120,
+            cookie_name: "jwt".to_string(),
+            cookie_domain: None,
+            redirect_after_login: "/".to_string(),
+            allowed_audiences: vec![],
+            issuer: "praeco-idp".to_string(),
+            claims_webhook_url: url,
+            claims_webhook_timeout_ms: 1000,
+            on_webhook_failure: "reject".to_string(),
+            debug_show_session_id: Some(false),
+            claims_webhook_client_cert: None,
+            claims_webhook_client_key: None,
+            claims_webhook_ca_cert: None,
+        }
+    }
+
+    #[test]
+    fn test_webhook_insecure_http_rejected() {
+        let params = dummy_idp_params(Some("http://evil-server.com/claims".to_string()));
+        let client = WebhookClient::new(&params);
+        match client {
+            Err(e) => assert!(e.to_string().contains("must use HTTPS")),
+            Ok(_) => panic!("Expected error for non-HTTPS URL"),
+        }
+    }
+
+    #[test]
+    fn test_webhook_localhost_http_allowed() {
+        let params = dummy_idp_params(Some("http://127.0.0.1:50053/claims".to_string()));
+        let client = WebhookClient::new(&params);
+        assert!(client.is_ok());
+
+        let params_lh = dummy_idp_params(Some("http://localhost:50053/claims".to_string()));
+        let client_lh = WebhookClient::new(&params_lh);
+        assert!(client_lh.is_ok());
+    }
+
+    #[test]
+    fn test_webhook_https_allowed() {
+        let params = dummy_idp_params(Some("https://secure.example.com/claims".to_string()));
+        let client = WebhookClient::new(&params);
+        assert!(client.is_ok());
     }
 }

@@ -173,7 +173,7 @@ The expected response is JSON containing the new OIDs:
 {"oids": ["2"]}
 ```
 
-If the webhook fails or times out, the IdP can optionally fall back to the certificate's original OIDs (`fallback_to_cert`) or reject the login entirely (`reject`).
+If the webhook fails, times out, or returns an error, the IdP defaults to fail-closed behavior (`reject`), returning `503 Service Unavailable` to prevent privilege escalation during outages. Optionally, `fallback_to_cert` can be explicitly enabled to fall back to the certificate's original OIDs. To protect against token and credential sniffing, remote webhooks must strictly use HTTPS.
 
 ### Sequence Diagram (QR-Code Flow with Webhook)
 ```mermaid
@@ -191,8 +191,9 @@ sequenceDiagram
     Note over Mobile: Scans QR Code
     Mobile->>IdP: 2. POST /auth/confirm?session=abc (mTLS)
     Note over IdP: Validates mTLS Certificate
+    Note over IdP: Checks Certificate Revocation List (CRL)
 
-    IdP->>Backend: 3. POST /internal/claims (mTLS)<br/>{"sub":"device.uuid","cert_oids":[]}
+    IdP->>Backend: 3. POST /internal/claims (HTTPS / mTLS)<br/>{"sub":"device.uuid","cert_oids":[]}
     Note over Backend: SELECT role FROM users<br/>WHERE uuid = 'uuid'
     Backend-->>IdP: {"oids": ["2"]}
 
@@ -200,7 +201,7 @@ sequenceDiagram
     IdP-->>Mobile: {"status":"confirmed"}
 
     Browser->>IdP: 4. GET /auth/status
-    Note over IdP: Issues JWT with oids=["2"]
+    Note over IdP: Issues JWT with jti=UUIDv4, oids=["2"]
     IdP-->>Browser: Set-Cookie: praeco_jwt=...<br/>{"status":"confirmed"}
 ```
 
@@ -210,7 +211,7 @@ To allow downstream API servers (Resource Servers) to independently and securely
 
 **Endpoint:** `GET /.well-known/jwks.json`
 
-When `jwt_public_key` is configured in `IdpParams`, the IdP automatically reads the PEM file, extracts the raw public key bytes (e.g., Ed25519 `x` coordinate), and computes a standard `kid` (Key ID) via SHA-256 thumbprint. It then serves the key in JWK format according to RFC 7517.
+When `jwt_public_key` is configured in `IdpParams`, the IdP automatically reads the PEM file, extracts the raw public key bytes (e.g., Ed25519 `x` coordinate), and validates the SubjectPublicKeyInfo (SPKI) structure before serving the key in JWK format according to RFC 7517.
 
 **Example Response:**
 ```json
@@ -219,7 +220,8 @@ When `jwt_public_key` is configured in `IdpParams`, the IdP automatically reads 
     {
       "kty": "OKP",
       "crv": "Ed25519",
-      "kid": "A1b2C3d4...",
+      "use": "sig",
+      "kid": "praeco-key-1",
       "x": "base64url-encoded-key-bytes"
     }
   ]
@@ -227,3 +229,15 @@ When `jwt_public_key` is configured in `IdpParams`, the IdP automatically reads 
 ```
 
 Resource Servers can periodically poll this endpoint to maintain an up-to-date cache of trusted signing keys, enabling zero-downtime key rotation without manual configuration distribution.
+
+## 5. JWT Revocation & Logout
+
+Praeco provides built-in support for token revocation and browser session invalidation:
+
+1. **Cryptographic `jti` (JWT ID):** Every JWT issued by the IdP is stamped with a unique UUIDv4 `jti`.
+2. **Denylist Storage (`JwtRevocationStore`):** In-memory, lock-free thread-safe storage tracks revoked `jti` entries until their natural expiration time (`exp`).
+3. **Revocation Endpoint (`POST /auth/revoke`):**
+   - **Logout:** Calling `POST /auth/revoke` with an `Authorization: Bearer <token>` header or session cookie extracts the `jti` and registers it in the revocation store.
+   - **Explicit Revocation:** Calling `POST /auth/revoke?jti=<UUID>` immediately revokes a specific token ID (e.g. from an administrative interface).
+   - **Cookie Invalidation:** Returns `Set-Cookie: <cookie_name>=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT` to clear the browser cookie immediately.
+4. **Enforcement in `JwtAuthService`:** Before forwarding any request with a JWT to downstream microservices, the proxy checks the revocation store. Revoked tokens are immediately rejected with `401 Unauthorized`.

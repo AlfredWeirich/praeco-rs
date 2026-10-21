@@ -30,6 +30,7 @@ use std::{
 
 // === External Crates ===
 use bytes::Bytes;
+use dashmap::DashMap;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
 use jsonwebtoken::DecodingKey;
@@ -41,6 +42,68 @@ use tracing::error;
 // === Internal Modules ===
 use crate::{ServiceRespBody, SrvError};
 use common::{Claims, load_decoding_keys, verify_jwt};
+
+/// Thread-safe storage for revoked JWT IDs (`jti`).
+#[derive(Clone, Default)]
+pub struct JwtRevocationStore {
+    /// Maps `jti` to expiration UNIX timestamp (seconds).
+    revoked: Arc<DashMap<String, u64>>,
+}
+
+impl JwtRevocationStore {
+    pub fn new() -> Self {
+        Self {
+            revoked: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Marks a JWT with the given `jti` as revoked until `expires_at`.
+    pub fn revoke(&self, jti: impl Into<String>, expires_at: u64) {
+        self.revoked.insert(jti.into(), expires_at);
+    }
+
+    /// Checks if a `jti` has been revoked. If expired, lazily prunes it.
+    pub fn is_revoked(&self, jti: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        if let Some(entry) = self.revoked.get(jti) {
+            if now < *entry.value() {
+                return true;
+            } else {
+                drop(entry);
+                self.revoked.remove(jti);
+            }
+        }
+        false
+    }
+
+    /// Explicitly purges all expired revocations.
+    pub fn cleanup_expired(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.revoked.retain(|_, exp| now < *exp);
+    }
+
+    pub fn len(&self) -> usize {
+        self.revoked.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.revoked.is_empty()
+    }
+}
+
+static GLOBAL_REVOCATION_STORE: std::sync::OnceLock<JwtRevocationStore> = std::sync::OnceLock::new();
+
+/// Returns the singleton instance of the global JWT revocation store.
+pub fn get_jwt_revocation_store() -> &'static JwtRevocationStore {
+    GLOBAL_REVOCATION_STORE.get_or_init(JwtRevocationStore::new)
+}
 
 /// A Tower [`Layer`] for JWT-based Authentication.
 ///
@@ -204,6 +267,16 @@ where
 
                     match claims_res {
                         Ok(claims) => {
+                            // --- Revocation Check (jti Denylist) ---
+                            if let Some(ref jti) = claims.jti {
+                                if get_jwt_revocation_store().is_revoked(jti) {
+                                    tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
+                                    let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
+                                    self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
+                                    continue;
+                                }
+                            }
+
                             // --- Role Mapping Logic ---
                             let mut roles: Vec<crate::configuration::UserRole> = claims
                                 .oids
@@ -376,4 +449,105 @@ fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRe
     let mut resp: Response<ServiceRespBody> = Response::new(body);
     *resp.status_mut() = StatusCode::UNAUTHORIZED;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    const TEST_PRIV_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+    const TEST_PUB_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+
+    #[test]
+    fn test_jwt_revocation_store_lifecycle() {
+        let store = JwtRevocationStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 1. Initially empty
+        assert!(!store.is_revoked("token-1"));
+        assert_eq!(store.len(), 0);
+
+        // 2. Revoke active token
+        store.revoke("token-1", now + 300);
+        assert!(store.is_revoked("token-1"));
+        assert!(!store.is_revoked("token-2"));
+        assert_eq!(store.len(), 1);
+
+        // 3. Expired token is lazily pruned
+        store.revoke("token-expired", now - 10);
+        assert!(!store.is_revoked("token-expired"));
+
+        // 4. Cleanup expired
+        store.revoke("token-stale", now - 5);
+        store.cleanup_expired();
+        assert!(!store.is_revoked("token-stale"));
+    }
+
+    #[tokio::test]
+    async fn test_jwtauth_service_rejects_revoked_jti() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let jti = "test-jti-uuid-999".to_string();
+        let claims = Claims {
+            sub: "admin-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: now as usize + 3600,
+            oids: vec!["1".to_string()],
+            jti: Some(jti.clone()),
+        };
+
+        let token = common::sign_jwt(&claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|_req: Request<Full<Bytes>>| async {
+            let body: ServiceRespBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut jwt_svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-server",
+            oid_mapping: Arc::new(vec![("1".to_string(), crate::configuration::UserRole("Admin".to_string()))]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+        };
+
+        // First request: token is NOT revoked -> should succeed (200 OK)
+        let req1 = Request::builder()
+            .uri("/api/test")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let resp1 = jwt_svc.ready().await.unwrap().call(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Now revoke the token's JTI
+        get_jwt_revocation_store().revoke(&jti, now + 3600);
+
+        // Second request: token's JTI IS revoked -> should be rejected (401 Unauthorized)
+        let req2 = Request::builder()
+            .uri("/api/test")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+
+        let resp2 = jwt_svc.ready().await.unwrap().call(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    }
 }
