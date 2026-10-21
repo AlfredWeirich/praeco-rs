@@ -68,7 +68,7 @@ use hyper_util::rt::TokioIo;
 use tokio::{net::TcpListener, runtime::Builder};
 
 use tokio_util::sync::CancellationToken;
-use tower::{Layer, limit::ConcurrencyLimit};
+use tower::Layer;
 use praeco_rs::BoxCloneSyncServiceExt;
 use arc_swap::ArcSwap;
 #[allow(unused_imports)]
@@ -1083,9 +1083,15 @@ fn apply_layers(
                     return Err(anyhow!("{server_name}: RateLimiter requests_per_second must be > 0"));
                 }
                 let dur = Duration::from_secs_f32(1.0 / cfg.requests_per_second as f32);
-                SimpleRateLimiterLayer::new(dur, server_name)
-                    .layer(svc)
-                    .boxed_clone_sync()
+                SimpleRateLimiterLayer::with_config(
+                    dur,
+                    cfg.key_by,
+                    cfg.max_entries,
+                    Duration::from_secs(cfg.ttl_seconds),
+                    server_name,
+                )
+                .layer(svc)
+                .boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(
                 praeco_rs::configuration::RateLimiter::TokenBucket(cfg),
@@ -1093,20 +1099,30 @@ fn apply_layers(
                 if cfg.max_capacity == 0 || cfg.refill == 0 || cfg.duration_micros == 0 {
                     return Err(anyhow!("{server_name}: TokenBucketRateLimiter parameters must all be > 0"));
                 }
-                TokenBucketRateLimiterLayer::new(
+                TokenBucketRateLimiterLayer::with_config(
                     cfg.max_capacity,
                     cfg.refill,
                     Duration::from_micros(cfg.duration_micros),
+                    cfg.key_by,
+                    cfg.max_entries,
+                    Duration::from_secs(cfg.ttl_seconds),
                     server_name,
                 )
                 .layer(svc)
                 .boxed_clone_sync()
             }
-            MiddlewareLayer::ConcurrencyLimit(max_requests) => {
-                if max_requests == 0 {
-                    return Err(anyhow!("{server_name}: ConcurrencyLimit max_requests must be > 0"));
+            MiddlewareLayer::ConcurrencyLimit(cfg) => {
+                if cfg.max_concurrent_requests == 0 {
+                    return Err(anyhow!("{server_name}: ConcurrencyLimit max_concurrent_requests must be > 0"));
                 }
-                ConcurrencyLimit::new(svc, max_requests).boxed_clone_sync()
+                praeco_rs::middleware::ConcurrencyLimitLayer::with_config(
+                    cfg.max_concurrent_requests,
+                    cfg.load_shed,
+                    cfg.queue_timeout_ms.map(Duration::from_millis),
+                    server_name,
+                )
+                .layer(svc)
+                .boxed_clone_sync()
             }
             MiddlewareLayer::Compression => SrvCompressionLayer::new(server_name)
                 .layer(svc)
