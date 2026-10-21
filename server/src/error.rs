@@ -21,6 +21,9 @@ use std::convert::Infallible;
 /// | [`Infallible`](SrvError::Infallible) | Type-system only; never actually constructed at runtime. |
 /// | [`Hyper`](SrvError::Hyper) | Errors from the Hyper HTTP engine (connection resets, protocol violations, …). |
 /// | [`HyperUtil`](SrvError::HyperUtil) | Errors from the Hyper utility / legacy client layer. |
+/// | [`PayloadTooLarge`](SrvError::PayloadTooLarge) | Client payload limit exceeded (`413 Payload Too Large`). |
+/// | [`DecompressionLimitExceeded`](SrvError::DecompressionLimitExceeded) | Decompressed payload bomb limit exceeded (`413 Payload Too Large`). |
+/// | [`ClientAborted`](SrvError::ClientAborted) | Client disconnected or aborted the request stream (`400 Bad Request`). |
 /// | [`Other`](SrvError::Other) | Catch-all for application-level errors expressed as plain strings. |
 #[derive(Debug, thiserror::Error)]
 pub enum SrvError {
@@ -45,6 +48,18 @@ pub enum SrvError {
     /// connect to an upstream backend.
     #[error("HyperUtil: {0}")]
     HyperUtil(#[from] HyperUtilError),
+
+    /// The client request payload exceeded the configured max_bytes limit.
+    #[error("Payload Limit Exceeded: {current} > {max}")]
+    PayloadTooLarge { current: usize, max: usize },
+
+    /// The decompressed body exceeded the decompression bomb protection limit.
+    #[error("Decompressed payload exceeds maximum allowed size: limit {max}")]
+    DecompressionLimitExceeded { max: usize },
+
+    /// The client closed the connection, reset the stream, or aborted the request.
+    #[error("Client Aborted: {0}")]
+    ClientAborted(String),
 
     /// Catch-all for internal or string-based application errors.
     ///

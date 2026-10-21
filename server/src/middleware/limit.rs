@@ -112,7 +112,9 @@ where
                     Ok(resp) => Poll::Ready(Ok(resp)),
                     Err(e) => {
                         let srv_err: SrvError = e.into();
-                        if srv_err.to_string().contains("Payload Limit Exceeded") {
+                        if matches!(srv_err, SrvError::PayloadTooLarge { .. })
+                            || srv_err.to_string().contains("Payload Limit Exceeded")
+                        {
                             let msg = "Payload too large (Streaming check)";
                             tracing::warn!("{}: {}", server_name, msg);
                             Poll::Ready(Ok(build_413_response(msg)))
@@ -205,10 +207,10 @@ where
                     *this.current_bytes += data.len();
 
                     if *this.current_bytes > *this.max_bytes {
-                        return Poll::Ready(Some(Err(SrvError::Other(format!(
-                            "Payload Limit Exceeded: {} > {}",
-                            this.current_bytes, this.max_bytes
-                        )))));
+                        return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
+                            current: *this.current_bytes,
+                            max: *this.max_bytes,
+                        })));
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))

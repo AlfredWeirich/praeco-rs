@@ -284,6 +284,18 @@ impl Service<Request<SrvBody>> for RouterService {
                 match body.collect().await {
                     Ok(c) => RequestBody::Buffered(c.to_bytes()),
                     Err(e) => {
+                        let err_str = e.to_string();
+                        if matches!(e, SrvError::PayloadTooLarge { .. })
+                            || err_str.contains("Payload Limit Exceeded")
+                            || matches!(e, SrvError::DecompressionLimitExceeded { .. })
+                            || err_str.contains("Decompressed payload")
+                        {
+                            tracing::warn!("{}: Request body exceeded payload limit: {}", server_name, e);
+                            return Ok(build_error_response(
+                                "Payload Too Large",
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                            ));
+                        }
                         error!("{}: Failed to read request body: {}", server_name, e);
                         return Ok(build_error_response("Bad Request", StatusCode::BAD_REQUEST));
                     }

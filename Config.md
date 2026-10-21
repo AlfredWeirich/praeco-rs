@@ -258,7 +258,9 @@ Here is an overview of the most useful values for configuration:
 * `max_decompressed_bytes`: Integer. Maximum size of the decompressed body in bytes (protection against Decompression Bombs).
 
 #### `[Server.Layers.MaxPayload]`
-* `max_bytes`: Integer. Maximum allowed payload size in bytes.
+* `max_bytes`: Integer. Maximum allowed request payload size in bytes.
+* *Header Fast-Path & Streaming Enforcement:* If `Content-Length` is present and exceeds `max_bytes`, the request is rejected immediately with `413 Payload Too Large`. For chunked or streaming uploads (REST and gRPC-Passthrough), bytes are tracked on the fly.
+* *Zero Upstream Blacklisting:* When a client exceeds `max_bytes` during a streaming upload, Praeco cleanly returns `413 Payload Too Large`. The error is isolated as a client-side fault (`ProxyErrorKind::PayloadTooLarge`); the upstream backend is **never** marked dead or removed from the load balancer pool.
 
 #### `[Server.Layers.ConcurrencyLimit]`
 * `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing. Must be strictly greater than `0`.
