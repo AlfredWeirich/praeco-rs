@@ -262,21 +262,35 @@ Here is an overview of the most useful values for configuration:
 
 #### `[Server.Layers.ConcurrencyLimit]`
 * `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing. Must be strictly greater than `0`.
+* `load_shed`: Boolean *(optional, default: `true`)*. When enabled, requests arriving while at maximum capacity immediately fail fast with `503 Service Unavailable` and a `Retry-After: 1` header instead of queueing indefinitely into memory.
+* `queue_timeout_ms`: Integer *(optional)*. If `load_shed = false`, maximum duration in milliseconds to wait for an available permit before timing out with `503 Service Unavailable`.
+* *Body-Aware Permits:* Concurrency permits are retained across the entire duration of response body streaming (EOF or client disconnect) to accurately account for streaming resources.
 
 #### `[Server.Layers.JWT]`
 * `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures. Keys are validated and parsed eagerly during startup and hot-reload.
 * `cookie_fallback`: String *(optional)*. The name of the HTTP cookie to read the JWT from if the `Authorization: Bearer <token>` header is absent (e.g. `"admin-jwt"`).
 * `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
-* `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that exactly matches this string. This prevents the "Confused Deputy" problem by ensuring tokens from other Identity Providers using the same key cannot be used.
-* `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that exactly matches this string. Ensures the token was specifically issued for this gateway/application.
+* `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that matches one of the expected issuers (supports comma-separated lists).
+* `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that matches one of the expected audiences (supports comma-separated lists).
 
 #### `[Server.Layers.RateLimiter]` (Simple)
 * `requests_per_second`: Integer. Strict limit of requests per second. Must be strictly greater than `0`.
+* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy:
+  * `"identity"`: Keyed by authenticated user (`sub` from JWT or SAN from mTLS cert), falling back to client IP.
+  * `"ip"`: Keyed strictly by client IP (`SocketAddr` / `X-Forwarded-For`).
+  * `"global"`: Server-wide shared bucket.
+* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys before pruning.
+* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning.
+* *RFC 6585 compliance:* Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
 
 #### `[Server.Layers.TokenBucketRateLimiter]`
 * `max_capacity`: Integer. Maximum burst size (number of tokens). Must be strictly greater than `0`.
 * `refill`: Integer. Number of added tokens per interval. Must be strictly greater than `0`.
 * `duration_micros`: Integer. Refill interval in microseconds. Must be strictly greater than `0`.
+* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy (`"identity"`, `"ip"`, or `"global"`).
+* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys before pruning.
+* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning.
+* *Float-precision refill:* Eliminates token drift by preserving fractional intervals without truncation. Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
 
 #### `[Server.Layers.Delay]`
 * `delay_micros`: Integer. Artificially delays each request (for debugging).

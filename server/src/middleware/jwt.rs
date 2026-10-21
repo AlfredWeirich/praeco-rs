@@ -550,4 +550,106 @@ mod tests {
         let resp2 = jwt_svc.ready().await.unwrap().call(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[tokio::test]
+    async fn test_jwtauth_preceding_rate_limiter_protects_authenticated_quota() {
+        use tower::service_fn;
+        use crate::middleware::rate_limiter::{TokenBucketRateLimiterService, RateLimitKeyStrategy};
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let alice_claims = Claims {
+            sub: "alice-uuid".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: now as usize + 3600,
+            oids: vec!["1".to_string()],
+            jti: Some("alice-jti".to_string()),
+        };
+        let alice_token = common::sign_jwt(&alice_claims, &enc_key).unwrap();
+
+        let bob_claims = Claims {
+            sub: "bob-uuid".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: now as usize + 3600,
+            oids: vec!["1".to_string()],
+            jti: Some("bob-jti".to_string()),
+        };
+        let bob_token = common::sign_jwt(&bob_claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|_req: Request<Full<Bytes>>| async {
+            let body: ServiceRespBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        // Inner rate limiter with capacity = 1 per identity
+        let rate_limited_svc = TokenBucketRateLimiterService::with_config(
+            inner_svc,
+            1,
+            1,
+            std::time::Duration::from_secs(60),
+            RateLimitKeyStrategy::Identity,
+            100,
+            std::time::Duration::from_secs(300),
+            "test-server",
+        );
+
+        // JwtAuth runs BEFORE rate limiter (outer layer)
+        let mut pipeline = JwtAuthService {
+            inner: rate_limited_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-server",
+            oid_mapping: Arc::new(vec![("1".to_string(), crate::configuration::UserRole("Admin".to_string()))]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+        };
+
+        // 1. Unauthenticated attacker sends 10 requests without token
+        for _ in 0..10 {
+            let unauth_req = Request::builder()
+                .uri("/api/admin")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = pipeline.ready().await.unwrap().call(unauth_req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        // 2. Alice makes her first request -> passes auth and rate limit (200 OK)
+        let req_alice1 = Request::builder()
+            .uri("/api/admin")
+            .header("Authorization", format!("Bearer {}", alice_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_alice1 = pipeline.ready().await.unwrap().call(req_alice1).await.unwrap();
+        assert_eq!(resp_alice1.status(), StatusCode::OK);
+
+        // 3. Alice makes her second request -> rate limited (429 Too Many Requests)
+        let req_alice2 = Request::builder()
+            .uri("/api/admin")
+            .header("Authorization", format!("Bearer {}", alice_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_alice2 = pipeline.ready().await.unwrap().call(req_alice2).await.unwrap();
+        assert_eq!(resp_alice2.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp_alice2.headers().contains_key(hyper::header::RETRY_AFTER));
+
+        // 4. Bob makes his request -> Bob has his own bucket, so Alice's limit does NOT block Bob!
+        let req_bob1 = Request::builder()
+            .uri("/api/admin")
+            .header("Authorization", format!("Bearer {}", bob_token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_bob1 = pipeline.ready().await.unwrap().call(req_bob1).await.unwrap();
+        assert_eq!(resp_bob1.status(), StatusCode::OK);
+    }
 }
+

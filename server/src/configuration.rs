@@ -502,7 +502,7 @@ pub enum MiddlewareLayer {
     /// Authenticates requests using JWT tokens (carries full config including public keys and cookie fallback).
     JwtAuth(JwtAuthConfig),
     /// Limits the number of concurrent requests.
-    ConcurrencyLimit(usize),
+    ConcurrencyLimit(ConcurrencyLimitConfig),
     /// Limits the maximum size of request payloads (in bytes).
     MaxPayload(usize),
     /// Adds an Alt-Svc header to the response.
@@ -689,11 +689,45 @@ pub struct ClientCertForwardingConfig {
     pub header_client_ip: Option<String>,
 }
 
+/// Keying strategy for rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKeyStrategy {
+    /// Keys requests by authenticated identity (JWT sub or mTLS SAN), falling back to client IP.
+    #[default]
+    Identity,
+    /// Keys requests strictly by client IP.
+    Ip,
+    /// Shared global rate limiter across the whole server route.
+    Global,
+}
+
+fn default_max_entries() -> usize {
+    10_000
+}
+
+fn default_ttl_seconds() -> u64 {
+    300
+}
+
+fn default_load_shed() -> bool {
+    true
+}
+
 /// Configuration for the simple fixed-window rate limiter.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SimpleRateLimiterConfig {
     /// Maximum number of requests per second.
     pub requests_per_second: u64,
+    /// Keying strategy: "identity", "ip", or "global" (default: "identity").
+    #[serde(default)]
+    pub key_by: RateLimitKeyStrategy,
+    /// Maximum number of tracking entries in memory before pruning (default: 10,000).
+    #[serde(default = "default_max_entries")]
+    pub max_entries: usize,
+    /// Entry idle TTL in seconds before pruning (default: 300).
+    #[serde(default = "default_ttl_seconds")]
+    pub ttl_seconds: u64,
 }
 
 /// Configuration for the token-bucket rate limiter.
@@ -705,6 +739,15 @@ pub struct TokenBucketRateLimiterConfig {
     pub refill: usize,
     /// Refill interval in microseconds.
     pub duration_micros: u64,
+    /// Keying strategy: "identity", "ip", or "global" (default: "identity").
+    #[serde(default)]
+    pub key_by: RateLimitKeyStrategy,
+    /// Maximum number of tracking entries in memory before pruning (default: 10,000).
+    #[serde(default = "default_max_entries")]
+    pub max_entries: usize,
+    /// Entry idle TTL in seconds before pruning (default: 300).
+    #[serde(default = "default_ttl_seconds")]
+    pub ttl_seconds: u64,
 }
 
 /// Configuration for the artificial delay layer.
@@ -734,6 +777,11 @@ pub struct JwtAuthConfig {
 pub struct ConcurrencyLimitConfig {
     /// Maximum number of in-flight requests.
     pub max_concurrent_requests: usize,
+    /// Whether to fail fast (503 Service Unavailable) when at capacity (default: true).
+    #[serde(default = "default_load_shed")]
+    pub load_shed: bool,
+    /// Optional queue timeout in milliseconds if load_shed is false.
+    pub queue_timeout_ms: Option<u64>,
 }
 
 /// Configuration for the CORS layer.
@@ -1415,7 +1463,7 @@ impl Layers {
                             server_name
                         )));
                     }
-                    Ok(MiddlewareLayer::ConcurrencyLimit(c.max_concurrent_requests))
+                    Ok(MiddlewareLayer::ConcurrencyLimit(c.clone()))
                 }
                 "Cors" => {
                     let c = self
