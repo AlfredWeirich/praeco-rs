@@ -422,6 +422,25 @@ Configures the outgoing connection of the proxy to the backend servers.
 | `ssl_client_certificate` | String | Proxy Client Certificate for mTLS to the backend. | `"/path/to/proxy-client.pem"` |
 | `ssl_client_key` | String | Proxy Private Key for mTLS to the backend. | `"/path/to/proxy-client.key"` |
 | `jwt` | String | Path to a JWT file, which is sent to the backend when `authentication = "JWT"`. | `"/path/to/token.jwt"` |
+| `connect_timeout_seconds` | Integer | TCP connect timeout to upstreams in seconds (default: 5). | `5` |
+| `request_timeout_seconds` | Integer | Request header timeout for upstream responses in seconds (default: 30, 0 = disabled). Returns 504 on expiry. | `30` |
+| `idle_timeout_seconds` | Integer | Connection pool idle keep-alive timeout in seconds (default: 90). | `90` |
+| `grpc_reflection_timeout_seconds` | Integer | gRPC reflection discovery RPC timeout in seconds (default: 10). | `10` |
+| `grpc_reflection_ttl_seconds` | Integer | Schema cache TTL in seconds before refreshing protobuf definitions (default: 600 / 10m). | `600` |
+
+#### Upstream Timeouts & Keep-Alive Mechanics (Zero-Hang Architecture)
+1. **Connect & Request Timeouts:**
+   - `connect_timeout_seconds`: Bound TCP and TLS connection establishment time. If a backend drops packets or stalls during the handshake, Praeco terminates the attempt after this duration instead of hanging indefinitely.
+   - `request_timeout_seconds`: Wraps REST and gRPC-Passthrough requests in an asynchronous deadline. If an upstream server accepts the connection but fails to reply within the timeout, Praeco returns `504 Gateway Timeout` and marks that specific upstream dead.
+2. **TCP & HTTP/2 Keepalive:**
+   - Praeco enables `TCP_NODELAY` and sets TCP Keepalive probes to 60 seconds on all upstream sockets.
+   - For HTTP/2 connections, keepalive PING frames are transmitted every 30 seconds with a 10-second acknowledgment timeout. Both active requests and idle connections in the pool are probed (`http2_keep_alive_while_idle = true`), allowing broken connections or silent state-table drops by middleboxes/firewalls to be pruned immediately.
+   - All connection pools run an active Tokio timer (`builder.pool_timer` & `builder.timer`) ensuring idle connections older than `idle_timeout_seconds` are evicted cleanly from memory.
+3. **gRPC Reflection Schema Caching & Fail-Closed TLS:**
+   - **Non-blocking I/O:** gRPC-Web reflection fetches occur completely outside `RwLock` read/write locks using single-flight mutexes, preventing concurrent gRPC-Web client requests from stalling during network schema queries.
+   - **TTL Invalidation:** Schema reflection caches expire after `grpc_reflection_ttl_seconds` (default 10 minutes) to accommodate dynamic upstream proto updates. In case of transient upstream discovery errors while an expired schema is present, Praeco applies stale-while-revalidate to ensure continuous uptime.
+   - **Fail-Closed Security:** If custom CA certificates or mTLS keys configured in `RouterParams` cannot be read from disk, reflection immediately fails closed with an error rather than silently degrading to system webpki trust stores.
+
 
 ---
 

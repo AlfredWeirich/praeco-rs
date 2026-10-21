@@ -21,6 +21,7 @@ pub async fn handle_grpc_passthrough(
         common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
         ServiceRespBody,
     >,
+    request_timeout: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
     let max_retries = route_info.target.max_retries;
@@ -114,7 +115,34 @@ pub async fn handle_grpc_passthrough(
             );
         });
 
-        match grpc_client.request(proxy_req).await {
+        let req_fut = grpc_client.request(proxy_req);
+        let resp_result = if let Some(timeout_dur) = request_timeout {
+            match tokio::time::timeout(timeout_dur, req_fut).await {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    error!(
+                        "{}: Upstream gRPC request timed out after {:?} for {}",
+                        server_name, timeout_dur, backend_base_uri
+                    );
+                    route_info.target.mark_dead(backend_base_uri);
+                    failed_nodes.push(backend_base_uri.clone());
+
+                    if attempts <= max_retries {
+                        warn!(
+                            "{}: Retrying timed-out gRPC request... (Attempt {}/{})",
+                            server_name, attempts, max_retries
+                        );
+                        continue;
+                    } else {
+                        return Ok(build_error_response("Gateway Timeout", StatusCode::GATEWAY_TIMEOUT));
+                    }
+                }
+            }
+        } else {
+            req_fut.await
+        };
+
+        match resp_result {
             Ok(res) => {
                 let (mut res_parts, res_body) = res.into_parts();
                 super::headers::clean_response_headers(&mut res_parts.headers);
@@ -148,3 +176,87 @@ pub async fn handle_grpc_passthrough(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+    use crate::configuration::{LbStrategy, RouteBackendType, RouteTarget, UpstreamNode};
+
+    #[tokio::test]
+    async fn test_grpc_passthrough_request_timeout_returns_504() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn a slow upstream that delays responding
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+
+        let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
+        let node = UpstreamNode {
+            uri: upstream_uri.clone(),
+            active_connections: AtomicUsize::new(0),
+            is_alive: AtomicBool::new(true),
+            last_failure_time: AtomicU64::new(0),
+            current_score: AtomicUsize::new(0),
+        };
+
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 10,
+            max_retries: 0,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let route_info = ParsedRoute {
+            prefix: "/chat.ChatService".to_string(),
+            target: target.clone(),
+            allowed_roles: Vec::new(),
+            backend_type: RouteBackendType::GrpcPassthrough,
+        };
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let pool_config = common::client::ClientPoolConfig {
+            http2_only: true,
+            ..Default::default()
+        };
+        let client = common::client::build_hyper_client(tls_config, pool_config);
+
+        let req_uri: Uri = "http://localhost/chat.ChatService/SendMessage".parse().unwrap();
+        let prepared_headers = hyper::HeaderMap::new();
+        let matched_params = matchit::Params::new();
+
+        let response = handle_grpc_passthrough(
+            &route_info,
+            RequestBody::Buffered(bytes::Bytes::new()),
+            Method::POST,
+            prepared_headers,
+            &req_uri,
+            &matched_params,
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "Timed out gRPC node must be marked dead");
+    }
+}
+

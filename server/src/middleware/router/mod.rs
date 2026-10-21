@@ -116,18 +116,24 @@ impl RouterService {
 
         let client = {
             let pool_config = common::client::ClientPoolConfig {
-                idle_timeout: Some(std::time::Duration::from_secs(90)),
+                idle_timeout: Some(std::time::Duration::from_secs(router_params.idle_timeout_seconds)),
                 max_idle_per_host: Some(1024),
                 http2_only: false,
+                connect_timeout: (router_params.connect_timeout_seconds > 0)
+                    .then(|| std::time::Duration::from_secs(router_params.connect_timeout_seconds)),
+                ..Default::default()
             };
             common::client::build_hyper_client(tls_client_config.clone(), pool_config)
         };
 
         let grpc_client = {
             let pool_config = common::client::ClientPoolConfig {
-                idle_timeout: Some(std::time::Duration::from_secs(90)),
+                idle_timeout: Some(std::time::Duration::from_secs(router_params.idle_timeout_seconds)),
                 max_idle_per_host: Some(1024),
                 http2_only: true,
+                connect_timeout: (router_params.connect_timeout_seconds > 0)
+                    .then(|| std::time::Duration::from_secs(router_params.connect_timeout_seconds)),
+                ..Default::default()
             };
             common::client::build_hyper_client(tls_client_config.clone(), pool_config)
         };
@@ -284,6 +290,12 @@ impl Service<Request<SrvBody>> for RouterService {
                 }
             };
 
+            let request_timeout = self_clone
+                .config
+                .router_params
+                .as_ref()
+                .and_then(|p| (p.request_timeout_seconds > 0).then(|| std::time::Duration::from_secs(p.request_timeout_seconds)));
+
             // Dispatch to the proper specialized terminal service
             match route_info.backend_type {
                 RouteBackendType::GrpcTranscoding => {
@@ -311,6 +323,7 @@ impl Service<Request<SrvBody>> for RouterService {
                         client_addr,
                         server_name,
                         &grpc_client,
+                        request_timeout,
                     )
                     .await
                 }
@@ -326,6 +339,7 @@ impl Service<Request<SrvBody>> for RouterService {
                         client_addr,
                         server_name,
                         &client,
+                        request_timeout,
                     )
                     .await
                 }

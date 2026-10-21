@@ -344,6 +344,15 @@ impl UpstreamNode {
     }
 }
 
+/// Cached gRPC DescriptorPool with creation timestamp for TTL-based cache expiration.
+#[derive(Debug, Clone)]
+pub struct CachedDescriptorPool {
+    /// The loaded descriptor pool containing protobuf definitions.
+    pub pool: std::sync::Arc<prost_reflect::DescriptorPool>,
+    /// Instant when this pool was retrieved via gRPC reflection.
+    pub created_at: std::time::Instant,
+}
+
 /// The load-balanced target configuration for a parsed route.
 #[derive(Debug)]
 pub struct RouteTarget {
@@ -359,9 +368,11 @@ pub struct RouteTarget {
     pub max_retries: usize,
     /// Interval in seconds for actively polling the /health endpoint of upstreams. 0 means disabled.
     pub active_health_check_interval: u64,
-    /// Cached gRPC DescriptorPool from reflection, lazily loaded by the router.
+    /// Cached gRPC DescriptorPool from reflection, lazily loaded by the router with TTL.
     /// Only used if backend_type is Grpc.
-    pub grpc_pool: tokio::sync::RwLock<Option<std::sync::Arc<prost_reflect::DescriptorPool>>>,
+    pub grpc_pool: tokio::sync::RwLock<Option<CachedDescriptorPool>>,
+    /// Mutex to synchronize reflection fetches without holding the read/write lock across network I/O.
+    pub grpc_reflection_lock: tokio::sync::Mutex<()>,
 }
 
 impl RouteTarget {
@@ -576,6 +587,26 @@ pub struct DecompressionConfig {
     pub max_decompressed_bytes: usize,
 }
 
+fn default_connect_timeout_seconds() -> u64 {
+    5
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_idle_timeout_seconds() -> u64 {
+    90
+}
+
+fn default_grpc_reflection_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_grpc_reflection_ttl_seconds() -> u64 {
+    600
+}
+
 /// Parameters for the reverse-proxy router's upstream connections.
 ///
 /// Controls how the router communicates with backend services (protocol,
@@ -596,6 +627,21 @@ pub struct RouterParams {
     pub ssl_client_certificate: Option<String>,
     /// Path to the client private key for upstream mTLS.
     pub ssl_client_key: Option<String>,
+    /// Connect timeout in seconds for upstream connections (default: 5).
+    #[serde(default = "default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// Request timeout in seconds for upstream response headers (default: 30).
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// Pool idle connection timeout in seconds (default: 90).
+    #[serde(default = "default_idle_timeout_seconds")]
+    pub idle_timeout_seconds: u64,
+    /// gRPC reflection schema fetch timeout in seconds (default: 10).
+    #[serde(default = "default_grpc_reflection_timeout_seconds")]
+    pub grpc_reflection_timeout_seconds: u64,
+    /// gRPC reflection schema cache TTL in seconds (default: 600 / 10 mins).
+    #[serde(default = "default_grpc_reflection_ttl_seconds")]
+    pub grpc_reflection_ttl_seconds: u64,
 }
 
 /// Parameters for the Identity Provider (IdP) service.
@@ -1245,6 +1291,7 @@ impl ServerConfig {
                     max_retries: cfg.max_retries.unwrap_or(2),
                     active_health_check_interval: cfg.active_health_check_interval.unwrap_or(0),
                     grpc_pool: tokio::sync::RwLock::new(None),
+                    grpc_reflection_lock: tokio::sync::Mutex::new(()),
                 };
 
                 rules.push(ParsedRoute {
@@ -1668,5 +1715,36 @@ mod tests {
         assert!(res.is_err());
         let err_msg = format!("{:#}", res.unwrap_err());
         assert!(err_msg.contains("max_concurrent_requests must be greater than 0"));
+    }
+
+    #[test]
+    fn test_router_params_defaults() {
+        let toml_str = r#"
+            protocol = "http"
+        "#;
+        let params: RouterParams = toml::from_str(toml_str).unwrap();
+        assert_eq!(params.connect_timeout_seconds, 5);
+        assert_eq!(params.request_timeout_seconds, 30);
+        assert_eq!(params.idle_timeout_seconds, 90);
+        assert_eq!(params.grpc_reflection_timeout_seconds, 10);
+        assert_eq!(params.grpc_reflection_ttl_seconds, 600);
+    }
+
+    #[test]
+    fn test_router_params_custom_timeouts() {
+        let toml_str = r#"
+            protocol = "https"
+            connect_timeout_seconds = 2
+            request_timeout_seconds = 15
+            idle_timeout_seconds = 45
+            grpc_reflection_timeout_seconds = 8
+            grpc_reflection_ttl_seconds = 300
+        "#;
+        let params: RouterParams = toml::from_str(toml_str).unwrap();
+        assert_eq!(params.connect_timeout_seconds, 2);
+        assert_eq!(params.request_timeout_seconds, 15);
+        assert_eq!(params.idle_timeout_seconds, 45);
+        assert_eq!(params.grpc_reflection_timeout_seconds, 8);
+        assert_eq!(params.grpc_reflection_ttl_seconds, 300);
     }
 }

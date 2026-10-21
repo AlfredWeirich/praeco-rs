@@ -86,6 +86,7 @@ impl WebhookClient {
             idle_timeout: Some(Duration::from_secs(60)),
             max_idle_per_host: Some(16),
             http2_only: false,
+            ..Default::default()
         };
 
         let client = common::client::build_hyper_client(tls_config, pool_config);
