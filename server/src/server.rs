@@ -560,9 +560,12 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
         // gRPC-specific pool: gRPC strictly requires HTTP/2 multiplexing.
         // We enforce `http2_only: true` so it strictly negotiates H2 during the TLS ALPN handshake.
         let grpc_pool_config = common::client::ClientPoolConfig {
-            idle_timeout: Some(Duration::from_secs(30)),
+            idle_timeout: Some(Duration::from_secs(router_params.idle_timeout_seconds)),
             max_idle_per_host: Some(16),
             http2_only: true, // Force HTTP/2 for gRPC
+            connect_timeout: (router_params.connect_timeout_seconds > 0)
+                .then(|| Duration::from_secs(router_params.connect_timeout_seconds)),
+            ..Default::default()
         };
         // Build the client specifically for gRPC health checks
         let grpc_client =
@@ -570,9 +573,12 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
         // Standard REST/HTTP pool: Allows HTTP/1.1 or H2 depending on what the upstream server supports.
         let pool_config = common::client::ClientPoolConfig {
-            idle_timeout: Some(Duration::from_secs(30)),
+            idle_timeout: Some(Duration::from_secs(router_params.idle_timeout_seconds)),
             max_idle_per_host: Some(16),
             http2_only: false, // Default negotiation for standard web traffic
+            connect_timeout: (router_params.connect_timeout_seconds > 0)
+                .then(|| Duration::from_secs(router_params.connect_timeout_seconds)),
+            ..Default::default()
         };
 
         // Build the client for standard REST health checks
@@ -671,14 +677,19 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                             let mut pool_guard = target_arc.grpc_pool.write().await;
                                             if pool_guard.is_none() {
                                                 match praeco_rs::middleware::router::build_grpc_pool(&base_uri, Some(&router_params)).await {
-                                                    Ok(p) => *pool_guard = Some(p),
+                                                    Ok(p) => {
+                                                        *pool_guard = Some(praeco_rs::configuration::CachedDescriptorPool {
+                                                            pool: p,
+                                                            created_at: std::time::Instant::now(),
+                                                        })
+                                                    }
                                                     Err(e) => tracing::warn!("{}: Failed to load gRPC reflection schema for active health check: {:?}", server_name, e)
                                                 }
                                             }
 
                                             // Search the loaded schema specifically for a health check endpoint
-                                            if let Some(pool) = pool_guard.as_ref() {
-                                                for service in pool.services() {
+                                            if let Some(cached) = pool_guard.as_ref() {
+                                                for service in cached.pool.services() {
                                                     for method in service.methods() {
                                                         // Commonly, gRPC services implement an endpoint containing 'health'
                                                         if method.name() == "health" {

@@ -100,6 +100,7 @@ where
 
     // Register Tokio timer so pool_idle_timeout and HTTP/2 keep-alive are actively scheduled
     builder.pool_timer(TokioTimer::new());
+    builder.timer(TokioTimer::new());
 
     if let Some(timeout) = pool_config.idle_timeout {
         builder.pool_idle_timeout(timeout);
@@ -128,4 +129,50 @@ where
     }
 
     builder.build(https_connector)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_client_pool_config_defaults() {
+        let cfg = ClientPoolConfig::default();
+        assert_eq!(cfg.idle_timeout, Some(Duration::from_secs(90)));
+        assert_eq!(cfg.max_idle_per_host, Some(1024));
+        assert!(!cfg.http2_only);
+        assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(cfg.tcp_keepalive, Some(Duration::from_secs(60)));
+        assert!(cfg.tcp_nodelay);
+        assert_eq!(cfg.http2_keep_alive_interval, Some(Duration::from_secs(30)));
+        assert_eq!(cfg.http2_keep_alive_timeout, Some(Duration::from_secs(10)));
+        assert!(cfg.http2_keep_alive_while_idle);
+        assert!(cfg.http2_adaptive_window);
+    }
+
+    #[test]
+    fn test_build_hyper_client_with_custom_keepalive_and_timeouts() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        let cfg = ClientPoolConfig {
+            connect_timeout: Some(Duration::from_secs(3)),
+            tcp_keepalive: Some(Duration::from_secs(15)),
+            tcp_nodelay: true,
+            http2_keep_alive_interval: Some(Duration::from_secs(10)),
+            http2_keep_alive_timeout: Some(Duration::from_secs(5)),
+            http2_keep_alive_while_idle: false,
+            http2_adaptive_window: true,
+            http2_only: true,
+            idle_timeout: Some(Duration::from_secs(45)),
+            max_idle_per_host: Some(32),
+        };
+
+        let _client: Client<HttpsConnector<HttpConnector>, hyper::body::Incoming> =
+            build_hyper_client(tls_config, cfg);
+    }
 }

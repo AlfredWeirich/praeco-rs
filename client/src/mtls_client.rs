@@ -336,6 +336,7 @@ fn build_h2_client(
         idle_timeout: None,
         max_idle_per_host: Some(1024),
         http2_only: false,
+        ..Default::default()
     };
 
     Ok(common::client::build_hyper_client(tls_client_config, pool_config))

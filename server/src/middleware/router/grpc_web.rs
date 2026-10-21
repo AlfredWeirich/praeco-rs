@@ -82,27 +82,70 @@ pub async fn handle_grpc_web(
             }
         }
 
-        // Double-Checked Locking Performance Fix!
-        let pool = {
+        let reflection_ttl = config
+            .router_params
+            .as_ref()
+            .map(|p| std::time::Duration::from_secs(p.grpc_reflection_ttl_seconds))
+            .unwrap_or(std::time::Duration::from_secs(600));
+
+        // 1. Fast path: check if cached pool is valid under read lock
+        let mut pool_opt = {
             let read_guard = route_info.target.grpc_pool.read().await;
-            if let Some(p) = &*read_guard {
-                p.clone()
-            } else {
-                drop(read_guard);
-                let mut write_guard = route_info.target.grpc_pool.write().await;
-                if let Some(p) = &*write_guard {
-                    p.clone()
+            if let Some(cached) = &*read_guard {
+                if cached.created_at.elapsed() < reflection_ttl {
+                    Some(cached.pool.clone())
                 } else {
-                    match build_grpc_pool(&upstream_node.uri, config.router_params.as_ref()).await {
-                        Ok(p) => {
-                            *write_guard = Some(p.clone());
-                            p
-                        }
-                        Err(e) => {
-                            error!(
-                                "{}: Failed to fetch gRPC reflection schema: {:?}",
-                                server_name, e
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        // 2. Slow path: fetch reflection without holding write lock across network I/O
+        if pool_opt.is_none() {
+            let _fetch_guard = route_info.target.grpc_reflection_lock.lock().await;
+
+            // Double check if another task refreshed it while we waited for the fetch lock
+            let recheck = {
+                let read_guard = route_info.target.grpc_pool.read().await;
+                if let Some(cached) = &*read_guard {
+                    if cached.created_at.elapsed() < reflection_ttl {
+                        Some(cached.pool.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(p) = recheck {
+                pool_opt = Some(p);
+            } else {
+                match build_grpc_pool(&upstream_node.uri, config.router_params.as_ref()).await {
+                    Ok(new_pool) => {
+                        let mut write_guard = route_info.target.grpc_pool.write().await;
+                        *write_guard = Some(crate::configuration::CachedDescriptorPool {
+                            pool: new_pool.clone(),
+                            created_at: std::time::Instant::now(),
+                        });
+                        pool_opt = Some(new_pool);
+                    }
+                    Err(e) => {
+                        error!(
+                            "{}: Failed to fetch gRPC reflection schema: {:?}",
+                            server_name, e
+                        );
+                        // Stale-while-revalidate fallback: if we have an expired pool, use it rather than failing
+                        let read_guard = route_info.target.grpc_pool.read().await;
+                        if let Some(cached) = &*read_guard {
+                            warn!(
+                                "{}: Using stale gRPC reflection schema due to upstream fetch failure",
+                                server_name
                             );
+                            pool_opt = Some(cached.pool.clone());
+                        } else {
                             return Ok(build_error_response(
                                 "Failed to fetch gRPC schema",
                                 StatusCode::BAD_GATEWAY,
@@ -111,7 +154,9 @@ pub async fn handle_grpc_web(
                     }
                 }
             }
-        };
+        }
+
+        let pool = pool_opt.expect("pool must be present");
 
         let uri_path = original_uri.path().trim_start_matches('/');
         let uri_parts: Vec<&str> = uri_path.split('/').collect();
@@ -326,27 +371,66 @@ pub async fn build_grpc_pool(
     let port = backend_base_uri.port_u16().unwrap_or(80);
     let scheme = backend_base_uri.scheme_str().unwrap_or("http");
 
+    let connect_timeout = router_params
+        .map(|p| std::time::Duration::from_secs(p.connect_timeout_seconds))
+        .unwrap_or(std::time::Duration::from_secs(5));
+    let request_timeout = router_params
+        .map(|p| std::time::Duration::from_secs(p.grpc_reflection_timeout_seconds))
+        .unwrap_or(std::time::Duration::from_secs(10));
+
     let target = format!("{}://{}:{}", scheme, host, port);
-    let mut endpoint = tonic::transport::Channel::from_shared(target)?;
+    let mut endpoint = tonic::transport::Channel::from_shared(target)?
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30));
 
     if scheme == "https" {
         let mut tls = tonic::transport::ClientTlsConfig::new().domain_name(host);
 
         if let Some(params) = router_params {
             if let Some(ca_path) = &params.ssl_root_certificate {
-                let pem = std::fs::read(ca_path).unwrap_or_else(|_| Vec::new());
-                if !pem.is_empty() {
-                    let ca = tonic::transport::Certificate::from_pem(pem);
-                    tls = tls.ca_certificate(ca);
+                let pem = std::fs::read(ca_path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read root CA certificate '{}': {}", ca_path, e),
+                    )
+                })?;
+                if pem.is_empty() {
+                    return Err(format!("Root CA certificate '{}' is empty", ca_path).into());
                 }
+                let ca = tonic::transport::Certificate::from_pem(pem);
+                tls = tls.ca_certificate(ca);
             }
 
-            if params.authentication == crate::configuration::AuthenticationMethod::ClientCert
-                && let (Some(cert_path), Some(key_path)) =
-                    (&params.ssl_client_certificate, &params.ssl_client_key)
-                && let (Ok(cert_pem), Ok(key_pem)) =
-                    (std::fs::read(cert_path), std::fs::read(key_path))
-            {
+            if params.authentication == crate::configuration::AuthenticationMethod::ClientCert {
+                let cert_path = params.ssl_client_certificate.as_ref().ok_or_else(|| {
+                    format!("{}: ssl_client_certificate must be specified for ClientCert authentication", host)
+                })?;
+                let key_path = params.ssl_client_key.as_ref().ok_or_else(|| {
+                    format!("{}: ssl_client_key must be specified for ClientCert authentication", host)
+                })?;
+
+                let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read client certificate '{}': {}", cert_path, e),
+                    )
+                })?;
+                let key_pem = std::fs::read(key_path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to read client key '{}': {}", key_path, e),
+                    )
+                })?;
+
+                if cert_pem.is_empty() || key_pem.is_empty() {
+                    return Err(format!(
+                        "Client certificate or key is empty ('{}', '{}')",
+                        cert_path, key_path
+                    ).into());
+                }
+
                 let identity = tonic::transport::Identity::from_pem(cert_pem, key_pem);
                 tls = tls.identity(identity);
             }
@@ -415,4 +499,68 @@ pub async fn build_grpc_pool(
     }
 
     Ok(Arc::new(pool))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configuration::{AuthenticationMethod, RouterParams};
+    use hyper::Uri;
+
+    #[tokio::test]
+    async fn test_build_grpc_pool_fail_closed_nonexistent_ca() {
+        let uri: Uri = "https://127.0.0.1:50051".parse().unwrap();
+        let params = RouterParams {
+            protocol: crate::configuration::Protocol::Https,
+            authentication: AuthenticationMethod::None,
+            ssl_root_certificate: Some("/path/to/nonexistent_ca_file_12345.pem".to_string()),
+            jwt: None,
+            ssl_client_certificate: None,
+            ssl_client_key: None,
+            connect_timeout_seconds: 1,
+            request_timeout_seconds: 1,
+            idle_timeout_seconds: 10,
+            grpc_reflection_timeout_seconds: 1,
+            grpc_reflection_ttl_seconds: 60,
+        };
+
+        let result = build_grpc_pool(&uri, Some(&params)).await;
+        assert!(result.is_err(), "build_grpc_pool must fail-closed if configured CA cannot be read");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to read root CA certificate"));
+    }
+
+    #[tokio::test]
+    async fn test_build_grpc_pool_fail_closed_missing_client_cert_for_mtls() {
+        let uri: Uri = "https://127.0.0.1:50051".parse().unwrap();
+        let params = RouterParams {
+            protocol: crate::configuration::Protocol::Https,
+            authentication: AuthenticationMethod::ClientCert,
+            ssl_root_certificate: None,
+            jwt: None,
+            ssl_client_certificate: None, // Missing cert!
+            ssl_client_key: None,
+            connect_timeout_seconds: 1,
+            request_timeout_seconds: 1,
+            idle_timeout_seconds: 10,
+            grpc_reflection_timeout_seconds: 1,
+            grpc_reflection_ttl_seconds: 60,
+        };
+
+        let result = build_grpc_pool(&uri, Some(&params)).await;
+        assert!(result.is_err(), "build_grpc_pool must fail-closed if ClientCert auth is configured but cert path missing");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("ssl_client_certificate must be specified"));
+    }
+
+    #[test]
+    fn test_cached_descriptor_pool_ttl() {
+        let pool = Arc::new(DescriptorPool::new());
+        let cached = crate::configuration::CachedDescriptorPool {
+            pool: pool.clone(),
+            created_at: std::time::Instant::now() - std::time::Duration::from_secs(601),
+        };
+        let ttl = std::time::Duration::from_secs(600);
+        assert!(cached.created_at.elapsed() >= ttl, "Pool older than 600s should be detected as expired");
+    }
 }
