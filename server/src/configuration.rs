@@ -956,7 +956,7 @@ impl Default for SecurityHeadersConfig {
 /// Each method maps a base path (e.g. `"/api"`) to a list of regex pattern
 /// strings. These are compiled into [`CompiledAllowedPathes`] during
 /// [`ServerConfig::finalize`].
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct AllowedPathes {
     /// Allowed GET path patterns.
     #[serde(rename = "GET")]
@@ -970,6 +970,49 @@ pub struct AllowedPathes {
     /// Allowed DELETE path patterns.
     #[serde(rename = "DELETE")]
     pub delete: Option<HashMap<String, Vec<String>>>,
+    /// Allowed PATCH path patterns.
+    #[serde(rename = "PATCH")]
+    pub patch: Option<HashMap<String, Vec<String>>>,
+    /// Allowed HEAD path patterns.
+    #[serde(rename = "HEAD")]
+    pub head: Option<HashMap<String, Vec<String>>>,
+}
+
+/// Pre-compiled regex patterns for path inspection for a specific HTTP method.
+///
+/// Supports exact path matching (fast $O(1)$ HashMap lookup) and prefix matching
+/// with longest-prefix-match-wins ordering.
+#[derive(Debug, Clone, Default)]
+pub struct MethodRules {
+    /// Exact path matches: path -> regex list
+    pub exact: HashMap<String, Vec<Regex>>,
+    /// Prefix matches: (prefix, regex list) sorted by descending prefix length
+    pub prefix: Vec<(String, Vec<Regex>)>,
+}
+
+impl MethodRules {
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.prefix.is_empty()
+    }
+
+    /// Checks if `full_path` matches any rule registered for `path`.
+    /// 1. Exact match fast-path.
+    /// 2. If no exact match, tries prefix matches in descending prefix length order.
+    pub fn is_allowed(&self, path: &str, full_path: &str) -> bool {
+        // 1. Exact match
+        if let Some(rules) = self.exact.get(path) {
+            return rules.iter().any(|re| re.is_match(full_path));
+        }
+        // 2. Prefix matches (longest first)
+        for (pfx, rules) in &self.prefix {
+            if path.starts_with(pfx) {
+                if rules.iter().any(|re| re.is_match(full_path)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Pre-compiled regex patterns for path inspection.
@@ -977,16 +1020,20 @@ pub struct AllowedPathes {
 /// Created from [`AllowedPathes`] during [`ServerConfig::finalize`].
 /// Used by the [`InspectionService`](crate::middleware::inspection::InspectionService)
 /// at runtime for zero-allocation path matching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompiledAllowedPathes {
     /// Compiled regex rules for GET requests.
-    pub get: HashMap<String, Vec<Regex>>,
+    pub get: MethodRules,
     /// Compiled regex rules for POST requests.
-    pub post: HashMap<String, Vec<Regex>>,
+    pub post: MethodRules,
     /// Compiled regex rules for PUT requests.
-    pub put: HashMap<String, Vec<Regex>>,
+    pub put: MethodRules,
     /// Compiled regex rules for DELETE requests.
-    pub delete: HashMap<String, Vec<Regex>>,
+    pub delete: MethodRules,
+    /// Compiled regex rules for PATCH requests.
+    pub patch: MethodRules,
+    /// Compiled regex rules for HEAD requests.
+    pub head: MethodRules,
 }
 
 /// Helper to provide `true` as the default value for `serde`.
@@ -1411,15 +1458,7 @@ impl ServerConfig {
     /// If no allowed paths are configured, creates an empty default (which
     /// means the Inspection layer will block everything).
     pub fn init_compiled_allowed_pathes(&mut self) -> Result<(), Error> {
-        // If allowed_pathes is missing in TOML, we create an empty default object
-        let raw = self.allowed_pathes.clone().unwrap_or(AllowedPathes {
-            get: None,
-            post: None,
-            put: None,
-            delete: None,
-        });
-
-        // Compile (creates empty HashMaps if None)
+        let raw = self.allowed_pathes.clone().unwrap_or_default();
         self.compiled_allowed_pathes = Some(Arc::new(CompiledAllowedPathes::from_raw(&raw)?));
         Ok(())
     }
@@ -1438,41 +1477,45 @@ impl CompiledAllowedPathes {
     ///
     /// Returns an error if any regex pattern is invalid.
     pub fn from_raw(raw: &AllowedPathes) -> Result<Self, Error> {
-        let compile_map = |opt_map: &Option<HashMap<String, Vec<String>>>| -> Result<HashMap<String, Vec<Regex>>, Error> {
-            let mut compiled = HashMap::new();
-            if let Some(map) = opt_map {
-                for (path, patterns) in map {
-                    let regexes: Result<Vec<_>, _> = patterns.iter().map(|p| Regex::new(p)).collect();
-                    compiled.insert(path.clone(), regexes.map_err(|e| Error::msg(format!("Regex error: {e}")))?);
+        let compile_method_rules =
+            |opt_map: &Option<HashMap<String, Vec<String>>>| -> Result<MethodRules, Error> {
+                let mut exact = HashMap::new();
+                let mut prefix = Vec::new();
+
+                if let Some(map) = opt_map {
+                    for (pattern, patterns) in map {
+                        let regexes: Result<Vec<_>, _> =
+                            patterns.iter().map(|p| Regex::new(p)).collect();
+                        let regexes = regexes
+                            .map_err(|e| Error::msg(format!("Regex error for '{pattern}': {e}")))?;
+
+                        if pattern.ends_with('*') {
+                            let pfx = if pattern.ends_with("/*") {
+                                &pattern[..pattern.len() - 1] // Keep trailing slash: "/api/"
+                            } else {
+                                &pattern[..pattern.len() - 1] // e.g. "/api"
+                            };
+                            prefix.push((pfx.to_string(), regexes));
+                        } else {
+                            exact.insert(pattern.clone(), regexes);
+                        }
+                    }
                 }
-            }
-            Ok(compiled)
-        };
+
+                // Deterministic longest-prefix match: sort descending by prefix length
+                prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+                Ok(MethodRules { exact, prefix })
+            };
 
         Ok(Self {
-            get: compile_map(&raw.get)?,
-            post: compile_map(&raw.post)?,
-            put: compile_map(&raw.put)?,
-            delete: compile_map(&raw.delete)?,
+            get: compile_method_rules(&raw.get)?,
+            post: compile_method_rules(&raw.post)?,
+            put: compile_method_rules(&raw.put)?,
+            delete: compile_method_rules(&raw.delete)?,
+            patch: compile_method_rules(&raw.patch)?,
+            head: compile_method_rules(&raw.head)?,
         })
-    }
-
-    /// Helper to find matching regex rules for a path, supporting wildcard suffixes (e.g. `/*`).
-    fn find_rules<'a>(map: &'a HashMap<String, Vec<Regex>>, path: &str) -> Option<&'a Vec<Regex>> {
-        // 1. Exact match (fast path)
-        if let Some(rules) = map.get(path) {
-            return Some(rules);
-        }
-        // 2. Prefix match for wildcards (e.g. "/chat.ChatService/*")
-        for (key, rules) in map {
-            if key.ends_with("/*") {
-                let prefix = &key[..key.len() - 1]; // e.g. "/chat.ChatService/"
-                if path.starts_with(prefix) {
-                    return Some(rules);
-                }
-            }
-        }
-        None
     }
 
     /// Checks whether a `(method, path, query)` triple matches the allowed rules.
@@ -1483,39 +1526,30 @@ impl CompiledAllowedPathes {
     /// Returns `false` for unrecognised HTTP methods or for paths that have no
     /// matching regex rules.
     pub fn is_allowed(&self, method: &str, path: &str, query: &str) -> bool {
-        // We assemble the full path for check,
-        // if a query string exists (matching your regex definitions).
         let full_path = if query.is_empty() {
             path.to_string()
         } else {
             format!("{}?{}", path, query)
         };
 
-        // Selection of the correct map based on the HTTP method
-        let map = match method {
-            "GET" => &self.get,
-            "POST" => &self.post,
-            "PUT" => &self.put,
-            "DELETE" => &self.delete,
-            "OPTIONS" => {
-                if let Some(regex_list) = Self::find_rules(&self.post, path)
-                    .or_else(|| Self::find_rules(&self.get, path))
-                    .or_else(|| Self::find_rules(&self.put, path))
-                    .or_else(|| Self::find_rules(&self.delete, path))
-                {
-                    return regex_list.iter().any(|re| re.is_match(&full_path));
-                }
-                return false;
+        match method {
+            "GET" => self.get.is_allowed(path, &full_path),
+            "POST" => self.post.is_allowed(path, &full_path),
+            "PUT" => self.put.is_allowed(path, &full_path),
+            "DELETE" => self.delete.is_allowed(path, &full_path),
+            "PATCH" => self.patch.is_allowed(path, &full_path),
+            "HEAD" => {
+                self.head.is_allowed(path, &full_path) || self.get.is_allowed(path, &full_path)
             }
-            _ => return false,
-        };
-
-        // Check: are there regex rules for this base path (e.g. "/help")?
-        if let Some(regex_list) = Self::find_rules(map, path) {
-            // If so: does at least one of the rules match the full_path?
-            regex_list.iter().any(|re| re.is_match(&full_path))
-        } else {
-            false
+            "OPTIONS" => {
+                self.get.is_allowed(path, &full_path)
+                    || self.post.is_allowed(path, &full_path)
+                    || self.put.is_allowed(path, &full_path)
+                    || self.delete.is_allowed(path, &full_path)
+                    || self.patch.is_allowed(path, &full_path)
+                    || self.head.is_allowed(path, &full_path)
+            }
+            _ => false,
         }
     }
 }
@@ -2128,6 +2162,78 @@ mod tests {
         assert!(matches!(layers[1], MiddlewareLayer::SecurityHeaders(_)));
         assert!(matches!(layers[2], MiddlewareLayer::Inspection));
         assert!(matches!(layers[3], MiddlewareLayer::ConcurrencyLimit(_)));
+    }
+
+    #[test]
+    fn test_compiled_allowed_pathes_longest_prefix_and_methods() {
+        let mut post_rules = HashMap::new();
+        // Exact rule
+        post_rules.insert(
+            "/api/v2/special".to_string(),
+            vec!["^/api/v2/special$".to_string()],
+        );
+        // More specific prefix rule
+        post_rules.insert(
+            "/api/v2/*".to_string(),
+            vec!["^/api/v2/items/[0-9]+$".to_string()],
+        );
+        // Broader prefix rule
+        post_rules.insert(
+            "/api/*".to_string(),
+            vec!["^/api/.*$".to_string()],
+        );
+
+        let mut get_rules = HashMap::new();
+        get_rules.insert("/status".to_string(), vec!["^/status$".to_string()]);
+
+        let mut patch_rules = HashMap::new();
+        patch_rules.insert("/update".to_string(), vec!["^/update$".to_string()]);
+
+        let mut head_rules = HashMap::new();
+        head_rules.insert("/ping".to_string(), vec!["^/ping$".to_string()]);
+
+        let raw = AllowedPathes {
+            post: Some(post_rules),
+            get: Some(get_rules),
+            patch: Some(patch_rules),
+            head: Some(head_rules),
+            ..Default::default()
+        };
+
+        let compiled = CompiledAllowedPathes::from_raw(&raw).unwrap();
+
+        // 1. Exact match
+        assert!(compiled.is_allowed("POST", "/api/v2/special", ""));
+
+        // 2. Longest prefix: /api/v2/items/123 matches /api/v2/*
+        assert!(compiled.is_allowed("POST", "/api/v2/items/123", ""));
+
+        // 3. /api/v1/other matches broader /api/*
+        assert!(compiled.is_allowed("POST", "/api/v1/other", ""));
+
+        // 4. /api/v2/letters doesn't match /api/v2/* pattern, but falls through to broader /api/*
+        assert!(compiled.is_allowed("POST", "/api/v2/letters", ""));
+
+        // 5. Unmatched path
+        assert!(!compiled.is_allowed("POST", "/other", ""));
+
+        // 6. PATCH support
+        assert!(compiled.is_allowed("PATCH", "/update", ""));
+        assert!(!compiled.is_allowed("PATCH", "/status", ""));
+
+        // 7. Explicit HEAD support
+        assert!(compiled.is_allowed("HEAD", "/ping", ""));
+
+        // 8. HEAD fallback to GET (/status is in GET)
+        assert!(compiled.is_allowed("HEAD", "/status", ""));
+
+        // 9. OPTIONS matches if any method allows the path
+        assert!(compiled.is_allowed("OPTIONS", "/status", ""));
+        assert!(compiled.is_allowed("OPTIONS", "/update", ""));
+        assert!(!compiled.is_allowed("OPTIONS", "/unregistered", ""));
+
+        // 10. Unsupported method
+        assert!(!compiled.is_allowed("TRACE", "/status", ""));
     }
 }
 
