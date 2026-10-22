@@ -23,7 +23,7 @@ categories = ["network-programming", "web-programming", "cryptography", "authent
 
 [workspace.dependencies]
 # Internal workspace crates
-common = { package = "praeco-common", version = "0.4.1", path = "common" }
+common = { package = "praeco-common", version = "0.5.0", path = "common" }
 
 # Async runtime & core utilities
 tokio = { version = "1.49", features = ["full"] }
