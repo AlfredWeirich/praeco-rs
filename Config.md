@@ -397,6 +397,38 @@ Each route acts isolated and offers four essential functions:
 | `cooldown_seconds` | Integer | Duration in seconds how long a dead node is not targeted. | **Default:** `10` |
 | `max_retries` | Integer | Maximum automatic retry attempts for failed requests. | **Default:** `2` |
 
+### Fine-Grained Path-Level RBAC (`[Server.rbac]`)
+
+While `allowed_roles` on a route prefix (`[Server.ReverseRoutes."..."]`) secures entire subtrees, modern APIs often require **fine-grained method- and path-level privilege separation** within the same reverse route (e.g. distinguishing between seller operations and super-admin commands under `/api/*`).
+
+The `[Server.rbac]` table maps specific URI paths or wildcard patterns to required roles:
+
+```toml
+[Server.rbac]
+# Exact path match (O(1) lookup)
+"/api/GetDatabaseTables"         = ["Admin"]
+"/api/GetTableContent"           = ["Admin"]
+"/api/AdminDeleteUser"           = ["Admin"]
+
+# Wildcard prefix match (ends with '*')
+"/api/Admin*"                    = ["Admin"]
+
+# Specific exception (exact match takes precedence over wildcard prefix)
+"/api/AdminGetProducts"          = ["Admin", "Seller"]
+
+# Explicit Deny-All (fail-closed: empty role list denies all callers)
+"/api/InternalSecret"            = []
+
+# Public override (wildcard role '*' permits all callers)
+"/api/PublicPing"                = ["*"]
+```
+
+#### Evaluation Order & Precedence:
+1. **Exact Path Match:** If the request URI matches an exact key in `[Server.rbac]`, that rule is enforced immediately.
+2. **Longest Prefix Wildcard Match:** If not matched exactly, keys ending with `*` are evaluated in order of descending prefix length (most specific prefix wins).
+3. **Empty Role List (`[]`) = Fail-Closed:** If a matched path rule has an empty role list, access is unconditionally denied with `403 Forbidden`.
+4. **Fallback to Route-Level `allowed_roles`:** If no path-specific rule in `[Server.rbac]` matches the request, authorization falls back to the enclosing route's `allowed_roles`. If the route's `allowed_roles` is empty `[]`, the route is unrestricted.
+
 
 #### Excursion: Backend Types (`backend_type`)
 The choice of backend type largely determines how the proxy handles data streams, especially if the backend is a gRPC server:
