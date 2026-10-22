@@ -1762,7 +1762,9 @@ impl Layers {
                 .unwrap_or(0);
             layers.insert(
                 insert_idx,
-                MiddlewareLayer::SecurityHeaders(SecurityHeadersConfig::default()),
+                MiddlewareLayer::SecurityHeaders(
+                    self.security_headers_config.clone().unwrap_or_default(),
+                ),
             );
         }
 
@@ -2142,12 +2144,17 @@ mod tests {
 
     #[test]
     fn test_security_headers_outermost_positioning() {
+        let custom_csp = "default-src 'self'; img-src 'self' data:".to_string();
         let layers_cfg = Layers {
             enabled: vec![
                 "Logger".to_string(),
                 "Inspection".to_string(),
                 "ConcurrencyLimit".to_string(),
             ],
+            security_headers_config: Some(SecurityHeadersConfig {
+                content_security_policy: custom_csp.clone(),
+                ..Default::default()
+            }),
             concurrency_limit_config: Some(ConcurrencyLimitConfig {
                 max_concurrent_requests: 100,
                 load_shed: true,
@@ -2158,8 +2165,14 @@ mod tests {
 
         let layers = layers_cfg.build_middleware_layers("test_server").unwrap();
         // SecurityHeaders must be placed near the top (outermost) so it intercepts short-circuit responses
+        // and must preserve custom [Server.Layers.SecurityHeaders] settings even if not in `enabled`.
         assert!(matches!(layers[0], MiddlewareLayer::Logger));
-        assert!(matches!(layers[1], MiddlewareLayer::SecurityHeaders(_)));
+        match &layers[1] {
+            MiddlewareLayer::SecurityHeaders(cfg) => {
+                assert_eq!(cfg.content_security_policy, custom_csp);
+            }
+            other => panic!("Expected SecurityHeaders at index 1, got {:?}", other),
+        }
         assert!(matches!(layers[2], MiddlewareLayer::Inspection));
         assert!(matches!(layers[3], MiddlewareLayer::ConcurrencyLimit(_)));
     }
@@ -2234,6 +2247,98 @@ mod tests {
 
         // 10. Unsupported method
         assert!(!compiled.is_allowed("TRACE", "/status", ""));
+    }
+
+    #[test]
+    fn test_chatapp_admin_rbac_and_idp_allowed_pathes() {
+        for config_path in [
+            "../conf.d/01_chatapp.toml.template",
+            "../conf.d/01_chatapp.toml.local.template",
+            "../conf.d/01_chatapp.toml",
+        ] {
+            let toml_str = std::fs::read_to_string(config_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", config_path, e));
+            let value: toml::Value = toml::from_str(&toml_str).unwrap();
+            let servers_arr = value
+                .get("Server")
+                .and_then(|v| v.as_array())
+                .expect("Expected [[Server]] array in config");
+
+            let servers: Vec<ServerConfig> = servers_arr
+                .iter()
+                .map(|v| v.clone().try_into().expect("Failed to deserialize ServerConfig"))
+                .collect();
+
+            // 1. Verify wurzelwerk_admin RBAC rules
+            let admin_srv = servers
+                .iter()
+                .find(|s| s.name == "wurzelwerk_admin")
+                .expect("wurzelwerk_admin missing");
+            let rbac = CompiledRbac::from_raw(admin_srv.rbac.as_ref().unwrap());
+
+            let seller_allowed = [
+                "/api/Logout",
+                "/api/WhoAmI",
+                "/api/GetAdminConversations",
+                "/api/AdminGetMembers",
+                "/api/GetAdminOrders",
+                "/api/AdminUpdateOrderStatus",
+                "/api/AdminGetProducts",
+                "/api/AdminAddProduct",
+                "/api/AdminDeleteProduct",
+                "/api/AdminGetRides",
+                "/api/AdminGetRideRequests",
+                "/api/AdminGetRideBookings",
+                "/api/AdminDeleteRide",
+                "/api/AdminDeleteRideReq",
+            ];
+            for path in &seller_allowed {
+                let roles = rbac.match_path(path).expect(path);
+                assert!(
+                    roles.contains(&UserRole("Seller".to_string())),
+                    "Expected Seller to be allowed on {} in {}",
+                    path,
+                    config_path
+                );
+            }
+
+            // Every other POST path in AllowedPathes must strictly require Admin only
+            let admin_post_paths = admin_srv
+                .allowed_pathes
+                .as_ref()
+                .unwrap()
+                .post
+                .as_ref()
+                .unwrap();
+            for path in admin_post_paths.keys() {
+                if !seller_allowed.contains(&path.as_str()) {
+                    let roles = rbac
+                        .match_path(path)
+                        .unwrap_or_else(|| panic!("Missing RBAC rule for {} in {}", path, config_path));
+                    assert_eq!(
+                        roles,
+                        &[UserRole("Admin".to_string())],
+                        "Endpoint {} must be restricted to Admin only in {}",
+                        path,
+                        config_path
+                    );
+                }
+            }
+
+            // 2. Verify wurzelwerk_idp AllowedPathes & Layers
+            let idp_srv = servers
+                .iter()
+                .find(|s| s.name == "wurzelwerk_idp")
+                .expect("wurzelwerk_idp missing");
+            let idp_paths = CompiledAllowedPathes::from_raw(idp_srv.allowed_pathes.as_ref().unwrap()).unwrap();
+            assert!(idp_paths.is_allowed("GET", "/.well-known/jwks.json", ""));
+            assert!(idp_paths.is_allowed("GET", "/auth/login_page", "aud=admin-dashboard"));
+            assert!(idp_paths.is_allowed("GET", "/auth/status", "session=abc_123&poll_secret=xyz-456"));
+            assert!(idp_paths.is_allowed("POST", "/auth/login", "aud=admin-dashboard"));
+            assert!(idp_paths.is_allowed("POST", "/auth/confirm", "session=abc_123&code=234-567"));
+            assert!(idp_paths.is_allowed("POST", "/auth/revoke", ""));
+            assert!(!idp_paths.is_allowed("GET", "/admin", ""));
+        }
     }
 }
 

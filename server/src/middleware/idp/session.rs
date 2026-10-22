@@ -17,6 +17,7 @@ const MAX_LOGIN_REQUESTS_PER_MINUTE: u32 = 15;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_ACTIVE_SESSIONS: usize = 5_000;
 const CLEANUP_THROTTLE_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_CONFIRM_ATTEMPTS: u8 = 3;
 
 /// Constant-time byte slice comparison to mitigate timing side-channels.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -87,6 +88,7 @@ struct SessionEntry {
     created_at: Instant,
     poll_secret: String,
     user_code: String,
+    failed_attempts: u8,
     aud: Option<String>,
     #[allow(dead_code)]
     client_ip: Option<IpAddr>,
@@ -187,6 +189,7 @@ impl SessionStore {
                 created_at: Instant::now(),
                 poll_secret: poll_secret.clone(),
                 user_code: user_code.clone(),
+                failed_attempts: 0,
                 aud,
                 client_ip,
                 status: SessionStatus::Pending,
@@ -205,13 +208,15 @@ impl SessionStore {
         })
     }
 
-    /// Confirms a pending session, attaching the verified identity (`Claims`).
-    /// If `user_code` is provided by the confirming device, it is validated against the session's code.
-    pub fn confirm_session(
+    /// Pre-validates that a pending session exists, is not expired, is not yet confirmed,
+    /// and that the mandatory `user_code` matches (enforcing `MAX_CONFIRM_ATTEMPTS`).
+    ///
+    /// Called before triggering external Claims Webhooks so invalid/brute-force confirm
+    /// requests never cause unnecessary backend load.
+    pub fn verify_session_code(
         &self,
         session_id: &str,
         user_code: Option<&str>,
-        mut claims: Claims,
     ) -> Result<(), ConfirmError> {
         let mut entry = match self.sessions.get_mut(session_id) {
             Some(e) => e,
@@ -220,6 +225,8 @@ impl SessionStore {
 
         if entry.created_at.elapsed() > self.ttl {
             debug!("Attempted to confirm expired session: {}", session_id);
+            drop(entry);
+            self.sessions.remove(session_id);
             return Err(ConfirmError::Expired);
         }
 
@@ -227,17 +234,63 @@ impl SessionStore {
             return Err(ConfirmError::AlreadyConfirmed);
         }
 
-        // If user_code is provided, verify it (case-insensitive, ignoring optional dashes)
-        if let Some(code) = user_code {
-            let clean_input: String = code.chars().filter(|c| *c != '-').collect();
-            let clean_expected: String = entry.user_code.chars().filter(|c| *c != '-').collect();
-            if !clean_input.eq_ignore_ascii_case(&clean_expected) {
-                warn!(
-                    "User code mismatch for session {}: provided '{}', expected '{}'",
-                    session_id, code, entry.user_code
-                );
-                return Err(ConfirmError::InvalidUserCode);
+        // Mandatory user_code verification (case-insensitive, ignoring optional dashes, constant-time)
+        let code_matches = match user_code {
+            Some(code) if !code.trim().is_empty() => {
+                let clean_input: String = code
+                    .chars()
+                    .filter(|c| *c != '-')
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                let clean_expected: String = entry
+                    .user_code
+                    .chars()
+                    .filter(|c| *c != '-')
+                    .map(|c| c.to_ascii_uppercase())
+                    .collect();
+                constant_time_eq(clean_input.as_bytes(), clean_expected.as_bytes())
             }
+            _ => false,
+        };
+
+        if !code_matches {
+            entry.failed_attempts = entry.failed_attempts.saturating_add(1);
+            let attempts = entry.failed_attempts;
+            warn!(
+                "Invalid or missing user_code for session {} (attempt {}/{})",
+                session_id, attempts, MAX_CONFIRM_ATTEMPTS
+            );
+            if attempts >= MAX_CONFIRM_ATTEMPTS {
+                warn!(
+                    "Session {} invalidated after {} failed user_code attempts",
+                    session_id, attempts
+                );
+                drop(entry);
+                self.sessions.remove(session_id);
+            }
+            return Err(ConfirmError::InvalidUserCode);
+        }
+
+        Ok(())
+    }
+
+    /// Confirms a pending session, attaching the verified identity (`Claims`).
+    /// The 6-character `user_code` is mandatory (fail-closed) and limited to `MAX_CONFIRM_ATTEMPTS` attempts.
+    pub fn confirm_session(
+        &self,
+        session_id: &str,
+        user_code: Option<&str>,
+        mut claims: Claims,
+    ) -> Result<(), ConfirmError> {
+        self.verify_session_code(session_id, user_code)?;
+
+        let mut entry = match self.sessions.get_mut(session_id) {
+            Some(e) => e,
+            None => return Err(ConfirmError::NotFound),
+        };
+
+        if matches!(entry.status, SessionStatus::Confirmed(_)) {
+            return Err(ConfirmError::AlreadyConfirmed);
         }
 
         // If the session was initiated with a specific audience, preserve it
@@ -394,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_user_code_verification_mismatch_rejected() {
+    fn test_user_code_verification_mismatch_and_missing_rejected() {
         let store = SessionStore::new(60);
         let info = store.create_session(None, None).unwrap();
 
@@ -407,14 +460,43 @@ mod tests {
             jti: None,
         };
 
-        // Mismatched user_code is rejected
-        let res = store.confirm_session(&info.session_id, Some("WRONG1"), claims.clone());
-        assert_eq!(res, Err(ConfirmError::InvalidUserCode));
+        // 1. Missing user_code (None) is rejected (fail-closed)
+        let res_missing = store.confirm_session(&info.session_id, None, claims.clone());
+        assert_eq!(res_missing, Err(ConfirmError::InvalidUserCode));
 
-        // Valid user_code (even without dash or lowercase) succeeds
+        // 2. Mismatched user_code is rejected
+        let res_wrong = store.confirm_session(&info.session_id, Some("WRONG1"), claims.clone());
+        assert_eq!(res_wrong, Err(ConfirmError::InvalidUserCode));
+
+        // 3. Valid user_code (even without dash or lowercase) succeeds on 3rd attempt
         let code_no_dash = info.user_code.replace('-', "").to_lowercase();
-        let res2 = store.confirm_session(&info.session_id, Some(&code_no_dash), claims);
-        assert_eq!(res2, Ok(()));
+        let res_valid = store.confirm_session(&info.session_id, Some(&code_no_dash), claims);
+        assert_eq!(res_valid, Ok(()));
+    }
+
+    #[test]
+    fn test_user_code_brute_force_invalidates_session_after_max_attempts() {
+        let store = SessionStore::new(60);
+        let info = store.create_session(None, None).unwrap();
+
+        let claims = Claims {
+            sub: "attacker".to_string(),
+            iss: "praeco-test".to_string(),
+            aud: None,
+            exp: 9999999999,
+            oids: vec![],
+            jti: None,
+        };
+
+        // 3 failed attempts invalidate the session
+        for _ in 0..MAX_CONFIRM_ATTEMPTS {
+            let res = store.confirm_session(&info.session_id, Some("BADCOD"), claims.clone());
+            assert_eq!(res, Err(ConfirmError::InvalidUserCode));
+        }
+
+        // 4th attempt even with the valid user_code returns NotFound because session was removed
+        let res_after = store.confirm_session(&info.session_id, Some(&info.user_code), claims);
+        assert_eq!(res_after, Err(ConfirmError::NotFound));
     }
 
     #[test]

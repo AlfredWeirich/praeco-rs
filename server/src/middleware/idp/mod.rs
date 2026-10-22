@@ -509,7 +509,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 IdpFuture::Ready { response: Some(resp) }
             }
 
-            // 2b. View session user_code on device (for Quishing verification)
+            // 2b. View session user_code on device (for Quishing verification by Swift URLSession before mTLS confirm)
             (Method::GET, "/auth/session_info") => {
                 let sid = match session_id {
                     Some(sid) => sid,
@@ -542,6 +542,22 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required to confirm session")),
                     },
                 };
+
+                // Pre-validate session and mandatory user_code BEFORE triggering outbound Claims Webhook
+                if let Err(err) = self.session_store.verify_session_code(&sid, user_code.as_deref()) {
+                    let resp = match err {
+                        ConfirmError::InvalidUserCode => {
+                            Self::response_err(StatusCode::BAD_REQUEST, "Invalid confirmation user code")
+                        }
+                        ConfirmError::AlreadyConfirmed => {
+                            Self::response_err(StatusCode::CONFLICT, "Session already confirmed")
+                        }
+                        ConfirmError::NotFound | ConfirmError::Expired => {
+                            Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired")
+                        }
+                    };
+                    return IdpFuture::Ready { response: Some(resp) };
+                }
 
                 if let Some(wh) = &self.webhook_client {
                     let sub = claims.sub.clone();
@@ -653,6 +669,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                     }
                 }
 
+                // Explicit ?jti=... query parameter revocation is restricted to mTLS-authenticated callers
+                // to prevent unauthenticated JTI revocation DoS and RevocationStore memory exhaustion.
                 if let Some(explicit_jti) = query.split('&').find_map(|kv| {
                     let mut parts = kv.splitn(2, '=');
                     if parts.next()? == "jti" {
@@ -661,14 +679,24 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         None
                     }
                 }) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    let exp = now + self.params.token_expiry_seconds;
-                    crate::middleware::jwt::get_jwt_revocation_store().revoke(&explicit_jti, exp);
-                    info!("{}: Explicitly revoked jti: {}", self.server_name, explicit_jti);
-                    revoked_any = true;
+                    if mtls_claims.is_none() {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::UNAUTHORIZED,
+                                "Unauthorized: mTLS required to revoke explicit JTI",
+                            )),
+                        };
+                    }
+                    if !explicit_jti.is_empty() && explicit_jti.len() <= 256 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let exp = now + self.params.token_expiry_seconds;
+                        crate::middleware::jwt::get_jwt_revocation_store().revoke(&explicit_jti, exp);
+                        info!("{}: Explicitly revoked jti via mTLS: {}", self.server_name, explicit_jti);
+                        revoked_any = true;
+                    }
                 }
 
                 let mut cookie_clear = format!(
@@ -833,23 +861,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_idp_revoke_via_query_param() {
+    async fn test_idp_revoke_via_query_param_requires_mtls() {
         let mut idp = create_test_idp_service();
         let jti = "query-param-jti-456";
 
         assert!(!crate::middleware::jwt::get_jwt_revocation_store().is_revoked(jti));
 
-        let body: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
-        let req = Request::builder()
+        // 1. Unauthenticated caller attempting ?jti= revocation must NOT revoke the JTI
+        let body1: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_unauth = Request::builder()
             .method(Method::POST)
             .uri(format!("/auth/revoke?jti={}", jti))
-            .body(body)
+            .body(body1)
             .unwrap();
 
-        let resp = idp.ready().await.unwrap().call(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_unauth = idp.ready().await.unwrap().call(req_unauth).await.unwrap();
+        assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+        assert!(!crate::middleware::jwt::get_jwt_revocation_store().is_revoked(jti));
 
-        let set_cookie = resp.headers().get("Set-Cookie").unwrap().to_str().unwrap();
+        // 2. mTLS-authenticated caller with PemCertExtension is allowed to revoke via ?jti=
+        let body2: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let mut req_mtls = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/auth/revoke?jti={}", jti))
+            .body(body2)
+            .unwrap();
+        req_mtls
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        req_mtls
+            .extensions_mut()
+            .insert(crate::SanCertExtension("admin-device".to_string()));
+
+        let resp_mtls = idp.ready().await.unwrap().call(req_mtls).await.unwrap();
+        assert_eq!(resp_mtls.status(), StatusCode::OK);
+
+        let set_cookie = resp_mtls.headers().get("Set-Cookie").unwrap().to_str().unwrap();
         assert!(set_cookie.contains("jwt=;"));
 
         assert!(crate::middleware::jwt::get_jwt_revocation_store().is_revoked(jti));

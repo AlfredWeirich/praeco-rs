@@ -92,7 +92,7 @@ pub async fn read_proxy_v2<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Optio
     reader.read_exact(&mut header).await?;
 
     if header[0..12] != PROXY_V2_MAGIC {
-        return Err(ProxyProtocolError::InvalidMagic(header[0..12].to_vec()));
+        return Err(ProxyProtocolError::InvalidMagic(header.to_vec()));
     }
 
     let version_cmd = header[12];
@@ -257,9 +257,15 @@ mod tests {
         assert!(matches!(err, ProxyProtocolError::Io(_))); // EOF before 16 bytes
 
         let fake_bytes = vec![0x16; 16];
-        let mut cursor2 = Cursor::new(fake_bytes);
+        let mut cursor2 = Cursor::new(fake_bytes.clone());
         let err2 = read_proxy_v2(&mut cursor2).await.unwrap_err();
-        assert!(matches!(err2, ProxyProtocolError::InvalidMagic(_)));
+        match err2 {
+            ProxyProtocolError::InvalidMagic(prefix) => {
+                assert_eq!(prefix.len(), 16);
+                assert_eq!(prefix, fake_bytes);
+            }
+            other => panic!("Expected InvalidMagic, got {:?}", other),
+        }
     }
 
     #[tokio::test]

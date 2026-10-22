@@ -2067,16 +2067,17 @@ async fn run_tunnel(
                                     ).await;
 
                                     match pp_result {
-                                        Ok(Ok(Some(addr))) => {
-                                            (addr, tokio_util::either::Either::Left(compat_stream))
-                                        }
-                                        Ok(Ok(None)) => {
-                                            (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Left(compat_stream))
-                                        }
-                                        Ok(Err(common::proxy_protocol::ProxyProtocolError::InvalidMagic(prefix))) => {
-                                            // Fallback for older Relay or raw stream: replay the consumed bytes
-                                            let prefixed = common::proxy_protocol::PrefixedStream::new(prefix, compat_stream);
-                                            (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Right(prefixed))
+                                        Ok(Ok(Some(addr))) => (addr, compat_stream),
+                                        Ok(Ok(None)) => (
+                                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                                            compat_stream,
+                                        ),
+                                        Ok(Err(common::proxy_protocol::ProxyProtocolError::InvalidMagic(_prefix))) => {
+                                            warn!(
+                                                "{}: Rejecting tunneled connection: proxy_protocol is enabled but stream did not start with a valid PROXY v2 header",
+                                                server_name
+                                            );
+                                            return;
                                         }
                                         Ok(Err(e)) => {
                                             warn!("{}: Failed to read PROXY-Protocol header: {}", server_name, e);
@@ -2088,7 +2089,10 @@ async fn run_tunnel(
                                         }
                                     }
                                 } else {
-                                    (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Left(compat_stream))
+                                    (
+                                        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
+                                        compat_stream,
+                                    )
                                 };
 
                                 // Enforce per-IP concurrency limits now that real client IP is resolved
