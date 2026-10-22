@@ -43,23 +43,65 @@ use tracing::error;
 use crate::{ServiceRespBody, SrvError};
 use common::{Claims, load_decoding_keys, verify_jwt};
 
+const MAX_REVOKED_ENTRIES: usize = 50_000;
+const REVOCATION_CLEANUP_INTERVAL_SECS: u64 = 30;
+const MAX_JTI_LEN: usize = 256;
+
 /// Thread-safe storage for revoked JWT IDs (`jti`).
 #[derive(Clone, Default)]
 pub struct JwtRevocationStore {
     /// Maps `jti` to expiration UNIX timestamp (seconds).
     revoked: Arc<DashMap<String, u64>>,
+    /// Timestamp (UNIX seconds) of last expired-entries cleanup.
+    last_cleanup: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JwtRevocationStore {
     pub fn new() -> Self {
         Self {
             revoked: Arc::new(DashMap::new()),
+            last_cleanup: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Marks a JWT with the given `jti` as revoked until `expires_at`.
     pub fn revoke(&self, jti: impl Into<String>, expires_at: u64) {
-        self.revoked.insert(jti.into(), expires_at);
+        let jti_str = jti.into();
+        if jti_str.is_empty() || jti_str.len() > MAX_JTI_LEN {
+            return;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let last = self.last_cleanup.load(std::sync::atomic::Ordering::Relaxed);
+        if self.revoked.len() >= MAX_REVOKED_ENTRIES
+            || now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS
+        {
+            if self
+                .last_cleanup
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                self.cleanup_expired();
+            }
+        }
+
+        if self.revoked.len() < MAX_REVOKED_ENTRIES || self.revoked.contains_key(&jti_str) {
+            self.revoked.insert(jti_str, expires_at);
+        } else {
+            tracing::warn!(
+                "JwtRevocationStore capacity ({}) reached; dropping revocation for jti",
+                MAX_REVOKED_ENTRIES
+            );
+        }
     }
 
     /// Checks if a `jti` has been revoked. If expired, lazily prunes it.
