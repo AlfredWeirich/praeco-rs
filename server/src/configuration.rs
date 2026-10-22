@@ -204,6 +204,10 @@ pub struct ServerConfig {
     /// Configuration for forwarding client certificate details to the backend.
     pub client_cert_forwarding: Option<ClientCertForwardingConfig>,
 
+    /// Connection limits for TCP/QUIC listeners (default: 10,000 global, 100 per IP).
+    #[serde(default, alias = "ConnectionLimits")]
+    pub connection_limits: ConnectionLimitsConfig,
+
     /// Middleware layer configuration (names + per-layer settings).
     #[serde(rename = "Layers")]
     pub layers: Layers,
@@ -818,6 +822,35 @@ pub struct JwtAuthConfig {
     pub expected_audience: String,
 }
 
+fn default_max_connections() -> usize {
+    10_000
+}
+
+fn default_max_connections_per_ip() -> usize {
+    100
+}
+
+/// Configuration for server connection limits (global and per-IP).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionLimitsConfig {
+    /// Maximum number of concurrent connections across the entire server instance (default: 10,000).
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum number of concurrent connections from a single IP address (default: 100).
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: usize,
+}
+
+impl Default for ConnectionLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: default_max_connections(),
+            max_connections_per_ip: default_max_connections_per_ip(),
+        }
+    }
+}
+
 /// Configuration for the concurrency limit layer.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ConcurrencyLimitConfig {
@@ -1098,6 +1131,19 @@ impl ServerConfig {
                     self.name
                 )));
             }
+        }
+
+        if self.connection_limits.max_connections == 0 {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': connection_limits.max_connections must be strictly greater than 0.",
+                self.name
+            )));
+        }
+        if self.connection_limits.max_connections_per_ip == 0 {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': connection_limits.max_connections_per_ip must be strictly greater than 0.",
+                self.name
+            )));
         }
 
         self.init_parsed_routes()?;
@@ -1746,5 +1792,90 @@ mod tests {
         assert_eq!(params.idle_timeout_seconds, 45);
         assert_eq!(params.grpc_reflection_timeout_seconds, 8);
         assert_eq!(params.grpc_reflection_ttl_seconds, 300);
+    }
+
+    #[test]
+    fn test_connection_limits_defaults() {
+        let toml_str = r#"
+            name = "conn_limits_default"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(server.connection_limits.max_connections, 10_000);
+        assert_eq!(server.connection_limits.max_connections_per_ip, 100);
+        assert!(server.finalize().is_ok());
+    }
+
+    #[test]
+    fn test_connection_limits_custom() {
+        let toml_str = r#"
+            name = "conn_limits_custom"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = []
+
+            [connection_limits]
+            max_connections = 500
+            max_connections_per_ip = 25
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(server.connection_limits.max_connections, 500);
+        assert_eq!(server.connection_limits.max_connections_per_ip, 25);
+        assert!(server.finalize().is_ok());
+    }
+
+    #[test]
+    fn test_connection_limits_zero_rejected() {
+        let toml_str = r#"
+            name = "conn_limits_zero"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = []
+
+            [connection_limits]
+            max_connections = 0
+            max_connections_per_ip = 25
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        let res = server.finalize();
+        assert!(res.is_err());
+        assert!(format!("{:#}", res.unwrap_err()).contains("max_connections must be strictly greater than 0"));
+
+        let toml_str_ip_zero = r#"
+            name = "conn_limits_ip_zero"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = []
+
+            [connection_limits]
+            max_connections = 100
+            max_connections_per_ip = 0
+        "#;
+        let mut server_ip_zero: ServerConfig = toml::from_str(toml_str_ip_zero).unwrap();
+        let res_ip = server_ip_zero.finalize();
+        assert!(res_ip.is_err());
+        assert!(format!("{:#}", res_ip.unwrap_err()).contains("max_connections_per_ip must be strictly greater than 0"));
     }
 }

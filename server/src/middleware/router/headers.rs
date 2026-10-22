@@ -321,6 +321,7 @@ mod tests {
             server_certs: None,
             client_certs: None,
             client_cert_forwarding: forwarding,
+            connection_limits: Default::default(),
             router_params: None,
             tunnel: None,
             layers: crate::configuration::Layers::default(),

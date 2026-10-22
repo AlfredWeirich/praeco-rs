@@ -129,6 +129,26 @@ This configuration controls the passing of verified client identities to backend
 * `header_roles`: String. HTTP header name for the forwarded user roles (e.g., `x-user-roles`).
 * `header_client_ip`: String. HTTP header name for the client IP address (e.g., `x-client-ip`).
 
+### Connection Limits (`[Server.connection_limits]`) (Optional)
+
+Protects against connection starvation, Slowloris, and socket exhaustion attacks across TCP, QUIC, and Yamux tunnel listeners. If omitted, secure defaults are applied automatically without requiring any manual configuration entries.
+
+* `max_connections`: Integer (Optional, **Default:** `10000`). Maximum number of simultaneous active client connections across TCP, QUIC, and tunnel listeners for this server instance.
+* `max_connections_per_ip`: Integer (Optional, **Default:** `100`). Maximum number of simultaneous active connections permitted from a single IP address (unspecified/tunnel addresses bypass the per-IP check and only count towards the global limit).
+
+```toml
+[Server.connection_limits]
+max_connections = 10000
+max_connections_per_ip = 100
+```
+
+> [!NOTE]
+> **Hardcoded Protocol Security Defaults (No Configuration Required):**
+> To keep configuration files slim while guaranteeing maximum resilience against known protocol-level attacks, low-level transport and protocol limits are enforced internally with secure defaults:
+> - **HTTP/2 Rapid Reset Mitigation (CVE-2023-44487):** `max_pending_accept_reset_streams = 20` (capped from hyper's default of 16,384), `max_concurrent_streams = 128` (capped from 1,024).
+> - **HTTP/2 Frame & Header Flood Mitigation:** `max_header_list_size = 65536` (64 KB, mitigates HPACK compression bombs), `max_frame_size = 16384` (16 KB standard frame cap).
+> - **HTTP/3 & QUIC Transport Hardening:** Stream receive window reduced to 1 MB and connection receive window to 8 MB (preventing unbounded memory exhaustion from oversized defaults); concurrent streams capped at 128; RFC 9000 §8 anti-amplification stateless address validation (`retry`) automatically active for unvalidated UDP peers; and concurrent request stream tasks bounded by a 128-permit semaphore.
+
 ### Identity Provider (IdP) Configuration
 
 #### `[Server.IdpParams]` (Required if `service = "Idp"`)
