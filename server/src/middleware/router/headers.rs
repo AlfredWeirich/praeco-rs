@@ -333,6 +333,8 @@ mod tests {
             idp_params: None,
             static_files_params: None,
             certified_key: None,
+            rbac: None,
+            compiled_rbac: None,
         }
     }
 

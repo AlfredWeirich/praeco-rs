@@ -220,6 +220,14 @@ pub struct ServerConfig {
     #[serde(rename = "ReverseRoutes")]
     pub rev_routes: Option<HashMap<String, RouteConfig>>,
 
+    /// Granular path-based Role-Based Access Control (RBAC) rules.
+    ///
+    /// Maps paths (exact or prefix wildcards ending with `*`) to required roles.
+    /// An empty list `[]` acts as an explicit Deny-All rule.
+    /// Wildcard `"*"` in the roles list permits any caller.
+    #[serde(default, rename = "Rbac", alias = "rbac")]
+    pub rbac: Option<HashMap<String, Vec<UserRole>>>,
+
     /// Additional parameters for the Router service (upstream protocol,
     /// auth settings, TLS for upstream connections).
     #[serde(rename = "RouterParams")]
@@ -241,6 +249,10 @@ pub struct ServerConfig {
     /// [`ServerConfig::finalize`].
     #[serde(skip)]
     pub compiled_allowed_pathes: Option<Arc<CompiledAllowedPathes>>,
+
+    /// Pre-compiled RBAC lookup structure computed in [`ServerConfig::finalize`].
+    #[serde(skip)]
+    pub compiled_rbac: Option<Arc<CompiledRbac>>,
 
     /// The loaded TLS private key + certificate chain. Computed in
     /// [`ServerConfig::finalize`] if HTTPS matches.
@@ -1148,6 +1160,7 @@ impl ServerConfig {
 
         self.init_parsed_routes()?;
         self.init_compiled_allowed_pathes()?;
+        self.init_compiled_rbac()?;
         // === VALIDATION STEP ===
         // We attempt to build the layers here. If there is a typo (e.g. "Decompressionx")
         // or a missing config section, this will return an Error immediately.
@@ -1371,6 +1384,12 @@ impl ServerConfig {
         self.compiled_allowed_pathes = Some(Arc::new(CompiledAllowedPathes::from_raw(&raw)?));
         Ok(())
     }
+
+    /// Compiles fine-grained RBAC rules into [`CompiledRbac`].
+    pub fn init_compiled_rbac(&mut self) -> Result<(), Error> {
+        self.compiled_rbac = self.rbac.as_ref().map(|raw| Arc::new(CompiledRbac::from_raw(raw)));
+        Ok(())
+    }
 }
 
 impl CompiledAllowedPathes {
@@ -1459,6 +1478,59 @@ impl CompiledAllowedPathes {
         } else {
             false
         }
+    }
+}
+
+/// Pre-compiled granular Role-Based Access Control lookup structure.
+///
+/// Supports exact path matching (O(1) lookup) and wildcard prefix matching
+/// (longest prefix first).
+#[derive(Debug, Clone, Default)]
+pub struct CompiledRbac {
+    /// Exact path matches: path -> required_roles
+    pub exact: HashMap<String, Vec<UserRole>>,
+    /// Wildcard / prefix matches: (prefix, required_roles) sorted by descending prefix length
+    pub prefix: Vec<(String, Vec<UserRole>)>,
+}
+
+impl CompiledRbac {
+    /// Compiles raw string patterns from the `[Server.rbac]` table.
+    ///
+    /// Keys ending with `*` are treated as prefix matches (e.g. `"/api/Admin*"` or `"/api/admin/*"`).
+    /// Other keys are treated as exact path matches.
+    pub fn from_raw(raw: &HashMap<String, Vec<UserRole>>) -> Self {
+        let mut exact = HashMap::new();
+        let mut prefix = Vec::new();
+
+        for (pattern, roles) in raw {
+            if pattern.ends_with('*') {
+                let pfx = &pattern[..pattern.len() - 1];
+                prefix.push((pfx.to_string(), roles.clone()));
+            } else {
+                exact.insert(pattern.clone(), roles.clone());
+            }
+        }
+
+        // Sort descending by prefix length: most specific prefix wins
+        prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        Self { exact, prefix }
+    }
+
+    /// Matches a request path against exact and prefix RBAC rules.
+    ///
+    /// Exact matches take precedence over prefix matches.
+    /// Returns `Some(&[UserRole])` if a rule matched, or `None` if no rule matched.
+    pub fn match_path<'a>(&'a self, path: &str) -> Option<&'a [UserRole]> {
+        if let Some(roles) = self.exact.get(path) {
+            return Some(roles.as_slice());
+        }
+        for (pfx, roles) in &self.prefix {
+            if path.starts_with(pfx) {
+                return Some(roles.as_slice());
+            }
+        }
+        None
     }
 }
 
@@ -1878,4 +1950,54 @@ mod tests {
         assert!(res_ip.is_err());
         assert!(format!("{:#}", res_ip.unwrap_err()).contains("max_connections_per_ip must be strictly greater than 0"));
     }
+
+    #[test]
+    fn test_compiled_rbac_matching() {
+        let toml_str = r#"
+            name = "rbac_test_server"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = []
+
+            [rbac]
+            "/api/Admin*" = ["Admin"]
+            "/api/AdminGetProducts" = ["Admin", "Seller"]
+            "/api/GetDatabaseTables" = ["Admin"]
+            "/api/Public*" = ["*"]
+            "/api/Blocked" = []
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(server.finalize().is_ok());
+
+        let compiled = server.compiled_rbac.as_ref().expect("compiled_rbac should be populated");
+
+        // Exact match
+        let tables_roles = compiled.match_path("/api/GetDatabaseTables").unwrap();
+        assert_eq!(tables_roles, &[UserRole("Admin".to_string())]);
+
+        // Exact match overrides prefix
+        let products_roles = compiled.match_path("/api/AdminGetProducts").unwrap();
+        assert_eq!(products_roles, &[UserRole("Admin".to_string()), UserRole("Seller".to_string())]);
+
+        // Prefix match
+        let delete_user_roles = compiled.match_path("/api/AdminDeleteUser").unwrap();
+        assert_eq!(delete_user_roles, &[UserRole("Admin".to_string())]);
+
+        // Wildcard role prefix
+        let public_roles = compiled.match_path("/api/Public/hello").unwrap();
+        assert_eq!(public_roles, &[UserRole("*".to_string())]);
+
+        // Empty role list (blocked)
+        let blocked_roles = compiled.match_path("/api/Blocked").unwrap();
+        assert!(blocked_roles.is_empty());
+
+        // Unmatched path
+        assert!(compiled.match_path("/other/path").is_none());
+    }
 }
+

@@ -250,7 +250,12 @@ impl Service<Request<SrvBody>> for RouterService {
             };
             let route_info = matched.value;
 
-            if let Err(forbidden_response) = rbac::enforce_rbac(&parts, route_info, server_name) {
+            if let Err(forbidden_response) = rbac::enforce_rbac(
+                &parts,
+                route_info,
+                self_clone.config.compiled_rbac.as_deref(),
+                server_name,
+            ) {
                 return Ok(forbidden_response);
             }
 
