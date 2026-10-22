@@ -1963,20 +1963,37 @@ async fn run_tunnel(
     let relay_port = parsed_url.port().unwrap_or(7001);
     
     let tcp_stream = TcpStream::connect((relay_host, relay_port)).await?;
+    let sock_ref = socket2::SockRef::from(&tcp_stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    let _ = sock_ref.set_tcp_keepalive(&keepalive);
+    let _ = sock_ref.set_nodelay(true);
+
     let domain = rustls::pki_types::ServerName::try_from(relay_host.to_string())?;
     
     let mut tls_stream = connector.connect(domain, tcp_stream).await?;
 
-    // 3. Register SNI
-    let reg_cmd = format!("REGISTER {}\n", tunnel.sni_domain);
+    // 3. Register SNI with capability negotiation (Phase 4)
+    let reg_cmd = if tunnel.proxy_protocol {
+        format!("REGISTER {} PROXY_V2\n", tunnel.sni_domain)
+    } else {
+        format!("REGISTER {}\n", tunnel.sni_domain)
+    };
     tls_stream.write_all(reg_cmd.as_bytes()).await?;
     tls_stream.flush().await?;
 
-    // 4. Setup Yamux
-    let cfg = yamux::Config::default();
+    // 4. Setup Yamux (S-27: configurable concurrent streams + scaled receive window)
+    let max_streams = tunnel.max_yamux_streams.unwrap_or(4096);
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(max_streams);
+    let min_window = max_streams * 256 * 1024;
+    cfg.set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
     let mut connection = yamux::Connection::new(tls_stream.compat(), cfg, yamux::Mode::Client);
 
     info!("{}: Tunnel connected successfully to {}", server_name, tunnel.target_url);
+
+    let use_proxy_protocol = tunnel.proxy_protocol;
 
     // 5. Accept Streams loop
     loop {
@@ -2001,18 +2018,54 @@ async fn run_tunnel(
                             let dynamic_stack = dynamic_stack.clone();
                             let oid_mapping = oid_mapping.clone();
                             let conn_token = cancel_token.child_token();
-                            
-                            // We must create a dummy SocketAddr since tunnels don't have real remote IPs (unless we proxy protocol it)
-                            let peer_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
 
                             tokio::spawn(async move {
-                                let _guard = connection_guard;
+                                let mut connection_guard = connection_guard;
                                 // Provide AsyncRead/Write compat for hyper
-                                let compat_stream = yamux_stream.compat();
+                                let mut compat_stream = yamux_stream.compat();
+
+                                let (peer_addr, stream) = if use_proxy_protocol {
+                                    let pp_result = tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        common::proxy_protocol::read_proxy_v2(&mut compat_stream),
+                                    ).await;
+
+                                    match pp_result {
+                                        Ok(Ok(Some(addr))) => {
+                                            (addr, tokio_util::either::Either::Left(compat_stream))
+                                        }
+                                        Ok(Ok(None)) => {
+                                            (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Left(compat_stream))
+                                        }
+                                        Ok(Err(common::proxy_protocol::ProxyProtocolError::InvalidMagic(prefix))) => {
+                                            // Fallback for older Relay or raw stream: replay the consumed bytes
+                                            let prefixed = common::proxy_protocol::PrefixedStream::new(prefix, compat_stream);
+                                            (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Right(prefixed))
+                                        }
+                                        Ok(Err(e)) => {
+                                            warn!("{}: Failed to read PROXY-Protocol header: {}", server_name, e);
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            warn!("{}: PROXY-Protocol read timed out", server_name);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    (std::net::SocketAddr::from(([0, 0, 0, 0], 0)), tokio_util::either::Either::Left(compat_stream))
+                                };
+
+                                // Enforce per-IP concurrency limits now that real client IP is resolved
+                                if !peer_addr.ip().is_unspecified() {
+                                    if let Err(e) = connection_guard.bind_ip(peer_addr.ip()) {
+                                        warn!("{}: Tunneled connection rejected: {}", server_name, e);
+                                        return;
+                                    }
+                                }
 
                                 let tls_result = tokio::time::timeout(
                                     Duration::from_secs(10),
-                                    acceptor.accept(compat_stream),
+                                    acceptor.accept(stream),
                                 ).await;
 
                                 match tls_result {

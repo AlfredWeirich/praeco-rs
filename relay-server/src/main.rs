@@ -90,6 +90,197 @@ impl TokenBucket {
     }
 }
 
+/// Canonicalizes an IP address:
+/// - IPv4 addresses remain unchanged.
+/// - IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are unwrapped to IPv4.
+/// - Standard IPv6 addresses are masked to a /64 subnet prefix to prevent rate-limit and connection-limit evasion.
+pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else {
+                let segs = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(
+                    segs[0], segs[1], segs[2], segs[3], 0, 0, 0, 0,
+                ))
+            }
+        }
+    }
+}
+
+use std::sync::atomic::AtomicUsize;
+
+/// Central connection tracker for the Relay Server.
+/// Enforces global and per-canonical-IP concurrency limits using RAII guards.
+pub struct RelayConnectionTracker {
+    max_global: usize,
+    max_per_ip: usize,
+    global_count: AtomicUsize,
+    ip_counts: DashMap<IpAddr, usize>,
+}
+
+/// RAII guard that decrements the connection count when dropped.
+pub struct RelayConnectionGuard {
+    tracker: Arc<RelayConnectionTracker>,
+    ip: IpAddr,
+}
+
+impl Drop for RelayConnectionGuard {
+    fn drop(&mut self) {
+        self.tracker.global_count.fetch_sub(1, Ordering::SeqCst);
+        let mut remove = false;
+        if let Some(mut count) = self.tracker.ip_counts.get_mut(&self.ip) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                remove = true;
+            }
+        }
+        if remove {
+            self.tracker.ip_counts.remove(&self.ip);
+        }
+    }
+}
+
+impl RelayConnectionTracker {
+    pub fn new(max_global: usize, max_per_ip: usize) -> Self {
+        Self {
+            max_global,
+            max_per_ip,
+            global_count: AtomicUsize::new(0),
+            ip_counts: DashMap::new(),
+        }
+    }
+
+    pub fn acquire(self: &Arc<Self>, raw_ip: IpAddr) -> Result<RelayConnectionGuard, &'static str> {
+        let ip = canonicalize_ip(raw_ip);
+
+        // 1. Check global limit
+        let prev_global = self.global_count.fetch_add(1, Ordering::SeqCst);
+        if prev_global >= self.max_global {
+            self.global_count.fetch_sub(1, Ordering::SeqCst);
+            return Err("Global connection limit reached");
+        }
+
+        // 2. Check per-IP limit
+        let mut entry = self.ip_counts.entry(ip).or_insert(0);
+        if *entry >= self.max_per_ip {
+            self.global_count.fetch_sub(1, Ordering::SeqCst);
+            return Err("Per-IP connection limit reached");
+        }
+        *entry += 1;
+        drop(entry);
+
+        Ok(RelayConnectionGuard {
+            tracker: self.clone(),
+            ip,
+        })
+    }
+
+    pub fn current_global(&self) -> usize {
+        self.global_count.load(Ordering::Relaxed)
+    }
+
+    pub fn current_for_ip(&self, raw_ip: IpAddr) -> usize {
+        let ip = canonicalize_ip(raw_ip);
+        self.ip_counts.get(&ip).map(|v| *v).unwrap_or(0)
+    }
+}
+
+/// Reads a full TLS ClientHello record from the incoming stream with a timeout and protection against Slowloris.
+///
+/// Handles TLS record fragmentation across multiple TCP segments. If the initial bytes indicate a non-TLS
+/// request (e.g. plain HTTP GET or port scanner), reads an initial chunk and returns it so the caller
+/// can log the diagnostic preview.
+pub async fn read_client_hello_record<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    timeout: Duration,
+) -> Result<Vec<u8>, &'static str> {
+    tokio::time::timeout(timeout, async {
+        let mut buf = Vec::with_capacity(4096);
+
+        // 1. Read the 5-byte TLS record header
+        while buf.len() < 5 {
+            let mut chunk = [0u8; 5];
+            let needed = 5 - buf.len();
+            let n = stream
+                .read(&mut chunk[..needed])
+                .await
+                .map_err(|_| "I/O error reading TLS header")?;
+            if n == 0 {
+                if buf.is_empty() {
+                    return Err("Connection closed before any data received");
+                } else {
+                    return Err("Unexpected EOF while reading TLS record header");
+                }
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+
+        // 2. Check if this is a TLS Handshake record (ContentType == 0x16)
+        if buf[0] != 0x16 {
+            // Not TLS handshake: might be plain HTTP (GET, POST), scanner probe, or garbage.
+            // Read any readily available additional data up to 512 bytes for scanner logging.
+            let mut extra = [0u8; 512];
+            if let Ok(Ok(n)) = tokio::time::timeout(Duration::from_millis(50), stream.read(&mut extra)).await {
+                buf.extend_from_slice(&extra[..n]);
+            }
+            return Ok(buf);
+        }
+
+        // 3. Extract the 16-bit record payload length
+        let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+        // Max allowed TLS record payload is 16384 bytes (RFC 8446 §5.1), plus 5-byte header = 16389 bytes.
+        if record_len > 16384 {
+            return Err("TLS record payload exceeds maximum allowable length of 16384 bytes");
+        }
+
+        let target_len = 5 + record_len;
+
+        // 4. Read the remainder of the full TLS record (handling any fragmentation)
+        let mut temp = [0u8; 4096];
+        while buf.len() < target_len {
+            let needed = target_len - buf.len();
+            let to_read = std::cmp::min(needed, temp.len());
+            let n = stream
+                .read(&mut temp[..to_read])
+                .await
+                .map_err(|_| "I/O error reading TLS record payload")?;
+            if n == 0 {
+                return Err("Unexpected EOF while reading TLS record payload");
+            }
+            buf.extend_from_slice(&temp[..n]);
+        }
+
+        Ok(buf)
+    })
+    .await
+    .map_err(|_| "Timed out while reading TLS ClientHello")?
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT (Ctrl+C). Shutting down Relay Server...");
+        }
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM. Shutting down Relay Server...");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+    info!("Shutdown signal received. Shutting down Relay Server...");
+}
+
 /// Represents a control handle to an active Yamux multiplexed connection.
 /// Used to request new outbound streams from the Relay to the Praeco backend.
 #[derive(Clone)]
@@ -109,8 +300,16 @@ impl Control {
     }
 }
 
+/// Represents an active tunnel route registered by a Praeco Gateway.
+#[derive(Clone)]
+struct TunnelRoute {
+    control: Control,
+    generation: u64,
+    supports_proxy_v2: bool,
+}
+
 /// Thread-safe map storing the active SNI-to-Control routing table.
-type SessionMap = Arc<DashMap<String, (Control, u64)>>;
+type SessionMap = Arc<DashMap<String, TunnelRoute>>;
 
 /// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
 /// Returns the `SdkTracerProvider` so it isn't dropped prematurely.
@@ -198,8 +397,20 @@ async fn main() -> Result<()> {
     // --- Spawn Control Plane ---
     let control_tunnels = active_tunnels.clone();
     let control_addr = config.control_plane_addr.clone();
+    let control_handshake_timeout = Duration::from_secs(config.control_plane_handshake_timeout_secs.unwrap_or(10));
+    let max_yamux_streams = config.max_yamux_streams.unwrap_or(4096);
+    let enable_proxy_protocol = config.enable_proxy_protocol.unwrap_or(true);
     tokio::spawn(async move {
-        if let Err(e) = run_control_plane(tls_acceptor, control_tunnels, &control_addr).await {
+        if let Err(e) = run_control_plane(
+            tls_acceptor,
+            control_tunnels,
+            &control_addr,
+            control_handshake_timeout,
+            max_yamux_streams,
+            enable_proxy_protocol,
+        )
+        .await
+        {
             error!("Control plane failed: {}", e);
         }
     });
@@ -216,6 +427,10 @@ async fn main() -> Result<()> {
         0 => None,
         secs => Some(Duration::from_secs(secs)),
     };
+    let max_global_conn = config.max_concurrent_connections.unwrap_or(10000);
+    let max_ip_conn = config.max_concurrent_connections_per_ip.unwrap_or(100);
+    let connection_tracker = Arc::new(RelayConnectionTracker::new(max_global_conn, max_ip_conn));
+    let client_hello_timeout = Duration::from_secs(config.client_hello_timeout_secs.unwrap_or(10));
     
     tokio::spawn(async move {
         if let Err(e) = run_data_plane(
@@ -225,6 +440,8 @@ async fn main() -> Result<()> {
             rate_burst,
             idle_timeout,
             tcp_keepalive,
+            connection_tracker,
+            client_hello_timeout,
         )
         .await
         {
@@ -232,7 +449,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let _ = tokio::signal::ctrl_c().await;
+    wait_for_shutdown().await;
     info!("Shutdown signal received. Shutting down Relay Server...");
     if let Some(provider) = _tracer_provider {
         let _ = provider.shutdown();
@@ -246,7 +463,8 @@ fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str, crl_path:
     let mut ca_reader = BufReader::new(ca_file);
     let mut root_store = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut ca_reader) {
-        root_store.add(cert?).unwrap();
+        let cert = cert.context("Failed to parse CA certificate")?;
+        root_store.add(cert).context("Failed to add CA certificate to root store")?;
     }
     
     let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
@@ -280,7 +498,14 @@ fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str, crl_path:
 /// When a Praeco instance connects, it sends a `REGISTER <sni>` command.
 /// The relay creates a Yamux session, stores the control handle in the `tunnels` map,
 /// and spawns a connection driver loop to multiplex incoming data plane requests.
-async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr: &str) -> Result<()> {
+async fn run_control_plane(
+    tls_acceptor: TlsAcceptor,
+    tunnels: SessionMap,
+    addr: &str,
+    handshake_timeout: Duration,
+    max_yamux_streams: usize,
+    enable_proxy_protocol: bool,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await.context("Failed to bind control plane")?;
     info!("Control plane listening on mTLS {}", addr);
 
@@ -293,18 +518,29 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
             }
         };
 
+        // Socket-level TCP Keepalive on Control Plane to detect dead connections without dummy streams
+        let sock_ref = socket2::SockRef::from(&stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10));
+        let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        let _ = sock_ref.set_nodelay(true);
+
         let acceptor = tls_acceptor.clone();
         let tunnels = tunnels.clone();
 
         tokio::spawn(async move {
             info!(target: "relay::control_plane", "New control connection");
             
-            // 1. Perform strict mTLS Handshake. 
-            // The client must present a valid certificate signed by our configured CA.
-            let mut tls_stream = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
+            // 1. Perform strict mTLS Handshake with timeout (S-27 Hardening).
+            let mut tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     warn!(target: "relay::control_plane", client_ip = %client_addr, error = %e, "mTLS handshake failed");
+                    return;
+                }
+                Err(_) => {
+                    warn!(target: "relay::control_plane", client_ip = %client_addr, "mTLS handshake timed out");
                     return;
                 }
             };
@@ -365,13 +601,15 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 }
             };
 
-            // --- Safe Parsing (P0.4) ---
+            // --- Safe Parsing with Capability Negotiation (P0.4 / Phase 4) ---
             let line_trimmed = line.trim();
-            let Some(("REGISTER", sni_raw)) = line_trimmed.split_once(' ') else {
+            let parts: Vec<&str> = line_trimmed.split_whitespace().collect();
+            if parts.is_empty() || parts[0] != "REGISTER" || parts.len() < 2 {
                 warn!(target: "relay::control_plane", client_ip = %client_addr, "Invalid register command format");
                 return;
-            };
-            let sni = sni_raw.trim().to_string();
+            }
+            let sni = parts[1].to_string();
+            let supports_proxy_v2 = parts[2..].contains(&"PROXY_V2") && enable_proxy_protocol;
 
             // --- Verify SNI against Certificate SANs (P0.2) ---
             if !allowed_snis.contains(&sni) {
@@ -379,9 +617,26 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 return;
             }
 
-            info!(target: "relay::control_plane", sni = %sni, "Praeco tunnel registered");
+            // --- Overwrite Protection (P0.3 / S-27) ---
+            // Prevent hijacking/blackholing of an active healthy tunnel
+            if let Some(existing) = tunnels.get(&sni) {
+                if !existing.value().control.tx.is_closed() {
+                    warn!(
+                        target: "relay::control_plane",
+                        sni = %sni,
+                        client_ip = %client_addr,
+                        "Registration rejected: active healthy tunnel already registered for this SNI"
+                    );
+                    return;
+                }
+            }
 
-            let cfg = YamuxConfig::default();
+            info!(target: "relay::control_plane", sni = %sni, proxy_v2 = supports_proxy_v2, "Praeco tunnel registered");
+
+            let mut cfg = YamuxConfig::default();
+            let min_window = max_yamux_streams * 256 * 1024;
+            cfg.set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
+            cfg.set_max_num_streams(max_yamux_streams);
             let mut connection = Connection::new(tls_stream.compat(), cfg, Mode::Server);
 
             let (tx, mut rx) = mpsc::channel(32);
@@ -394,46 +649,21 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
             static GENERATION: AtomicU64 = AtomicU64::new(1);
             let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst);
 
-            tunnels.insert(sni.clone(), (control.clone(), my_generation));
-
-            // --- Health Check Task (Keepalive) ---
-            // Actively tests the multiplexed connection by opening dummy streams.
-            // If the backend has silently disappeared, this ensures the stale routing entry is removed.
-            let ping_sni = sni.clone();
-            let ping_tunnels = tunnels.clone();
-            let mut ping_control = control.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
-                // Tick first to wait 30s before first ping
-                interval.tick().await; 
-                loop {
-                    interval.tick().await;
-                    // Check if we are still the active generation (P0.5)
-                    let still_active = if let Some(entry) = ping_tunnels.get(&ping_sni) {
-                        entry.value().1 == my_generation
-                    } else {
-                        false
-                    };
-                    if !still_active {
-                        break; // Another tunnel took over or it was deleted
-                    }
-                    
-                    match ping_control.open_stream().await {
-                        Ok(s) => drop(s), // Ping OK
-                        Err(_) => {
-                            warn!(target: "relay::control_plane", sni = %ping_sni, "Heartbeat failed, removing tunnel");
-                            // Remove only if generation matches (P0.5)
-                            ping_tunnels.remove_if(&ping_sni, |_, (_, g)| *g == my_generation);
-                            break;
-                        }
-                    }
-                }
-            });
+            tunnels.insert(
+                sni.clone(),
+                TunnelRoute {
+                    control: control.clone(),
+                    generation: my_generation,
+                    supports_proxy_v2,
+                },
+            );
 
             // --- Connection Driver Loop ---
             // This loop polls the Yamux multiplexer. It constantly checks for new outbound
             // stream requests (originating from the Data Plane) and pushes them down the tunnel,
             // whilst simultaneously driving all active streams to completion.
+            // When the underlying TCP/mTLS socket drops (detected via TCP keepalive or EOF),
+            // this loop exits cleanly and removes the tunnel without spurious TLS warnings.
             let mut pending_outbound: Option<oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>> = None;
 
             std::future::poll_fn(|cx| {
@@ -475,7 +705,7 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
             }).await;
 
             // Remove only if generation matches (P0.5)
-            tunnels.remove_if(&sni, |_, (_, g)| *g == my_generation);
+            tunnels.remove_if(&sni, |_, route| route.generation == my_generation);
         }.instrument(info_span!("control_connection", client_ip = %client_addr)));
     }
 }
@@ -634,6 +864,8 @@ async fn run_data_plane(
     burst: f32,
     idle_timeout: Option<Duration>,
     tcp_keepalive: Option<Duration>,
+    connection_tracker: Arc<RelayConnectionTracker>,
+    client_hello_timeout: Duration,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("Data plane listening on {} (SNI-Routing)", addr);
@@ -667,27 +899,41 @@ async fn run_data_plane(
             let _ = sock_ref.set_nodelay(true);
         }
 
-        // --- Rate Limiting Check ---
-        let mut bucket = rate_limits.entry(client_addr.ip()).or_insert_with(|| TokenBucket::new(burst));
+        // --- Rate Limiting Check (Aggregated IPv6 on /64 to prevent evasion) ---
+        let canonical_ip = canonicalize_ip(client_addr.ip());
+        let mut bucket = rate_limits.entry(canonical_ip).or_insert_with(|| TokenBucket::new(burst));
         if !bucket.consume(rate, burst) {
             warn!(target: "relay::data_plane", client_ip = %client_addr, "Rate limit exceeded, dropping connection");
             continue; // Drop instantly
         }
         drop(bucket); // Explicitly release the lock before spawning
 
+        // --- Concurrency Limit Check (Global & Per-IP /64 Cap) ---
+        let connection_guard = match connection_tracker.acquire(client_addr.ip()) {
+            Ok(guard) => guard,
+            Err(e) => {
+                warn!(target: "relay::data_plane", client_ip = %client_addr, error = %e, "Connection rejected: concurrency limit reached");
+                continue;
+            }
+        };
+
         let tunnels = tunnels.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            let n = match client_stream.read(&mut buf).await {
-                Ok(0) => return,
-                Ok(n) => n,
-                Err(_) => return,
+            let _guard = connection_guard;
+
+            // --- Read TLS ClientHello Record (Protected against Slowloris & TCP Fragmentation) ---
+            let buf = match read_client_hello_record(&mut client_stream, client_hello_timeout).await {
+                Ok(b) => b,
+                Err(err_msg) => {
+                    warn!(target: "relay::data_plane", client_ip = %client_addr, error = %err_msg, "Failed to read ClientHello");
+                    return;
+                }
             };
 
-            let sni = match extract_sni(&buf[..n]) {
+            let sni = match extract_sni(&buf) {
                 Ok(s) => s,
                 Err(reason) => {
-                    let preview_len = std::cmp::min(n, 64);
+                    let preview_len = std::cmp::min(buf.len(), 64);
                     let preview = &buf[..preview_len];
                     
                     let is_ascii = preview.iter().all(|&b| b.is_ascii_graphic() || b.is_ascii_whitespace());
@@ -713,8 +959,8 @@ async fn run_data_plane(
                 return;
             }
 
-            let mut control = match tunnels.get(&sni) {
-                Some(entry) => entry.value().0.clone(),
+            let (mut control, supports_proxy_v2) = match tunnels.get(&sni) {
+                Some(entry) => (entry.value().control.clone(), entry.value().supports_proxy_v2),
                 None => {
                     warn!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "No active tunnel for SNI");
                     return;
@@ -731,7 +977,16 @@ async fn run_data_plane(
             
             let mut tokio_tunnel = tunnel_stream.compat_write();
 
-            if let Err(e) = tokio_tunnel.write_all(&buf[..n]).await {
+            if supports_proxy_v2 {
+                let local_addr = client_stream.local_addr().unwrap_or(client_addr);
+                let ppv2_header = common::proxy_protocol::encode_proxy_v2(client_addr, local_addr);
+                if let Err(e) = tokio_tunnel.write_all(&ppv2_header).await {
+                    warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write PROXY-Protocol v2 header to tunnel");
+                    return;
+                }
+            }
+
+            if let Err(e) = tokio_tunnel.write_all(&buf).await {
                 warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write ClientHello to tunnel");
                 return;
             }
@@ -930,5 +1185,202 @@ mod tests {
         let _client_conn = Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
 
         listener_task.await.unwrap();
+    }
+
+    #[test]
+    fn test_canonicalize_ip() {
+        // IPv4
+        let ip4: IpAddr = "192.168.1.50".parse().unwrap();
+        assert_eq!(canonicalize_ip(ip4), ip4);
+
+        // IPv4-mapped IPv6
+        let ip4_mapped: IpAddr = "::ffff:192.168.1.50".parse().unwrap();
+        assert_eq!(canonicalize_ip(ip4_mapped), ip4);
+
+        // IPv6 /64 aggregation
+        let ip6_a: IpAddr = "2001:db8:abcd:0012:0000:0000:0000:0001".parse().unwrap();
+        let ip6_b: IpAddr = "2001:db8:abcd:0012:ffff:ffff:ffff:ffff".parse().unwrap();
+        let ip6_masked: IpAddr = "2001:db8:abcd:0012::".parse().unwrap();
+
+        assert_eq!(canonicalize_ip(ip6_a), ip6_masked);
+        assert_eq!(canonicalize_ip(ip6_b), ip6_masked);
+        assert_eq!(canonicalize_ip(ip6_a), canonicalize_ip(ip6_b));
+    }
+
+    #[test]
+    fn test_relay_connection_tracker_limits() {
+        let tracker = Arc::new(RelayConnectionTracker::new(3, 2));
+
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        // 1. Acquire 2 connections for ip1 (allowed)
+        let g1 = tracker.acquire(ip1).expect("g1 should succeed");
+        let g2 = tracker.acquire(ip1).expect("g2 should succeed");
+        assert_eq!(tracker.current_global(), 2);
+        assert_eq!(tracker.current_for_ip(ip1), 2);
+
+        // 2. 3rd connection for ip1 exceeds per-IP limit (max 2)
+        assert!(tracker.acquire(ip1).is_err());
+
+        // 3. 3rd global connection for ip2 (allowed)
+        let g3 = tracker.acquire(ip2).expect("g3 should succeed");
+        assert_eq!(tracker.current_global(), 3);
+
+        // 4. 4th connection exceeds global limit (max 3)
+        assert!(tracker.acquire(ip2).is_err());
+
+        // 5. Drop g1 -> global drops to 2, ip1 drops to 1
+        drop(g1);
+        assert_eq!(tracker.current_global(), 2);
+        assert_eq!(tracker.current_for_ip(ip1), 1);
+
+        // Now ip1 can acquire 1 more
+        let g4 = tracker.acquire(ip1).expect("g4 should succeed");
+        assert_eq!(tracker.current_global(), 3);
+        assert_eq!(tracker.current_for_ip(ip1), 2);
+
+        // Drop remaining
+        drop(g2);
+        drop(g3);
+        drop(g4);
+        assert_eq!(tracker.current_global(), 0);
+        assert_eq!(tracker.current_for_ip(ip1), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_client_hello_record_fragmented() {
+        // Construct a synthetic valid TLS handshake record:
+        // Header: [0x16, 0x03, 0x01, 0x00, 0x0A] (length 10)
+        // Payload: 10 bytes of dummy handshake
+        let mut full_record = vec![0x16, 0x03, 0x01, 0x00, 0x0A];
+        full_record.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+        let to_send = full_record.clone();
+
+        // Send in 3 separate fragmented chunks:
+        // Chunk 1: 3 bytes of header
+        // Chunk 2: 2 bytes of header + 4 bytes of payload
+        // Chunk 3: 6 bytes of payload
+        tokio::spawn(async move {
+            client_write.write_all(&to_send[..3]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            client_write.write_all(&to_send[3..9]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            client_write.write_all(&to_send[9..]).await.unwrap();
+        });
+
+        let result = read_client_hello_record(&mut server_read, Duration::from_secs(2))
+            .await
+            .expect("Fragmented record reading should succeed");
+
+        assert_eq!(result, full_record);
+    }
+
+    #[tokio::test]
+    async fn test_read_client_hello_record_non_tls_scanner() {
+        let http_probe = b"GET /admin/shell HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+
+        tokio::spawn(async move {
+            client_write.write_all(http_probe).await.unwrap();
+        });
+
+        let result = read_client_hello_record(&mut server_read, Duration::from_secs(2))
+            .await
+            .expect("Non-TLS scanner probe should return without error");
+
+        assert!(result.starts_with(b"GET /"));
+        // Passing non-TLS record to extract_sni will yield a clean error for the scanner preview logger
+        assert!(extract_sni(&result).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tunnel_overwrite_protection() {
+        let active_tunnels: SessionMap = Arc::new(DashMap::new());
+        let (tx, _rx) = mpsc::channel(32);
+        let control = Control { tx };
+
+        // Register tunnel for api.test.com
+        active_tunnels.insert(
+            "api.test.com".to_string(),
+            TunnelRoute {
+                control: control.clone(),
+                generation: 1,
+                supports_proxy_v2: false,
+            },
+        );
+
+        // When existing tunnel's tx is open (active & healthy), new registration must be rejected
+        let existing = active_tunnels.get("api.test.com").unwrap();
+        assert!(!existing.value().control.tx.is_closed(), "Channel should be open");
+
+        // If the old tunnel closes its receiver (drops connection), tx.is_closed() becomes true
+        drop(_rx);
+        assert!(existing.value().control.tx.is_closed(), "Channel should now be closed");
+    }
+
+    #[test]
+    fn test_register_command_parsing_capability_negotiation() {
+        let parse_register = |line: &str, enable_pp: bool| -> Option<(String, bool)> {
+            let line_trimmed = line.trim();
+            let parts: Vec<&str> = line_trimmed.split_whitespace().collect();
+            if parts.is_empty() || parts[0] != "REGISTER" || parts.len() < 2 {
+                return None;
+            }
+            let sni = parts[1].to_string();
+            let ppv2 = parts[2..].contains(&"PROXY_V2") && enable_pp;
+            Some((sni, ppv2))
+        };
+
+        // 1. Legacy Praeco without PROXY_V2
+        let (sni1, pp1) = parse_register("REGISTER api.example.com\n", true).unwrap();
+        assert_eq!(sni1, "api.example.com");
+        assert!(!pp1);
+
+        // 2. Modern Praeco with PROXY_V2 and Relay enabled
+        let (sni2, pp2) = parse_register("REGISTER chat.example.com PROXY_V2\n", true).unwrap();
+        assert_eq!(sni2, "chat.example.com");
+        assert!(pp2);
+
+        // 3. Modern Praeco with PROXY_V2 but Relay config has enable_proxy_protocol = false
+        let (sni3, pp3) = parse_register("REGISTER chat.example.com PROXY_V2\n", false).unwrap();
+        assert_eq!(sni3, "chat.example.com");
+        assert!(!pp3);
+
+        // 4. Extensible capability flags
+        let (sni4, pp4) = parse_register("REGISTER stream.example.com OTHER_FLAG PROXY_V2\n", true).unwrap();
+        assert_eq!(sni4, "stream.example.com");
+        assert!(pp4);
+    }
+
+    #[test]
+    fn test_relay_config_custom_max_yamux_streams() {
+        let toml_content = r#"
+            control_plane_addr = "127.0.0.1:7001"
+            data_plane_addr = "127.0.0.1:443"
+            ca_cert_path = "ca.pem"
+            server_cert_path = "cert.pem"
+            server_key_path = "key.pem"
+            max_yamux_streams = 8192
+            max_concurrent_connections = 50000
+            max_concurrent_connections_per_ip = 500
+            client_hello_timeout_secs = 15
+            control_plane_handshake_timeout_secs = 12
+        "#;
+        let config: RelayConfig = toml::from_str(toml_content).unwrap();
+        assert_eq!(config.max_yamux_streams, Some(8192));
+        assert_eq!(config.max_concurrent_connections, Some(50000));
+        assert_eq!(config.max_concurrent_connections_per_ip, Some(500));
+        assert_eq!(config.client_hello_timeout_secs, Some(15));
+        assert_eq!(config.control_plane_handshake_timeout_secs, Some(12));
+
+        // Test scaling calculation for Yamux config
+        let max_streams = config.max_yamux_streams.unwrap_or(4096);
+        let mut yamux_cfg = YamuxConfig::default();
+        let min_window = max_streams * 256 * 1024;
+        yamux_cfg.set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
+        yamux_cfg.set_max_num_streams(max_streams);
     }
 }

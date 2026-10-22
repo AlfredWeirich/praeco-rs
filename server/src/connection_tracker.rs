@@ -124,6 +124,28 @@ pub struct ConnectionGuard {
     ip: Option<IpAddr>,
 }
 
+impl ConnectionGuard {
+    /// Associates a resolved client IP with this active connection guard,
+    /// checking and incrementing the per-IP connection limit.
+    pub fn bind_ip(&mut self, ip: IpAddr) -> Result<(), AcquireError> {
+        if ip.is_unspecified() || self.ip.is_some() {
+            return Ok(());
+        }
+        let mut entry = self.tracker.ip_counts.entry(ip).or_insert(0);
+        if *entry as usize >= self.tracker.max_connections_per_ip {
+            let cur_ip = *entry;
+            return Err(AcquireError::IpLimitReached {
+                ip,
+                current: cur_ip,
+                max: self.tracker.max_connections_per_ip,
+            });
+        }
+        *entry += 1;
+        self.ip = Some(ip);
+        Ok(())
+    }
+}
+
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.tracker.release(self.ip);
@@ -419,5 +441,44 @@ mod tests {
 
         cancel_token.cancel();
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_connection_guard_bind_ip() {
+        let tracker = ConnectionTracker::new(10, 2);
+        let ip: IpAddr = Ipv4Addr::new(203, 0, 113, 5).into();
+
+        // 1. Acquire permit with None (tunnel stream before reading PROXY header)
+        let mut g1 = tracker.acquire(None).expect("global acquire ok");
+        assert_eq!(tracker.current_connections(), 1);
+        assert_eq!(tracker.connections_for_ip(&ip), 0);
+
+        // 2. Bind IP after reading PROXY header
+        g1.bind_ip(ip).expect("bind_ip 1 ok");
+        assert_eq!(tracker.connections_for_ip(&ip), 1);
+
+        // 3. Second connection from same IP
+        let mut g2 = tracker.acquire(None).expect("global acquire ok");
+        g2.bind_ip(ip).expect("bind_ip 2 ok");
+        assert_eq!(tracker.connections_for_ip(&ip), 2);
+
+        // 4. Third connection exceeds per-IP limit (2)
+        let mut g3 = tracker.acquire(None).expect("global acquire ok");
+        let err = g3.bind_ip(ip).expect_err("should reject third connection from same IP");
+        assert!(matches!(err, AcquireError::IpLimitReached { .. }));
+
+        // Dropping g3 releases global permit
+        drop(g3);
+        assert_eq!(tracker.current_connections(), 2);
+        assert_eq!(tracker.connections_for_ip(&ip), 2);
+
+        // Dropping g1 decrements both global and IP count
+        drop(g1);
+        assert_eq!(tracker.current_connections(), 1);
+        assert_eq!(tracker.connections_for_ip(&ip), 1);
+
+        drop(g2);
+        assert_eq!(tracker.current_connections(), 0);
+        assert_eq!(tracker.connections_for_ip(&ip), 0);
     }
 }

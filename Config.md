@@ -192,6 +192,8 @@ Configures this server instance to bypass opening a local listening port (ignore
 * `client_cert_path`: String. Path to the client certificate (PEM) used to authenticate against the relay.
 * `client_key_path`: String. Path to the client private key (PEM).
 * `ca_cert_path`: String. Path to the CA certificate (PEM) that signed the relay server's certificate.
+* `max_yamux_streams`: Integer (Optional). Maximum number of concurrent Yamux multiplexed streams over the tunnel connection. **Default:** `4096` (replaces Yamux default of `512`). Each forwarded public client connection occupies exactly 1 Yamux stream.
+* `proxy_protocol`: Boolean (Optional). Whether to negotiate HAProxy PROXY-Protocol v2 with the Relay Server to propagate the real client IP (IPv4 and IPv6). **Default:** `true`. When active, Praeco extracts the client IP before the TLS handshake and uses it for IP rate limiting, per-IP connection limits, access logging, and `X-Forwarded-For` / `X-Real-IP` headers.
 
 **Example without `ip` and `port`:**
 ```toml
@@ -208,6 +210,8 @@ sni_domain = "api.example.com"
 client_cert_path = "certs/praeco_client.pem"
 client_key_path = "certs/praeco_client.key"
 ca_cert_path = "certs/relay_ca.pem"
+max_yamux_streams = 4096
+proxy_protocol = true
 ```
 
 ---

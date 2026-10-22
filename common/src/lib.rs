@@ -329,6 +329,7 @@ pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error
     Ok(root_store)
 }
 pub mod client;
+pub mod proxy_protocol;
 
 #[cfg(test)]
 mod tests {

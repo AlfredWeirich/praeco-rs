@@ -20,6 +20,8 @@ service = "Router"
 [Server.tunnel]
 target_url = "tls://localhost:7001"
 sni_domain = "api.aweirich.eu"
+max_yamux_streams = 4096
+proxy_protocol = true
 
 # --- RELAY AUTHENTICATION (Control Plane) ---
 # Diese Zertifikate werden vom Praeco Gateway an den Relay-Server gesendet.
