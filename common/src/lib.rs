@@ -277,19 +277,42 @@ pub fn build_tls_client_config(
 /// Builds a [`RootCertStore`] containing the system-wide WebPKI roots plus
 /// an optional custom CA certificate.
 ///
+/// Builds a `RootCertStore` for TLS client configurations.
+///
+/// # Security (S-17: Strict PKI Isolation)
+///
+/// * When `ca_path` is `Some(path)`, a strict, isolated trust store is created
+///   containing **only** the custom CA certificates loaded from that file. This
+///   enforces private PKI pinning and prevents rogue/commercial WebPKI certificates
+///   from being accepted for internal upstreams or webhooks.
+/// * When `ca_path` is `None`, the trust store defaults to well-known public
+///   WebPKI root certificates (`webpki_roots`).
+///
 /// # Arguments
 ///
-/// * `ca_path` – Optional path to a PEM file with additional trusted CA
-///   certificates (e.g. self-signed CAs used in internal environments).
+/// * `ca_path` – Optional path to a PEM file with trusted CA certificates
+///   (e.g. self-signed CAs used in internal environments).
 ///
 /// # Errors
 ///
 /// Returns an error if the custom CA certificate file cannot be read or parsed.
 pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
-    // Start with the well-known WebPKI root certificates (Let's Encrypt, etc.)
+    if let Some(path) = ca_path {
+        // Enforce strict private PKI isolation: only trust the configured custom CA!
+        let root_cert = load_certs(path, "root_store")?;
+        root_store.add_parsable_certificates(root_cert);
+    } else {
+        // No custom CA configured: fall back to well-known WebPKI roots for public internet
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    Ok(root_store)
+}
+
+/// Builds a `RootCertStore` containing both public WebPKI roots and an optional custom CA.
+pub fn build_root_store_with_webpki(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
+    let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    // Optionally add a custom CA (e.g. self-signed for internal environments)
     if let Some(path) = ca_path {
         let root_cert = load_certs(path, "root_store")?;
         root_store.add_parsable_certificates(root_cert);
@@ -354,5 +377,33 @@ mod tests {
 
         // 3. Mismatched audience fails
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", "wrong-aud").is_err());
+    }
+
+    #[test]
+    fn test_build_root_store_none_uses_webpki() {
+        let store = build_root_store(&None).expect("build_root_store should succeed with None");
+        // Should contain all WebPKI roots (> 100)
+        assert!(store.len() > 100);
+    }
+
+    #[test]
+    fn test_build_root_store_custom_ca_isolates_and_excludes_webpki() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ca_path = manifest_dir
+            .parent()
+            .unwrap()
+            .join("client_certs/ca.cert.pem")
+            .to_string_lossy()
+            .to_string();
+
+        let store = build_root_store(&Some(ca_path.clone()))
+            .expect("build_root_store should succeed with custom CA");
+        // Strict isolation: must contain ONLY the custom CA (1 cert), NOT the 100+ WebPKI roots!
+        assert_eq!(store.len(), 1);
+
+        // Meanwhile, build_root_store_with_webpki includes both
+        let combined_store = build_root_store_with_webpki(&Some(ca_path))
+            .expect("build_root_store_with_webpki should succeed");
+        assert!(combined_store.len() > 100);
     }
 }
