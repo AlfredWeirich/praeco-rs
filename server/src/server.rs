@@ -396,6 +396,7 @@ async fn start_single_server(
                 break;
             }
 
+            let start_time = std::time::Instant::now();
             if let Err(e) = run_tunnel(
                 tunnel.clone(),
                 tls_config.clone(),
@@ -410,7 +411,13 @@ async fn start_single_server(
                 info!("{}: Tunnel connection ended cleanly", server_config.name);
             }
 
-            retry_count += 1;
+            // If the tunnel ran stably for >= 30 seconds, reset retry_count so future reconnects don't wait 64s
+            if start_time.elapsed() >= Duration::from_secs(30) {
+                retry_count = 0;
+            } else {
+                retry_count += 1;
+            }
+
             let delay = initial_delay * 2u32.pow(retry_count.min(6));
             warn!("{}: Reconnecting tunnel in {:?}", server_config.name, delay);
             
@@ -682,8 +689,7 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                         // For gRPC, we resolve the health path structurally using Server Reflection (lazily)
                         let mut grpc_health_path: Option<String> = None;
-                        // Flag to ensure we only try reflection resolution once to avoid overhead
-                        let mut checked_grpc_reflection = false;
+                        let mut reflection_attempts: usize = 0;
 
                         // The infinite loop for periodic health checking
                         loop {
@@ -696,10 +702,10 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                                     if is_grpc {
                                         // --- gRPC Health Check Resolution ---
-                                        // On the first run, try to dynamically fetch the server's protobuf schema
-                                        // using gRPC reflection, and search it for a method named "health".
-                                        if !checked_grpc_reflection {
-                                            checked_grpc_reflection = true;
+                                        // Lazily fetch the server's protobuf schema using gRPC reflection,
+                                        // and search it for an endpoint method named "health".
+                                        if grpc_health_path.is_none() {
+                                            reflection_attempts += 1;
 
                                             // Acquire write lock to initialize the grpc reflection pool if empty
                                             let mut pool_guard = target_arc.grpc_pool.write().await;
@@ -711,7 +717,11 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                             created_at: std::time::Instant::now(),
                                                         })
                                                     }
-                                                    Err(e) => tracing::warn!("{}: Failed to load gRPC reflection schema for active health check: {:?}", server_name, e)
+                                                    Err(e) => {
+                                                        if reflection_attempts <= 3 || reflection_attempts % 10 == 0 {
+                                                            tracing::warn!("{}: Failed to load gRPC reflection schema for active health check: {:?}", server_name, e);
+                                                        }
+                                                    }
                                                 }
                                             }
 
@@ -719,7 +729,6 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                             if let Some(cached) = pool_guard.as_ref() {
                                                 for service in cached.pool.services() {
                                                     for method in service.methods() {
-                                                        // Commonly, gRPC services implement an endpoint containing 'health'
                                                         if method.name() == "health" {
                                                             grpc_health_path = Some(format!("/{}/health", service.full_name()));
                                                             break;
@@ -729,8 +738,8 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                 }
                                             }
 
-                                            if grpc_health_path.is_none() {
-                                                tracing::warn!("{}: No 'health' method found in gRPC reflection schema for {}; skipping active health check", server_name, base_uri);
+                                            if grpc_health_path.is_none() && (reflection_attempts <= 3 || reflection_attempts % 10 == 0) {
+                                                tracing::warn!("{}: No 'health' method found in gRPC reflection schema for {}; will retry on next check", server_name, base_uri);
                                             }
                                         }
 
@@ -769,34 +778,37 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                                     // Dispatch the request asynchronously over the connection pool
                                     let req = req_builder.body(req_body).unwrap();
-                                    // TODO: Move this hardcoded 5s timeout to Config.toml in the future
                                     match tokio::time::timeout(Duration::from_secs(5), client.request(req)).await {
-                                        Ok(Ok(mut resp)) => {
-
-                                            // We consider any 200 OK status as a healthy indication
-                                            let is_ok = resp.status() == StatusCode::OK;
+                                        Ok(Ok(resp)) => {
+                                            let resp_status = resp.status();
+                                            let is_ok = resp_status == StatusCode::OK;
                                             let mut health_score_ok = true;
 
-                                            // If it's a gRPC health check, parse the HealthScore
+                                            // If it's a gRPC health check, parse the HealthScore with a 64KB body limit
                                             if is_ok && is_grpc && grpc_health_path.is_some() {
-                                                use http_body_util::BodyExt;
-                                                if let Ok(bytes) = resp.body_mut().collect().await.map(|b| b.to_bytes()) {
+                                                use http_body_util::{BodyExt, Limited};
+                                                let limited_body = Limited::new(resp.into_body(), 64 * 1024);
+                                                if let Ok(collected) = limited_body.collect().await {
+                                                    let bytes = collected.to_bytes();
                                                     // Frame format: 1 byte compressed flag, 4 bytes length, then protobuf payload
                                                     if bytes.len() >= 5 {
                                                         let payload_len = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
                                                         if bytes.len() >= 5 + payload_len {
                                                             let raw_payload = &bytes[5..5 + payload_len];
-
-                                                            // HealthScore is { uint32 score = 1; }
-                                                            // For small varints like <= 127 in field 1, it's just `0x08 <val>`
-                                                            // We can decode the varint manually, or use a dynamic message.
-                                                            // Since we don't have statically compiled prost bindings in `server`,
-                                                            // let's do a simple manual decode of the protobuf payload.
                                                             let mut healthy = false;
                                                             if raw_payload.len() >= 2 && raw_payload[0] == 0x08 { // field 1, varint
-                                                                // Decode varint (simplified assuming score is 0-100, so it fits in 1 byte)
-                                                                let score = raw_payload[1];
-                                                                target_arc.upstreams[idx].current_score.store(score as usize, std::sync::atomic::Ordering::Relaxed);
+                                                                // Decode standard protobuf varint (supports scores > 127)
+                                                                let mut score = 0usize;
+                                                                let mut shift = 0;
+                                                                for &b in &raw_payload[1..] {
+                                                                    score |= ((b & 0x7F) as usize) << shift;
+                                                                    if (b & 0x80) == 0 {
+                                                                        break;
+                                                                    }
+                                                                    shift += 7;
+                                                                    if shift >= 32 { break; }
+                                                                }
+                                                                target_arc.upstreams[idx].current_score.store(score, std::sync::atomic::Ordering::Relaxed);
                                                                 if score > 0 {
                                                                     healthy = true;
                                                                 }
@@ -812,12 +824,14 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                         health_score_ok = false; // Too short to be a valid frame
                                                     }
                                                 } else {
-                                                    health_score_ok = false; // Failed to read body
+                                                    health_score_ok = false; // Failed to read body or exceeded limit
                                                 }
                                             } else if is_ok && !is_grpc {
-                                                // For REST, parse the JSON {"score": 100} response
-                                                use http_body_util::BodyExt;
-                                                if let Ok(bytes) = resp.body_mut().collect().await.map(|b| b.to_bytes()) {
+                                                // For REST, parse the JSON {"score": 100} response with a 64KB body limit
+                                                use http_body_util::{BodyExt, Limited};
+                                                let limited_body = Limited::new(resp.into_body(), 64 * 1024);
+                                                if let Ok(collected) = limited_body.collect().await {
+                                                    let bytes = collected.to_bytes();
                                                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                                                         if let Some(score) = json.get("score").and_then(|s| s.as_u64()) {
                                                             target_arc.upstreams[idx].current_score.store(score as usize, std::sync::atomic::Ordering::Relaxed);
@@ -825,14 +839,13 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                                 health_score_ok = false;
                                                             }
                                                         } else {
-                                                            // if no score field exists, we should probably consider it unhealthy based on the new convention
                                                             health_score_ok = false;
                                                         }
                                                     } else {
                                                         health_score_ok = false; // Invalid JSON
                                                     }
                                                 } else {
-                                                    health_score_ok = false; // Failed to read body
+                                                    health_score_ok = false; // Failed to read body or exceeded limit
                                                 }
                                             }
 
@@ -842,31 +855,47 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
                                                 // If the node was previously considered dead, revive it in the LB
                                                 if !target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
                                                     info!("{}: Health check recovered '{}'", server_name, final_uri);
-                                                    target_arc.upstreams[idx].is_alive.store(true, std::sync::atomic::Ordering::Relaxed);
+                                                    target_arc.upstreams[idx].mark_alive();
                                                 }
                                             } else {
                                                 target_arc.upstreams[idx].current_score.store(0, std::sync::atomic::Ordering::Relaxed);
-                                                // If it returns non-200 and was marked alive, consider it dead
                                                 if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
-                                                    tracing::warn!("{}: Health check failed status {} for '{}' (Score OK: {})", server_name, resp.status(), final_uri, health_score_ok);
-                                                    target_arc.upstreams[idx].is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                                                    tracing::warn!("{}: Health check failed status {} for '{}' (Score OK: {})", server_name, resp_status, final_uri, health_score_ok);
+                                                    target_arc.upstreams[idx].mark_dead();
+                                                } else {
+                                                    // Keep failure timestamp fresh so cooldown doesn't prematurely revive dead node
+                                                    let now = std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_secs();
+                                                    target_arc.upstreams[idx].last_failure_time.store(now, std::sync::atomic::Ordering::Relaxed);
                                                 }
                                             }
                                         }
                                         Ok(Err(e)) => {
                                             target_arc.upstreams[idx].current_score.store(0, std::sync::atomic::Ordering::Relaxed);
-                                            // Network errors means the node is dead/unresponsive
                                             if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
                                                 tracing::warn!("{}: Health check network error for '{}': {}", server_name, final_uri, e);
-                                                target_arc.upstreams[idx].is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                                                target_arc.upstreams[idx].mark_dead();
+                                            } else {
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                target_arc.upstreams[idx].last_failure_time.store(now, std::sync::atomic::Ordering::Relaxed);
                                             }
                                         }
                                         Err(_) => {
                                             target_arc.upstreams[idx].current_score.store(0, std::sync::atomic::Ordering::Relaxed);
-                                            // Timeout means the node is dead/unresponsive
                                             if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
                                                 tracing::warn!("{}: Health check timed out after 5s for '{}'", server_name, final_uri);
-                                                target_arc.upstreams[idx].is_alive.store(false, std::sync::atomic::Ordering::Relaxed);
+                                                target_arc.upstreams[idx].mark_dead();
+                                            } else {
+                                                let now = std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_secs();
+                                                target_arc.upstreams[idx].last_failure_time.store(now, std::sync::atomic::Ordering::Relaxed);
                                             }
                                         }
                                     }
@@ -1962,7 +1991,11 @@ async fn run_tunnel(
     let relay_host = parsed_url.host_str().unwrap_or("localhost");
     let relay_port = parsed_url.port().unwrap_or(7001);
     
-    let tcp_stream = TcpStream::connect((relay_host, relay_port)).await?;
+    let connect_timeout = Duration::from_secs(10);
+    let tcp_stream = match tokio::time::timeout(connect_timeout, TcpStream::connect((relay_host, relay_port))).await {
+        Ok(res) => res?,
+        Err(_) => return Err(anyhow!("Connection to relay server at {}:{} timed out after 10s", relay_host, relay_port).into()),
+    };
     let sock_ref = socket2::SockRef::from(&tcp_stream);
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
@@ -1972,7 +2005,10 @@ async fn run_tunnel(
 
     let domain = rustls::pki_types::ServerName::try_from(relay_host.to_string())?;
     
-    let mut tls_stream = connector.connect(domain, tcp_stream).await?;
+    let mut tls_stream = match tokio::time::timeout(connect_timeout, connector.connect(domain, tcp_stream)).await {
+        Ok(res) => res?,
+        Err(_) => return Err(anyhow!("TLS handshake with relay server at {}:{} timed out after 10s", relay_host, relay_port).into()),
+    };
 
     // 3. Register SNI with capability negotiation (Phase 4)
     let reg_cmd = if tunnel.proxy_protocol {

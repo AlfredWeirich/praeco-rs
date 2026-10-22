@@ -345,6 +345,26 @@ pub struct UpstreamNode {
 }
 
 impl UpstreamNode {
+    /// Marks the node as dead and records the current failure timestamp.
+    pub fn mark_dead(&self) {
+        self.is_alive
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_failure_time
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Marks the node as alive and clears the failure timestamp.
+    pub fn mark_alive(&self) {
+        self.is_alive
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.last_failure_time
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Checks if the node is considered available for routing.
     /// A node is available if it is marked alive, or if the cooldown period has elapsed.
     pub fn is_available(&self, cooldown_seconds: u64) -> bool {
@@ -356,7 +376,8 @@ impl UpstreamNode {
             .last_failure_time
             .load(std::sync::atomic::Ordering::Relaxed);
         if last_fail == 0 {
-            return true;
+            // Node is explicitly marked dead but has no failure timestamp: not available
+            return false;
         }
 
         let now = std::time::SystemTime::now()
@@ -404,14 +425,17 @@ impl RouteTarget {
     pub fn mark_dead(&self, uri: &Uri) {
         for node in &self.upstreams {
             if &node.uri == uri {
-                node.is_alive
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                node.last_failure_time
-                    .store(now, std::sync::atomic::Ordering::Relaxed);
+                node.mark_dead();
+                break;
+            }
+        }
+    }
+
+    /// Marks an upstream node as alive after a successful request or health check.
+    pub fn mark_alive(&self, uri: &Uri) {
+        for node in &self.upstreams {
+            if &node.uri == uri {
+                node.mark_alive();
                 break;
             }
         }
@@ -907,6 +931,12 @@ pub struct SecurityHeadersConfig {
     pub strict_transport_security: String,
     pub x_content_type_options: String,
     pub x_frame_options: String,
+    #[serde(default = "default_referrer_policy")]
+    pub referrer_policy: String,
+}
+
+fn default_referrer_policy() -> String {
+    "strict-origin-when-cross-origin".to_string()
 }
 
 impl Default for SecurityHeadersConfig {
@@ -916,6 +946,7 @@ impl Default for SecurityHeadersConfig {
             strict_transport_security: "max-age=63072000; includeSubDomains; preload".to_string(),
             x_content_type_options: "nosniff".to_string(),
             x_frame_options: "DENY".to_string(),
+            referrer_policy: default_referrer_policy(),
         }
     }
 }
@@ -1687,12 +1718,18 @@ impl Layers {
             })
             .collect::<Result<_, _>>()?;
 
-        // Fallback: If SecurityHeaders was not explicitly enabled in the list,
-        // we add it with standard strict defaults to protect the server.
+        // Position SecurityHeaders: If SecurityHeaders was not explicitly enabled in the list,
+        // we insert it near the top (outermost layer) so that all short-circuit responses
+        // (401, 403, 429, 503, etc.) carry standard security headers.
         if !self.enabled.iter().any(|n| n == "SecurityHeaders") {
-            layers.push(MiddlewareLayer::SecurityHeaders(
-                SecurityHeadersConfig::default(),
-            ));
+            let insert_idx = layers
+                .iter()
+                .position(|l| !matches!(l, MiddlewareLayer::TraceId | MiddlewareLayer::Logger | MiddlewareLayer::Timing | MiddlewareLayer::Counter))
+                .unwrap_or(0);
+            layers.insert(
+                insert_idx,
+                MiddlewareLayer::SecurityHeaders(SecurityHeadersConfig::default()),
+            );
         }
 
         Ok(layers)
@@ -2032,6 +2069,65 @@ mod tests {
 
         // Unmatched path
         assert!(compiled.match_path("/other/path").is_none());
+    }
+
+    #[test]
+    fn test_upstream_node_mark_dead_and_is_available() {
+        let node = UpstreamNode {
+            uri: "http://127.0.0.1:8080".parse().unwrap(),
+            active_connections: std::sync::atomic::AtomicUsize::new(0),
+            is_alive: std::sync::atomic::AtomicBool::new(true),
+            last_failure_time: std::sync::atomic::AtomicU64::new(0),
+            current_score: std::sync::atomic::AtomicUsize::new(100),
+        };
+
+        // 1. Initially alive
+        assert!(node.is_available(10));
+
+        // 2. Mark dead -> unavailable immediately
+        node.mark_dead();
+        assert!(!node.is_available(10));
+
+        // 3. Manually reset last_failure_time to 0 while is_alive=false -> must still be unavailable!
+        node.last_failure_time.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(!node.is_available(10));
+
+        // 4. Simulate cooldown elapsed
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - 15;
+        node.last_failure_time.store(past, std::sync::atomic::Ordering::Relaxed);
+        assert!(node.is_available(10)); // 15s > 10s cooldown -> now available for retry
+
+        // 5. Recover node
+        node.mark_alive();
+        assert!(node.is_available(10));
+        assert_eq!(node.last_failure_time.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_security_headers_outermost_positioning() {
+        let layers_cfg = Layers {
+            enabled: vec![
+                "Logger".to_string(),
+                "Inspection".to_string(),
+                "ConcurrencyLimit".to_string(),
+            ],
+            concurrency_limit_config: Some(ConcurrencyLimitConfig {
+                max_concurrent_requests: 100,
+                load_shed: true,
+                queue_timeout_ms: None,
+            }),
+            ..Default::default()
+        };
+
+        let layers = layers_cfg.build_middleware_layers("test_server").unwrap();
+        // SecurityHeaders must be placed near the top (outermost) so it intercepts short-circuit responses
+        assert!(matches!(layers[0], MiddlewareLayer::Logger));
+        assert!(matches!(layers[1], MiddlewareLayer::SecurityHeaders(_)));
+        assert!(matches!(layers[2], MiddlewareLayer::Inspection));
+        assert!(matches!(layers[3], MiddlewareLayer::ConcurrencyLimit(_)));
     }
 }
 

@@ -76,6 +76,12 @@ where
                 xframe,
             );
         }
+        if let Ok(refpol) = HeaderValue::from_str(&this.config.referrer_policy) {
+            headers.insert(
+                hyper::header::HeaderName::from_static("referrer-policy"),
+                refpol,
+            );
+        }
 
         Poll::Ready(Ok(response))
     }
