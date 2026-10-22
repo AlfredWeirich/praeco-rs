@@ -123,26 +123,27 @@ where
                     );
                 }
 
+                let safe_headers = sanitize_headers(res.headers());
                 if status.is_server_error() {
                     tracing::error!(
                         "{}: <-- Response: Status {} | Headers: {:?}",
                         this.server_name,
                         status,
-                        res.headers()
+                        safe_headers
                     );
                 } else if status.is_client_error() || is_cors_preflight_failed {
                     tracing::warn!(
                         "{}: <-- Response: Status {} | Headers: {:?}",
                         this.server_name,
                         status,
-                        res.headers()
+                        safe_headers
                     );
                 } else {
                     tracing::info!(
                         "{}: <-- Response: Status {} | Headers: {:?}",
                         this.server_name,
                         status,
-                        res.headers()
+                        safe_headers
                     );
                 }
             }
@@ -152,6 +153,51 @@ where
         }
 
         Poll::Ready(response)
+    }
+}
+
+/// Redacts sensitive response headers like Set-Cookie, Cookie, and Authorization from logs.
+fn sanitize_headers(headers: &hyper::HeaderMap) -> hyper::HeaderMap {
+    let mut sanitized = headers.clone();
+    let sensitive = [
+        hyper::header::SET_COOKIE,
+        hyper::header::COOKIE,
+        hyper::header::AUTHORIZATION,
+    ];
+    for name in &sensitive {
+        if sanitized.contains_key(name) {
+            sanitized.insert(
+                name.clone(),
+                hyper::header::HeaderValue::from_static("[REDACTED]"),
+            );
+        }
+    }
+    sanitized
+}
+
+/// Redacts sensitive query parameters like session, token, code, secret, jwt from logs.
+fn sanitize_uri(uri: &hyper::Uri) -> String {
+    if let Some(query) = uri.query() {
+        let sanitized_query: Vec<String> = query
+            .split('&')
+            .map(|pair| {
+                if let Some((k, _)) = pair.split_once('=') {
+                    if matches!(
+                        k.to_lowercase().as_str(),
+                        "session" | "token" | "code" | "jwt" | "secret" | "poll_secret"
+                    ) {
+                        format!("{}=[REDACTED]", k)
+                    } else {
+                        pair.to_string()
+                    }
+                } else {
+                    pair.to_string()
+                }
+            })
+            .collect();
+        format!("{}?{}", uri.path(), sanitized_query.join("&"))
+    } else {
+        uri.to_string()
     }
 }
 
@@ -211,7 +257,7 @@ where
             "{}: --> {} {} | IP: {} | Roles: {} ",
             server_name,
             req.method(),
-            req.uri(),
+            sanitize_uri(req.uri()),
             client_ip,
             roles_str,
         );
@@ -225,5 +271,35 @@ where
             req_method,
             req_origin,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_headers_redacts_sensitive_tokens() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(hyper::header::SET_COOKIE, "admin-jwt=secret123; Path=/; HttpOnly".parse().unwrap());
+        headers.insert(hyper::header::AUTHORIZATION, "Bearer topsecret456".parse().unwrap());
+        headers.insert(hyper::header::COOKIE, "session_id=789".parse().unwrap());
+
+        let sanitized = sanitize_headers(&headers);
+        assert_eq!(sanitized.get(hyper::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(sanitized.get(hyper::header::SET_COOKIE).unwrap(), "[REDACTED]");
+        assert_eq!(sanitized.get(hyper::header::AUTHORIZATION).unwrap(), "[REDACTED]");
+        assert_eq!(sanitized.get(hyper::header::COOKIE).unwrap(), "[REDACTED]");
+    }
+
+    #[test]
+    fn test_sanitize_uri_redacts_sensitive_query_parameters() {
+        let uri: hyper::Uri = "/auth/status?session=abc123456&poll_secret=def789&foo=bar".parse().unwrap();
+        let sanitized = sanitize_uri(&uri);
+        assert_eq!(sanitized, "/auth/status?session=[REDACTED]&poll_secret=[REDACTED]&foo=bar");
+
+        let plain_uri: hyper::Uri = "/api/products?category=food".parse().unwrap();
+        assert_eq!(sanitize_uri(&plain_uri), "/api/products?category=food");
     }
 }

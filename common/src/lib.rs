@@ -67,42 +67,10 @@ pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'s
 /// * `path` – File path to the PEM-encoded private key.
 /// * `_server_name` – Reserved for future logging (currently unused).
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the file cannot be opened, contains no recognised key, or
-///   has a PEM parse error.
-// pub fn load_single_key(path: &str, server_name: &str) -> PrivateKeyDer<'static> {
-//     // Read the private key file contents into memory
-//     let key_data = std::fs::read(path).unwrap_or_else(|_| {
-//         error!("{server_name}: Failed to read {path}");
-//         panic!("{server_name}: Failed to read {path}");
-//     });
-
-//     // Attempt to parse one or more private keys in PKCS#8 format
-//     let mut keys = rustls_pemfile::pkcs8_private_keys(&mut &key_data[..])
-//         .map(|res| {
-//             res.map(PrivateKeyDer::from)
-//                 .expect("Invalid private key format")
-//         })
-//         .collect::<Vec<_>>();
-
-//     // Ensure exactly one key is used; log and panic if none, warn if multiple
-//     match keys.len() {
-//         0 => {
-//             error!("{server_name}: No private key found in server key file");
-//             panic!("{server_name}: No private key found in server key file");
-//         }
-//         1 => {
-//             trace!("{server_name}: Single private key loaded successfully.");
-//         }
-//         _ => {
-//             warn!("{server_name}: Multiple private keys found, using the first one");
-//         }
-//     }
-
-//     // Return the first parsed key
-//     keys.remove(0)
-// }
+/// Returns an error if the file cannot be opened, contains no recognised key, or
+/// has a PEM parse error.
 pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'static>, Error> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("{server_name}: Cannot open key file '{path}'"))?;

@@ -26,6 +26,7 @@ pub async fn handle_grpc_passthrough(
     let mut failed_nodes = Vec::new();
     let max_retries = route_info.target.max_retries;
     let mut attempts = 0;
+    let is_stream = matches!(request_body, RequestBody::Stream(_));
 
     loop {
         let mut current_headers = if attempts == max_retries {
@@ -132,13 +133,19 @@ pub async fn handle_grpc_passthrough(
                     route_info.target.mark_dead(backend_base_uri);
                     failed_nodes.push(backend_base_uri.clone());
 
-                    if attempts <= max_retries {
+                    if !is_stream && attempts <= max_retries {
                         warn!(
                             "{}: Retrying timed-out gRPC request... (Attempt {}/{})",
                             server_name, attempts, max_retries
                         );
                         continue;
                     } else {
+                        if is_stream && attempts <= max_retries {
+                            warn!(
+                                "{}: Streaming gRPC request timed out on {}; cannot retry consumed stream",
+                                server_name, backend_base_uri
+                            );
+                        }
                         return Ok(build_error_response("Gateway Timeout", StatusCode::GATEWAY_TIMEOUT));
                     }
                 }
@@ -149,6 +156,9 @@ pub async fn handle_grpc_passthrough(
 
         match resp_result {
             Ok(res) => {
+                if !upstream_node.is_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    upstream_node.mark_alive();
+                }
                 let (mut res_parts, res_body) = res.into_parts();
                 super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
@@ -209,15 +219,21 @@ pub async fn handle_grpc_passthrough(
                         route_info.target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
-                        if attempts <= max_retries {
+                        if !is_stream && attempts <= max_retries {
                             warn!(
                                 "{}: Retrying request... (Attempt {}/{})",
                                 server_name, attempts, max_retries
                             );
                             continue;
                         } else {
+                            if is_stream && attempts <= max_retries {
+                                warn!(
+                                    "{}: Streaming gRPC request failed on {}; cannot retry consumed stream",
+                                    server_name, backend_base_uri
+                                );
+                            }
                             error!(
-                                "{}: Max retries reached. Returning 502 Bad Gateway.",
+                                "{}: Max retries reached or stream not retryable. Returning 502 Bad Gateway.",
                                 server_name
                             );
                             return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));

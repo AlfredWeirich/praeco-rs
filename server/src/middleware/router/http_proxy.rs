@@ -30,6 +30,15 @@ pub async fn handle_http_proxy(
     let mut failed_nodes = Vec::new();
     let max_retries = route_info.target.max_retries;
     let mut attempts = 0;
+    let is_stream = matches!(request_body, RequestBody::Stream(_));
+    let is_idempotent = matches!(
+        original_method,
+        hyper::Method::GET
+            | hyper::Method::HEAD
+            | hyper::Method::PUT
+            | hyper::Method::DELETE
+            | hyper::Method::OPTIONS
+    );
 
     loop {
         let mut current_headers = if attempts == max_retries {
@@ -125,13 +134,24 @@ pub async fn handle_http_proxy(
                     route_info.target.mark_dead(backend_base_uri);
                     failed_nodes.push(backend_base_uri.clone());
 
-                    if attempts <= max_retries {
+                    if !is_stream && is_idempotent && attempts <= max_retries {
                         warn!(
-                            "{}: Retrying timed-out request... (Attempt {}/{})",
+                            "{}: Retrying timed-out idempotent request... (Attempt {}/{})",
                             server_name, attempts, max_retries
                         );
                         continue;
                     } else {
+                        if !is_idempotent && attempts <= max_retries {
+                            warn!(
+                                "{}: Non-idempotent {} request timed out on {}; skipping retry to prevent side-effects",
+                                server_name, original_method, backend_base_uri
+                            );
+                        } else if is_stream && attempts <= max_retries {
+                            warn!(
+                                "{}: Streaming request timed out on {}; cannot retry consumed stream",
+                                server_name, backend_base_uri
+                            );
+                        }
                         return Ok(build_error_response("Gateway Timeout", StatusCode::GATEWAY_TIMEOUT));
                     }
                 }
@@ -142,6 +162,9 @@ pub async fn handle_http_proxy(
 
         match resp_result {
             Ok(res) => {
+                if !upstream_node.is_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    upstream_node.mark_alive();
+                }
                 let (mut res_parts, res_body) = res.into_parts();
                 super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
@@ -200,16 +223,27 @@ pub async fn handle_http_proxy(
                         route_info.target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
-                        if attempts <= max_retries {
+                        if !is_stream && is_idempotent && attempts <= max_retries {
                             warn!(
                                 "{}: Retrying request... (Attempt {}/{})",
                                 server_name, attempts, max_retries
                             );
                             continue;
                         } else {
+                            if !is_idempotent && attempts <= max_retries {
+                                warn!(
+                                    "{}: Non-idempotent {} request failed on {}; skipping retry to prevent duplicate side-effects",
+                                    server_name, original_method, backend_base_uri
+                                );
+                            } else if is_stream && attempts <= max_retries {
+                                warn!(
+                                    "{}: Streaming request failed on {}; cannot retry consumed stream",
+                                    server_name, backend_base_uri
+                                );
+                            }
                             error!(
-                                "{}: Max retries reached. Returning 502 Bad Gateway.",
-                                server_name
+                                "{}: Max retries reached or request not retryable (stream={}, idempotent={}). Returning 502 Bad Gateway.",
+                                server_name, is_stream, is_idempotent
                             );
                             return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));
                         }
