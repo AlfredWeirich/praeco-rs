@@ -160,11 +160,31 @@ where
         }
 
         // Stage 2: Streaming byte counter
+        let is_grpc = req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| {
+                let s = s.trim().to_lowercase();
+                s.starts_with("application/grpc")
+            })
+            .unwrap_or(false);
+
+        let grpc_state = if is_grpc {
+            Some(GrpcFramingState::Header {
+                buf: [0u8; 5],
+                pos: 0,
+            })
+        } else {
+            None
+        };
+
         let (parts, body) = req.into_parts();
         let limited_body = LimitedBody {
             inner: body,
             max_bytes,
             current_bytes: 0,
+            grpc_state,
         };
 
         let req = Request::from_parts(parts, limited_body.boxed());
@@ -178,6 +198,21 @@ where
     }
 }
 
+/// Internal state machine for tracking gRPC message framing.
+///
+/// In gRPC (HTTP/2 or HTTP/3), every message starts with a 5-byte prefix:
+/// - 1 byte: compression flag (`0x00` = uncompressed, `0x01` = compressed)
+/// - 4 bytes: message length in big-endian (`u32`)
+///
+/// By parsing this framing, the max-payload limiter enforces `max_bytes`
+/// on each individual message in a gRPC stream (preventing giant-payload attacks)
+/// while allowing long-lived streaming RPCs (like chat or pub/sub) to run indefinitely.
+#[derive(Debug, Clone)]
+enum GrpcFramingState {
+    Header { buf: [u8; 5], pos: usize },
+    Payload { remaining: usize },
+}
+
 /// A body wrapper that counts the bytes passing through and aborts with an
 /// error when the configured limit is exceeded.
 #[pin_project]
@@ -186,6 +221,7 @@ pub struct LimitedBody<B> {
     inner: B,
     max_bytes: usize,
     current_bytes: usize,
+    grpc_state: Option<GrpcFramingState>,
 }
 
 impl<B> Body for LimitedBody<B>
@@ -204,13 +240,60 @@ where
         match this.inner.poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
-                    *this.current_bytes += data.len();
+                    if let Some(state) = this.grpc_state {
+                        let mut offset = 0;
+                        while offset < data.len() {
+                            match state {
+                                GrpcFramingState::Header { buf, pos } => {
+                                    let needed = 5 - *pos;
+                                    let available = data.len() - offset;
+                                    let to_copy = needed.min(available);
+                                    buf[*pos..*pos + to_copy]
+                                        .copy_from_slice(&data[offset..offset + to_copy]);
+                                    *pos += to_copy;
+                                    offset += to_copy;
 
-                    if *this.current_bytes > *this.max_bytes {
-                        return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
-                            current: *this.current_bytes,
-                            max: *this.max_bytes,
-                        })));
+                                    if *pos == 5 {
+                                        let msg_len = u32::from_be_bytes([
+                                            buf[1], buf[2], buf[3], buf[4],
+                                        ]) as usize;
+                                        if msg_len > *this.max_bytes {
+                                            return Poll::Ready(Some(Err(
+                                                SrvError::PayloadTooLarge {
+                                                    current: msg_len,
+                                                    max: *this.max_bytes,
+                                                },
+                                            )));
+                                        }
+                                        *state = GrpcFramingState::Payload {
+                                            remaining: msg_len,
+                                        };
+                                    }
+                                }
+                                GrpcFramingState::Payload { remaining } => {
+                                    let available = data.len() - offset;
+                                    let consumed = available.min(*remaining);
+                                    *remaining -= consumed;
+                                    offset += consumed;
+
+                                    if *remaining == 0 {
+                                        *state = GrpcFramingState::Header {
+                                            buf: [0u8; 5],
+                                            pos: 0,
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        *this.current_bytes += data.len();
+
+                        if *this.current_bytes > *this.max_bytes {
+                            return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
+                                current: *this.current_bytes,
+                                max: *this.max_bytes,
+                            })));
+                        }
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -605,5 +688,128 @@ mod tests {
         let _req3 = Request::builder().uri("/other").body(Full::new(Bytes::new())).unwrap();
         // Since inner_svc can't take rx again, let's test that the semaphore itself has capacity
         assert_eq!(svc.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_grpc_streaming_multiple_messages_exceeding_cumulative_limit_succeeds() {
+        // max_bytes = 25.
+        // We will send 3 gRPC messages, each with 10 bytes payload (15 bytes total per message).
+        // Total bytes = 45 bytes > 25. In the old cumulative implementation, this failed.
+        // In the new framing implementation, each message is 10 <= 25, so it must succeed!
+        let inner_svc = service_fn(|mut req: Request<SrvBody>| async move {
+            let mut total_received = 0;
+            while let Some(frame) = req.body_mut().frame().await {
+                let frame = frame.unwrap();
+                if let Some(data) = frame.data_ref() {
+                    total_received += data.len();
+                }
+            }
+            let body: SrvBody = Full::new(Bytes::from(format!("Received {}", total_received)))
+                .map_err(SrvError::from)
+                .boxed();
+            Ok::<Response<SrvBody>, SrvError>(Response::new(body))
+        });
+
+        let layer = MaxPayloadLayer::new(25, "test_grpc_streaming");
+        let mut svc = layer.layer(inner_svc);
+
+        // Helper to encode a gRPC frame: [0x00][u32 len][payload]
+        let make_grpc_msg = |payload: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(5 + payload.len());
+            buf.push(0x00); // uncompressed
+            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            buf.extend_from_slice(payload);
+            buf
+        };
+
+        let msg1 = make_grpc_msg(&[b'A'; 10]);
+        let msg2 = make_grpc_msg(&[b'B'; 10]);
+        let msg3 = make_grpc_msg(&[b'C'; 10]);
+
+        let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, SrvError>>(5);
+
+        struct ChannelReqBody {
+            rx: tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, SrvError>>,
+        }
+        impl Body for ChannelReqBody {
+            type Data = Bytes;
+            type Error = SrvError;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.rx.poll_recv(cx)
+            }
+        }
+
+        let req = Request::builder()
+            .uri("/chat.ChatService/StreamMessages")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(ChannelReqBody { rx: body_rx }.boxed())
+            .unwrap();
+
+        let fut = svc.ready().await.unwrap().call(req);
+
+        // Stream the 3 messages
+        body_tx.send(Ok(http_body::Frame::data(Bytes::from(msg1)))).await.unwrap();
+        body_tx.send(Ok(http_body::Frame::data(Bytes::from(msg2)))).await.unwrap();
+        body_tx.send(Ok(http_body::Frame::data(Bytes::from(msg3)))).await.unwrap();
+        drop(body_tx); // EOF
+
+        let mut resp = fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_data = resp.body_mut().frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(resp_data, Bytes::from("Received 45"));
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_grpc_single_message_exceeds_limit_fails() {
+        let inner_svc = service_fn(|mut req: Request<SrvBody>| async move {
+            while let Some(frame) = req.body_mut().frame().await {
+                let _ = frame?;
+            }
+            Ok::<Response<SrvBody>, SrvError>(Response::new(Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed()))
+        });
+
+        let layer = MaxPayloadLayer::new(25, "test_grpc_single_oversized");
+        let mut svc = layer.layer(inner_svc);
+
+        // gRPC frame declaring 30 bytes payload (30 > 25 limit)
+        let mut oversized_header = vec![0x00];
+        oversized_header.extend_from_slice(&(30u32).to_be_bytes());
+        oversized_header.extend_from_slice(&[b'X'; 10]); // send partial data
+
+        let req = Request::builder()
+            .uri("/chat.ChatService/SendMessage")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::from(oversized_header)).map_err(SrvError::from).boxed())
+            .unwrap();
+
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        // Since inner body polling fails with PayloadTooLarge, MaxPayloadFuture maps it to 413 Payload Too Large!
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_http_cumulative_stream_fails() {
+        let inner_svc = service_fn(|mut req: Request<SrvBody>| async move {
+            while let Some(frame) = req.body_mut().frame().await {
+                let _ = frame?;
+            }
+            Ok::<Response<SrvBody>, SrvError>(Response::new(Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed()))
+        });
+
+        let layer = MaxPayloadLayer::new(25, "test_http_cumulative");
+        let mut svc = layer.layer(inner_svc);
+
+        // Standard HTTP (no application/grpc): 30 bytes total > 25 limit
+        let req = Request::builder()
+            .uri("/upload")
+            .header(hyper::header::CONTENT_TYPE, "application/octet-stream")
+            .body(Full::new(Bytes::from(vec![b'Z'; 30])).map_err(SrvError::from).boxed())
+            .unwrap();
+
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
