@@ -20,5 +20,7 @@ jsonwebtoken = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "net"] }
 tracing = { workspace = true }
 webpki-roots = { workspace = true }

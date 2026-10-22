@@ -44,6 +44,19 @@ pub struct RelayConfig {
     pub data_plane_idle_timeout_secs: Option<u64>,
     /// TCP keepalive probe interval in seconds on the data plane sockets.
     pub tcp_keepalive_secs: Option<u64>,
+
+    /// Optional limit on the total number of concurrent data plane connections (default: 10000).
+    pub max_concurrent_connections: Option<usize>,
+    /// Optional limit on the number of concurrent data plane connections per IP /64 (default: 100).
+    pub max_concurrent_connections_per_ip: Option<usize>,
+    /// Timeout in seconds to read the TLS ClientHello on the data plane (default: 10).
+    pub client_hello_timeout_secs: Option<u64>,
+    /// Timeout in seconds for the mTLS handshake on the control plane (default: 10).
+    pub control_plane_handshake_timeout_secs: Option<u64>,
+    /// Max concurrent Yamux streams per tunnel connection (default: 4096).
+    pub max_yamux_streams: Option<usize>,
+    /// Whether to enable PROXY-Protocol v2 for tunnels that negotiate it (default: true).
+    pub enable_proxy_protocol: Option<bool>,
 }
 
 impl Default for RelayConfig {
@@ -64,6 +77,12 @@ impl Default for RelayConfig {
             rate_limit_burst: Some(100),
             data_plane_idle_timeout_secs: Some(1800),
             tcp_keepalive_secs: Some(60),
+            max_concurrent_connections: Some(10000),
+            max_concurrent_connections_per_ip: Some(100),
+            client_hello_timeout_secs: Some(10),
+            control_plane_handshake_timeout_secs: Some(10),
+            max_yamux_streams: Some(4096),
+            enable_proxy_protocol: Some(true),
         }
     }
 }

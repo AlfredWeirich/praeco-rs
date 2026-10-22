@@ -43,6 +43,7 @@ matchit = { workspace = true }
 local-ip-address = { workspace = true }
 urlencoding = { workspace = true }
 url = { workspace = true }
+socket2 = { workspace = true }
 
 # --- HTTP/3 & QUIC (Requires git master for Quinn 0.11 support) ---
 quinn = { workspace = true }

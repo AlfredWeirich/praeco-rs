@@ -56,3 +56,37 @@ data_plane_idle_timeout_secs = 1800
 # Standard: 60 Sekunden.
 tcp_keepalive_secs = 60
 
+# ==========================================
+# Concurrency & DoS Hardening Settings (S-27)
+# ==========================================
+
+# Maximale Anzahl gleichzeitiger Verbindungen auf der Data-Plane (Global).
+# Standard: 10000
+max_concurrent_connections = 10000
+
+# Maximale Anzahl gleichzeitiger Verbindungen pro Client-IP (IPv6 aggregiert auf /64).
+# Standard: 100
+max_concurrent_connections_per_ip = 100
+
+# Timeout für das vollständige Einlesen des TLS ClientHello in Sekunden.
+# Verhindert Slowloris-Angriffe und blockierte Verbindungen bei TCP-Fragmentierung.
+# Standard: 10
+client_hello_timeout_secs = 10
+
+# Timeout für den internen mTLS-Handshake auf der Control-Plane in Sekunden.
+# Standard: 10
+control_plane_handshake_timeout_secs = 10
+
+# Maximale Anzahl paralleler Yamux-Streams pro Tunnel.
+# Verhindert Flaschenhälse bei hoher Last (Standard: 4096, vorher 512).
+max_yamux_streams = 4096
+
+# PROXY-Protocol v2 Unterstützung (Phase 4).
+# Wenn true, wird für Praeco-Gateways, die beim REGISTER-Befehl PROXY_V2 aushandeln,
+# vor jedem Stream die echte Client-IP (IPv4/IPv6) via binärem HAProxy PROXY-Protocol v2
+# an das Gateway übertragen.
+# Standard: true
+enable_proxy_protocol = true
+
+
+

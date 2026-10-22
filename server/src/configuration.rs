@@ -150,6 +150,14 @@ pub struct TunnelConfig {
     pub client_cert_path: String,
     pub client_key_path: String,
     pub ca_cert_path: String,
+    /// Maximum concurrent Yamux multiplexed streams over the tunnel connection.
+    /// Defaults to 4096 (replaces Yamux default of 512).
+    #[serde(default)]
+    pub max_yamux_streams: Option<usize>,
+    /// Whether to enable PROXY-Protocol v2 negotiation for propagating real client IP addresses.
+    /// Defaults to true.
+    #[serde(default = "default_true")]
+    pub proxy_protocol: bool,
 }
 
 /// Configuration for a single server instance (one listener address).
@@ -1741,6 +1749,32 @@ mod tests {
         assert!(server.ip.is_none());
         assert!(server.port.is_none());
         assert!(server.finalize().is_ok());
+        assert_eq!(server.tunnel.as_ref().unwrap().max_yamux_streams, None);
+        assert!(server.tunnel.as_ref().unwrap().proxy_protocol);
+    }
+
+    #[test]
+    fn test_tunnel_config_custom_max_yamux_streams() {
+        let toml_str = r#"
+            name = "custom_tunnel_server"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+
+            [tunnel]
+            target_url = "tls://localhost:7001"
+            sni_domain = "example.com"
+            client_cert_path = "dummy.pem"
+            client_key_path = "dummy.key"
+            ca_cert_path = "dummy_ca.pem"
+            max_yamux_streams = 8192
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
+        assert!(server.finalize().is_ok());
+        assert_eq!(server.tunnel.as_ref().unwrap().max_yamux_streams, Some(8192));
     }
 
     #[test]

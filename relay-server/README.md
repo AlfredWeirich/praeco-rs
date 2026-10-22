@@ -19,14 +19,17 @@ Das System besteht aus zwei Ebenen:
    - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) abgesichert.
    - Praeco meldet über ein einfaches Textprotokoll (`REGISTER <sni_domain>\n`), für welche Domain es verantwortlich ist (z.B. `api.aweirich.eu`).
    - Anschließend wird die Verbindung auf das **Yamux** Multiplexing-Protokoll umgeschaltet, sodass mehrere unabhängige Streams durch eine einzige TCP-Verbindung geleitet werden können.
-   - **Health Checks:** Der Relay-Server überwacht die Tunnel-Gesundheit durch aktives Ping-Verhalten. Alle 30 Sekunden werden Yamux-Streams getestet, um unsauber beendete TCP-Verbindungen (Praeco-Zombies) aufzuspüren und aus dem System zu entfernen.
+   - **Health Checks & Keepalive:** Der Relay-Server überwacht die Tunnel-Gesundheit durch OS-Level TCP-Keepalive auf Socket-Ebene (30s Probe, 10s Intervall). Tote Verbindungen werden zuverlässig bereinigt, ohne störende Dummy-Streams oder TLS-Handshake-Fehlalarme am Gateway zu verursachen.
+   - **Route-Overwrite-Schutz:** Eine Neuregistrierung einer Domain wird abgewiesen, solange bereits ein aktiver, gesunder Tunnel für diesen SNI existiert (Schutz vor Kaperung/Blackholing).
+   - **PROXY-Protocol v2 Negozierung:** Praeco kann beim Registrieren dynamisch das Feature `PROXY_V2` aushandeln (`REGISTER <sni> PROXY_V2`). In diesem Fall schickt das Relay für jeden eingehenden Client den binären HAProxy PROXY-Protocol v2 Header mit der echten Client-IP (IPv4/IPv6) voran.
 
 2. **Data Plane (Standard Port 443 / SNI-Routing):**
    - Nimmt öffentliche Client-Verbindungen (z.B. aus dem Webbrowser) unverschlüsselt auf TCP-Ebene an.
-   - Der Server liest den initialen TLS-Handshake (`ClientHello`), um die angefragte SNI (Domain) zu extrahieren.
+   - Der Server liest den initialen TLS-Handshake (`ClientHello`) geschützt gegen Slowloris (10s Timeout) und handhabt TCP-Fragmentierung sowie große Post-Quantum Key Shares sauber.
+   - Schützt vor DoS-Angriffen über globale Verbindungs-Limits, Concurrency-Caps pro IP und aggregiertes IPv6 `/64`-Rate-Limiting.
    - Er sucht nach einer aktiven Praeco-Verbindung für diese SNI.
-   - Es wird asynchron ein neuer **Yamux-Stream** in der bestehenden Control-Plane-Verbindung geöffnet.
-   - Der gesamte TCP-Traffic wird blind durch diesen Stream geleitet. Praeco terminiert das TLS lokal.
+   - Es wird asynchron ein neuer **Yamux-Stream** (bis zu 4096 Streams pro Tunnel) in der bestehenden Control-Plane-Verbindung geöffnet.
+   - Bei ausgehandeltem `PROXY_V2` wird zuerst der 28-Byte (IPv4) bzw. 52-Byte (IPv6) PPv2-Header und danach der TLS-Stream weitergeleitet. Praeco terminiert das TLS lokal und nutzt die echte Client-IP für Rate-Limiting, Concurrency-Limits und Access-Logs.
 
 ## Einschränkungen: HTTP/3 und Encrypted Client Hello (ECH)
 
@@ -64,6 +67,13 @@ server_key_path = "server_certs/self_signed/privkey_self.pem"
 enable_opentelemetry = false
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
+
+# Concurrency & DoS Hardening (S-27)
+max_concurrent_connections = 10000
+max_concurrent_connections_per_ip = 100
+client_hello_timeout_secs = 10
+control_plane_handshake_timeout_secs = 10
+max_yamux_streams = 4096
 ```
 
 ### Logging & Tracing
