@@ -175,7 +175,8 @@ fn sanitize_headers(headers: &hyper::HeaderMap) -> hyper::HeaderMap {
     sanitized
 }
 
-/// Redacts sensitive query parameters like session, token, code, secret, jwt from logs.
+/// Redacts sensitive query parameters like session, token, secret, jwt from logs.
+/// Note: 'code' (e.g. user_code / one-time pairing codes) is deliberately kept visible for device onboarding.
 fn sanitize_uri(uri: &hyper::Uri) -> String {
     if let Some(query) = uri.query() {
         let sanitized_query: Vec<String> = query
@@ -184,7 +185,7 @@ fn sanitize_uri(uri: &hyper::Uri) -> String {
                 if let Some((k, _)) = pair.split_once('=') {
                     if matches!(
                         k.to_lowercase().as_str(),
-                        "session" | "token" | "code" | "jwt" | "secret" | "poll_secret"
+                        "session" | "token" | "jwt" | "secret" | "poll_secret"
                     ) {
                         format!("{}=[REDACTED]", k)
                     } else {
@@ -301,5 +302,8 @@ mod tests {
 
         let plain_uri: hyper::Uri = "/api/products?category=food".parse().unwrap();
         assert_eq!(sanitize_uri(&plain_uri), "/api/products?category=food");
+
+        let code_uri: hyper::Uri = "/auth/confirm?session=abc123456&code=891023".parse().unwrap();
+        assert_eq!(sanitize_uri(&code_uri), "/auth/confirm?session=[REDACTED]&code=891023");
     }
 }
