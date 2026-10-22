@@ -331,32 +331,39 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
                 return;
             }
 
-            let mut buf = [0u8; 1024];
-            let mut line = String::new();
-            let mut total_read = 0;
+            // --- Read REGISTER command byte-by-byte (up to '\n') ---
+            // We must NOT over-read into a multi-byte buffer, because Praeco immediately
+            // sends Yamux binary frames (e.g. ping/SYN) after the newline. Any over-read
+            // bytes would corrupt both the SNI extraction and the subsequent Yamux stream.
+            let mut line_bytes = Vec::with_capacity(128);
             let timeout_res = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let n = match tls_stream.read(&mut buf).await {
-                        Ok(0) => return false,
-                        Ok(n) => n,
+                let mut byte = [0u8; 1];
+                while line_bytes.len() < 1024 {
+                    match tls_stream.read_exact(&mut byte).await {
+                        Ok(_) => {
+                            if byte[0] == b'\n' {
+                                return true;
+                            }
+                            line_bytes.push(byte[0]);
+                        }
                         Err(_) => return false,
-                    };
-                    total_read += n;
-                    line.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if line.contains('\n') {
-                        return true;
-                    }
-                    // Prevent memory exhaustion (P0.4)
-                    if total_read > 1024 {
-                        return false;
                     }
                 }
+                false
             }).await;
 
             if !timeout_res.unwrap_or(false) {
                 warn!(target: "relay::control_plane", client_ip = %client_addr, "REGISTER command failed, timed out or too long");
                 return;
             }
+
+            let line = match String::from_utf8(line_bytes) {
+                Ok(l) => l,
+                Err(_) => {
+                    warn!(target: "relay::control_plane", client_ip = %client_addr, "REGISTER command is not valid UTF-8");
+                    return;
+                }
+            };
 
             // --- Safe Parsing (P0.4) ---
             let line_trimmed = line.trim();
@@ -368,7 +375,7 @@ async fn run_control_plane(tls_acceptor: TlsAcceptor, tunnels: SessionMap, addr:
 
             // --- Verify SNI against Certificate SANs (P0.2) ---
             if !allowed_snis.contains(&sni) {
-                warn!(target: "relay::control_plane", client_ip = %client_addr, requested_sni = %sni, "SNI not authorized by client certificate");
+                warn!(target: "relay::control_plane", client_ip = %client_addr, requested_sni = %sni, allowed_snis = ?allowed_snis, "SNI not authorized by client certificate");
                 return;
             }
 
@@ -812,4 +819,116 @@ fn is_valid_sni(sni: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_praeco_client_cert_snis() {
+        let cert_file = File::open("../server_certs/self_signed/praeco_client.pem").unwrap();
+        let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>().unwrap();
+        let cert_der = certs.first().unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(cert_der).unwrap();
+        let mut allowed_snis = Vec::new();
+        for ext in cert.iter_extensions() {
+            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                for name in &san.general_names {
+                    if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                        allowed_snis.push(dns.to_string());
+                    }
+                }
+            }
+        }
+        println!("ALLOWED SNIS: {:?}", allowed_snis);
+        assert!(allowed_snis.contains(&"wurzelwerk.api.aweirich.eu".to_string()));
+        assert!(allowed_snis.contains(&"wurzelwerk.onboarding.aweirich.eu".to_string()));
+        assert!(allowed_snis.contains(&"wurzelwerk.admin.aweirich.eu".to_string()));
+        assert!(allowed_snis.contains(&"wurzelwerk.idp.aweirich.eu".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_full_control_plane_registration() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpStream;
+        // 1. Setup Acceptor
+        let acceptor = setup_mtls_acceptor(
+            "../server_certs/self_signed/relay_ca.pem",
+            "../server_certs/self_signed/relay_server.pem",
+            "../server_certs/self_signed/relay_server.key",
+            None,
+        ).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let listener_task = tokio::spawn(async move {
+            let (stream, _client_addr) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            let mut allowed_snis = Vec::new();
+            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
+                if let Some(cert_der) = certs.first() {
+                    if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) {
+                        for ext in cert.iter_extensions() {
+                            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                                for name in &san.general_names {
+                                    if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                                        allowed_snis.push(dns.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut line_bytes = Vec::new();
+            let mut byte = [0u8; 1];
+            while tls_stream.read_exact(&mut byte).await.is_ok() {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line_bytes.push(byte[0]);
+            }
+            let line = String::from_utf8(line_bytes).unwrap();
+            let line_trimmed = line.trim();
+            let Some(("REGISTER", sni_raw)) = line_trimmed.split_once(' ') else {
+                panic!("Invalid REGISTER");
+            };
+            let sni = sni_raw.trim().to_string();
+            assert!(allowed_snis.contains(&sni), "SNI not authorized! allowed_snis: {:?}, requested: {:?}", allowed_snis, sni);
+
+        });
+
+        // 2. Client side (Praeco run_tunnel)
+        let mut root_store = rustls::RootCertStore::empty();
+        let ca_file = File::open("../server_certs/self_signed/relay_ca.pem").unwrap();
+        for cert in rustls_pemfile::certs(&mut BufReader::new(ca_file)) {
+            root_store.add(cert.unwrap()).unwrap();
+        }
+        let cert_file = File::open("../server_certs/self_signed/praeco_client.pem").unwrap();
+        let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<Vec<_>, _>>().unwrap();
+        let key_file = File::open("../server_certs/self_signed/praeco_client.key").unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_file)).unwrap().unwrap();
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(certs, key).unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp_stream = TcpStream::connect(addr).await.unwrap();
+        let domain = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
+        let mut tls_stream = connector.connect(domain, tcp_stream).await.unwrap();
+
+        let reg_cmd = "REGISTER wurzelwerk.onboarding.aweirich.eu\n";
+        tls_stream.write_all(reg_cmd.as_bytes()).await.unwrap();
+        tls_stream.flush().await.unwrap();
+
+        // Simulate Praeco immediately wrapping the stream in Yamux
+        let _client_conn = Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
+
+        listener_task.await.unwrap();
+    }
 }

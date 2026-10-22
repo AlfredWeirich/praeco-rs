@@ -39,6 +39,8 @@ use tower::Service;
 
 /// Server configuration, route parsing, and role definitions.
 pub mod configuration;
+/// Connection tracking and limits (global and per-IP).
+pub mod connection_tracker;
 /// Unified error type ([`SrvError`]) used across all layers.
 pub mod error;
 /// Tower middleware layers (logging, Alt-Svc header injection, routing, …).

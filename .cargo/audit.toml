@@ -1,0 +1,10 @@
+# Configuration for cargo-audit
+
+[advisories]
+# RUSTSEC-2023-0071: Marvin Attack on RSA PKCS#1 v1.5 decryption.
+# Transitive dependency of jsonwebtoken (features = ["rust_crypto"]).
+# Patches: None available (patched = []).
+# Praeco uses EdDSA (Ed25519) and only performs JWT signature verification (no RSA decryption).
+ignore = [
+    "RUSTSEC-2023-0071",
+]

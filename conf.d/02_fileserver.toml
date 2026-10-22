@@ -14,6 +14,11 @@ service = "StaticFiles"
 root = "./server/www"
 fallback_to_index = true
 
+# Optional: Connection limits across TCP, QUIC, and tunnels (Defaults: 10000 global, 100 per IP)
+# [Server.connection_limits]
+# max_connections = 10000
+# max_connections_per_ip = 100
+
 [Server.Layers]
     enabled = ["Logger", "Cors"]
 

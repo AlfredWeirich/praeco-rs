@@ -92,6 +92,7 @@ use praeco_rs::{
         compression::{SrvCompressionLayer, SrvDecompressionLayer},
     },
     tls_conf::{extract_client_metadata, tls_config},
+    connection_tracker::{AcquireError, ConnectionTracker},
 };
 
 use http_body_util::BodyExt;
@@ -372,6 +373,10 @@ async fn start_single_server(
     }
 
     let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+    let connection_tracker = Arc::new(ConnectionTracker::new(
+        server_config.connection_limits.max_connections,
+        server_config.connection_limits.max_connections_per_ip,
+    ));
 
     if let Some(tunnel) = &server_config.tunnel {
         info!("{}: Connecting to Zero-Trust Tunnel at {}", server_config.name, tunnel.target_url);
@@ -398,6 +403,7 @@ async fn start_single_server(
                 cancel_token.clone(),
                 server_config.static_name.expect("missing static_name"),
                 oid_mapping.clone(),
+                connection_tracker.clone(),
             ).await {
                 error!("{}: Tunnel crashed: {:?}", server_config.name, e);
             } else {
@@ -442,13 +448,16 @@ async fn start_single_server(
             }
         };
 
+        let static_name = server_config.static_name.expect("missing static_name");
+
         if let Err(e) = run_dual_stack(
             server_addr,
             tls_config,
             dynamic_stack,
             cancel_token,
-            server_config.static_name.expect("missing static_name"),
+            static_name,
             oid_mapping,
+            connection_tracker.clone(),
         )
         .await
         {
@@ -468,29 +477,48 @@ async fn start_single_server(
             }
         };
 
+        let static_name = server_config.static_name.expect("missing static_name");
+
         loop {
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
                 res = listener.accept() => {
                     match res {
                         Ok((stream, peer_addr)) => {
+                            let peer_ip = peer_addr.ip();
+                            let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
+                                Ok(guard) => guard,
+                                Err(AcquireError::GlobalLimitReached { current, max }) => {
+                                    warn!("{}: Global connection limit reached ({} >= {}), dropping HTTP connection from {}", static_name, current, max, peer_addr);
+                                    drop(stream);
+                                    continue;
+                                }
+                                Err(AcquireError::IpLimitReached { ip, current, max }) => {
+                                    warn!("{}: Per-IP connection limit reached for {} ({} >= {}), dropping HTTP connection", static_name, ip, current, max);
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             let svc = (**dynamic_stack.load()).clone(); // fresh stack per connection
                             let conn_token = cancel_token.clone();
                             let oid_mapping = oid_mapping.clone();
                             tokio::spawn(async move {
+                                let _guard = conn_guard;
                                 let handler = ConnectionHandler::new(svc, peer_addr, Vec::new(), None, None, oid_mapping);
                                 let mut builder = auto::Builder::new(TokioExecutor::new());
                                 // Timeout: drop clients that take too long to send HTTP/1 headers
                                 builder.http1()
                                     .timer(TokioTimer::new())
                                     .header_read_timeout(Duration::from_secs(10));
-                                // Timeout: detect dead HTTP/2 connections via keep-alive pings
+                                // Timeout: detect dead HTTP/2 connections via keep-alive pings + hardened limits
                                 builder
                                     .http2()
                                     .timer(TokioTimer::new())
                                     .initial_stream_window_size(1024 * 1024)
-                                    .max_concurrent_streams(1024)
-                                    .max_pending_accept_reset_streams(Some(16384))
+                                    .max_concurrent_streams(128)
+                                    .max_pending_accept_reset_streams(Some(20))
+                                    .max_header_list_size(65536)
+                                    .max_frame_size(16384)
                                     .keep_alive_interval(Some(Duration::from_secs(30)))
                                     .keep_alive_timeout(Duration::from_secs(10));
                                 let conn = builder
@@ -1259,6 +1287,7 @@ pub async fn run_dual_stack(
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let arc_tls_config = Arc::new(tls_config);
 
@@ -1274,6 +1303,7 @@ pub async fn run_dual_stack(
         tcp_cancel_token,
         server_name,
         oid_mapping.clone(),
+        connection_tracker.clone(),
     );
 
     // 2. UDP Listener (HTTP/3)
@@ -1284,6 +1314,7 @@ pub async fn run_dual_stack(
         udp_cancel_token,
         server_name,
         oid_mapping,
+        connection_tracker,
     );
 
     // Wait for both listeners to finish (shutdown signal)
@@ -1306,6 +1337,7 @@ async fn run_tcp_listener(
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tcp_listener = TcpListener::bind(server_addr).await?;
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
@@ -1316,6 +1348,20 @@ async fn run_tcp_listener(
                 _ = cancel_token.cancelled() => break,
                 res = tcp_listener.accept() => {
                     if let Ok((stream, peer_addr)) = res {
+                        let peer_ip = peer_addr.ip();
+                        let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
+                            Ok(guard) => guard,
+                            Err(AcquireError::GlobalLimitReached { current, max }) => {
+                                warn!("{}: Global connection limit reached ({} >= {}), dropping TCP connection from {}", server_name, current, max, peer_addr);
+                                drop(stream);
+                                continue;
+                            }
+                            Err(AcquireError::IpLimitReached { ip, current, max }) => {
+                                warn!("{}: Per-IP connection limit reached for {} ({} >= {}), dropping TCP connection", server_name, ip, current, max);
+                                drop(stream);
+                                continue;
+                            }
+                        };
                         // Optimization 2
                         // Disable Nagle's algorithm — send small responses immediately
                         // instead of waiting to batch them. Critical for low-latency APIs.
@@ -1323,7 +1369,9 @@ async fn run_tcp_listener(
                         let acceptor = acceptor.clone();
                         let dynamic_stack = dynamic_stack.clone();
                         let oid_mapping = oid_mapping.clone();
+                        let conn_token = cancel_token.clone();
                         tokio::spawn(async move {
+                            let _guard = conn_guard;
                             trace!("{}: TCP Connection accepted", server_name);
                             // Timeout: abort TLS handshakes that stall (Slowloris protection)
                             let tls_result = tokio::time::timeout(
@@ -1350,20 +1398,29 @@ async fn run_tcp_listener(
                                     let mut builder = auto::Builder::new(TokioExecutor::new());
                                     // Timeout: drop clients that take too long to send HTTP/1 headers
                                     builder.http1()
-                                    .timer(TokioTimer::new())
-                                    .header_read_timeout(Duration::from_secs(10));
-                                    // Timeout: detect dead HTTP/2 connections via keep-alive pings
+                                        .timer(TokioTimer::new())
+                                        .header_read_timeout(Duration::from_secs(10));
+                                    // Timeout: detect dead HTTP/2 connections via keep-alive pings + hardened limits
                                     builder
                                         .http2()
                                         .timer(TokioTimer::new())
                                         .initial_stream_window_size(1024 * 1024)
-                                        .max_concurrent_streams(1024)
-                                        .max_pending_accept_reset_streams(Some(16384))
+                                        .max_concurrent_streams(128)
+                                        .max_pending_accept_reset_streams(Some(20))
+                                        .max_header_list_size(65536)
+                                        .max_frame_size(16384)
                                         .keep_alive_interval(Some(Duration::from_secs(30)))
                                         .keep_alive_timeout(Duration::from_secs(10));
-                                    let _ = builder
-                                        .serve_connection(TokioIo::new(tls_stream), handler)
-                                        .await;
+                                    let conn = builder
+                                        .serve_connection(TokioIo::new(tls_stream), handler);
+                                    let mut conn = std::pin::pin!(conn);
+                                    tokio::select! {
+                                        res = conn.as_mut() => { let _ = res; },
+                                        _ = conn_token.cancelled() => {
+                                            conn.as_mut().graceful_shutdown();
+                                            let _ = conn.await;
+                                        }
+                                    }
                                 }
                                 Ok(Err(e)) => {
                                     error!("{}: TLS Handshake failed: {}", server_name, e);
@@ -1399,6 +1456,7 @@ async fn run_udp_listener(
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Determine if we need to modify the TLS config for QUIC (ALPN)
     // Quinn expects explicit "h3" ALPN
@@ -1410,15 +1468,14 @@ async fn run_udp_listener(
 
     let mut quinn_server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
 
-    // Optimization 3
-    // Tune QUIC transport for higher throughput (defaults are conservative)
+    // Hardened QUIC transport parameters
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_uni_streams(1024u32.into());
-    transport.max_concurrent_bidi_streams(1024u32.into());
-    // Aggressively tune flow control windows to prevent stream resets under high load
-    transport.receive_window(128_000_000u32.into());
-    transport.send_window(128_000_000u64);
-    transport.stream_receive_window(16_000_000u32.into());
+    transport.max_concurrent_uni_streams(128u32.into());
+    transport.max_concurrent_bidi_streams(128u32.into());
+    // Safe flow control windows to prevent memory exhaustion (8MB conn, 1MB stream)
+    transport.receive_window(8_388_608u32.into());
+    transport.send_window(8_388_608u64);
+    transport.stream_receive_window(1_048_576u32.into());
     // Timeout: close idle QUIC connections after 30 seconds
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(Duration::from_secs(30)).unwrap(),
@@ -1435,11 +1492,34 @@ async fn run_udp_listener(
                 _ = cancel_token.cancelled() => break,
                 res = endpoint.accept() => {
                     if let Some(conn) = res {
+                        // Anti-amplification / address validation check (RFC 9000 §8)
+                        if !conn.remote_address_validated() && conn.may_retry() {
+                            if let Err(e) = conn.retry() {
+                                trace!("{}: Failed to send QUIC retry packet: {:?}", server_name, e);
+                            }
+                            continue;
+                        }
+
+                        let peer_ip = conn.remote_address().ip();
+                        let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
+                            Ok(guard) => guard,
+                            Err(AcquireError::GlobalLimitReached { current, max }) => {
+                                warn!("{}: Global connection limit reached ({} >= {}), dropping QUIC connection from {}", server_name, current, max, conn.remote_address());
+                                conn.refuse();
+                                continue;
+                            }
+                            Err(AcquireError::IpLimitReached { ip, current, max }) => {
+                                warn!("{}: Per-IP connection limit reached for {} ({} >= {}), dropping QUIC connection", server_name, ip, current, max);
+                                conn.refuse();
+                                continue;
+                            }
+                        };
                         trace!("{}: UDP Connection accepted", server_name);
                         let dynamic_stack = dynamic_stack.clone();
                         let oid_mapping = oid_mapping.clone();
 
                         tokio::spawn(async move {
+                            let _guard = conn_guard;
                             if let Err(e) = handle_h3_connection(conn, dynamic_stack, server_name, oid_mapping).await {
                                 error!("{}: H3 Connection Error: {:?}", server_name, e);
                             }
@@ -1522,10 +1602,20 @@ async fn handle_h3_connection(
     // The underlying Tower service handles its own cheap lock-free cloning.
     let base_svc = (**dynamic_stack.load()).clone();
 
+    // Bound concurrent request stream tasks per QUIC connection
+    let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(128));
+
     // 4. Request Loop
     loop {
         match h3_server.accept().await {
             Ok(Some(resolver)) => {
+                let permit = match stream_semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("{}: Max concurrent H3 streams reached (128), shedding request", server_name);
+                        continue;
+                    }
+                };
                 // Cheap lock-free clone per QUIC stream
                 let svc = base_svc.clone();
                 // Cheap clone of the already calculated roles
@@ -1536,6 +1626,7 @@ async fn handle_h3_connection(
                 let req_cert_san = client_cert_san.clone();
 
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match resolver.resolve_request().await {
                         Ok((req, stream)) => {
                             let (mut sender, receiver) = stream.split();
@@ -1841,6 +1932,7 @@ async fn run_tunnel(
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<std::collections::HashMap<String, praeco_rs::configuration::UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
@@ -1878,6 +1970,7 @@ async fn run_tunnel(
     // 3. Register SNI
     let reg_cmd = format!("REGISTER {}\n", tunnel.sni_domain);
     tls_stream.write_all(reg_cmd.as_bytes()).await?;
+    tls_stream.flush().await?;
 
     // 4. Setup Yamux
     let cfg = yamux::Config::default();
@@ -1893,14 +1986,27 @@ async fn run_tunnel(
                     match inbound {
                         Some(Ok(yamux_stream)) => {
                             trace!("{}: Tunneled connection accepted", server_name);
+                            let connection_guard = match connection_tracker.acquire(None) {
+                                Ok(guard) => guard,
+                                Err(AcquireError::GlobalLimitReached { current, max }) => {
+                                    warn!("{}: Tunneled connection rejected: global connection limit reached ({} >= {})", server_name, current, max);
+                                    continue;
+                                }
+                                Err(AcquireError::IpLimitReached { ip, current, max }) => {
+                                    warn!("{}: Tunneled connection rejected: IP connection limit reached for {} ({} >= {})", server_name, ip, current, max);
+                                    continue;
+                                }
+                            };
                             let acceptor = acceptor.clone();
                             let dynamic_stack = dynamic_stack.clone();
                             let oid_mapping = oid_mapping.clone();
+                            let conn_token = cancel_token.child_token();
                             
                             // We must create a dummy SocketAddr since tunnels don't have real remote IPs (unless we proxy protocol it)
                             let peer_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
 
                             tokio::spawn(async move {
+                                let _guard = connection_guard;
                                 // Provide AsyncRead/Write compat for hyper
                                 let compat_stream = yamux_stream.compat();
 
@@ -1928,9 +2034,22 @@ async fn run_tunnel(
                                         builder.http1().timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(10));
                                         builder.http2().timer(TokioTimer::new())
                                             .initial_stream_window_size(1024 * 1024)
-                                            .max_concurrent_streams(1024);
+                                            .max_concurrent_streams(128)
+                                            .max_pending_accept_reset_streams(Some(20))
+                                            .max_header_list_size(65536)
+                                            .max_frame_size(16384)
+                                            .keep_alive_interval(Some(Duration::from_secs(30)))
+                                            .keep_alive_timeout(Duration::from_secs(10));
                                         
-                                        let _ = builder.serve_connection(TokioIo::new(tls_stream), handler).await;
+                                        let conn = builder.serve_connection(TokioIo::new(tls_stream), handler);
+                                        let mut conn = std::pin::pin!(conn);
+                                        tokio::select! {
+                                            res = conn.as_mut() => { let _ = res; },
+                                            _ = conn_token.cancelled() => {
+                                                conn.as_mut().graceful_shutdown();
+                                                let _ = conn.await;
+                                            }
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         warn!("{}: TLS handshake via tunnel failed: {}", server_name, e);
