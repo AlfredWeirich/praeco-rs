@@ -1,6 +1,6 @@
 [package]
 name = "praeco-rs"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 description = "Ultra-fast API Gateway with mTLS OID authorization and gRPC JSON-transcoding"
 readme = "../Readme.md"
