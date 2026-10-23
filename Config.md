@@ -304,6 +304,7 @@ Here is an overview of the most useful values for configuration:
 * `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
 * `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that matches one of the expected issuers (supports comma-separated lists).
 * `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that matches one of the expected audiences (supports comma-separated lists).
+* `revoke_on_paths`: Array of strings *(optional, default: `[]`)*. Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` claim is automatically added to the global `JwtRevocationStore` while still forwarding the request to the upstream backend (so the backend can clear browser cookies, while any subsequent replay of the token is rejected at the proxy edge with `401 Unauthorized`).
 
 #### `[Server.Layers.RateLimiter]` (Simple)
 * `requests_per_second`: Integer. Strict limit of requests per second. Must be strictly greater than `0`.

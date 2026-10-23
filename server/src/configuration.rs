@@ -870,6 +870,11 @@ pub struct JwtAuthConfig {
     pub expected_issuer: String,
     /// The expected audience (`aud`) to validate against. This is mandatory.
     pub expected_audience: String,
+    /// Optional list of request paths (e.g. `["/api/Logout"]`) on which a valid JWT's `jti`
+    /// is automatically added to the global [`JwtRevocationStore`](crate::middleware::JwtRevocationStore)
+    /// while still forwarding the request to the upstream backend.
+    #[serde(default)]
+    pub revoke_on_paths: Vec<String>,
 }
 
 fn default_max_connections() -> usize {

@@ -168,6 +168,8 @@ pub struct JwtAuthLayer {
     expected_issuer: String,
     /// Expected audience.
     expected_audience: String,
+    /// Request paths on which a valid JWT's `jti` is automatically revoked upon forwarding.
+    revoke_on_paths: Arc<Vec<String>>,
 }
 
 impl JwtAuthLayer {
@@ -201,7 +203,15 @@ impl JwtAuthLayer {
             redirect_on_failure,
             expected_issuer,
             expected_audience,
+            revoke_on_paths: Arc::new(Vec::new()),
         })
+    }
+
+    /// Configures request paths (such as `["/api/Logout"]`) that automatically add
+    /// a verified token's `jti` to the global [`JwtRevocationStore`].
+    pub fn with_revoke_on_paths(mut self, paths: Vec<String>) -> Self {
+        self.revoke_on_paths = Arc::new(paths);
+        self
     }
 }
 
@@ -218,6 +228,7 @@ impl<S> Layer<S> for JwtAuthLayer {
             redirect_on_failure: self.redirect_on_failure.clone(),
             expected_issuer: self.expected_issuer.clone(),
             expected_audience: self.expected_audience.clone(),
+            revoke_on_paths: Arc::clone(&self.revoke_on_paths),
         }
     }
 }
@@ -247,6 +258,8 @@ pub struct JwtAuthService<S> {
     expected_issuer: String,
     /// Expected audience.
     expected_audience: String,
+    /// Request paths on which a valid JWT's `jti` is automatically revoked upon forwarding.
+    revoke_on_paths: Arc<Vec<String>>,
 }
 
 #[pin_project(project = JwtAuthFutureProj)]
@@ -266,6 +279,7 @@ where
         server_name: &'static str,
         oid_mapping: Arc<Vec<(String, crate::configuration::UserRole)>>,
         redirect: Option<String>,
+        revoke_on_paths: Arc<Vec<String>>,
     },
     /// Verification succeeded, the request was forwarded to the inner service.
     Inner {
@@ -297,6 +311,7 @@ where
                     server_name,
                     oid_mapping,
                     redirect,
+                    revoke_on_paths,
                 } => {
                     // Wait for the blocking task to finish decoding the JWT
                     let claims_result = std::task::ready!(Pin::new(verify_task).poll(cx));
@@ -340,6 +355,31 @@ where
                             tracing::trace!("{}: JWT Roles mapped: {:?}", server_name, roles);
 
                             let mut request = req.take().unwrap();
+
+                            // --- Auto-Revoke JTI on Configured Logout Paths ([F-11]) ---
+                            if !revoke_on_paths.is_empty()
+                                && revoke_on_paths.iter().any(|p| p == request.uri().path())
+                            {
+                                if let Some(ref jti) = claims.jti {
+                                    let exp = if claims.exp > 0 {
+                                        claims.exp as u64
+                                    } else {
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                            + 3600
+                                    };
+                                    get_jwt_revocation_store().revoke(jti.clone(), exp);
+                                    tracing::info!(
+                                        "{}: Auto-revoked JWT jti '{}' on logout path '{}'",
+                                        server_name,
+                                        jti,
+                                        request.uri().path()
+                                    );
+                                }
+                            }
+
                             request.extensions_mut().insert::<Claims>(claims);
                             request
                                 .extensions_mut()
@@ -437,6 +477,7 @@ where
 
         let inner = self.inner.clone();
         let redirect = self.redirect_on_failure.clone();
+        let revoke_on_paths = Arc::clone(&self.revoke_on_paths);
 
         let expected_iss = self.expected_issuer.clone();
         let expected_aud = self.expected_audience.clone();
@@ -454,6 +495,7 @@ where
                     server_name,
                     oid_mapping,
                     redirect,
+                    revoke_on_paths,
                 }
             }
             None => {
@@ -628,6 +670,7 @@ mod tests {
             redirect_on_failure: None,
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(Vec::new()),
         };
 
         // First request: token is NOT revoked -> should succeed (200 OK)
@@ -652,6 +695,86 @@ mod tests {
 
         let resp2 = jwt_svc.ready().await.unwrap().call(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_jwtauth_service_auto_revokes_jti_on_configured_logout_path() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let jti = "logout-auto-revoke-jti-42".to_string();
+        let claims = Claims {
+            sub: "admin-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: now as usize + 3600,
+            oids: vec!["1".to_string()],
+            jti: Some(jti.clone()),
+        };
+
+        let token = common::sign_jwt(&claims, &enc_key).unwrap();
+        assert!(!get_jwt_revocation_store().is_revoked(&jti));
+
+        let inner_svc = service_fn(|_req: Request<Full<Bytes>>| async {
+            let body: ServiceRespBody = Full::new(Bytes::from(r#"{"status":"logged_out"}"#))
+                .map_err(SrvError::from)
+                .boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut jwt_svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-server",
+            oid_mapping: Arc::new(vec![("1".to_string(), crate::configuration::UserRole("Admin".to_string()))]),
+            cookie_fallback: Some("admin-jwt".to_string()),
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(vec!["/api/Logout".to_string()]),
+        };
+
+        // 1. Regular API call (/api/WhoAmI) succeeds and does NOT revoke the JTI
+        let req_whoami = Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/api/WhoAmI")
+            .header("Cookie", format!("admin-jwt={}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_whoami = jwt_svc.ready().await.unwrap().call(req_whoami).await.unwrap();
+        assert_eq!(resp_whoami.status(), StatusCode::OK);
+        assert!(!get_jwt_revocation_store().is_revoked(&jti));
+
+        // 2. Logout call (/api/Logout) is forwarded to the backend (200 OK) AND revokes the JTI
+        let req_logout = Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/api/Logout")
+            .header("Cookie", format!("admin-jwt={}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_logout = jwt_svc.ready().await.unwrap().call(req_logout).await.unwrap();
+        assert_eq!(resp_logout.status(), StatusCode::OK);
+        assert!(
+            get_jwt_revocation_store().is_revoked(&jti),
+            "JTI must be revoked in global store immediately upon hitting /api/Logout"
+        );
+
+        // 3. Replaying the same token after logout must now be rejected with 401 Unauthorized
+        let req_replay = Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/api/WhoAmI")
+            .header("Cookie", format!("admin-jwt={}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_replay = jwt_svc.ready().await.unwrap().call(req_replay).await.unwrap();
+        assert_eq!(resp_replay.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -714,6 +837,7 @@ mod tests {
             redirect_on_failure: None,
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(Vec::new()),
         };
 
         // 1. Unauthenticated attacker sends 10 requests without token
