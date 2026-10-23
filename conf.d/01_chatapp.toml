@@ -218,6 +218,7 @@ pki_base_oid = "1.3.6.1.4.1.65111"
         redirect_on_failure = "https://wurzelwerk.idp.aweirich.eu/auth/login_page"
         expected_issuer = "praeco-idp"
         expected_audience = "admin-dashboard"
+        revoke_on_paths = ["/api/Logout"]
     
     [Server.Layers.SecurityHeaders]
         content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"

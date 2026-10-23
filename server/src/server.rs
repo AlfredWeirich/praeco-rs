@@ -1143,7 +1143,8 @@ fn apply_layers(
                     cfg.redirect_on_failure.clone(),
                     cfg.expected_issuer.clone(),
                     cfg.expected_audience.clone(),
-                )?;
+                )?
+                .with_revoke_on_paths(cfg.revoke_on_paths.clone());
                 layer.layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(praeco_rs::configuration::RateLimiter::Simple(cfg)) => {
