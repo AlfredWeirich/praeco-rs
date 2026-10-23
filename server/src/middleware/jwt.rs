@@ -472,16 +472,15 @@ where
 /// context — the `Ok` variant is always returned, making the error type irrelevant.
 fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRespBody>, T> {
     if let Some(url) = redirect {
-        let body: ServiceRespBody = Full::new(Bytes::new())
-            .map_err(SrvError::from)
-            .boxed();
-        let mut resp = Response::new(body);
-        *resp.status_mut() = StatusCode::FOUND;
-        resp.headers_mut().insert(
-            hyper::header::LOCATION,
-            hyper::header::HeaderValue::from_str(url).unwrap(),
-        );
-        return Ok(resp);
+        if let Ok(loc_val) = hyper::header::HeaderValue::from_str(url) {
+            let body: ServiceRespBody = Full::new(Bytes::new())
+                .map_err(SrvError::from)
+                .boxed();
+            let mut resp = Response::new(body);
+            *resp.status_mut() = StatusCode::FOUND;
+            resp.headers_mut().insert(hyper::header::LOCATION, loc_val);
+            return Ok(resp);
+        }
     }
 
     let body: ServiceRespBody = Full::new(Bytes::from("Unauthorized"))
@@ -527,6 +526,68 @@ mod tests {
         store.revoke("token-stale", now - 5);
         store.cleanup_expired();
         assert!(!store.is_revoked("token-stale"));
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_enforces_capacity_cap() {
+        let store = JwtRevocationStore::new();
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        for i in 0..MAX_REVOKED_ENTRIES {
+            store.revoke(format!("jti-{i}"), far_future);
+        }
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+
+        // A new jti beyond the cap must be dropped (bounded memory, no eviction).
+        store.revoke("jti-overflow", far_future);
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+        assert!(!store.is_revoked("jti-overflow"));
+        assert!(store.is_revoked("jti-0"), "existing revocations must not be evicted");
+
+        // Refreshing an already-known jti is still allowed at capacity.
+        store.revoke("jti-0", far_future + 10);
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+        assert!(store.is_revoked("jti-0"));
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_cleanup_frees_capacity() {
+        let store = JwtRevocationStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Fill the store completely with already-expired entries.
+        for i in 0..MAX_REVOKED_ENTRIES {
+            store.revoke(format!("old-{i}"), now.saturating_sub(1));
+        }
+        // At capacity, revoke() triggers an expiry sweep and then accepts the new entry.
+        store.revoke("fresh", now + 300);
+        assert!(store.is_revoked("fresh"));
+        assert!(store.len() <= 1 + MAX_REVOKED_ENTRIES);
+        assert!(store.len() < MAX_REVOKED_ENTRIES, "expired entries must be swept");
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_rejects_empty_and_oversized_jti() {
+        let store = JwtRevocationStore::new();
+        let far_future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
+        store.revoke("", far_future);
+        store.revoke("x".repeat(MAX_JTI_LEN + 1), far_future);
+        assert!(store.is_empty());
+
+        store.revoke("x".repeat(MAX_JTI_LEN), far_future);
+        assert_eq!(store.len(), 1);
     }
 
     #[tokio::test]

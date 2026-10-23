@@ -156,26 +156,21 @@ pub fn prepare_proxy_headers(
     }
 
     // 4. Sanitize and manage Forwarded / X-Forwarded-* headers
-    // Untrusted client-supplied Forwarded (RFC 7239) is removed
+    // Unconditionally strip client-supplied forwarding headers at the edge proxy to prevent spoofing
     original_headers.remove(&header::HeaderName::from_static("forwarded"));
+    original_headers.remove(&header::HeaderName::from_static("x-forwarded-for"));
+    original_headers.remove(&header::HeaderName::from_static("x-real-ip"));
+    original_headers.remove(&header::HeaderName::from_static("x-forwarded-host"));
+    original_headers.remove(&header::HeaderName::from_static("x-forwarded-proto"));
 
-    // Handle Client IP
+    // Authoritatively set Client IP headers from verified socket / PROXY-v2 address
     if let Some(addr) = extensions.get::<std::net::SocketAddr>() {
-        let ip_str = addr.ip().to_string();
-        if let Ok(real_ip_val) = header::HeaderValue::from_str(&ip_str) {
-            original_headers.insert("x-real-ip", real_ip_val);
-        }
-
-        // Manage X-Forwarded-For: append client IP or create new
-        if let Some(existing_xff) = original_headers.get("x-forwarded-for") {
-            if let Ok(existing_str) = existing_xff.to_str() {
-                let chained_ip = format!("{}, {}", existing_str, ip_str);
-                if let Ok(val) = header::HeaderValue::from_str(&chained_ip) {
-                    original_headers.insert("x-forwarded-for", val);
-                }
+        if !addr.ip().is_unspecified() {
+            let ip_str = addr.ip().to_string();
+            if let Ok(ip_val) = header::HeaderValue::from_str(&ip_str) {
+                original_headers.insert("x-real-ip", ip_val.clone());
+                original_headers.insert("x-forwarded-for", ip_val);
             }
-        } else if let Ok(val) = header::HeaderValue::from_str(&ip_str) {
-            original_headers.insert("x-forwarded-for", val);
         }
     }
 
@@ -186,9 +181,13 @@ pub fn prepare_proxy_headers(
     };
     original_headers.insert("x-forwarded-proto", proto_val);
 
-    // Manage X-Forwarded-Host (from Host header if present)
+    // Manage X-Forwarded-Host (from Host header if present, or tunnel sni_domain fallback)
     if let Some(host_val) = original_headers.get(header::HOST).cloned() {
         original_headers.insert("x-forwarded-host", host_val);
+    } else if let Some(tunnel) = &config.tunnel {
+        if let Ok(sni_val) = header::HeaderValue::from_str(&tunnel.sni_domain) {
+            original_headers.insert("x-forwarded-host", sni_val);
+        }
     }
 
     // 5. Inject JWT Bearer Token if configured
@@ -377,9 +376,28 @@ mod tests {
         prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
 
         assert_eq!(headers.get("x-real-ip").unwrap(), "192.168.1.100");
-        assert_eq!(headers.get("x-forwarded-for").unwrap(), "10.0.0.1, 192.168.1.100");
+        assert_eq!(headers.get("x-forwarded-for").unwrap(), "192.168.1.100");
         assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
         assert_eq!(headers.get("x-forwarded-host").unwrap(), "api.example.com");
+    }
+
+    #[test]
+    fn test_spoofed_forwarded_host_and_xff_stripped_when_no_host_or_unspecified_ip() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-forwarded-for", header::HeaderValue::from_static("1.2.3.4"));
+        headers.insert("x-real-ip", header::HeaderValue::from_static("1.2.3.4"));
+        headers.insert("x-forwarded-host", header::HeaderValue::from_static("attacker.tld"));
+
+        let config = make_test_config(None);
+        let mut extensions = hyper::http::Extensions::new();
+        let unspec_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+        extensions.insert(unspec_addr);
+
+        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
+
+        assert!(!headers.contains_key("x-forwarded-for"));
+        assert!(!headers.contains_key("x-real-ip"));
+        assert!(!headers.contains_key("x-forwarded-host"));
     }
 
     #[test]

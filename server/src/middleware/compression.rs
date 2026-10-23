@@ -139,8 +139,19 @@ where
         // Determine which compression algorithm to use (if any).
         let accept_header = this.accept_encoding;
         let server_name = *this.server_name;
-        
-        let algo = if accept_header.contains("gzip") {
+
+        // Skip compression if the response is already compressed or is a gRPC stream
+        // (compressing a gRPC response body strips HTTP/2 trailers like `grpc-status`).
+        let already_encoded = resp.headers().contains_key(CONTENT_ENCODING);
+        let is_grpc = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/grpc"));
+
+        let algo = if already_encoded || is_grpc {
+            None
+        } else if accept_header.contains("gzip") {
             Some("gzip")
         } else if accept_header.contains("br") {
             Some("br")
@@ -503,5 +514,109 @@ impl<R: AsyncRead> AsyncRead for LimitedReader<R> {
             }
             other => other,
         }
+    }
+}
+
+
+// ============================================================================
+//  TESTS
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+    use tower::{ServiceExt, service_fn};
+
+    const PAYLOAD: &[u8] = b"hello hello hello hello hello hello hello hello";
+
+    fn full_body(data: &'static [u8]) -> SrvBody {
+        Full::new(Bytes::from_static(data))
+            .map_err(|never| match never {})
+            .boxed()
+    }
+
+    /// Runs the compression service against an inner service that answers with the
+    /// given `Content-Type` / `Content-Encoding` headers and returns the final response.
+    async fn run(
+        content_type: Option<&'static str>,
+        content_encoding: Option<&'static str>,
+        accept_encoding: &str,
+        body: SrvBody,
+    ) -> Response<SrvBody> {
+        let body = std::sync::Mutex::new(Some(body));
+        let inner = service_fn(move |_req: Request<SrvBody>| {
+            let body = body.lock().unwrap().take().unwrap();
+            async move {
+                let mut builder = Response::builder();
+                if let Some(ct) = content_type {
+                    builder = builder.header(CONTENT_TYPE, ct);
+                }
+                if let Some(ce) = content_encoding {
+                    builder = builder.header(CONTENT_ENCODING, ce);
+                }
+                Ok::<_, SrvError>(builder.body(body).unwrap())
+            }
+        });
+        let svc = SrvCompressionLayer::new("test").layer(inner);
+        let req = Request::builder()
+            .header(ACCEPT_ENCODING, accept_encoding)
+            .body(full_body(b""))
+            .unwrap();
+        svc.oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_plain_response_is_gzip_compressed() {
+        let resp = run(Some("application/json"), None, "gzip", full_body(PAYLOAD)).await;
+        assert_eq!(resp.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..2], &[0x1f, 0x8b], "body must carry the gzip magic header");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_response_is_not_compressed() {
+        let resp = run(Some("application/grpc"), None, "gzip", full_body(PAYLOAD)).await;
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], PAYLOAD);
+    }
+
+    #[tokio::test]
+    async fn test_grpc_proto_subtype_is_not_compressed() {
+        let resp = run(Some("application/grpc+proto"), None, "br, gzip", full_body(PAYLOAD)).await;
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_already_encoded_response_is_not_double_compressed() {
+        let resp = run(Some("application/json"), Some("br"), "gzip", full_body(PAYLOAD)).await;
+        assert_eq!(resp.headers().get(CONTENT_ENCODING).unwrap(), "br");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], PAYLOAD, "backend-encoded body must pass through untouched");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_trailers_survive_compression_layer() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let frames: Vec<Result<Frame<Bytes>, SrvError>> = vec![
+            Ok(Frame::data(Bytes::from_static(PAYLOAD))),
+            Ok(Frame::trailers(trailers)),
+        ];
+        let body: SrvBody = BodyExt::boxed(StreamBody::new(futures_util::stream::iter(frames)));
+
+        let resp = run(Some("application/grpc"), None, "gzip", body).await;
+        let collected = resp.into_body().collect().await.unwrap();
+        let trailers = collected.trailers().cloned().expect("grpc trailers must be preserved");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+    }
+
+    #[tokio::test]
+    async fn test_no_accept_encoding_leaves_response_untouched() {
+        let resp = run(Some("application/json"), None, "", full_body(PAYLOAD)).await;
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
     }
 }

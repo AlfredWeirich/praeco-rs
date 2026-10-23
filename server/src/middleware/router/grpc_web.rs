@@ -60,13 +60,8 @@ pub async fn handle_grpc_web(
         impl Drop for ConnectionGuard {
             fn drop(&mut self) {
                 if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
-                    let current = node
-                        .active_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if current > 0 {
-                        node.active_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    node.active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -231,19 +226,29 @@ pub async fn handle_grpc_web(
         let grpc_target_path = format!("/{}/{}", service_name, method_name);
         let mut proxy_uri_parts = backend_base_uri.clone().into_parts();
         proxy_uri_parts.path_and_query =
-            Some(hyper::http::uri::PathAndQuery::from_maybe_shared(grpc_target_path).unwrap());
-        let final_target_uri = Uri::from_parts(proxy_uri_parts).unwrap();
+            match hyper::http::uri::PathAndQuery::from_maybe_shared(grpc_target_path) {
+                Ok(pq) => Some(pq),
+                Err(e) => {
+                    return Ok(build_error_response(
+                        &format!("Invalid gRPC target path: {}", e),
+                        StatusCode::BAD_REQUEST,
+                    ));
+                }
+            };
+        let final_target_uri = match Uri::from_parts(proxy_uri_parts) {
+            Ok(u) => u,
+            Err(e) => {
+                return Ok(build_error_response(
+                    &format!("Invalid gRPC target URI: {}", e),
+                    StatusCode::BAD_REQUEST,
+                ));
+            }
+        };
 
-        let mut builder = Request::builder()
+        let builder = Request::builder()
             .method(Method::POST)
             .uri(final_target_uri)
-            .version(hyper::Version::HTTP_2)
-            .header(header::CONTENT_TYPE, "application/grpc")
-            .header("te", "trailers");
-
-        if let Some(auth) = current_headers.get(header::AUTHORIZATION) {
-            builder = builder.header(header::AUTHORIZATION, auth.clone());
-        }
+            .version(hyper::Version::HTTP_2);
 
         let mut proxy_req = match builder.body(boxed_body) {
             Ok(req) => req,
@@ -257,11 +262,23 @@ pub async fn handle_grpc_web(
 
         *proxy_req.version_mut() = hyper::Version::HTTP_2;
 
+        // Replace client JSON headers with authoritative gRPC wire headers
+        current_headers.remove(header::CONTENT_LENGTH);
+        current_headers.remove(header::CONNECTION);
+        current_headers.remove(header::TRANSFER_ENCODING);
+        current_headers.remove(header::UPGRADE);
+        current_headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/grpc"),
+        );
+        current_headers.insert(
+            header::TE,
+            header::HeaderValue::from_static("trailers"),
+        );
+
         // Ensure x-trace-id is present for gRPC backends that expect it
-        if let Some(trace_id) = current_headers.get("traceparent") {
-            if !current_headers.contains_key("x-trace-id") {
-                current_headers.insert("x-trace-id", trace_id.clone());
-            }
+        if let Some(trace_id) = current_headers.get("traceparent").cloned() {
+            current_headers.entry("x-trace-id").or_insert(trace_id);
         }
 
         *proxy_req.headers_mut() = current_headers;
@@ -275,7 +292,30 @@ pub async fn handle_grpc_web(
             );
         });
 
-        match grpc_client.request(proxy_req).await {
+        let req_timeout = config
+            .router_params
+            .as_ref()
+            .and_then(|p| {
+                (p.request_timeout_seconds > 0)
+                    .then(|| std::time::Duration::from_secs(p.request_timeout_seconds))
+            })
+            .unwrap_or(std::time::Duration::from_secs(30));
+
+        let req_result = match tokio::time::timeout(req_timeout, grpc_client.request(proxy_req)).await {
+            Ok(res) => res,
+            Err(_) => {
+                error!(
+                    "{}: gRPC transcoding request to {} timed out after {:?}",
+                    server_name, backend_base_uri, req_timeout
+                );
+                return Ok(build_error_response(
+                    "Gateway Timeout",
+                    StatusCode::GATEWAY_TIMEOUT,
+                ));
+            }
+        };
+
+        match req_result {
             Ok(mut res) => {
                 if res.status() != StatusCode::OK {
                     return Ok(build_error_response(
@@ -284,12 +324,25 @@ pub async fn handle_grpc_web(
                     ));
                 }
 
-                let res_body_bytes = match res.body_mut().collect().await {
-                    Ok(c) => c.to_bytes(),
-                    Err(e) => {
+                const MAX_GRPC_WEB_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+                let collect_res = tokio::time::timeout(
+                    req_timeout,
+                    http_body_util::Limited::new(res.body_mut(), MAX_GRPC_WEB_RESPONSE_BYTES).collect(),
+                )
+                .await;
+
+                let res_body_bytes = match collect_res {
+                    Ok(Ok(c)) => c.to_bytes(),
+                    Ok(Err(e)) => {
                         return Ok(build_error_response(
                             &format!("Failed to read gRPC body: {}", e),
                             StatusCode::BAD_GATEWAY,
+                        ));
+                    }
+                    Err(_) => {
+                        return Ok(build_error_response(
+                            "Gateway Timeout reading gRPC response body",
+                            StatusCode::GATEWAY_TIMEOUT,
                         ));
                     }
                 };
@@ -301,8 +354,12 @@ pub async fn handle_grpc_web(
                     ));
                 }
 
-                let payload_len =
-                    u32::from_be_bytes(res_body_bytes[1..5].try_into().unwrap()) as usize;
+                let payload_len = u32::from_be_bytes([
+                    res_body_bytes[1],
+                    res_body_bytes[2],
+                    res_body_bytes[3],
+                    res_body_bytes[4],
+                ]) as usize;
                 if res_body_bytes.len() < 5 + payload_len {
                     return Ok(build_error_response(
                         "Truncated gRPC Response",
@@ -390,7 +447,7 @@ pub async fn build_grpc_pool(
 
         if let Some(params) = router_params {
             if let Some(ca_path) = &params.ssl_root_certificate {
-                let pem = std::fs::read(ca_path).map_err(|e| {
+                let pem = tokio::fs::read(ca_path).await.map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!("Failed to read root CA certificate '{}': {}", ca_path, e),
@@ -411,13 +468,13 @@ pub async fn build_grpc_pool(
                     format!("{}: ssl_client_key must be specified for ClientCert authentication", host)
                 })?;
 
-                let cert_pem = std::fs::read(cert_path).map_err(|e| {
+                let cert_pem = tokio::fs::read(cert_path).await.map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!("Failed to read client certificate '{}': {}", cert_path, e),
                     )
                 })?;
-                let key_pem = std::fs::read(key_path).map_err(|e| {
+                let key_pem = tokio::fs::read(key_path).await.map_err(|e| {
                     std::io::Error::new(
                         e.kind(),
                         format!("Failed to read client key '{}': {}", key_path, e),
@@ -562,5 +619,245 @@ mod tests {
         };
         let ttl = std::time::Duration::from_secs(600);
         assert!(cached.created_at.elapsed() >= ttl, "Pool older than 600s should be detected as expired");
+    }
+
+    // ------------------------------------------------------------------------
+    //  End-to-end tests for the JSON -> gRPC transcoding path ([F-09])
+    // ------------------------------------------------------------------------
+
+    use crate::configuration::{
+        CachedDescriptorPool, LbStrategy, RouteBackendType, RouteTarget, UpstreamNode,
+    };
+    use prost_reflect::prost_types::{
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+        MethodDescriptorProto, ServiceDescriptorProto,
+        field_descriptor_proto::{Label, Type},
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::time::Duration;
+
+    /// Builds a descriptor pool with `test.Echo/Say(test.Msg{text}) -> test.Msg`
+    /// so that no live gRPC reflection server is required.
+    fn test_descriptor_pool() -> Arc<DescriptorPool> {
+        let file = FileDescriptorProto {
+            name: Some("test.proto".into()),
+            package: Some("test".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Msg".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("text".into()),
+                    json_name: Some("text".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::String as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            service: vec![ServiceDescriptorProto {
+                name: Some("Echo".into()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("Say".into()),
+                    input_type: Some(".test.Msg".into()),
+                    output_type: Some(".test.Msg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Arc::new(
+            DescriptorPool::from_file_descriptor_set(FileDescriptorSet { file: vec![file] })
+                .expect("valid test descriptor set"),
+        )
+    }
+
+    fn test_server_config(request_timeout_seconds: u64) -> ServerConfig {
+        let toml_str = format!(
+            r#"
+            name = "grpc_web_test"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+            request_timeout_seconds = {request_timeout_seconds}
+
+            [Layers]
+            enabled = []
+        "#
+        );
+        toml::from_str(&toml_str).expect("valid test server config")
+    }
+
+    fn test_route(port: u16) -> ParsedRoute {
+        let node = UpstreamNode {
+            uri: format!("http://127.0.0.1:{port}").parse().unwrap(),
+            active_connections: AtomicUsize::new(0),
+            is_alive: AtomicBool::new(true),
+            last_failure_time: AtomicU64::new(0),
+            current_score: AtomicUsize::new(0),
+        };
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 60,
+            max_retries: 0,
+            active_health_check_interval: 0,
+            // Pre-populated cache => handle_grpc_web never needs to perform reflection.
+            grpc_pool: tokio::sync::RwLock::new(Some(CachedDescriptorPool {
+                pool: test_descriptor_pool(),
+                created_at: std::time::Instant::now(),
+            })),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+        ParsedRoute {
+            prefix: "/".to_string(),
+            target,
+            allowed_roles: Vec::new(),
+            backend_type: RouteBackendType::GrpcTranscoding,
+        }
+    }
+
+    /// Spawns a one-shot HTTP/2 (h2c) mock upstream that serves the given handler.
+    async fn spawn_h2_upstream<F, Fut>(handler: F) -> u16
+    where
+        F: Fn(hyper::Request<hyper::body::Incoming>) -> Fut + Send + 'static,
+        Fut: std::future::Future<
+                Output = Result<hyper::Response<Full<Bytes>>, std::convert::Infallible>,
+            > + Send
+            + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let io = hyper_util::rt::TokioIo::new(socket);
+                let _ = hyper::server::conn::http2::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, hyper::service::service_fn(handler))
+                .await;
+            }
+        });
+        port
+    }
+
+    async fn call_grpc_web(
+        route: &ParsedRoute,
+        config: &ServerConfig,
+        headers: hyper::HeaderMap,
+    ) -> Response<ServiceRespBody> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let client = common::client::build_hyper_client(
+            tls_config,
+            common::client::ClientPoolConfig {
+                http2_only: true,
+                ..Default::default()
+            },
+        );
+        let uri: Uri = "http://localhost/test.Echo/Say".parse().unwrap();
+        handle_grpc_web(
+            route,
+            RequestBody::Buffered(Bytes::from_static(br#"{"text":"hello"}"#)),
+            Method::POST,
+            headers,
+            &uri,
+            None,
+            "test_server",
+            &client,
+            config,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_forwards_grpc_wire_headers_not_client_json_headers() {
+        let captured = Arc::new(std::sync::Mutex::new(None::<hyper::HeaderMap>));
+        let cap = captured.clone();
+        let port = spawn_h2_upstream(move |req| {
+            let cap = cap.clone();
+            async move {
+                *cap.lock().unwrap() = Some(req.headers().clone());
+                let _ = req.into_body().collect().await;
+                // gRPC frame: compressed-flag(0) + len(4) + protobuf Msg{text:"hi"}
+                let frame = Bytes::from_static(&[0, 0, 0, 0, 4, 0x0a, 0x02, b'h', b'i']);
+                Ok(hyper::Response::builder()
+                    .status(200)
+                    .body(Full::new(frame))
+                    .unwrap())
+            }
+        })
+        .await;
+
+        let route = test_route(port);
+        let config = test_server_config(5);
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(header::CONTENT_LENGTH, "9999".parse().unwrap());
+        headers.insert(header::CONNECTION, "keep-alive".parse().unwrap());
+
+        let resp = call_grpc_web(&route, &config, headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("hi"));
+
+        let seen = captured.lock().unwrap().clone().expect("upstream must have been called");
+        assert_eq!(seen.get(header::CONTENT_TYPE).unwrap(), "application/grpc");
+        assert_eq!(seen.get(header::TE).unwrap(), "trailers");
+        assert_ne!(
+            seen.get(header::CONTENT_LENGTH).map(|v| v.to_str().unwrap()),
+            Some("9999"),
+            "stale client Content-Length must not be forwarded"
+        );
+        assert!(seen.get(header::CONNECTION).is_none(), "hop-by-hop headers must be stripped");
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_request_timeout_returns_504() {
+        let port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(hyper::Response::new(Full::new(Bytes::new())))
+        })
+        .await;
+
+        let route = test_route(port);
+        let config = test_server_config(1);
+
+        let started = std::time::Instant::now();
+        let resp = call_grpc_web(&route, &config, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "request_timeout_seconds must bound the upstream call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_response_body_limit_returns_502() {
+        let port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            // 16 MiB + 1 byte exceeds MAX_GRPC_WEB_RESPONSE_BYTES.
+            let oversized = Bytes::from(vec![0u8; 16 * 1024 * 1024 + 1]);
+            Ok(hyper::Response::new(Full::new(oversized)))
+        })
+        .await;
+
+        let route = test_route(port);
+        let config = test_server_config(30);
+
+        let resp = call_grpc_web(&route, &config, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

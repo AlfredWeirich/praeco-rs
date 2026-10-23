@@ -51,13 +51,8 @@ pub async fn handle_grpc_passthrough(
         impl Drop for ConnectionGuard {
             fn drop(&mut self) {
                 if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
-                    let current = node
-                        .active_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if current > 0 {
-                        node.active_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    node.active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

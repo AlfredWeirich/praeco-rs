@@ -63,13 +63,8 @@ pub async fn handle_http_proxy(
         impl Drop for ConnectionGuard {
             fn drop(&mut self) {
                 if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
-                    let current = node
-                        .active_connections
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if current > 0 {
-                        node.active_connections
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    node.active_connections
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -354,15 +349,17 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
             }
         }
 
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-            match io_err.kind() {
-                std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted
-                | std::io::ErrorKind::UnexpectedEof => {
-                    return ProxyErrorKind::ClientAborted(io_err.to_string());
+        if is_user_body {
+            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                match io_err.kind() {
+                    std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof => {
+                        return ProxyErrorKind::ClientAborted(io_err.to_string());
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -773,6 +770,86 @@ mod tests {
         assert!(
             target.upstreams[0].is_alive.load(Ordering::Relaxed),
             "Upstream node must NOT be marked dead on decompression bomb limit"
+        );
+    }
+
+    /// Regression test for [F-10]: a raw `std::io::Error` (e.g. `ConnectionReset`) caused by the
+    /// *upstream* socket must be classified as an upstream failure (502 + node marked dead),
+    /// not as a client abort (400).
+    #[tokio::test]
+    async fn test_http_proxy_upstream_tcp_reset_returns_502_and_marks_node_dead() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // SO_LINGER=0 turns the close into a TCP RST (ConnectionReset on the proxy side).
+                #[allow(deprecated)]
+                let _ = socket.set_linger(Some(Duration::ZERO));
+                drop(socket);
+            }
+        });
+
+        let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
+        let node = UpstreamNode {
+            uri: upstream_uri.clone(),
+            active_connections: AtomicUsize::new(0),
+            is_alive: AtomicBool::new(true),
+            last_failure_time: AtomicU64::new(0),
+            current_score: AtomicUsize::new(0),
+        };
+
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 60,
+            max_retries: 0,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let route_info = ParsedRoute {
+            prefix: "/api".to_string(),
+            target: target.clone(),
+            allowed_roles: Vec::new(),
+            backend_type: RouteBackendType::Rest,
+        };
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let client = common::client::build_hyper_client(tls_config, common::client::ClientPoolConfig::default());
+
+        let matched_params = matchit::Params::new();
+        let req_uri: Uri = "http://localhost/api/reset".parse().unwrap();
+
+        let response = handle_http_proxy(
+            &route_info,
+            RequestBody::Buffered(bytes::Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &req_uri,
+            &matched_params,
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            !target.upstreams[0].is_alive.load(Ordering::Relaxed),
+            "Upstream node MUST be marked dead when the upstream socket resets"
         );
     }
 }

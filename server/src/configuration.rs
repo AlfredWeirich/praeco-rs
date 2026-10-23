@@ -822,6 +822,9 @@ pub struct SimpleRateLimiterConfig {
     /// Entry idle TTL in seconds before pruning (default: 300).
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
+    /// Whether to trust `X-Forwarded-For` / `X-Real-IP` headers when socket IP is unspecified (default: false).
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 /// Configuration for the token-bucket rate limiter.
@@ -842,6 +845,9 @@ pub struct TokenBucketRateLimiterConfig {
     /// Entry idle TTL in seconds before pruning (default: 300).
     #[serde(default = "default_ttl_seconds")]
     pub ttl_seconds: u64,
+    /// Whether to trust `X-Forwarded-For` / `X-Real-IP` headers when socket IP is unspecified (default: false).
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 /// Configuration for the artificial delay layer.

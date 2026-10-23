@@ -87,10 +87,11 @@ impl std::fmt::Display for RateLimitKey {
 pub fn extract_rate_limit_key<ReqBody>(
     req: &Request<ReqBody>,
     strategy: RateLimitKeyStrategy,
+    trust_forwarded_headers: bool,
 ) -> RateLimitKey {
     match strategy {
         RateLimitKeyStrategy::Global => RateLimitKey::Global,
-        RateLimitKeyStrategy::Ip => extract_ip_key(req),
+        RateLimitKeyStrategy::Ip => extract_ip_key(req, trust_forwarded_headers),
         RateLimitKeyStrategy::Identity => {
             // 1. Try JWT Claims `sub`
             if let Some(claims) = req.extensions().get::<common::Claims>() {
@@ -105,36 +106,39 @@ pub fn extract_rate_limit_key<ReqBody>(
                 }
             }
             // 3. Fallback to client IP
-            extract_ip_key(req)
+            extract_ip_key(req, trust_forwarded_headers)
         }
     }
 }
 
-fn extract_ip_key<ReqBody>(req: &Request<ReqBody>) -> RateLimitKey {
-    // 1. Direct TCP connection socket address
+fn extract_ip_key<ReqBody>(req: &Request<ReqBody>, trust_forwarded_headers: bool) -> RateLimitKey {
+    // 1. Direct TCP / QUIC / PROXY-v2 connection socket address
     if let Some(addr) = req.extensions().get::<std::net::SocketAddr>() {
         let ip = addr.ip();
         if !ip.is_unspecified() {
-            return RateLimitKey::Ip(ip);
+            return RateLimitKey::Ip(common::canonical_client_ip(ip));
         }
     }
 
-    // 2. Check X-Forwarded-For if socket address was unspecified (e.g. 0.0.0.0 through tunnel)
-    if let Some(xff) = req.headers().get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first_ip) = s.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse::<std::net::IpAddr>() {
-                    return RateLimitKey::Ip(ip);
+    // Only inspect X-Forwarded-For / X-Real-IP when explicitly configured as behind a trusted HTTP proxy
+    if trust_forwarded_headers {
+        // 2. Check X-Forwarded-For if socket address was unspecified
+        if let Some(xff) = req.headers().get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first_ip) = s.split(',').next() {
+                    if let Ok(ip) = first_ip.trim().parse::<std::net::IpAddr>() {
+                        return RateLimitKey::Ip(common::canonical_client_ip(ip));
+                    }
                 }
             }
         }
-    }
 
-    // 3. Check X-Real-IP
-    if let Some(xrip) = req.headers().get("x-real-ip") {
-        if let Ok(s) = xrip.to_str() {
-            if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
-                return RateLimitKey::Ip(ip);
+        // 3. Check X-Real-IP
+        if let Some(xrip) = req.headers().get("x-real-ip") {
+            if let Ok(s) = xrip.to_str() {
+                if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
+                    return RateLimitKey::Ip(common::canonical_client_ip(ip));
+                }
             }
         }
     }
@@ -175,22 +179,34 @@ impl KeyedSimpleRateLimitStore {
         let now = Instant::now();
         self.maybe_cleanup(now);
 
-        let mut entry = self.entries.entry(key.clone()).or_insert_with(|| {
-            KeyedSimpleEntry {
-                next_allowed: now,
-                last_seen: now,
+        // 1. Fast path (O(1)): Key is already tracked in the map
+        if let Some(mut entry) = self.entries.get_mut(key) {
+            entry.last_seen = now;
+            if now < entry.next_allowed {
+                let wait_secs = (entry.next_allowed.duration_since(now).as_secs_f64()).ceil().max(1.0) as u64;
+                return Err(wait_secs);
+            } else {
+                entry.next_allowed = now + limit_duration;
+                return Ok(());
             }
-        });
-
-        entry.last_seen = now;
-
-        if now < entry.next_allowed {
-            let wait_secs = (entry.next_allowed.duration_since(now).as_secs_f64()).ceil().max(1.0) as u64;
-            Err(wait_secs)
-        } else {
-            entry.next_allowed = now + limit_duration;
-            Ok(())
         }
+
+        // 2. Slow path for new unknown keys: enforce hard max_entries cap (Fail-Closed)
+        if self.entries.len() >= self.max_entries {
+            self.maybe_cleanup_when_full(now);
+            if self.entries.len() >= self.max_entries {
+                return Err(1);
+            }
+        }
+
+        self.entries.insert(
+            key.clone(),
+            KeyedSimpleEntry {
+                next_allowed: now + limit_duration,
+                last_seen: now,
+            },
+        );
+        Ok(())
     }
 
     /// Explicitly purges entries that have been inactive longer than `ttl`.
@@ -203,7 +219,16 @@ impl KeyedSimpleRateLimitStore {
 
     fn maybe_cleanup(&self, now: Instant) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if self.entries.len() >= self.max_entries || now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+            if now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+                *last_cleanup = now;
+                self.cleanup(now);
+            }
+        }
+    }
+
+    fn maybe_cleanup_when_full(&self, now: Instant) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
+            if now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
@@ -226,6 +251,7 @@ pub struct SimpleRateLimiterLayer {
     key_by: RateLimitKeyStrategy,
     max_entries: usize,
     ttl: Duration,
+    trust_forwarded_headers: bool,
     server_name: &'static str,
 }
 
@@ -254,8 +280,15 @@ impl SimpleRateLimiterLayer {
             key_by,
             max_entries,
             ttl,
+            trust_forwarded_headers: false,
             server_name,
         }
+    }
+
+    /// Sets whether to trust `X-Forwarded-For` / `X-Real-IP` headers when the socket IP is unspecified.
+    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded_headers = trust;
+        self
     }
 }
 
@@ -270,6 +303,7 @@ impl<S> Layer<S> for SimpleRateLimiterLayer {
             self.ttl,
             self.server_name,
         )
+        .with_trust_forwarded_headers(self.trust_forwarded_headers)
     }
 }
 
@@ -280,6 +314,7 @@ pub struct SimpleRateLimiterService<S> {
     store: KeyedSimpleRateLimitStore,
     limit_duration: Duration,
     key_by: RateLimitKeyStrategy,
+    trust_forwarded_headers: bool,
     server_name: &'static str,
 }
 
@@ -308,8 +343,14 @@ impl<S> SimpleRateLimiterService<S> {
             store: KeyedSimpleRateLimitStore::new(max_entries, ttl),
             limit_duration: per,
             key_by,
+            trust_forwarded_headers: false,
             server_name,
         }
+    }
+
+    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded_headers = trust;
+        self
     }
 }
 
@@ -356,7 +397,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key(&req, self.key_by);
+        let key = extract_rate_limit_key(&req, self.key_by, self.trust_forwarded_headers);
         let server_name = self.server_name;
 
         match self.store.check_and_record(&key, self.limit_duration) {
@@ -428,30 +469,44 @@ impl KeyedTokenBucketStore {
 
         self.maybe_cleanup(now);
 
-        let mut entry = self.entries.entry(key.clone()).or_insert_with(|| {
-            KeyedBucketEntry {
-                tokens: cap_f64,
-                last_refill: now,
-                last_seen: now,
+        // 1. Fast path (O(1)): Key is already tracked in the map
+        if let Some(mut entry) = self.entries.get_mut(key) {
+            let elapsed = now.duration_since(entry.last_refill);
+            let added = elapsed.as_secs_f64() * rate;
+            entry.tokens = (entry.tokens + added).min(cap_f64);
+            entry.last_refill = now;
+            entry.last_seen = now;
+
+            if entry.tokens >= 1.0 {
+                entry.tokens -= 1.0;
+                return Ok(());
+            } else {
+                let needed = 1.0 - entry.tokens;
+                let retry_after_secs = (needed / rate).ceil().max(1.0) as u64;
+                return Err(retry_after_secs);
             }
-        });
+        }
 
-        // 1. Refill tokens using floating-point math to preserve fractional intervals
-        let elapsed = now.duration_since(entry.last_refill);
-        let added = elapsed.as_secs_f64() * rate;
-        entry.tokens = (entry.tokens + added).min(cap_f64);
-        entry.last_refill = now;
-        entry.last_seen = now;
+        // 2. Slow path for new unknown keys: enforce hard max_entries cap (Fail-Closed)
+        if self.entries.len() >= self.max_entries {
+            self.maybe_cleanup_when_full(now);
+            if self.entries.len() >= self.max_entries {
+                return Err(1);
+            }
+        }
 
-        // 2. Consume 1.0 token if available
-        if entry.tokens >= 1.0 {
-            entry.tokens -= 1.0;
+        if cap_f64 >= 1.0 {
+            self.entries.insert(
+                key.clone(),
+                KeyedBucketEntry {
+                    tokens: cap_f64 - 1.0,
+                    last_refill: now,
+                    last_seen: now,
+                },
+            );
             Ok(())
         } else {
-            // Calculate delay in whole seconds until at least 1.0 token is available
-            let needed = 1.0 - entry.tokens;
-            let retry_after_secs = (needed / rate).ceil().max(1.0) as u64;
-            Err(retry_after_secs)
+            Err(1)
         }
     }
 
@@ -465,7 +520,16 @@ impl KeyedTokenBucketStore {
 
     fn maybe_cleanup(&self, now: Instant) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if self.entries.len() >= self.max_entries || now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+            if now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+                *last_cleanup = now;
+                self.cleanup(now);
+            }
+        }
+    }
+
+    fn maybe_cleanup_when_full(&self, now: Instant) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
+            if now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
@@ -490,6 +554,7 @@ pub struct TokenBucketRateLimiterLayer {
     key_by: RateLimitKeyStrategy,
     max_entries: usize,
     ttl: Duration,
+    trust_forwarded_headers: bool,
     server_name: &'static str,
 }
 
@@ -529,8 +594,15 @@ impl TokenBucketRateLimiterLayer {
             key_by,
             max_entries,
             ttl,
+            trust_forwarded_headers: false,
             server_name,
         }
+    }
+
+    /// Sets whether to trust `X-Forwarded-For` / `X-Real-IP` headers when the socket IP is unspecified.
+    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded_headers = trust;
+        self
     }
 }
 
@@ -547,6 +619,7 @@ impl<S> Layer<S> for TokenBucketRateLimiterLayer {
             self.ttl,
             self.server_name,
         )
+        .with_trust_forwarded_headers(self.trust_forwarded_headers)
     }
 }
 
@@ -559,6 +632,7 @@ pub struct TokenBucketRateLimiterService<S> {
     refill_tokens: usize,
     interval: Duration,
     key_by: RateLimitKeyStrategy,
+    trust_forwarded_headers: bool,
     server_name: &'static str,
 }
 
@@ -599,8 +673,14 @@ impl<S> TokenBucketRateLimiterService<S> {
             refill_tokens,
             interval,
             key_by,
+            trust_forwarded_headers: false,
             server_name,
         }
+    }
+
+    pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
+        self.trust_forwarded_headers = trust;
+        self
     }
 }
 
@@ -647,7 +727,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key(&req, self.key_by);
+        let key = extract_rate_limit_key(&req, self.key_by, self.trust_forwarded_headers);
         let server_name = self.server_name;
 
         match self.store.try_consume(&key, self.capacity, self.refill_tokens, self.interval) {
@@ -864,5 +944,64 @@ mod tests {
         // Running cleanup prunes stale entries
         store.cleanup(Instant::now());
         assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_forwarded_headers_ignored_by_default() {
+        let svc = DummyOkService;
+        let mut limiter = TokenBucketRateLimiterService::with_config(
+            svc,
+            1, // capacity = 1
+            1,
+            Duration::from_secs(60),
+            RateLimitKeyStrategy::Ip,
+            100,
+            Duration::from_secs(300),
+            "test_server",
+        );
+
+        let real_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)), 4000);
+
+        // Request 1 with spoofed X-Forwarded-For consumes the real peer's token
+        let mut req1 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "203.0.113.1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req1.extensions_mut().insert(real_peer);
+        let resp1 = limiter.call(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Request 2 from the same peer with a DIFFERENT spoofed X-Forwarded-For must still be blocked!
+        let mut req2 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "203.0.113.2")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req2.extensions_mut().insert(real_peer);
+        let resp2 = limiter.call(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_store_max_entries_fail_closed_without_eviction() {
+        let store = KeyedTokenBucketStore::new(2, Duration::from_secs(300));
+        let key1 = RateLimitKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let key2 = RateLimitKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        let key3 = RateLimitKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)));
+
+        // Fill up to max_entries = 2 (each with capacity = 2)
+        assert!(store.try_consume(&key1, 2, 1, Duration::from_secs(60)).is_ok());
+        assert!(store.try_consume(&key2, 2, 1, Duration::from_secs(60)).is_ok());
+        assert_eq!(store.len(), 2);
+
+        // New unknown key3 must be rejected (Fail-Closed) when store is at capacity
+        assert_eq!(store.try_consume(&key3, 2, 1, Duration::from_secs(60)), Err(1));
+        assert_eq!(store.len(), 2);
+
+        // Existing key1 was NOT evicted and still has its second token available
+        assert!(store.try_consume(&key1, 2, 1, Duration::from_secs(60)).is_ok());
+        // Third request on key1 is now rate-limited as expected
+        assert!(store.try_consume(&key1, 2, 1, Duration::from_secs(60)).is_err());
     }
 }

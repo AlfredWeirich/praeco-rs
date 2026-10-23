@@ -3,9 +3,11 @@
 **praeco-common** provides shared utilities, types, and connection logic for the `praeco-rs` ecosystem.
 
 It is designed to be a central repository for reusable components such as:
-- **HTTP/TLS Connection Pooling**: Pre-configured `hyper` clients with `rustls` integration, ensuring consistent performance and connection limits across the gateway and client utilities.
-- **JWT Validation Structures**: Shared token claims and parsing helpers.
-- **Security Primitives**: Core structures used for authentication and authorization.
+- **HTTP/TLS Connection Pooling**: Pre-configured `hyper` clients with `rustls` integration, active keep-alive probes, connect timeouts, and strict custom PKI isolation (`build_root_store` trusts *only* the configured custom CA without merging public Mozilla WebPKI roots unless `ca_path` is `None` or `build_root_store_with_webpki` is explicitly used).
+- **Client IP Canonicalization (`canonical_client_ip`)**: Normalizes client IP addresses across all rate limiters, connection trackers, and session stores by unwrapping IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d` $\to$ `a.b.c.d`), preserving loopback (`::1`) and unspecified (`::`) addresses, and masking standard IPv6 unicast addresses to their `/64` subnet prefix (`segments[0..4]`) to prevent IPv6 `/64` rotation bypasses.
+- **HAProxy PROXY-Protocol v2 (`proxy_protocol`)**: Binary encoder (`encode_proxy_v2`), strict fail-closed parser (`read_proxy_v2` with full 16-byte `InvalidMagic` header preservation and 512-byte payload bounds), and `PrefixedStream` for propagating real client IPs across Yamux Layer-4 tunnels.
+- **JWT Validation Structures**: Shared token claims (`Claims`) and parsing helpers.
+- **Security Primitives**: Core structures used for authentication, OID role mapping (`UserRole`, `MtlsClaims`), and authorization.
 
 *(The name **praeco** comes from Latin, meaning "herald" or "crier" — just as a historical herald controlled the flow of information and announced messages to the public, this gateway acts as the sovereign announcer and gatekeeper for your network traffic).*
 
