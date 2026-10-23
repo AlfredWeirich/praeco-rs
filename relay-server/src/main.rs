@@ -473,6 +473,30 @@ fn setup_mtls_acceptor(ca_path: &str, cert_path: &str, key_path: &str, crl_path:
         let crl_file = File::open(path)?;
         let mut crl_reader = BufReader::new(crl_file);
         let crls = rustls_pemfile::crls(&mut crl_reader).collect::<Result<Vec<_>, _>>()?;
+        for crl_der in &crls {
+            match x509_parser::parse_x509_crl(crl_der.as_ref()) {
+                Ok((_, parsed_crl)) => {
+                    if let Some(next_update) = parsed_crl.next_update() {
+                        let now_ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        if next_update.timestamp() < now_ts {
+                            warn!(
+                                crl_path = %path,
+                                next_update = %next_update,
+                                "Loaded CRL has expired (nextUpdate is in the past)! Revocation checks may use stale data."
+                            );
+                        }
+                    } else {
+                        warn!(crl_path = %path, "Loaded CRL does not contain a nextUpdate field.");
+                    }
+                }
+                Err(e) => {
+                    warn!(crl_path = %path, error = %e, "Failed to parse CRL with x509-parser for expiration check");
+                }
+            }
+        }
         verifier_builder = verifier_builder.with_crls(crls);
     }
     
@@ -608,11 +632,16 @@ async fn run_control_plane(
                 warn!(target: "relay::control_plane", client_ip = %client_addr, "Invalid register command format");
                 return;
             }
-            let sni = parts[1].to_string();
+            let sni = parts[1].to_ascii_lowercase();
             let supports_proxy_v2 = parts[2..].contains(&"PROXY_V2") && enable_proxy_protocol;
 
+            if !is_valid_sni(&sni) {
+                warn!(target: "relay::control_plane", client_ip = %client_addr, requested_sni = %sni, "Invalid SNI hostname in REGISTER command");
+                return;
+            }
+
             // --- Verify SNI against Certificate SANs (P0.2) ---
-            if !allowed_snis.contains(&sni) {
+            if !allowed_snis.iter().any(|allowed| allowed.eq_ignore_ascii_case(&sni)) {
                 warn!(target: "relay::control_plane", client_ip = %client_addr, requested_sni = %sni, allowed_snis = ?allowed_snis, "SNI not authorized by client certificate");
                 return;
             }
@@ -901,6 +930,11 @@ async fn run_data_plane(
 
         // --- Rate Limiting Check (Aggregated IPv6 on /64 to prevent evasion) ---
         let canonical_ip = canonicalize_ip(client_addr.ip());
+        const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
+        if !rate_limits.contains_key(&canonical_ip) && rate_limits.len() >= MAX_RATE_LIMIT_ENTRIES {
+            warn!(target: "relay::data_plane", client_ip = %client_addr, "Rate limit table at capacity, dropping new IP connection");
+            continue;
+        }
         let mut bucket = rate_limits.entry(canonical_ip).or_insert_with(|| TokenBucket::new(burst));
         if !bucket.consume(rate, burst) {
             warn!(target: "relay::data_plane", client_ip = %client_addr, "Rate limit exceeded, dropping connection");
@@ -931,7 +965,7 @@ async fn run_data_plane(
             };
 
             let sni = match extract_sni(&buf) {
-                Ok(s) => s,
+                Ok(s) => s.to_ascii_lowercase(),
                 Err(reason) => {
                     let preview_len = std::cmp::min(buf.len(), 64);
                     let preview = &buf[..preview_len];
@@ -1107,7 +1141,6 @@ mod tests {
     async fn test_full_control_plane_registration() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         use tokio::io::AsyncWriteExt;
-        use tokio::net::TcpStream;
         // 1. Setup Acceptor
         let acceptor = setup_mtls_acceptor(
             "../server_certs/self_signed/relay_ca.pem",
@@ -1116,12 +1149,10 @@ mod tests {
             None,
         ).unwrap();
 
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let (client_io, server_io) = tokio::io::duplex(65536);
 
         let listener_task = tokio::spawn(async move {
-            let (stream, _client_addr) = listener.accept().await.unwrap();
-            let mut tls_stream = acceptor.accept(stream).await.unwrap();
+            let mut tls_stream = acceptor.accept(server_io).await.unwrap();
             let mut allowed_snis = Vec::new();
             if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                 if let Some(cert_der) = certs.first() {
@@ -1173,9 +1204,8 @@ mod tests {
             .with_client_auth_cert(certs, key).unwrap();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
-        let tcp_stream = TcpStream::connect(addr).await.unwrap();
         let domain = rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap();
-        let mut tls_stream = connector.connect(domain, tcp_stream).await.unwrap();
+        let mut tls_stream = connector.connect(domain, client_io).await.unwrap();
 
         let reg_cmd = "REGISTER wurzelwerk.onboarding.aweirich.eu\n";
         tls_stream.write_all(reg_cmd.as_bytes()).await.unwrap();

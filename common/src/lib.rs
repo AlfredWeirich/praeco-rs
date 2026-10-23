@@ -319,6 +319,30 @@ pub fn build_root_store_with_webpki(ca_path: &Option<String>) -> Result<RootCert
     }
     Ok(root_store)
 }
+/// Canonicalizes a client IP address for rate-limiting and connection-tracking:
+/// - IPv4 addresses remain unchanged.
+/// - IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped to their IPv4 address.
+/// - Loopback (`::1`) and unspecified (`::`) IPv6 addresses remain unchanged.
+/// - All other IPv6 addresses are masked to their `/64` subnet prefix so that a single
+///   residential/cloud `/64` allocation cannot bypass per-IP limits or exhaust rate-limit tables.
+pub fn canonical_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V4(v4) => std::net::IpAddr::V4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return std::net::IpAddr::V4(mapped_v4);
+            }
+            if v6.is_loopback() || v6.is_unspecified() {
+                return std::net::IpAddr::V6(v6);
+            }
+            let segs = v6.segments();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                segs[0], segs[1], segs[2], segs[3], 0, 0, 0, 0,
+            ))
+        }
+    }
+}
+
 pub mod client;
 pub mod proxy_protocol;
 
@@ -405,5 +429,25 @@ mod tests {
         let combined_store = build_root_store_with_webpki(&Some(ca_path))
             .expect("build_root_store_with_webpki should succeed");
         assert!(combined_store.len() > 100);
+    }
+
+    #[test]
+    fn test_canonical_client_ip() {
+        use std::net::IpAddr;
+
+        let ip4: IpAddr = "192.168.1.50".parse().unwrap();
+        assert_eq!(canonical_client_ip(ip4), ip4);
+
+        let ip4_mapped: IpAddr = "::ffff:192.168.1.50".parse().unwrap();
+        assert_eq!(canonical_client_ip(ip4_mapped), ip4);
+
+        let loopback6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(canonical_client_ip(loopback6), loopback6);
+
+        let ip6_a: IpAddr = "2001:db8:abcd:0012:0000:0000:0000:0001".parse().unwrap();
+        let ip6_b: IpAddr = "2001:db8:abcd:0012:ffff:ffff:ffff:ffff".parse().unwrap();
+        let ip6_masked: IpAddr = "2001:db8:abcd:0012::".parse().unwrap();
+        assert_eq!(canonical_client_ip(ip6_a), ip6_masked);
+        assert_eq!(canonical_client_ip(ip6_b), ip6_masked);
     }
 }

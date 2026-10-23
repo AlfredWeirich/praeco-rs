@@ -115,12 +115,12 @@ Explanation: If a client certificate has the OID `1.3.6.1.4.1.65111.1` (where `1
 #### `[[Server.client_certs]]` (Required if `authentication = "ClientCert"`)
 Array of tables (multiple CAs can be trusted).
 * `ssl_client_ca`: String. Path to the CA certificate to verify client certificates.
-* `ssl_client_crl`: String (Optional). Path to the Certificate Revocation List.
+* `ssl_client_crl`: String (Optional). Path to the Certificate Revocation List. On startup and hot-reload, Praeco parses the X.509 CRL and validates its `nextUpdate` timestamp, logging an explicit security warning if the CRL has expired.
 
 #### `[Server.client_cert_forwarding]` (Optional)
 This configuration controls the passing of verified client identities to backend servers.
-1. **Global Identity Header Sanitizing (Protection against Spoofing):**
-   Unconditionally — across **all** servers and routes, regardless of whether `client_cert_forwarding` is enabled — Praeco-rs removes all incoming client-supplied identity headers (`x-client-cert`, `x-client-san`, `x-client-roles`, `x-ssl-*`, etc.) as well as untrusted `Forwarded` headers. Hop-by-hop headers per RFC 7230 §6.1 are removed, `X-Real-IP` and `X-Forwarded-*` are safely managed, and backend `Server` headers are stripped from responses.
+1. **Global Identity & Forwarding Header Sanitizing (Protection against Spoofing):**
+   Unconditionally — across **all** servers, protocols (HTTP/1.1, HTTP/2, HTTP/3), and routes, regardless of whether `client_cert_forwarding` is enabled — Praeco-rs removes all incoming client-supplied identity headers (`x-client-cert`, `x-client-san`, `x-client-roles`, `x-ssl-*`, etc.) as well as all untrusted client forwarding headers (`forwarded`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-host`, `x-forwarded-proto`). Hop-by-hop headers per RFC 7230 §6.1 are removed, `X-Real-IP` and `X-Forwarded-*` (`For`, `Proto`, and `Host` including HTTP/2 & HTTP/3 `:authority` fallback) are authoritatively re-created from the verified socket or PROXY-v2 peer address, and backend `Server` headers are stripped from responses.
 2. **Verified Injection:**
    If the client has successfully authenticated via mTLS, this section allows injecting the verified certificate, SAN, roles, or client IP under the specified header names into the request forwarded to the backend.
 
@@ -134,7 +134,7 @@ This configuration controls the passing of verified client identities to backend
 Protects against connection starvation, Slowloris, and socket exhaustion attacks across TCP, QUIC, and Yamux tunnel listeners. If omitted, secure defaults are applied automatically without requiring any manual configuration entries.
 
 * `max_connections`: Integer (Optional, **Default:** `10000`). Maximum number of simultaneous active client connections across TCP, QUIC, and tunnel listeners for this server instance.
-* `max_connections_per_ip`: Integer (Optional, **Default:** `100`). Maximum number of simultaneous active connections permitted from a single IP address (unspecified/tunnel addresses bypass the per-IP check and only count towards the global limit).
+* `max_connections_per_ip`: Integer (Optional, **Default:** `100`). Maximum number of simultaneous active connections permitted from a single client IP or IPv6 `/64` subnet (`canonical_client_ip` unwraps IPv4-mapped IPv6 addresses and masks standard IPv6 addresses to their `/64` prefix so attackers cannot bypass per-IP limits by rotating interface identifiers within a `/64` allocation; unspecified addresses bypass the per-IP check and only count towards the global limit).
 
 ```toml
 [Server.connection_limits]
@@ -172,6 +172,12 @@ Configures the built-in Identity Provider, which issues JWTs based on mTLS or De
 * `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
 * `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
 
+> [!IMPORTANT]
+> **IdP Hardening (Quishing Protection, Webhook Pre-Validation & Revocation):**
+> - **Mandatory 6-Character `user_code` Verification:** `POST /auth/confirm?session=<id>&code=<user_code>` strictly requires the 6-character visual confirmation code displayed by the browser (`GET /auth/session_info?session=<id>` allows the mobile scanner to retrieve the code prior to confirmation). Verification is performed in constant time (`constant_time_eq`) **before** invoking any external `claims_webhook_url`, and the session is permanently invalidated after `3` failed attempts (`MAX_CONFIRM_ATTEMPTS = 3`).
+> - **mTLS-Protected Explicit JTI Revocation:** Calling `POST /auth/revoke?jti=<UUID>` to revoke an arbitrary token ID requires a valid mTLS client certificate (`401 Unauthorized` without mTLS), whereas standard browser logout via cookie or `Authorization: Bearer` header remains available to end-users. The in-memory `JwtRevocationStore` is bounded to `50,000` entries (`MAX_REVOKED_ENTRIES`) with throttled 30-second expiry cleanup.
+> - **Per-IP Session Limits:** `SessionStore` applies IPv6 `/64` prefix canonicalization (`canonical_client_ip`) to per-IP session creation quotas (`max 20 sessions/IP`, `10,000` global sessions).
+
 ### Static File Server Configuration
 
 #### `[Server.StaticFilesParams]` (Required if `service = "StaticFiles"`)
@@ -193,7 +199,7 @@ Configures this server instance to bypass opening a local listening port (ignore
 * `client_key_path`: String. Path to the client private key (PEM).
 * `ca_cert_path`: String. Path to the CA certificate (PEM) that signed the relay server's certificate.
 * `max_yamux_streams`: Integer (Optional). Maximum number of concurrent Yamux multiplexed streams over the tunnel connection. **Default:** `4096` (replaces Yamux default of `512`). Each forwarded public client connection occupies exactly 1 Yamux stream.
-* `proxy_protocol`: Boolean (Optional). Whether to negotiate HAProxy PROXY-Protocol v2 with the Relay Server to propagate the real client IP (IPv4 and IPv6). **Default:** `true`. When active, Praeco extracts the client IP before the TLS handshake and uses it for IP rate limiting, per-IP connection limits, access logging, and `X-Forwarded-For` / `X-Real-IP` headers.
+* `proxy_protocol`: Boolean (Optional). Whether to negotiate HAProxy PROXY-Protocol v2 with the Relay Server to propagate the real client IP (IPv4 and IPv6). **Default:** `true`. When active, Praeco operates **strictly fail-closed** on the tunnel stream (terminating any stream that lacks a valid 16-byte PROXY-v2 header signature rather than falling back to an unattributed connection) and extracts the verified client IP before the TLS handshake for IP rate limiting, per-IP connection limits, access logging, and `X-Forwarded-For` / `X-Real-IP` headers.
 
 **Example without `ip` and `port`:**
 ```toml
@@ -235,7 +241,7 @@ Each layer takes over a specific task in the request lifecycle:
 | `"Inspection"` | Checks the URL path of the request against a regex whitelist and blocks unauthorized calls. |
 | `"Cors"` | Adds CORS headers (Cross-Origin Resource Sharing) and handles preflight requests. |
 | `"SecurityHeaders"` | Adds HTTP security headers (like CSP, HSTS, anti-sniffing) to the server response. |
-| `"Compression"` | Compresses HTTP responses (e.g., Gzip) to save bandwidth. |
+| `"Compression"` | Compresses HTTP responses (e.g., Gzip) to save bandwidth. Automatically skips already-compressed responses (`Content-Encoding`) and gRPC streams (`Content-Type: application/grpc*`) to preserve HTTP/2 trailers. |
 | `"Decompression"` | Decompresses the incoming request body (includes protection against "decompression bombs"). |
 | `"RateLimiter:Simple"` | Limits requests per second via a hard limit (Fixed-Window Algorithm). |
 | `"RateLimiter:TokenBucket"` | Allows short-term bursts and periodically refills the limit. |
@@ -249,7 +255,7 @@ Additional configuration blocks for specific layers:
 
 #### `[Server.Layers.SecurityHeaders]`
 Defines the security headers that the proxy sends to the client. 
-**Note:** If this layer is *missing* from the `enabled` array, the proxy automatically injects it for your protection with extremely strict default values (e.g., `default-src 'none'`)! If you want to override these values (e.g., for a dashboard), you must explicitly activate the layer and define *all* 4 values. If values are missing, the server will not start and will display an error message.
+**Note:** Even if `"SecurityHeaders"` is omitted from the `enabled` array, the proxy automatically injects `SecurityHeadersLayer` for your protection! If you have defined a custom `[Server.Layers.SecurityHeaders]` block on the server, those custom values are honored automatically; otherwise, strict API default values (e.g., `default-src 'none'`) are applied. When defining a custom `[Server.Layers.SecurityHeaders]` block, you must specify all 4 values.
 
 Here is an overview of the most useful values for configuration:
 
@@ -302,20 +308,23 @@ Here is an overview of the most useful values for configuration:
 #### `[Server.Layers.RateLimiter]` (Simple)
 * `requests_per_second`: Integer. Strict limit of requests per second. Must be strictly greater than `0`.
 * `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy:
-  * `"identity"`: Keyed by authenticated user (`sub` from JWT or SAN from mTLS cert), falling back to client IP.
-  * `"ip"`: Keyed strictly by client IP (`SocketAddr` / `X-Forwarded-For`).
+  * `"identity"`: Keyed by authenticated user (`sub` from JWT or SAN from mTLS cert), falling back to canonicalized client IP (`canonical_client_ip`).
+  * `"ip"`: Keyed strictly by canonicalized client IP (`SocketAddr` / `PROXY_V2`). Standard IPv6 addresses are masked to their `/64` subnet prefix and IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped to IPv4 so attackers cannot bypass limits by rotating IPv6 interface identifiers.
   * `"global"`: Server-wide shared bucket.
-* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys before pruning.
+* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys.
 * `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning.
+* `trust_forwarded_headers`: Boolean *(optional, default: `false`)*. When `false` (default), `X-Forwarded-For` and `X-Real-IP` headers are ignored for rate-limiting key extraction to prevent IP spoofing, using only the verified socket / PROXY-v2 peer IP. Set to `true` only if Praeco runs behind a trusted L7 reverse proxy that does not use PROXY-Protocol v2.
+* *Performance & Anti-Cache-Thrashing (Fail-Closed):* Known keys are updated via an allocation-free $O(1)$ fast-path (`get_mut`), TTL cleanup is throttled to at most once every 10 seconds (`CLEANUP_INTERVAL_SECS = 10`), and when `entries.len() >= max_entries` is reached after TTL cleanup, requests from unknown keys fail closed with `429 Too Many Requests` (`Retry-After: 1`) without evicting active rate-limit buckets.
 * *RFC 6585 compliance:* Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
 
 #### `[Server.Layers.TokenBucketRateLimiter]`
 * `max_capacity`: Integer. Maximum burst size (number of tokens). Must be strictly greater than `0`.
 * `refill`: Integer. Number of added tokens per interval. Must be strictly greater than `0`.
 * `duration_micros`: Integer. Refill interval in microseconds. Must be strictly greater than `0`.
-* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy (`"identity"`, `"ip"`, or `"global"`).
-* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys before pruning.
-* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning.
+* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy (`"identity"`, `"ip"`, or `"global"`), using `canonical_client_ip` (IPv6 `/64` subnet aggregation and IPv4-mapped IPv6 unwrapping).
+* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys (fail-closed with `429 Too Many Requests` for unknown keys when at capacity, protecting existing buckets against cache-thrashing).
+* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning (throttled 10s sweep).
+* `trust_forwarded_headers`: Boolean *(optional, default: `false`)*. Whether to trust `X-Forwarded-For` / `X-Real-IP` headers for IP extraction (default `false`).
 * *Float-precision refill:* Eliminates token drift by preserving fractional intervals without truncation. Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
 
 #### `[Server.Layers.Delay]`
@@ -489,15 +498,15 @@ Configures the outgoing connection of the proxy to the backend servers.
 #### Upstream Timeouts & Keep-Alive Mechanics (Zero-Hang Architecture)
 1. **Connect & Request Timeouts:**
    - `connect_timeout_seconds`: Bound TCP and TLS connection establishment time. If a backend drops packets or stalls during the handshake, Praeco terminates the attempt after this duration instead of hanging indefinitely.
-   - `request_timeout_seconds`: Wraps REST and gRPC-Passthrough requests in an asynchronous deadline. If an upstream server accepts the connection but fails to reply within the timeout, Praeco returns `504 Gateway Timeout` and marks that specific upstream dead.
+   - `request_timeout_seconds`: Wraps REST, gRPC-Passthrough, and gRPC-Web (`backend_type = "grpc"`, which also enforces a 16 MiB upstream response body cap via `http_body_util::Limited`) requests in an asynchronous deadline. If an upstream server accepts the connection but fails to reply within the timeout, Praeco returns `504 Gateway Timeout` and marks that specific upstream dead.
 2. **TCP & HTTP/2 Keepalive:**
    - Praeco enables `TCP_NODELAY` and sets TCP Keepalive probes to 60 seconds on all upstream sockets.
    - For HTTP/2 connections, keepalive PING frames are transmitted every 30 seconds with a 10-second acknowledgment timeout. Both active requests and idle connections in the pool are probed (`http2_keep_alive_while_idle = true`), allowing broken connections or silent state-table drops by middleboxes/firewalls to be pruned immediately.
    - All connection pools run an active Tokio timer (`builder.pool_timer` & `builder.timer`) ensuring idle connections older than `idle_timeout_seconds` are evicted cleanly from memory.
 3. **gRPC Reflection Schema Caching & Fail-Closed TLS:**
-   - **Non-blocking I/O:** gRPC-Web reflection fetches occur completely outside `RwLock` read/write locks using single-flight mutexes, preventing concurrent gRPC-Web client requests from stalling during network schema queries.
+   - **Non-blocking Async I/O:** gRPC-Web reflection fetches and TLS key/CA reads (`tokio::fs::read`) occur completely outside `RwLock` read/write locks using single-flight mutexes, preventing concurrent gRPC-Web client requests or Tokio worker threads from stalling during schema queries.
    - **TTL Invalidation:** Schema reflection caches expire after `grpc_reflection_ttl_seconds` (default 10 minutes) to accommodate dynamic upstream proto updates. In case of transient upstream discovery errors while an expired schema is present, Praeco applies stale-while-revalidate to ensure continuous uptime.
-   - **Fail-Closed Security:** If custom CA certificates or mTLS keys configured in `RouterParams` cannot be read from disk, reflection immediately fails closed with an error rather than silently degrading to system webpki trust stores.
+   - **Strict Custom PKI Isolation & Fail-Closed Security:** When a custom `ssl_root_certificate` is configured in `RouterParams`, Praeco trusts **exclusively** that custom CA (without merging public Mozilla WebPKI roots). If custom CA certificates or mTLS keys cannot be read from disk, reflection and upstream connections immediately fail closed with an error rather than silently degrading to system WebPKI trust stores.
 
 
 ---
@@ -519,15 +528,21 @@ In a Zero-Trust architecture, `praeco-rs` relies heavily on various cryptographi
 
 ## Relay Server Configuration (`RelayConfig.toml`)
 
-The Praeco Relay Server operates as a standalone proxy (TCP/SNI router) and uses its own configuration file, typically named `RelayConfig.toml`.
+The Praeco Relay Server operates as a standalone proxy (TCP/SNI router) and uses its own configuration file, typically named `RelayConfig.toml`. In addition to mTLS authentication, the Relay Server enforces **SAN-to-SNI authorization** on the Control Plane (a Praeco client certificate may only `REGISTER <sni>` if its X.509 SAN or CN matches the requested domain), generation-tagged routing entries, and IPv6 `/64` prefix canonicalization (`canonical_client_ip`) on the Data Plane.
 
 | Parameter | Data Type | Description | Default Value |
 | :--- | :--- | :--- | :--- |
 | `control_plane_addr` | String | The address where the Relay accepts incoming mTLS Yamux tunnels from Praeco backend instances. | `"0.0.0.0:7001"` |
 | `data_plane_addr` | String | The address where the Relay accepts public internet HTTPS traffic (SNI Routing). | `"0.0.0.0:443"` |
 | `ca_cert_path` | String | Path to the CA certificate used to verify the mTLS connections from backend instances. | `"../client_certs/ca.cert.pem"` |
+| `crl_path` | String *(optional)* | Path to a Certificate Revocation List (CRL) for revoking compromised tunnel client certificates; parsed at startup with X.509 `nextUpdate` expiration verification. | `None` |
 | `server_cert_path` | String | Path to the Relay's own public TLS certificate (for the control plane). | `"server.crt"` |
 | `server_key_path` | String | Path to the Relay's private key. | `"server.key"` |
 | `enable_opentelemetry` | Boolean | Enables Jaeger tracing for the Relay. | `false` |
-| `rate_limit_connections_per_sec` | Integer | Limits the number of new TCP connections allowed per second per IP address on the Data Plane (DDoS mitigation). | `50` |
-| `rate_limit_burst` | Integer | The maximum burst of TCP connections allowed at once per IP. | `100` |
+| `rate_limit_connections_per_sec` | Integer | Limits the number of new TCP connections allowed per second per IP / IPv6 `/64` subnet on the Data Plane (bounded to `100,000` active buckets). | `50` |
+| `rate_limit_burst` | Integer | The maximum burst of TCP connections allowed at once per IP / IPv6 `/64` subnet. | `100` |
+| `max_concurrent_connections` | Integer | Global maximum of simultaneous Data Plane TCP connections. | `10000` |
+| `max_concurrent_connections_per_ip` | Integer | Maximum simultaneous Data Plane TCP connections per client IP / IPv6 `/64` subnet. | `100` |
+| `client_hello_timeout_secs` | Integer | Maximum duration in seconds to receive and parse the complete TLS `ClientHello` record (handles TCP fragmentation up to 16 KB). | `10` |
+| `control_plane_handshake_timeout_secs` | Integer | Timeout in seconds for mTLS handshake and `REGISTER` command on the Control Plane. | `10` |
+| `max_yamux_streams` | Integer | Maximum concurrent Yamux streams per tunnel connection. | `4096` |

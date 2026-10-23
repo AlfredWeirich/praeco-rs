@@ -154,6 +154,7 @@ pub fn tls_config(
                         "{server_name}: Failed to load CRL from '{crl_path}': {e}"
                     ))
                 })?;
+                warn_if_crl_expired(server_name, crl_path, crl.as_ref());
                 trace!("{server_name}: Added CRL from {crl_path}");
                 crls.push(crl);
             }
@@ -205,6 +206,48 @@ pub fn tls_config(
     );
 
     Ok(config)
+}
+
+/// Checks a DER-encoded X.509 CRL for expiration (`nextUpdate` in the past) or missing
+/// `nextUpdate` field, emitting a warning log if stale. Returns `true` if the CRL is
+/// valid and not expired, or `false` if expired, missing `nextUpdate`, or unparseable.
+pub fn warn_if_crl_expired(server_name: &str, crl_path: &str, crl_der: &[u8]) -> bool {
+    match x509_parser::parse_x509_crl(crl_der) {
+        Ok((_, parsed_crl)) => {
+            if let Some(next_update) = parsed_crl.next_update() {
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if next_update.timestamp() < now_ts {
+                    tracing::warn!(
+                        "{}: CRL '{}' has expired (nextUpdate: {}). Revocation checks may use stale data!",
+                        server_name,
+                        crl_path,
+                        next_update
+                    );
+                    return false;
+                }
+                true
+            } else {
+                tracing::warn!(
+                    "{}: CRL '{}' does not contain a nextUpdate field.",
+                    server_name,
+                    crl_path
+                );
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{}: Failed to parse CRL '{}' with x509-parser for expiration check: {}",
+                server_name,
+                crl_path,
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Extracts custom PKI OIDs from a DER-encoded X.509 certificate.

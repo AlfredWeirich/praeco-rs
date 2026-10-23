@@ -45,6 +45,8 @@ impl ConnectionTracker {
     /// If successful, returns a [`ConnectionGuard`] which automatically releases
     /// the permits when dropped.
     pub fn acquire(&self, ip: Option<IpAddr>) -> Result<ConnectionGuard, AcquireError> {
+        let ip = ip.map(common::canonical_client_ip);
+
         // 1. Check and increment global counter
         let current = self.current_connections.fetch_add(1, Ordering::SeqCst);
         if current >= self.max_connections {
@@ -82,7 +84,7 @@ impl ConnectionTracker {
     /// Internal release function called by [`ConnectionGuard::drop`].
     fn release(&self, ip: Option<IpAddr>) {
         self.current_connections.fetch_sub(1, Ordering::SeqCst);
-        if let Some(ip_addr) = ip {
+        if let Some(ip_addr) = ip.map(common::canonical_client_ip) {
             if !ip_addr.is_unspecified() {
                 if let dashmap::mapref::entry::Entry::Occupied(mut occ) = self.ip_counts.entry(ip_addr) {
                     let count = occ.get_mut();
@@ -103,7 +105,8 @@ impl ConnectionTracker {
 
     /// Returns the active connection count for a specific IP address.
     pub fn connections_for_ip(&self, ip: &IpAddr) -> u32 {
-        self.ip_counts.get(ip).map(|v| *v).unwrap_or(0)
+        let canonical = common::canonical_client_ip(*ip);
+        self.ip_counts.get(&canonical).map(|v| *v).unwrap_or(0)
     }
 
     /// Returns the configured global maximum number of connections.
@@ -128,6 +131,7 @@ impl ConnectionGuard {
     /// Associates a resolved client IP with this active connection guard,
     /// checking and incrementing the per-IP connection limit.
     pub fn bind_ip(&mut self, ip: IpAddr) -> Result<(), AcquireError> {
+        let ip = common::canonical_client_ip(ip);
         if ip.is_unspecified() || self.ip.is_some() {
             return Ok(());
         }

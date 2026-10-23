@@ -61,9 +61,9 @@ This flow allows a user on an untrusted device (like a desktop web browser) to s
 2. **Display & Polling:** 
    The browser displays the QR Code and the visual `user_code`. It continuously polls the IdP via `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>` (or `X-Poll-Secret` header). Without this secret, polling is rejected with `401 Unauthorized`. While unconfirmed, the IdP returns `{"status":"pending"}`.
    
-3. **Session Confirmation (with Quishing Protection):** 
-   The user scans the QR code with their trusted mobile app. The mobile app can display the code for user verification and makes a `POST` request to `/auth/confirm?session=<session_id>&code=<user_code>`. 
-   Crucially, the mobile app performs this request over an **mTLS connection** using its client certificate. The IdP verifies that `code` matches the session's `user_code`, extracts the identity claims (Subject and OIDs) from the mobile certificate, and marks the session as "confirmed".
+3. **Session Confirmation (Mandatory Quishing Protection & Brute-Force Lockout):** 
+   The user scans the QR code with their trusted mobile app. The mobile app can query `GET /auth/session_info?session=<session_id>` (without mTLS) to retrieve and display the 6-character `user_code` so the user can compare it with the desktop screen, and then makes a `POST` request to `/auth/confirm?session=<session_id>&code=<user_code>`. 
+   Crucially, the mobile app performs this confirmation over an **mTLS connection** using its client certificate. The `code` parameter is **mandatory**: the IdP verifies in constant time (`constant_time_eq`) that `code` matches the session's `user_code` **before** invoking any external Claims Webhook. After `3` failed confirmation attempts (`MAX_CONFIRM_ATTEMPTS = 3`), the session is permanently invalidated and evicted to prevent brute-force guessing. Upon matching, the IdP extracts the identity claims (Subject and OIDs) from the mobile certificate (or resolves them via the Claims Webhook) and marks the session as "confirmed".
    
 4. **Token Issuance & Single Use Consumption:** 
    On the browser's next polling request to `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>`, the IdP sees the session is confirmed. It generates a signed JWT and atomically consumes (removes) the session to prevent replay.
@@ -125,13 +125,17 @@ curl -s "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK...
 
 **Step 3: Confirm Session via mTLS (Trusted Device)**
 ```bash
-# The trusted device uses its certificate and optional user_code to confirm
+# Optional: Mobile app fetches the 6-char user_code to display for visual verification
+curl -s "https://localhost:1339/auth/session_info?session=abc123xyz"
+# Example Response: {"user_code":"K7X-9P2"}
+
+# The trusted device uses its mTLS certificate and the MANDATORY user_code to confirm
 curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz&code=K7X-9P2" \
   --cert client_certs/device.crt \
   --key client_certs/device.key \
   --cacert server_certs/ca.crt
 ```
-*Example Response:* `{"status":"confirmed"}`
+*Example Response:* `{"status":"confirmed"}` (or `400 Bad Request` on invalid code; session is permanently invalidated after 3 failed attempts).
 
 **Step 4: Retrieve JWT (Untrusted Client)**
 ```bash
@@ -185,13 +189,12 @@ sequenceDiagram
     participant Backend as Backend API<br/>(Webhook)
 
     Browser->>IdP: 1. POST /auth/login
-    IdP-->>Browser: {"session": "abc"}
-    Note over Browser: Displays QR Code
+    IdP-->>Browser: {"session": "abc", "poll_secret": "sec...", "user_code": "K7X-9P2"}
+    Note over Browser: Displays QR Code & User Code K7X-9P2
 
-    Note over Mobile: Scans QR Code
-    Mobile->>IdP: 2. POST /auth/confirm?session=abc (mTLS)
-    Note over IdP: Validates mTLS Certificate
-    Note over IdP: Checks Certificate Revocation List (CRL)
+    Note over Mobile: Scans QR Code & verifies K7X-9P2
+    Mobile->>IdP: 2. POST /auth/confirm?session=abc&code=K7X-9P2 (mTLS)
+    Note over IdP: 1. Validates mTLS Certificate & CRL<br/>2. Verifies user_code BEFORE webhook (max 3 attempts)
 
     IdP->>Backend: 3. POST /internal/claims (HTTPS / mTLS)<br/>{"sub":"device.uuid","cert_oids":[]}
     Note over Backend: SELECT role FROM users<br/>WHERE uuid = 'uuid'
@@ -200,7 +203,7 @@ sequenceDiagram
     Note over IdP: Overwrites claims.oids = ["2"]
     IdP-->>Mobile: {"status":"confirmed"}
 
-    Browser->>IdP: 4. GET /auth/status
+    Browser->>IdP: 4. GET /auth/status?session=abc&poll_secret=sec...
     Note over IdP: Issues JWT with jti=UUIDv4, oids=["2"]
     IdP-->>Browser: Set-Cookie: praeco_jwt=...<br/>{"status":"confirmed"}
 ```
@@ -235,9 +238,9 @@ Resource Servers can periodically poll this endpoint to maintain an up-to-date c
 Praeco provides built-in support for token revocation and browser session invalidation:
 
 1. **Cryptographic `jti` (JWT ID):** Every JWT issued by the IdP is stamped with a unique UUIDv4 `jti`.
-2. **Denylist Storage (`JwtRevocationStore`):** In-memory, lock-free thread-safe storage tracks revoked `jti` entries until their natural expiration time (`exp`).
+2. **Bounded Denylist Storage (`JwtRevocationStore`):** Thread-safe in-memory storage tracks revoked `jti` entries until their natural expiration time (`exp`). To protect against memory exhaustion (OOM), `JwtRevocationStore` is bounded to `50,000` active entries (`MAX_REVOKED_ENTRIES = 50_000`), enforces a maximum `jti` length of `256` bytes (`MAX_JTI_LEN = 256`), and performs throttled expired-entry cleanup every `30` seconds (`REVOCATION_CLEANUP_INTERVAL_SECS = 30`).
 3. **Revocation Endpoint (`POST /auth/revoke`):**
-   - **Logout:** Calling `POST /auth/revoke` with an `Authorization: Bearer <token>` header or session cookie extracts the `jti` and registers it in the revocation store.
-   - **Explicit Revocation:** Calling `POST /auth/revoke?jti=<UUID>` immediately revokes a specific token ID (e.g. from an administrative interface).
+   - **Browser / Bearer Logout:** Calling `POST /auth/revoke` with an `Authorization: Bearer <token>` header or session cookie extracts the `jti` from the token and registers it in the revocation store.
+   - **mTLS-Protected Explicit Revocation:** Calling `POST /auth/revoke?jti=<UUID>` to revoke an explicit token ID requires a valid **mTLS client certificate** (`401 Unauthorized: mTLS required to revoke explicit JTI` without mTLS), preventing unauthenticated attackers from flooding the revocation store or revoking arbitrary sessions.
    - **Cookie Invalidation:** Returns `Set-Cookie: <cookie_name>=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT` to clear the browser cookie immediately.
 4. **Enforcement in `JwtAuthService`:** Before forwarding any request with a JWT to downstream microservices, the proxy checks the revocation store. Revoked tokens are immediately rejected with `401 Unauthorized`.

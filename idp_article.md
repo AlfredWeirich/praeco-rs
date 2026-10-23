@@ -58,21 +58,21 @@ For this, the IdP leverages the trusted, certificate-bearing mobile app to secur
 From a user's perspective, this complex cryptographic handshake is completely invisible. It boils down to a simple, familiar QR code scan. Here is the UX flow and how it looks in our practical example, the ChatApp.
 
 #### 1. Session Initiation & Display (The Web Browser)
-The user opens the Admin Dashboard in their desktop browser. Because they aren’t authenticated, Praeco redirects them to the IdP login page. The browser requests a temporary session and renders the returned `session_id` as a large QR code on the screen.
+The user opens the Admin Dashboard in their desktop browser. Because they aren’t authenticated, Praeco redirects them to the IdP login page. The browser requests a temporary session and renders the returned `session_id` as a large QR code alongside a 6-character visual `user_code` on the screen.
 
 > **[PLACEHOLDER FOR IMAGE 1]**
 > `<!-- INSERT IMAGE: Desktop browser showing the QR code on the login page -->`
-> *Caption: The desktop browser displaying the generated QR code, waiting for the user to scan it.*
+> *Caption: The desktop browser displaying the generated QR code and 6-character user code, waiting for the user to scan it.*
 
 Behind the scenes, the browser initiated the session like this:
 ```bash
-# Request a new session_id
+# Request a new session_id, high-entropy poll_secret, and 6-character user_code
 curl -s -X POST https://localhost:1339/auth/login
-# Response: {"session":"abc123xyz"}
+# Response: {"session":"abc123xyz","poll_secret":"8R1NQlJlr...","user_code":"K7X-9P2"}
 ```
-And starts continuously polling for confirmation:
+And starts continuously polling for confirmation (authenticated by `poll_secret` to prevent session hijacking):
 ```bash
-curl -s "https://localhost:1339/auth/status?session=abc123xyz"
+curl -s "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=8R1NQlJlr..."
 # Response: {"status":"pending"}
 ```
 
@@ -83,20 +83,20 @@ The user opens their trusted ChatApp on their iPhone and uses the built-in QR sc
 > `<!-- INSERT IMAGE: iPhone app showing the camera scanning the QR code / confirming login -->`
 > *Caption: The trusted ChatApp scanning the QR code and prompting the user to confirm the login.*
 
-Once the user confirms, the mobile app sends an authorization request to the IdP. **Crucially, this request is made over an mTLS connection using the iPhone's securely stored client certificate.** 
+To protect against **Quishing** (QR-code phishing), the mobile app fetches the session's visual code (`GET /auth/session_info?session=abc123xyz`) and displays it so the user can verify it matches `K7X-9P2` on their desktop screen. Once the user confirms, the mobile app sends an authorization request to the IdP including the mandatory `code` parameter. **Crucially, this request is made over an mTLS connection using the iPhone's securely stored client certificate.** 
 
-Praeco extracts the user's identity (UUID) and Admin/Seller roles directly from the certificate during the TLS handshake, and attaches those cryptographically verified claims to the pending session.
+Praeco verifies the 6-character `user_code` in constant time (invalidating the session after 3 failed attempts) **before** querying any external Claims Webhook, extracts the user's identity (UUID) and Admin/Seller roles from the certificate (or dynamic Claims Webhook), and attaches those cryptographically verified claims to the pending session.
 
 ```bash
-# The trusted mobile app confirms the session using its mTLS cert
-curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz" \
+# The trusted mobile app confirms the session using its mTLS cert and mandatory user_code
+curl -s -X POST "https://localhost:1339/auth/confirm?session=abc123xyz&code=K7X-9P2" \
   --cert client_certs/device.crt \
   --key client_certs/device.key \
   --cacert server_certs/ca.crt
 ```
 
 #### 3. Token Issuance & Redirection (The Web Browser)
-On the next poll interval, the desktop browser sees that the session is confirmed. The Praeco IdP generates a JWT signed with its own private EdDSA key, embedding the roles and UUID extracted from the mobile certificate. 
+On the next poll interval, the desktop browser sees that the session is confirmed. The Praeco IdP atomically consumes the session (single-use) and generates a JWT signed with its own private EdDSA key, embedding the roles, UUID, and a unique `jti` (for revocation support via `POST /auth/revoke`). 
 
 To ensure maximum security, the JWT is returned as an `HttpOnly`, `Secure`, and `SameSite=Lax` cookie. 
 
@@ -125,22 +125,22 @@ sequenceDiagram
 
     %% 1. Session Init
     Browser->>IdP: 1. POST /auth/login (Standard TLS)
-    IdP-->>Browser: 200 OK {"session": "abc123xyz"}
-    Note over Browser: Displays QR Code (Session ID)
+    IdP-->>Browser: 200 OK {"session": "abc123xyz", "poll_secret": "sec...", "user_code": "K7X-9P2"}
+    Note over Browser: Displays QR Code & User Code K7X-9P2
 
     %% 2. Polling
-    Browser->>IdP: 2. GET /auth/status?session=abc123xyz (Polling)
+    Browser->>IdP: 2. GET /auth/status?session=abc123xyz&poll_secret=sec... (Polling)
     IdP-->>Browser: 200 OK {"status": "pending"}
 
     %% 3. Mobile Scan & Confirmation
-    Note over Mobile: User scans QR Code
-    Mobile->>IdP: 3. POST /auth/confirm?session=abc123xyz (mTLS)
-    Note over IdP: Validates iPhone Certificate<br/>Extracts UUID & Roles (OIDs)<br/>Marks session "confirmed"
+    Note over Mobile: User scans QR Code & verifies K7X-9P2
+    Mobile->>IdP: 3. POST /auth/confirm?session=abc123xyz&code=K7X-9P2 (mTLS)
+    Note over IdP: Validates iPhone Certificate & User Code (max 3 tries)<br/>Extracts UUID & Roles (OIDs / Webhook)<br/>Marks session "confirmed"
     IdP-->>Mobile: 200 OK {"status": "confirmed"}
 
     %% 4. Issuance
-    Browser->>IdP: 4. GET /auth/status?session=abc123xyz (Next Poll)
-    Note over IdP: Session Confirmed!<br/>Issues signed JWT with iPhone claims
+    Browser->>IdP: 4. GET /auth/status?session=abc123xyz&poll_secret=sec... (Next Poll)
+    Note over IdP: Session Confirmed!<br/>Atomically consumes session & issues signed JWT
     IdP-->>Browser: 200 OK Set-Cookie: admin-jwt=... (HttpOnly, Secure, SameSite=Lax)<br/>{"status": "confirmed", "redirect": "/admin"}
 
     %% 5. Access
@@ -205,14 +205,26 @@ We define a new server block running on port `1339`. Notice that `authentication
     
     [Server.IdpParams]
         jwt_private_key = "/certs/idp_private.pem"
+        jwt_public_key = "/certs/idp_public.pem"
         token_expiry_seconds = 28800 # 8 hours
         session_ttl_seconds = 120
         cookie_name = "admin-jwt"
         redirect_after_login = "https://localhost:1338/admin"
+        issuer = "wurzelwerk-idp"
+        allowed_audiences = ["wurzelwerk-admin"]
+
+    [Server.Layers]
+        enabled = ["Logger", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.TokenBucketRateLimiter]
+        max_capacity = 60
+        refill = 10
+        duration_micros = 1000000
+        key_by = "ip"
 ```
 
 ### 2. The Admin Server (Consuming the JWT)
-On the actual Admin Dashboard server (Port `1338`), we enable the `JwtAuth` layer. We provide it with the IdP's public key so it can cryptographically verify incoming requests. 
+On the actual Admin Dashboard server (Port `1338`), we enable the `JwtAuth` layer. We provide it with the IdP's public key and mandatory `expected_issuer` and `expected_audience` claims so it can cryptographically verify incoming requests. 
 
 If a request arrives without a valid JWT cookie, Praeco intercepts it and automatically redirects the user to the IdP login page.
 
@@ -221,15 +233,17 @@ If a request arrives without a valid JWT cookie, Praeco intercepts it and automa
     name = "chatapp_admin"
     port = 1338
     protocol = "https"
-    authentication = "None"
+    authentication = "JWT"
     
     [Server.Layers]
-        enabled = ["JwtAuth", "SecurityHeaders", "Proxy"]
+        enabled = ["Logger", "JwtAuth", "SecurityHeaders"]
 
     [Server.Layers.JWT]
         jwt_public_keys = ["/certs/idp_public.pem"]
         cookie_fallback = "admin-jwt"
         redirect_on_failure = "https://localhost:1339/auth/login_page"
+        expected_issuer = "wurzelwerk-idp"
+        expected_audience = "wurzelwerk-admin"
 ```
 
 ## Conclusion

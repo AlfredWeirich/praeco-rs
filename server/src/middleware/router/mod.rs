@@ -262,6 +262,15 @@ impl Service<Request<SrvBody>> for RouterService {
             let original_method = parts.method;
             let mut prepared_headers = parts.headers;
 
+            // For HTTP/2 and HTTP/3, populate Host from :authority if not explicitly present
+            if !prepared_headers.contains_key(header::HOST) {
+                if let Some(auth) = parts.uri.authority() {
+                    if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+                        prepared_headers.insert(header::HOST, hv);
+                    }
+                }
+            }
+
             if let Err(err_resp) = headers::prepare_proxy_headers(
                 &mut prepared_headers,
                 server_name,

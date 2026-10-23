@@ -16,17 +16,17 @@ Das System besteht aus zwei Ebenen:
 
 1. **Control Plane (Standard Port 7001 / mTLS + Yamux):**
    - Lokale Praeco-Instanzen verbinden sich ausgehend (outbound) mit diesem Port.
-   - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) abgesichert.
-   - Praeco meldet über ein einfaches Textprotokoll (`REGISTER <sni_domain>\n`), für welche Domain es verantwortlich ist (z.B. `api.aweirich.eu`).
+   - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) sowie eine optionale Certificate Revocation List (`crl_path`, inkl. automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start) abgesichert.
+   - **SAN-zu-SNI Autorisierung:** Der Relay-Server extrahiert die X.509 Subject Alternative Names (SANs) bzw. den Common Name (CN) aus dem präsentierten Client-Zertifikat und stellt kryptografisch sicher, dass eine Praeco-Instanz via `REGISTER <sni_domain>\n` ausschließlich Domains registrieren darf, für die ihr Zertifikat autorisiert ist (inkl. RFC-6125-konformer Wildcard-Prüfung wie `*.aweirich.eu`).
    - Anschließend wird die Verbindung auf das **Yamux** Multiplexing-Protokoll umgeschaltet, sodass mehrere unabhängige Streams durch eine einzige TCP-Verbindung geleitet werden können.
    - **Health Checks & Keepalive:** Der Relay-Server überwacht die Tunnel-Gesundheit durch OS-Level TCP-Keepalive auf Socket-Ebene (30s Probe, 10s Intervall). Tote Verbindungen werden zuverlässig bereinigt, ohne störende Dummy-Streams oder TLS-Handshake-Fehlalarme am Gateway zu verursachen.
-   - **Route-Overwrite-Schutz:** Eine Neuregistrierung einer Domain wird abgewiesen, solange bereits ein aktiver, gesunder Tunnel für diesen SNI existiert (Schutz vor Kaperung/Blackholing).
-   - **PROXY-Protocol v2 Negozierung:** Praeco kann beim Registrieren dynamisch das Feature `PROXY_V2` aushandeln (`REGISTER <sni> PROXY_V2`). In diesem Fall schickt das Relay für jeden eingehenden Client den binären HAProxy PROXY-Protocol v2 Header mit der echten Client-IP (IPv4/IPv6) voran.
+   - **Route-Overwrite-Schutz & Generations-ID:** Eine Neuregistrierung einer Domain wird abgewiesen, solange bereits ein aktiver, gesunder Tunnel für diesen SNI existiert (Schutz vor Kaperung/Blackholing). Jede Registrierung ist mit einer eindeutigen `generation_id` versehen, sodass das Schließen einer veralteten Verbindung niemals einen bereits neu aufgebauten Tunnel aus der Routing-Tabelle entfernt.
+   - **PROXY-Protocol v2 Negozierung (Fail-Closed):** Praeco kann beim Registrieren dynamisch das Feature `PROXY_V2` aushandeln (`REGISTER <sni> PROXY_V2`). In diesem Fall schickt das Relay für jeden eingehenden Client den binären HAProxy PROXY-Protocol v2 Header mit der echten Client-IP (IPv4/IPv6) voran. Ist `proxy_protocol = true` am Praeco-Gateway aktiv, prüft Praeco den 16-Byte PPv2-Header strikt **fail-closed** und verwirft jeden Stream ohne gültige PPv2-Signatur sofort.
 
 2. **Data Plane (Standard Port 443 / SNI-Routing):**
    - Nimmt öffentliche Client-Verbindungen (z.B. aus dem Webbrowser) unverschlüsselt auf TCP-Ebene an.
-   - Der Server liest den initialen TLS-Handshake (`ClientHello`) geschützt gegen Slowloris (10s Timeout) und handhabt TCP-Fragmentierung sowie große Post-Quantum Key Shares sauber.
-   - Schützt vor DoS-Angriffen über globale Verbindungs-Limits, Concurrency-Caps pro IP und aggregiertes IPv6 `/64`-Rate-Limiting.
+   - Der Server akkumuliert den initialen TLS-Handshake (`ClientHello`, bis zu 16 KB) geschützt gegen Slowloris (10s Timeout) und handhabt TCP-Fragmentierung sowie große Post-Quantum Key Shares sauber.
+   - Schützt vor DoS-Angriffen über globale Verbindungs-Limits, Concurrency-Caps pro IP und eine auf `100.000` Einträge begrenzte L4-Rate-Limiting-Tabelle mittels `canonical_client_ip` (IPv4-mapped IPv6 Unwrapping sowie IPv6 `/64`-Subnetz-Maskierung).
    - Er sucht nach einer aktiven Praeco-Verbindung für diese SNI.
    - Es wird asynchron ein neuer **Yamux-Stream** (bis zu 4096 Streams pro Tunnel) in der bestehenden Control-Plane-Verbindung geöffnet.
    - Bei ausgehandeltem `PROXY_V2` wird zuerst der 28-Byte (IPv4) bzw. 52-Byte (IPv6) PPv2-Header und danach der TLS-Stream weitergeleitet. Praeco terminiert das TLS lokal und nutzt die echte Client-IP für Rate-Limiting, Concurrency-Limits und Access-Logs.
@@ -60,6 +60,7 @@ data_plane_addr = "0.0.0.0:443"
 
 # Zertifikate für die Control-Plane Authentifizierung
 ca_cert_path = "server_certs/self_signed/myca.pem"
+# crl_path = "server_certs/self_signed/myca.crl.pem" # Optional: CRL mit nextUpdate-Prüfung
 server_cert_path = "server_certs/self_signed/fullchain_self.pem"
 server_key_path = "server_certs/self_signed/privkey_self.pem"
 

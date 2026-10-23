@@ -148,8 +148,24 @@ impl SessionStore {
         client_ip: Option<IpAddr>,
         aud: Option<String>,
     ) -> Result<SessionInfo, CreateSessionError> {
-        // 1. IP Rate Limiting
+        let client_ip = client_ip.map(common::canonical_client_ip);
+
+        // 1. Throttled Cleanup
+        self.maybe_cleanup_expired();
+
+        // 2. IP Rate Limiting
         if let Some(ip) = client_ip {
+            if !self.ip_rate_limits.contains_key(&ip)
+                && self.ip_rate_limits.len() >= self.max_active_sessions * 2
+            {
+                self.cleanup_expired_force();
+                if !self.ip_rate_limits.contains_key(&ip)
+                    && self.ip_rate_limits.len() >= self.max_active_sessions * 2
+                {
+                    warn!("IdP IP rate limit table capacity reached");
+                    return Err(CreateSessionError::CapacityExceeded);
+                }
+            }
             let mut rate_entry = self.ip_rate_limits.entry(ip).or_insert((0, Instant::now()));
             let (count, start) = rate_entry.value_mut();
             if start.elapsed() > RATE_LIMIT_WINDOW {
@@ -163,9 +179,6 @@ impl SessionStore {
                 }
             }
         }
-
-        // 2. Throttled Cleanup
-        self.maybe_cleanup_expired();
 
         // 3. Capacity Check
         if self.sessions.len() >= self.max_active_sessions {

@@ -10,10 +10,10 @@ Das System ist in drei voneinander unabhängige Vertrauensbereiche (Trust Zones)
 
 ### 1. Die mTLS-Brücke (Identitäts-Prüfung)
 Verbindet die iOS-App, das Praeco Gateway und das ChatApp Backend über striktes Mutual TLS.
-- **Root of Trust:** `ca.pem` (ChatApp)
+- **Root of Trust:** `ca.pem` (ChatApp) — strikt isolierter Root-Store ohne Vermischung mit öffentlichen Mozilla-WebPKI-Wurzeln (`build_root_store`).
 - **Abhängigkeiten:**
   - **ChatApp (`Config.toml`):** Nutzt `ca.key`, um Zertifikate für iOS-Geräte auszustellen (Onboarding).
-  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren.
+  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren, sowie optional `ssl_client_crl` (mit automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start und Hot-Reload).
   - **Praeco Intern:** Praeco leitet Traffic an die ChatApp weiter und authentifiziert sich dabei selbst per mTLS mit `proxy-client.pem`.
   - **ChatApp Server:** Der gRPC-Server der ChatApp vertraut eingehenden Praeco-Verbindungen, da auch `proxy-client.pem` von `ca.pem` signiert wurde.
 
@@ -24,14 +24,14 @@ Regelt, wie administrative JWT-Ausweise signiert und verifiziert werden.
   - **Praeco IdP:** Signiert JWTs mit `idp_private.pem`.
   - **ChatApp Backend:** Verifiziert diese JWTs, indem es den öffentlichen Schlüssel über die Route `/.well-known/jwks.json` abruft (`idp_jwks_url`).
   - **TLS-Abhängigkeit:** Damit die ChatApp den IdP-Endpoint sicher per HTTPS erreichen kann, muss sie dem TLS-Zertifikat des IdPs vertrauen. (Bisher über die intern mitgelieferte `public_ca.pem` gelöst).
-  - **Praeco IdP Webhook (Neu):** Der IdP ruft das ChatApp Backend unter `/internal/claims` auf, um tagesaktuelle Rollen für das JWT zu holen. Dabei authentifiziert er sich via mTLS mit dem internen `proxy-client.pem` (genau wie das Gateway), welches von der ChatApp über `ca.pem` validiert wird.
+  - **Praeco IdP Webhook & Revocation:** Der IdP ruft das ChatApp Backend unter `/internal/claims` erst **nach** erfolgreicher Constant-Time-Prüfung des 6-stelligen Quishing-Schutzcodes (`user_code`, max. 3 Versuche) auf, um tagesaktuelle Rollen für das JWT zu holen. Dabei authentifiziert er sich via mTLS mit dem internen `proxy-client.pem` (genau wie das Gateway), welches von der ChatApp über `ca.pem` validiert wird. Ebenso erfordert der explizite Token-Widerruf (`POST /auth/revoke?jti=...`) am IdP ein gültiges mTLS-Clientzertifikat.
 
 ### 3. Das Relay-Tunnel Puzzle (Control Plane / Firewall-Bypass)
 Sichert den Tunnel zwischen dem lokalen Praeco-Netzwerk und dem Cloud-Relay.
 - **Root of Trust:** `relay_ca.pem`
 - **Abhängigkeiten:**
-  - **Praeco Tunnel-Client:** Nutzt `praeco_client.pem` als Ausweis und prüft den Server gegen `relay_ca.pem`.
-  - **Relay Server (`RelayConfig.toml`):** Nutzt `relay_server.pem` als Ausweis und prüft eingehende Praeco-Verbindungen gegen `relay_ca.pem`.
+  - **Praeco Tunnel-Client:** Nutzt `praeco_client.pem` als Ausweis (dessen X.509 SANs/CN die zu registrierende `sni_domain` abdecken müssen) und prüft den Server gegen `relay_ca.pem`.
+  - **Relay Server (`RelayConfig.toml`):** Nutzt `relay_server.pem` als Ausweis, prüft eingehende Praeco-Verbindungen gegen `relay_ca.pem` (sowie optional `crl_path` inkl. `nextUpdate`-Prüfung) und autorisiert `REGISTER <sni> [PROXY_V2]` strikt anhand der Zertifikats-SANs.
   - Beide Endpunkt-Zertifikate **müssen** von der isolierten `relay_ca.pem` ausgestellt worden sein.
 
 ---

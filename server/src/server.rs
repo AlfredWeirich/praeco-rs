@@ -1158,6 +1158,7 @@ fn apply_layers(
                     Duration::from_secs(cfg.ttl_seconds),
                     server_name,
                 )
+                .with_trust_forwarded_headers(cfg.trust_forwarded_headers)
                 .layer(svc)
                 .boxed_clone_sync()
             }
@@ -1176,6 +1177,7 @@ fn apply_layers(
                     Duration::from_secs(cfg.ttl_seconds),
                     server_name,
                 )
+                .with_trust_forwarded_headers(cfg.trust_forwarded_headers)
                 .layer(svc)
                 .boxed_clone_sync()
             }
@@ -1953,6 +1955,54 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, FuturesAsyncReadCompatExt};
 use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 
+/// Resolves the client address of a freshly accepted tunneled (Yamux) stream.
+///
+/// * `use_proxy_protocol == false`: the peer is unknown and attributed to `0.0.0.0:0`.
+/// * `use_proxy_protocol == true`: a valid HAProxy PROXY v2 header is **mandatory**. A
+///   stream that does not start with one (wrong magic, truncated, I/O error or timeout)
+///   yields `None` and must be dropped by the caller (fail-closed).
+///
+/// A PROXY v2 `LOCAL` command (no address) is accepted and attributed to `0.0.0.0:0`.
+async fn resolve_tunnel_peer<S>(
+    mut stream: S,
+    use_proxy_protocol: bool,
+    server_name: &str,
+) -> Option<(std::net::SocketAddr, S)>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let unspecified = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    if !use_proxy_protocol {
+        return Some((unspecified, stream));
+    }
+
+    let pp_result = tokio::time::timeout(
+        Duration::from_secs(5),
+        common::proxy_protocol::read_proxy_v2(&mut stream),
+    )
+    .await;
+
+    match pp_result {
+        Ok(Ok(Some(addr))) => Some((addr, stream)),
+        Ok(Ok(None)) => Some((unspecified, stream)),
+        Ok(Err(common::proxy_protocol::ProxyProtocolError::InvalidMagic(_prefix))) => {
+            warn!(
+                "{}: Rejecting tunneled connection: proxy_protocol is enabled but stream did not start with a valid PROXY v2 header",
+                server_name
+            );
+            None
+        }
+        Ok(Err(e)) => {
+            warn!("{}: Failed to read PROXY-Protocol header: {}", server_name, e);
+            None
+        }
+        Err(_) => {
+            warn!("{}: PROXY-Protocol read timed out", server_name);
+            None
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain))]
 async fn run_tunnel(
     tunnel: praeco_rs::configuration::TunnelConfig,
@@ -2058,41 +2108,19 @@ async fn run_tunnel(
                             tokio::spawn(async move {
                                 let mut connection_guard = connection_guard;
                                 // Provide AsyncRead/Write compat for hyper
-                                let mut compat_stream = yamux_stream.compat();
+                                let compat_stream = yamux_stream.compat();
 
-                                let (peer_addr, stream) = if use_proxy_protocol {
-                                    let pp_result = tokio::time::timeout(
-                                        Duration::from_secs(5),
-                                        common::proxy_protocol::read_proxy_v2(&mut compat_stream),
-                                    ).await;
-
-                                    match pp_result {
-                                        Ok(Ok(Some(addr))) => (addr, compat_stream),
-                                        Ok(Ok(None)) => (
-                                            std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                                            compat_stream,
-                                        ),
-                                        Ok(Err(common::proxy_protocol::ProxyProtocolError::InvalidMagic(_prefix))) => {
-                                            warn!(
-                                                "{}: Rejecting tunneled connection: proxy_protocol is enabled but stream did not start with a valid PROXY v2 header",
-                                                server_name
-                                            );
-                                            return;
-                                        }
-                                        Ok(Err(e)) => {
-                                            warn!("{}: Failed to read PROXY-Protocol header: {}", server_name, e);
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            warn!("{}: PROXY-Protocol read timed out", server_name);
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    (
-                                        std::net::SocketAddr::from(([0, 0, 0, 0], 0)),
-                                        compat_stream,
-                                    )
+                                // Fail-closed: with `proxy_protocol = true` a stream without a
+                                // valid PROXY v2 header is dropped instead of being attributed
+                                // to the unspecified address (which would bypass per-IP limits).
+                                let Some((peer_addr, stream)) = resolve_tunnel_peer(
+                                    compat_stream,
+                                    use_proxy_protocol,
+                                    server_name,
+                                )
+                                .await
+                                else {
+                                    return;
                                 };
 
                                 // Enforce per-IP concurrency limits now that real client IP is resolved
@@ -2169,3 +2197,77 @@ async fn run_tunnel(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tunnel_peer_tests {
+    use super::resolve_tunnel_peer;
+    use std::io::Cursor;
+    use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn test_without_proxy_protocol_peer_is_unspecified() {
+        let (addr, _stream) = resolve_tunnel_peer(Cursor::new(vec![0x16, 0x03, 0x01]), false, "t")
+            .await
+            .expect("stream without proxy_protocol must be accepted");
+        assert!(addr.ip().is_unspecified());
+    }
+
+    #[tokio::test]
+    async fn test_valid_proxy_v2_ipv4_header_yields_real_client_addr() {
+        let src: SocketAddr = "203.0.113.7:54321".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let mut bytes = common::proxy_protocol::encode_proxy_v2(src, dst);
+        bytes.extend_from_slice(b"\x16\x03\x01tls-client-hello");
+
+        let (addr, _stream) = resolve_tunnel_peer(Cursor::new(bytes), true, "t")
+            .await
+            .expect("valid PROXY v2 header must be accepted");
+        assert_eq!(addr, src);
+    }
+
+    #[tokio::test]
+    async fn test_valid_proxy_v2_ipv6_header_yields_real_client_addr() {
+        let src: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
+        let dst: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let bytes = common::proxy_protocol::encode_proxy_v2(src, dst);
+
+        let (addr, _stream) = resolve_tunnel_peer(Cursor::new(bytes), true, "t")
+            .await
+            .expect("valid IPv6 PROXY v2 header must be accepted");
+        assert_eq!(addr, src);
+    }
+
+    /// [F-04] A raw TLS ClientHello (no PROXY header) must be rejected fail-closed
+    /// when `proxy_protocol = true`, never attributed to `0.0.0.0:0`.
+    #[tokio::test]
+    async fn test_missing_proxy_header_is_rejected_fail_closed() {
+        let tls_client_hello = vec![
+            0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03, 0xde, 0xad, 0xbe,
+            0xef, 0x00, 0x11, 0x22, 0x33, 0x44,
+        ];
+        assert!(
+            resolve_tunnel_peer(Cursor::new(tls_client_hello), true, "t")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_proxy_header_is_rejected() {
+        // Fewer than the 16 bytes of a PROXY v2 fixed header, then EOF.
+        assert!(
+            resolve_tunnel_peer(Cursor::new(vec![0x0d, 0x0a, 0x0d, 0x0a]), true, "t")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_empty_stream_is_rejected_when_proxy_protocol_required() {
+        assert!(
+            resolve_tunnel_peer(Cursor::new(Vec::<u8>::new()), true, "t")
+                .await
+                .is_none()
+        );
+    }
+}
