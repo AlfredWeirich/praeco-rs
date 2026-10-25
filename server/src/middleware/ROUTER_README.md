@@ -83,7 +83,7 @@ pub struct RouterService {
 |--------|---------|
 | `http_proxy` | Handles standard REST/HTTP forwarding, URI rewrites, and retries. |
 | `grpc_passthrough` | Proxies pure gRPC traffic, fixing `te: trailers` and managing streaming. |
-| `grpc_web` | Handles dynamic JSON-to-Protobuf transcoding using non-blocking async reflection (`tokio::fs::read`), preserving `content-type: application/grpc` and `te: trailers`, enforcing `request_timeout_seconds`, and bounding upstream responses to `16 MiB` (`http_body_util::Limited`). |
+| `grpc_web` | Handles dynamic JSON-to-Protobuf transcoding using non-blocking async reflection (`tokio::fs::read`), preserving `content-type: application/grpc` and `te: trailers`, propagating W3C `traceparent` (`HeaderInjector`) and `x-trace-id` headers end-to-end, enforcing `request_timeout_seconds`, and bounding upstream responses to `16 MiB` (`http_body_util::Limited`). |
 | `rbac` | Enforces Role-Based Access Control logic based on configured OIDs. |
 | `headers` | Prepares proxy headers, unconditionally strips client identity and forwarding headers, strips hop-by-hop headers, authoritatively sets `X-Forwarded-*` / `X-Real-IP`, and cleans upstream responses. |
 | `upstreams` | Upstream management and target evaluation logic. |

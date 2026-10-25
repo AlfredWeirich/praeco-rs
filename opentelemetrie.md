@@ -27,11 +27,14 @@ A **Trace** consists of a tree of **Spans**.
 
 We leverage the Rust ecosystem around `tracing`, `tower-http`, and `opentelemetry`.
 
-1. **The Root Span (Entry):** 
-   The `tower-http` middleware (TraceLayer) intercepts every HTTP request in the proxy and backend. It creates the root span (e.g., `POST /chat.ChatService/StreamMessages`).
-   *Special Note:* We manually extract the `TraceContext` from the HTTP headers here (`opentelemetry::global::get_text_map_propagator`) so the backend knows to attach to an existing trace from the proxy.
+1. **The Root Span & Edge Context Extraction (Entry):** 
+   - **Outer `TraceLayer` (`server.rs`):** The `tower-http` `TraceLayer` intercepts every incoming HTTP request and constructs the root `"request"` span (e.g., `POST /chat.ChatService/StreamMessages`). Before the span is entered, `make_span_with` extracts any client-supplied W3C `traceparent` header via `opentelemetry_http::HeaderExtractor` and attaches it via `OpenTelemetrySpanExt::set_parent`.
+   - **`TraceIdLayer` (`middleware/trace_id.rs`):** Extracts an existing `traceparent` (or `x-trace-id` fallback), or synthesizes a fresh W3C `00-{trace-id}-{span-id}-01` identifier if none was sent by the client. It stores the identifier in the HTTP request extensions, ensures the `traceparent` header is present on the request, attaches the extracted W3C `SpanContext` to a dedicated `trace_id` span **prior to first entry** (avoiding `SetParentError::AlreadyStarted`), and instruments the inner service future (`Instrumented<S::Future>`) with zero heap boxing overhead.
 
-2. **Sub-Spans (Method Level):** 
+2. **Downstream Propagation (`HeaderInjector`):**
+   When `RouterService` dispatches an upstream request—whether via `http_proxy` (REST), `grpc_passthrough` (native HTTP/2 gRPC), or `grpc_web` (dynamic JSON-to-gRPC transcoding)—it injects the active OpenTelemetry span context (`traceparent`, `tracestate`) into the outgoing request headers via `opentelemetry_http::HeaderInjector` and mirrors the authoritative `traceparent` value into `x-trace-id`.
+
+3. **Sub-Spans (Method Level):** 
    Using the `#[tracing::instrument(skip_all)]` macro, we instrument asynchronous handler methods (like `do_stream_messages` or `authorize_request`). Rust automatically creates a child span when these functions are called.
 
 ---

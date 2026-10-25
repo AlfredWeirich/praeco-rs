@@ -1,3 +1,34 @@
+//! # Dynamic JSON-to-gRPC Transcoding (`GrpcTranscoding`)
+//!
+//! This module implements Praeco's on-the-fly **REST/JSON-to-gRPC transcoding** engine.
+//! It enables standard HTTP/1.1, HTTP/2, or HTTP/3 clients (such as web browsers or
+//! REST services) to invoke backend gRPC methods using regular JSON payloads without
+//! requiring pre-compiled `.proto` stubs at the gateway.
+//!
+//! ## Architecture & Workflow
+//!
+//! 1. **Dynamic Schema Discovery (`build_grpc_pool`)**:
+//!    - Queries the upstream gRPC server via the standard **gRPC Server Reflection** protocol
+//!      (`grpc.reflection.v1alpha.ServerReflection`) over HTTP/2 (supporting both plaintext `h2c`
+//!      and End-to-End TLS/mTLS).
+//!    - Compiles the returned `FileDescriptorProto` definitions into a cached
+//!      [`prost_reflect::DescriptorPool`] with configurable TTL and *stale-while-revalidate*
+//!      fallback resilience.
+//! 2. **JSON-to-Protobuf Framing (`handle_grpc_web`)**:
+//!    - Resolves the target gRPC service and method from the URI path (`/<package>.<Service>/<Method>`).
+//!    - Deserializes the incoming JSON body directly into a [`prost_reflect::DynamicMessage`]
+//!      seeded by the method's input descriptor, encodes it into binary Protobuf, and prefixes
+//!      the 5-byte gRPC Length-Prefixed-Message header (`[compressed_flag: u8, length: u32]`).
+//! 3. **W3C Trace Context & Wire Header Propagation**:
+//!    - Replaces client JSON headers with authoritative gRPC wire headers
+//!      (`content-type: application/grpc`, `te: trailers`).
+//!    - Injects the active OpenTelemetry span context (`traceparent`, `tracestate`) into the
+//!      outgoing HTTP/2 request via [`opentelemetry_http::HeaderInjector`] and mirrors the
+//!      authoritative `traceparent` into `x-trace-id` for legacy gRPC metadata consumers.
+//! 4. **Protobuf-to-JSON Response Translation**:
+//!    - Reads the bounded (max 16 MiB) binary gRPC response frame, decodes the Protobuf payload
+//!      using the method's output descriptor, and serializes it back to `application/json`.
+
 use bytes::{BufMut, Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, Request, Response, StatusCode, Uri, header};
@@ -19,6 +50,27 @@ use crate::{
     configuration::{ParsedRoute, ServerConfig},
 };
 
+/// Transcodes an incoming HTTP/JSON request into a binary HTTP/2 gRPC call,
+/// dispatches it to a load-balanced upstream node, and translates the binary
+/// Protobuf response back into `application/json`.
+///
+/// # Arguments
+///
+/// * `route_info` – The matched [`ParsedRoute`] containing upstream nodes, retry policy,
+///   and the RwLock-protected gRPC reflection [`DescriptorPool`] cache.
+/// * `request_body` – The buffered JSON request payload from the client.
+/// * `original_method` – The HTTP method of the incoming request (must be `POST`).
+/// * `prepared_headers` – Sanitized proxy headers (including forwarded identity and trace headers).
+/// * `original_uri` – The original request URI whose path identifies `/<Service>/<Method>`.
+/// * `client_addr` – Optional peer socket address used for sticky load-balancing.
+/// * `server_name` – Static server identifier for structured logging and diagnostics.
+/// * `grpc_client` – Shared HTTP/2-only Hyper client configured with upstream TLS/mTLS.
+/// * `config` – Reference to the enclosing [`ServerConfig`] for timeout and reflection parameters.
+///
+/// # Returns
+///
+/// Returns an HTTP [`Response<ServiceRespBody>`] with `content-type: application/json` on success,
+/// or an appropriate synthetic HTTP error status (`400`, `404`, `502`, `504`) on failure.
 pub async fn handle_grpc_web(
     route_info: &ParsedRoute,
     request_body: RequestBody, // not mut since GrpcWeb buffers only
@@ -276,14 +328,11 @@ pub async fn handle_grpc_web(
             header::HeaderValue::from_static("trailers"),
         );
 
-        // Ensure x-trace-id is present for gRPC backends that expect it
-        if let Some(trace_id) = current_headers.get("traceparent").cloned() {
-            current_headers.entry("x-trace-id").or_insert(trace_id);
-        }
-
         *proxy_req.headers_mut() = current_headers;
 
-        // Inject OpenTelemetry context (e.g., traceparent) into the outgoing request headers.
+        // Inject OpenTelemetry context (e.g., W3C `traceparent` and `tracestate`) into the
+        // outgoing HTTP/2 gRPC request headers so distributed traces stay connected across
+        // JSON-to-gRPC transcoding.
         opentelemetry::global::get_text_map_propagator(|propagator| {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
             propagator.inject_context(
@@ -291,6 +340,13 @@ pub async fn handle_grpc_web(
                 &mut opentelemetry_http::HeaderInjector(proxy_req.headers_mut()),
             );
         });
+
+        // Ensure `x-trace-id` is populated for gRPC backends that expect it, using the
+        // authoritative `traceparent` header (either freshly injected by OpenTelemetry above
+        // or preserved from `TraceIdLayer` / incoming client headers).
+        if let Some(trace_id) = proxy_req.headers().get("traceparent").cloned() {
+            proxy_req.headers_mut().entry("x-trace-id").or_insert(trace_id);
+        }
 
         let req_timeout = config
             .router_params
@@ -420,6 +476,27 @@ pub async fn handle_grpc_web(
     }
 }
 
+/// Connects to an upstream gRPC server and builds a [`prost_reflect::DescriptorPool`]
+/// by querying its `grpc.reflection.v1alpha.ServerReflection` service.
+///
+/// # Security & Fail-Closed Guarantees
+///
+/// * If `https` is used and `ssl_root_certificate` is configured, the CA file is read
+///   and validated strictly (non-existent or empty files return an `Err`).
+/// * If `AuthenticationMethod::ClientCert` (mTLS) is configured in `router_params`,
+///   both `ssl_client_certificate` and `ssl_client_key` must be present and non-empty,
+///   otherwise connection setup fails closed.
+///
+/// # Arguments
+///
+/// * `backend_base_uri` – Base URI (`http://` or `https://`) of the upstream gRPC node.
+/// * `router_params` – Optional [`RouterParams`](crate::configuration::RouterParams) containing
+///   TLS/mTLS certificate paths and connection/reflection timeouts.
+///
+/// # Returns
+///
+/// Returns an `Arc<DescriptorPool>` containing all non-reflection service and message descriptors
+/// advertised by the upstream gRPC endpoint.
 pub async fn build_grpc_pool(
     backend_base_uri: &Uri,
     router_params: Option<&crate::configuration::RouterParams>,
@@ -859,5 +936,60 @@ mod tests {
 
         let resp = call_grpc_web(&route, &config, hyper::HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_propagates_w3c_traceparent_and_x_trace_id() {
+        let captured = Arc::new(std::sync::Mutex::new(None::<hyper::HeaderMap>));
+        let cap = captured.clone();
+        let port = spawn_h2_upstream(move |req| {
+            let cap = cap.clone();
+            async move {
+                *cap.lock().unwrap() = Some(req.headers().clone());
+                let _ = req.into_body().collect().await;
+                let frame = Bytes::from_static(&[0, 0, 0, 0, 4, 0x0a, 0x02, b'o', b'k']);
+                Ok(hyper::Response::builder()
+                    .status(200)
+                    .body(Full::new(frame))
+                    .unwrap())
+            }
+        })
+        .await;
+
+        let route = test_route(port);
+        let config = test_server_config(5);
+
+        let expected_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("traceparent", expected_tp.parse().unwrap());
+
+        let resp = call_grpc_web(&route, &config, headers).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("upstream gRPC server must have been called");
+        let seen_tp = seen
+            .get("traceparent")
+            .expect("traceparent header must be forwarded to gRPC upstream")
+            .to_str()
+            .unwrap();
+        let seen_x_trace = seen
+            .get("x-trace-id")
+            .expect("x-trace-id header must be populated from traceparent")
+            .to_str()
+            .unwrap();
+
+        assert!(
+            seen_tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"),
+            "traceparent '{}' must preserve the original 32-hex trace-id",
+            seen_tp
+        );
+        assert_eq!(
+            seen_x_trace, seen_tp,
+            "x-trace-id must match the authoritative outgoing traceparent header"
+        );
     }
 }

@@ -832,7 +832,7 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 ## Middleware Layer Pipeline (`[Server.Layers]`)
 
 ### Ordering Constraints & Execution Model
-1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0).
+1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0). It extracts an incoming W3C `traceparent` (or `x-trace-id`) header—or synthesizes a fresh `00-{trace-id}-{span-id}-01` identifier—and links the OpenTelemetry parent context to the request span before downstream layers run.
 2. **`Inspection` After `Decompression`:** If both are enabled, `"Inspection"` must appear after `"Decompression"`. Otherwise, the WAF inspects compressed bytes.
 3. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
 
