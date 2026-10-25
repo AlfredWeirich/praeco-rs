@@ -47,7 +47,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 > **Why choose `praeco-rs`?** It shines in highly secure, zero-trust enterprise environments where gRPC interoperability, advanced load distribution, and strict rate control are primary requirements.
 
 - **Declarative Middleware Pipeline**: The entire middleware stack (Timeout, Concurrency Limits, Rate Limiting, Compression, CORS, OTLP Tracing) can be configured, reordered, and toggled on/off in `Config.toml` in seconds, **without writing or recompiling any Rust code**.
-- **Native OpenTelemetry (OTLP) Integration**: `praeco-rs` integrates directly with the `tracing` and `opentelemetry` ecosystem, allowing you to export distributed traces directly to Jaeger, Zipkin, or Datadog via standard OTLP right out of the box.
+- **Native OpenTelemetry (OTLP) Integration**: `praeco-rs` integrates directly with the `tracing` and `opentelemetry` ecosystem, exporting distributed traces to Jaeger, Zipkin, or Datadog via standard OTLP out of the box. Incoming W3C `traceparent` (or `x-trace-id`) headers are extracted at the edge (`TraceIdLayer` & `TraceLayer`), linked as the OpenTelemetry parent context prior to span entry, and automatically propagated (`traceparent` + `x-trace-id`) across REST, gRPC passthrough, and dynamic JSON-to-gRPC transcoding hops.
 - **Lightweight WAF (Inspection Layer)**: Includes a highly optimized Regex-based inspection middleware that validates the `(method, path, query)` against a configured allow-list. It operates with zero heap allocations on the happy path, dropping malicious requests before they consume downstream resources.
 - **Strict RFC 3986 Path Sanitization & Traversal Protection**: Enforces canonical URI paths across all layers and upstream dispatch. Rejects directory traversal attempts (`..`, `%2e%2e`), encoded slashes (`%2f`), null bytes (`%00`), and backslashes with `400 Bad Request`, and collapses multi-slashes (`//`) to eliminate semantic desync and RBAC/WAF bypasses.
 - **Out-of-the-box REST to gRPC Gateway**: Unlike Pingora or Sōzu, `praeco-rs` can dynamically reflect backend gRPC schemas and translate incoming REST/JSON requests into binary Protobuf on the fly (JSON-to-gRPC transcoding) with non-blocking async I/O, upstream deadlines (`request_timeout_seconds`), a 16 MiB response cap, and automatic compression bypass for `application/grpc*` streams to preserve HTTP/2 trailers. This eliminates the need for separate sidecars like Envoy for transcoding.
@@ -81,16 +81,13 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 To elevate `praeco-rs` even further, the following points remain on the roadmap:
 
 ### 1. Distributed Caching
-Implementing an HTTP response caching layer (e.g., using Redis) for specific routes to reduce backend load, similar to what Pingora offers out of the box for CDN use-cases.
+Implementing an HTTP response caching layer (e.g., using Redis or an in-memory TinyLFU cache with Singleflight request coalescing) for specific routes to reduce backend load, similar to what Pingora offers out of the box for CDN use-cases.
 
-### 2. Flawless Trace Propagation (Tracing Polish)
-OpenTelemetry is already built-in. However, if the proxy translates an incoming JSON/REST request into a gRPC request on-the-fly, it must be absolutely ensured that the unique Request ID (Trace ID) is never lost. This is the only way tools like Jaeger can exactly map an error in the backend to the original REST request of the client. This requires more in-depth testing in complex edge cases.
-
-### 3. Circuit Breaking
+### 2. Circuit Breaking
 Currently, the proxy regularly checks in the background (Health Checks) whether a backend is still alive. If it is dead, no more traffic is sent there.
 A **Circuit Breaker** would go one step further: If a backend suddenly becomes extremely slow or throws errors (even though the last health check was still "OK"), the circuit "trips" immediately. The proxy instantly blocks further traffic to this node to prevent a complete traffic jam in the system (Cascading Failure).
 
-### 4. Pluggable End-Services (Beyond Routing)
+### 3. Pluggable End-Services (Beyond Routing)
 Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), a `StaticFiles` service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.

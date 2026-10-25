@@ -1073,12 +1073,31 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
                     let path = request.uri().path();
                     let method = request.method();
                     let otel_name = format!("{} {}", method, path);
-                    info_span!(
+                    let span = info_span!(
                         "request",
                         otel.name = otel_name.as_str(),
                         http.method = %method,
                         http.uri = %request.uri()
-                    )
+                    );
+                    // Extract any incoming W3C `traceparent` header and link the outer HTTP
+                    // request span to the caller's distributed trace context prior to span entry.
+                    // If no valid `traceparent` is present (e.g. a request arriving over a
+                    // long-lived Relay Server Yamux tunnel where `tunneled_connection` is active),
+                    // detach from any ambient tunnel span via `Context::new()` so each HTTP
+                    // request starts its own clean root trace in Jaeger.
+                    opentelemetry::global::get_text_map_propagator(|propagator| {
+                        use opentelemetry::trace::TraceContextExt;
+                        use tracing_opentelemetry::OpenTelemetrySpanExt;
+                        let parent_cx = propagator.extract(
+                            &opentelemetry_http::HeaderExtractor(request.headers()),
+                        );
+                        if parent_cx.span().span_context().is_valid() {
+                            let _ = span.set_parent(parent_cx);
+                        } else {
+                            let _ = span.set_parent(opentelemetry::Context::new());
+                        }
+                    });
+                    span
                 })
                 .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
