@@ -147,29 +147,43 @@ where
             }
         }
 
-        // 4. Create a span for this request's trace context and attach the extracted W3C
-        //    OpenTelemetry context BEFORE entering the span (`tracing-opentelemetry` requires
-        //    `set_parent` to be called prior to the first `on_enter` event).
-        //    If the outer `TraceLayer` span already shares the same Trace ID, `trace_span`
-        //    naturally inherits it as a child span without overriding its parent Span ID.
-        let trace_span = info_span!("trace_id", traceparent = %trace_id);
-        opentelemetry::global::get_text_map_propagator(|propagator| {
+        // 4. Attach the W3C OpenTelemetry context to the active span hierarchy:
+        //    - In production (`server.rs`), `TraceLayer::make_span_with` has ALREADY extracted
+        //      `traceparent` and linked the outer `"request"` span (`GET /...` or `POST /...`)
+        //      prior to entry. In that case (`current_sc.is_valid() && current_sc.trace_id() == parent_sc.trace_id()`),
+        //      we record `traceparent` directly on `Span::current()` and reuse it so all downstream
+        //      log events (`LoggerService`, `RouterService`, etc.) are attached directly to the
+        //      main HTTP request span in Jaeger rather than hidden inside a separate child span.
+        //    - When `TraceIdLayer` is used standalone (or when no outer OTel span has adopted
+        //      the incoming `traceparent` yet), we create a dedicated `trace_id` span and call
+        //      `set_parent` prior to first entry (`tracing-opentelemetry` rejects `set_parent`
+        //      once a span has already been entered).
+        let span_to_instrument = opentelemetry::global::get_text_map_propagator(|propagator| {
             let parent_cx = propagator.extract(&HeaderExtractor(req.headers()));
             let parent_sc = parent_cx.span().span_context().clone();
-            if parent_sc.is_valid()
-                && (!current_sc.is_valid() || current_sc.trace_id() != parent_sc.trace_id())
+
+            if current_sc.is_valid()
+                && (!parent_sc.is_valid() || current_sc.trace_id() == parent_sc.trace_id())
             {
-                let _ = trace_span.set_parent(parent_cx);
+                let current = tracing::Span::current();
+                current.record("traceparent", trace_id.as_str());
+                current
+            } else {
+                let trace_span = info_span!("trace_id", traceparent = %trace_id);
+                if parent_sc.is_valid() {
+                    let _ = trace_span.set_parent(parent_cx);
+                }
+                trace_span
             }
         });
 
         // 5. Enter the span during synchronous `call` construction and instrument the returned
         //    future so `Span::current()` carries the extracted Trace ID across all async polls.
         let fut = {
-            let _guard = trace_span.enter();
+            let _guard = span_to_instrument.enter();
             self.inner.call(req)
         };
-        fut.instrument(trace_span)
+        fut.instrument(span_to_instrument)
     }
 }
 
