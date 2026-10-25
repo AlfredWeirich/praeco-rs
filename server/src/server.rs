@@ -1077,7 +1077,8 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
                         "request",
                         otel.name = otel_name.as_str(),
                         http.method = %method,
-                        http.uri = %request.uri()
+                        http.uri = %request.uri(),
+                        traceparent = tracing::field::Empty
                     );
                     // Extract any incoming W3C `traceparent` header and link the outer HTTP
                     // request span to the caller's distributed trace context prior to span entry.
