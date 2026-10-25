@@ -1,220 +1,359 @@
-# Configuration Manual (`Config.toml`)
+# Praeco Configuration Reference Manual (`Config.toml`)
 
-This manual describes all available parameters of the `Config.toml` and their possible values. The configuration controls the global behavior of the gateway as well as the detailed settings of individual server instances (listeners, routes, middleware).
+This manual provides an exhaustive, production-grade technical reference for all configuration parameters available in `Config.toml` (Praeco API Gateway) and `RelayConfig.toml` (Praeco Relay Server).
 
-## Starting with an Alternative Configuration File
- 
-By default, the server looks for a file named `Config.toml` in the current directory upon startup. However, you can pass an alternative configuration file to the server by specifying the path as the first command-line argument:
- 
+Every parameter includes:
+- **Exact data type and syntax**
+- **Mandatory vs. Optional status**
+- **Default value when omitted**
+- **Internal runtime mechanics and architectural side effects** (e.g. thread allocation, memory buffering, network connections, logging behavior)
+- **Validation rules, constraints, and fail-closed security behaviors**
+- **Practical TOML configuration snippets**
+
+---
+
+## Table of Contents
+
+1. [Startup, Lifecycle & Hot-Reloading](#startup-lifecycle--hot-reloading)
+2. [Global System Settings](#global-system-settings)
+   - [Includes (`includes`)](#includes-includes)
+   - [Tokio Worker Threads (`tokio_threads`)](#tokio-worker-threads-tokio_threads)
+   - [Log Directory & Stdout Interaction (`log_dir`)](#log-directory--stdout-interaction-log_dir)
+   - [PKI Base Object Identifier (`pki_base_oid`)](#pki-base-object-identifier-pki_base_oid)
+3. [Telemetry & Distributed Tracing](#telemetry--distributed-tracing)
+   - [Enable OpenTelemetry (`enable_opentelemetry`)](#enable-opentelemetry-enable_opentelemetry)
+   - [Jaeger / OTLP Endpoint (`jaeger_endpoint`)](#jaeger--otlp-endpoint-jaeger_endpoint)
+   - [Telemetry Log Level (`otel_log_level`)](#telemetry-log-level-otel_log_level)
+   - [Sampling Ratio (`otel_sample_ratio`)](#sampling-ratio-otel_sample_ratio)
+4. [Server Instances (`[[Server]]`)](#server-instances-server)
+   - [Instance Identification & Lifecycle (`name`, `enabled`)](#instance-identification--lifecycle)
+   - [Network Binding & Dual Protocol (`protocol`, `ip`, `port`)](#network-binding--dual-protocol)
+   - [Authentication Modes (`authentication`)](#authentication-modes-authentication)
+   - [Base Service Selection (`service`)](#base-service-selection-service)
+   - [Outbound Zero-Trust Tunneling (`[Server.tunnel]`)](#outbound-zero-trust-tunneling-servertunnel)
+   - [Connection Limits & Protocol Defense (`[Server.connection_limits]`)](#connection-limits--protocol-defense-serverconnection_limits)
+   - [Role-Based Access Control & OID Mapping (`[Server.oid_mapping]`)](#role-based-access-control--oid-mapping-serveroid_mapping)
+   - [TLS & Client Certificate Verification (`[Server.server_certs]`, `[[Server.client_certs]]`)](#tls--client-certificate-verification)
+   - [Client Certificate Header Forwarding & Anti-Spoofing (`[Server.client_cert_forwarding]`)](#client-certificate-header-forwarding--anti-spoofing-serverclient_cert_forwarding)
+5. [Base Services Deep-Dive](#base-services-deep-dive)
+   - [Echo Service (`service = "Echo"`)](#echo-service-service--echo)
+   - [Static File Server & SPA Routing (`service = "StaticFiles"`)](#static-file-server--spa-routing-service--staticfiles)
+   - [Identity Provider (`service = "Idp"`)](#identity-provider-service--idp)
+   - [Reverse Proxy Router (`service = "Router"`)](#reverse-proxy-router-service--router)
+6. [gRPC Architecture & Features Deep-Dive](#grpc-architecture--features-deep-dive)
+   - [Mode Comparison: Passthrough vs. Transcoding](#mode-comparison-passthrough-vs-transcoding)
+   - [Native gRPC Passthrough (`backend_type = "grpc_passthrough"`)](#native-grpc-passthrough-backend_type--grpc_passthrough)
+   - [Dynamic JSON-to-gRPC Transcoding (`backend_type = "grpc"`)](#dynamic-json-to-grpc-transcoding-backend_type--grpc)
+   - [gRPC Server Reflection & Schema Caching](#grpc-server-reflection--schema-caching)
+   - [Active Health Checking & Score Metrics for gRPC](#active-health-checking--score-metrics-for-grpc)
+   - [HTTP/2 Upstream Connection Pool & Keep-Alive Mechanics](#http2-upstream-connection-pool--keep-alive-mechanics)
+   - [HTTP/2 Trailers Preservation & Compression Layer Bypass](#http2-trailers-preservation--compression-layer-bypass)
+   - [gRPC Error Propagation & Gateway Status Codes](#grpc-error-propagation--gateway-status-codes)
+7. [Granular Path-Level RBAC (`[Server.rbac]`)](#granular-path-level-rbac-serverrbac)
+8. [Lightweight WAF / Inspection Layer (`[Server.AllowedPathes]`)](#lightweight-waf--inspection-layer-serverallowedpathes)
+9. [Middleware Layer Pipeline (`[Server.Layers]`)](#middleware-layer-pipeline-serverlayers)
+   - [Ordering Constraints & Execution Model](#ordering-constraints--execution-model)
+   - [Detailed Layer Reference](#detailed-layer-reference)
+10. [Relay Server Configuration (`RelayConfig.toml`)](#relay-server-configuration-relayconfigtoml)
+11. [Appendix: Cryptographic Keys & Certificates Overview](#appendix-cryptographic-keys--certificates-overview)
+12. [Complete Production Configuration Examples](#complete-production-configuration-examples)
+
+---
+
+## Startup, Lifecycle & Hot-Reloading
+
+### Launching the Gateway
+
+Praeco can be started with a default or custom configuration file:
+
 ```bash
-# When running the compiled binary
-./server /path/to/another_config.toml
+# Standard startup (searches for ./Config.toml in current working directory)
+./server
 
-# When running via Cargo (during development)
-cargo run --bin server -- /path/to/another_config.toml
+# Custom configuration file passed as first CLI argument
+./server /etc/praeco/production.toml
+
+# Via Cargo during development
+cargo run --bin server -- /path/to/custom_config.toml
 ```
 
-When receiving a `SIGHUP` signal, `praeco-rs` dynamically hot-reloads from the exact configuration file specified at startup. The reload process runs an atomic, crash-safe dry-run: all service stacks and TLS contexts are validated in memory before any live listeners or global state are swapped. If validation fails, the running configuration remains completely untouched.
+### Atomic Hot-Reloading via `SIGHUP`
+
+To trigger a live configuration reload without dropping client connections:
+
+```bash
+kill -HUP <PID_OF_PRAECO>
+```
+
+#### Under the Hood: The Crash-Safe Dry-Run Process
+1. **File Reading & Deserialization:** The configuration file specified at launch (and all globbed `includes`) is read and parsed into memory.
+2. **Regex Pre-Compilation:** All regular expressions in `[Server.AllowedPathes]` and path patterns in `[Server.rbac]` are compiled.
+3. **Eager Cryptographic Validation:** Server TLS certificate chains, private keys, client CA roots, CRLs, and JWT public/private keys are read and validated from disk. If a certificate file is missing or contains invalid PEM data, the process stops here.
+4. **Middleware Ordering & Constraint Checks:** The middleware stack of every server is validated (e.g. verifying that `TraceId` is first and CORS credentials rules are satisfied).
+5. **Atomic Swap:** Only if **all** validation checks pass, Praeco swaps the running configuration in memory via an `arc-swap` atomic pointer swap (`Config::update_global`).
+   - Existing in-flight connections continue processing against their existing middleware stacks.
+   - All newly accepted connections immediately run on the newly loaded configuration.
+   - **Rollback Guarantee:** If any step fails (syntax error, missing certificate, invalid regex), an error log is emitted and the running gateway continues operating on the previous valid configuration **with zero downtime and zero dropped sockets**.
 
 ---
 
 ## Global System Settings
 
-These parameters are located at the top level of the file and affect the overall system.
+Global settings are defined at the root of `Config.toml` (outside any `[[Server]]` table). They control system-wide concurrency, logging architecture, modularity, and PKI root definitions.
 
-| Parameter | Data Type | Description | Possible Values / Default Value |
-| :--- | :--- | :--- | :--- |
-| `tokio_threads` | Integer | Sets the number of worker threads for the asynchronous Tokio runtime. Useful for performance tuning on dedicated hardware. | **Default:** `Available CPU cores * 2`<br>**Example:** `50` |
-| `pki_base_oid` | String | The base OID (Object Identifier) for security validation. Serves as the root for interpreting certificate extensions (Private Enterprise Number). | **Example:** `"1.3.6.1.4.1.65111"` |
-| `log_dir` | String | Directory path for persistent log files. If commented out or omitted, logs are only written to standard output (`stdout`). | **Example:** `"log"` |
-| `includes` | Array of Strings | A list of glob patterns pointing to external TOML configuration files. All `[[Server]]` blocks defined in the included files will be merged dynamically at startup. Global settings in included files are ignored. | **Example:** `["./conf.d/*.toml", "/etc/praeco/apps.toml"]` |
+| Parameter | Data Type | Requirement | Default Value | Summary |
+| :--- | :--- | :--- | :--- | :--- |
+| [`includes`](#includes-includes) | Array of Strings | Optional | `[]` (None) | Glob patterns to external modular configuration files. |
+| [`tokio_threads`](#tokio-worker-threads-tokio_threads) | Integer | Optional | Available CPU Cores * 2 | Number of async worker OS threads for the Tokio runtime. |
+| [`log_dir`](#log-directory--stdout-interaction-log_dir) | String | Optional | `None` (Stdout only) | Directory for asynchronous, non-blocking rolling log files. |
+| [`pki_base_oid`](#pki-base-object-identifier-pki_base_oid) | String | Optional | `None` | Base Private Enterprise Number (PEN) OID for role mapping. |
 
 ---
 
-## Telemetry (`[telemetry]`)
+### Includes (`includes`)
 
-This block controls the OpenTelemetry (OTLP) tracing settings for Jaeger or other tracing backends.
+- **Data Type:** Array of Strings (e.g. `["conf.d/*.toml", "/etc/praeco/apps/*.toml"]`)
+- **Requirement:** Optional
+- **Default Value:** `[]` (Empty list; only the main configuration file is parsed)
 
-| Parameter | Data Type | Description | Possible Values / Default Value |
-| :--- | :--- | :--- | :--- |
-| `enable_opentelemetry` | Boolean | Enables or disables the export of spans to an OTLP collector. | `true`, `false` (**Default:** `true`) |
-| `jaeger_endpoint` | String | The URL of the OTLP-compatible tracing collector (e.g., Jaeger). | **Default:** `"http://localhost:4317"` |
-| `otel_log_level` | String | The log level of the telemetry events sent to the collector. Filters out internal logs. | `"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"` (**Default:** `"info"`) |
+#### Detailed Mechanics & System Impact:
+- **Evaluation Order:** At startup and during `SIGHUP` reload, Praeco processes the patterns in the order declared using the `glob` crate.
+- **Path Resolution:** Relative paths are resolved against the **parent directory of the root configuration file** (not the current working directory). Absolute paths are respected as-is.
+- **Merging Behavior:** All `[[Server]]` blocks found across matching files are appended to the internal server registry. 
+- **Isolation:** Global parameters (such as `tokio_threads` or `log_dir`) defined inside included files are **safely ignored**. Global settings can only be set from the root `Config.toml`.
+- **Error Handling:** If an include pattern matches no files, Praeco logs an informational trace and continues. However, if an included file contains syntax errors or invalid TOML, the entire startup/reload fails closed.
 
-Jaeger is started with:
-jaeger-1.60.0-darwin-arm64/jaeger-all-in-one --collector.otlp.enabled=true
-The results can be viewed at: http://localhost:16686/
-
-### Generating Client Certificates with OIDs
-To easily create valid client certificates for testing or production purposes, the project includes the script [`client_certs/generate_mtls_oid_certs.sh`](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/client_certs/generate_mtls_oid_certs.sh).
-
-**Using the script**
-The script can be conveniently controlled via command line parameters:
-
-* **`-c`**: Common Name (CN) of the certificate (Default: `client.weirich`). Serves for clarity for administrators.
-* **`-e`**: E-Mail address (Default: `alfred.weirich@gmail.com`).
-* **`-o`**: Comma-separated list of OID suffixes from which the permissions (roles) should be derived (Default: `1`).
-
-**Examples:**
-```bash
-# Creates a certificate for an Admin (Role 1):
-./generate_mtls_oid_certs.sh -c admin.weirich -o 1
-
-# Creates a multi-role certificate (e.g., Operator and Viewer):
-./generate_mtls_oid_certs.sh -c dev.weirich -o 2,3
-
-# Creates a certificate WITHOUT ANY roles (Guest access):
-./generate_mtls_oid_certs.sh -c guest.weirich -o "none"
+```toml
+# Root Config.toml
+includes = [
+    "conf.d/*.toml",
+    "/etc/praeco/extra_servers.toml"
+]
 ```
 
-**How does the assignment work technically?**
-1. The script fully automatically reads the `pki_base_oid` from your current `Config.toml` (e.g., `1.3.6.1.4.1.65111`).
-2. It generates a local Root CA (`ca.cert.pem`), which you can later configure in the server as a trust anchor (`Server.mtls_client_ca_file`).
-3. It dynamically injects the selected OID suffixes into the new certificate. For example, if `-o 1,2` are passed, it injects `...65111.1` and `...65111.2`.
-4. The proxy evaluates *only* these OIDs. If a suffix is contained in the certificate (e.g., `1`), the client automatically gets the role specified in the `[oid_mapping]` table (here: `Admin`).
-5. **Fallback:** If `-o "none"` is passed, the certificate contains no OIDs. The proxy then automatically downgrades this validly authenticated but role-less client to the **`Guest`** role.
-6. In the end, the script outputs a `client.p12` file, which you can directly import into Postman, cURL, or the browser.
+---
+
+### Tokio Worker Threads (`tokio_threads`)
+
+- **Data Type:** Integer (`usize`)
+- **Requirement:** Optional
+- **Default Value:** `Available Logical CPU Cores * 2` (e.g. `16` on an 8-core CPU)
+
+#### Detailed Mechanics & System Impact:
+- **Under the Hood:** Initializes the asynchronous runtime via `tokio::runtime::Builder::new_multi_thread().worker_threads(threads).enable_all().build()`.
+- **Resource Allocation:** Each worker thread is an OS thread pinned to an async event loop polling non-blocking sockets (epoll on Linux, kqueue on macOS).
+- **Impact of Setting Too High:** Setting this value significantly higher than the number of hardware threads (e.g. `128` on a 4-core CPU) induces heavy thread context switching and cache thrashing, reducing overall throughput.
+- **Impact of Setting Too Low:** Setting this to `1` or `2` on high-concurrency systems can cause async tasks to stall if CPU-intensive operations (such as TLS handshakes, Gzip compression, or regex evaluation) occupy the threads.
+- **Recommended Tuning:** On bare-metal servers or dedicated VMs, setting `tokio_threads` equal to the number of physical CPU cores or keeping the default `num_cpus * 2` provides optimal latency and throughput.
+
+```toml
+# Restrict Tokio to 16 dedicated worker threads
+tokio_threads = 16
+```
+
+---
+
+### Log Directory & Stdout Interaction (`log_dir`)
+
+- **Data Type:** String (Filesystem directory path)
+- **Requirement:** Optional
+- **Default Value:** `None` (Stdout-only logging)
+
+#### Detailed Mechanics & System Impact:
+- **Does stdout still receive logs when `log_dir` is set?**
+  **YES, DEFINITELY.** Setting `log_dir` does **not** disable terminal logging. Praeco uses a composite subscriber architecture (`tracing_subscriber::Registry`):
+  1. **Standard Output Layer (`stdout_layer`):** Always active. Outputs colored, human-readable log lines with ANSI formatting (`with_ansi(true)`).
+  2. **File Logging Layer (`file_layer`):** Dynamically attached only when `log_dir` is configured.
+  3. **Telemetry Layer (`telemetry_layer`):** Active when `enable_opentelemetry = true`.
+  All active layers receive every log event simultaneously.
+
+- **Non-Blocking Asynchronous Disk I/O:**
+  File logging wraps `tracing_appender::rolling::RollingFileAppender` inside `tracing_appender::non_blocking`. Log records are dispatched to an internal memory buffer and written to disk by a dedicated background worker thread (`WorkerGuard`). **Disk latency or disk I/O stalls never block the async Tokio worker threads.**
+
+- **File Rotation & Naming:**
+  - **Rotation Cadence:** Daily rotation (`Rotation::DAILY`).
+  - **Filename Convention:** Files are named `app.YYYY-MM-DD.log` inside the specified directory.
+  - **Formatting:** ANSI color codes are stripped (`with_ansi(false)`) so logs are clean for ingest by tools like Filebeat, Vector, Promtail, or Fluentbit.
+
+- **Log Level Filtering:**
+  Both `stdout` and file logging evaluate the `RUST_LOG` environment variable (e.g. `RUST_LOG=info,praeco_rs=debug`), defaulting to `"info"` if unset.
+
+```toml
+# Enable rolling daily logs in the /var/log/praeco directory
+# Logs will appear BOTH on stdout (with ANSI color) AND in /var/log/praeco/app.YYYY-MM-DD.log
+log_dir = "/var/log/praeco"
+```
+
+---
+
+### PKI Base Object Identifier (`pki_base_oid`)
+
+- **Data Type:** String (Dotted decimal ASN.1 OID notation, e.g. `"1.3.6.1.4.1.65111"`)
+- **Requirement:** Optional (Mandatory if certificate OID role mapping or JWT OID claims are used)
+- **Default Value:** `None`
+
+#### Detailed Mechanics & System Impact:
+- **Under the Hood:** During `Config::init`, Praeco parses each numeric component into an optimized vector of 64-bit integers (`Vec<u64>`). If the string contains non-numeric segments or invalid characters, startup fails immediately.
+- **OID Extraction from Certificates:** When an incoming client certificate is verified during an mTLS handshake, Praeco's ASN.1 parser (`extract_oids_from_cert`) scans all X.509 extensions.
+- **Prefix Matching:** An extension is recognized as an authorization OID only if its integer sequence starts with `pki_base_oid`. The final component is extracted as the role suffix (e.g. OID `1.3.6.1.4.1.65111.1` yields suffix `"1"`).
+- **What happens if omitted?** If `pki_base_oid` is omitted from `Config.toml`, Praeco cannot extract role suffixes from client certificates. Any client authenticating via mTLS will receive the fallback role **`Guest`**, regardless of what extensions are in the certificate.
+
+```toml
+# Private Enterprise Number (PEN) assigned by IANA: 65111
+pki_base_oid = "1.3.6.1.4.1.65111"
+```
+
+---
+
+## Telemetry & Distributed Tracing
+
+Praeco includes native OpenTelemetry (OTLP) integration using Tonic gRPC export. Telemetry settings are defined at the top level of `Config.toml`.
+
+| Parameter | Data Type | Requirement | Default Value | Summary |
+| :--- | :--- | :--- | :--- | :--- |
+| [`enable_opentelemetry`](#enable-opentelemetry-enable_opentelemetry) | Boolean | Optional | `false` | Master switch for exporting spans to an OTLP collector. |
+| [`jaeger_endpoint`](#jaeger--otlp-endpoint-jaeger_endpoint) | String | Optional | `"http://localhost:4317"` | OTLP gRPC endpoint URL. |
+| [`otel_log_level`](#telemetry-log-level-otel_log_level) | String | Optional | `"info"` | Log level filter for spans sent to the collector. |
+| [`otel_sample_ratio`](#sampling-ratio-otel_sample_ratio) | Float (`f64`) | Optional | `1.0` (100%) | Probabilistic sampling ratio (`0.0` to `1.0`). |
+
+---
+
+### Enable OpenTelemetry (`enable_opentelemetry`)
+
+- **Data Type:** Boolean (`true` or `false`)
+- **Requirement:** Optional
+- **Default Value:** `false`
+
+#### Detailed Mechanics & System Impact:
+- **When `false`:** The OpenTelemetry SDK is not initialized. No OTLP background exporter tasks are spawned, no gRPC channels to collectors are opened, and zero network overhead is incurred.
+- **When `true`:** Initializes `opentelemetry_sdk::trace::SdkTracerProvider` with a batch exporter and registers the global `TextMapPropagator` (`TraceContextPropagator`) to inject and extract W3C `traceparent` headers across incoming and outgoing reverse-proxy requests.
+- **Resilience:** If the telemetry collector is unreachable at startup, Tonic attempts reconnections in the background without crashing the gateway.
+
+---
+
+### Jaeger / OTLP Endpoint (`jaeger_endpoint`)
+
+- **Data Type:** String (URL with scheme, host, and port)
+- **Requirement:** Optional
+- **Default Value:** `"http://localhost:4317"`
+
+#### Detailed Mechanics & System Impact:
+- **Protocol:** Uses OTLP over **gRPC** (standard port `4317`), compatible with Jaeger v1.35+, OpenTelemetry Collector, Grafana Tempo, and Datadog Agent.
+- **Note on HTTP vs gRPC:** Do not specify port `4318` (which is standard OTLP HTTP/protobuf), as Praeco uses Tonic gRPC transport.
+- **Batching:** Spans are buffered in memory and flushed in batches asynchronously to minimize network round-trips.
+
+---
+
+### Telemetry Log Level (`otel_log_level`)
+
+- **Data Type:** String (`"trace"`, `"debug"`, `"info"`, `"warn"`, `"error"`)
+- **Requirement:** Optional
+- **Default Value:** `"info"`
+
+#### Detailed Mechanics & System Impact:
+- **Dedicated Filtering:** Operates independently of the console logger. You can set stdout to `"debug"` while restricting exported telemetry spans to `"info"` or `"warn"`, saving telemetry storage and network bandwidth.
+
+---
+
+### Sampling Ratio (`otel_sample_ratio`)
+
+- **Data Type:** Float (`f64`) between `0.0` and `1.0`
+- **Requirement:** Optional
+- **Default Value:** `1.0` (100% sampling / `AlwaysOn`)
+
+#### Detailed Mechanics & System Impact:
+- **Under the Hood:**
+  - If set to `1.0`, uses `opentelemetry_sdk::trace::Sampler::AlwaysOn`.
+  - If set to `< 1.0`, uses `opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(TraceIdRatioBased(ratio)))`.
+- **Parent-Based Behavior:** If an incoming HTTP request arrives with a W3C `traceparent` header that was already sampled upstream (e.g. by an API client or external gateway), Praeco **always** records and exports the span, ensuring complete end-to-end distributed traces.
+- **Probabilistic Roots:** For un-traced incoming requests, the span is sampled probabilistically according to `otel_sample_ratio` (e.g. `0.1` samples 10% of requests).
+
+```toml
+# Production Telemetry Configuration
+enable_opentelemetry = true
+jaeger_endpoint = "http://jaeger-collector.monitoring:4317"
+otel_log_level = "info"
+otel_sample_ratio = 0.25 # Sample 25% of new root traces
+```
 
 ---
 
 ## Server Instances (`[[Server]]`)
 
-You can define multiple `[[Server]]` blocks to run multiple listeners simultaneously (e.g., one for API, one for Onboarding).
+Multiple `[[Server]]` blocks can be declared to run distinct listeners (or tunnels) side-by-side.
 
-### Network Configuration & Basics
+### Instance Identification & Lifecycle
 
-| Parameter | Data Type | Description | Possible Values |
-| :--- | :--- | :--- | :--- |
-| `name` | String | Unique name of the instance (for logs and metrics). | **Example:** `"first_server"` |
-| `ip` | String *(optional with tunnel)* | The IP address to bind to. Mandatory if no `[Server.tunnel]` is defined. | `"0.0.0.0"` (all), `"192.168.x.x"`, `"local"` (automatic local IP) |
-| `port` | Integer *(optional with tunnel)* | The TCP port of the listener. Mandatory if no `[Server.tunnel]` is defined. | **Example:** `1336` |
-| `enabled` | Boolean | Main switch to turn the server on or off. | `true`, `false` (**Default:** `true`) |
-| `protocol` | String | Transport protocol. (If `https`, `[Server.server_certs]` must be configured). | `"http"`, `"https"` (**Default:** `"http"`) |
-| `authentication` | String | Authentication method for incoming connections. | `"None"` (Public)<br>`"ClientCert"` or `"mTLS"` (Strict Certificate-based)<br>`"OptionalClientCert"` (Client cert requested but not required, useful for IdP device auth)<br>`"JWT"` (Token-based) |
-| `service` | String | The base service that processes the request after the middleware. | `"Echo"` (Returns request)<br>`"Router"` (Reverse proxy)<br>`"Idp"` (Identity Provider for JWT issuance)<br>`"StaticFiles"` (Static File Server for SPAs and assets) |
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `name` | String | **Mandatory** | *None* | Unique name identifier. Leaked into `'static str` during initialization to allow zero-copy reference passing in middleware logs and metrics. Matches against TLS certificate resolvers. |
+| `enabled` | Boolean | Optional | `true` | When `false`, the server instance is completely ignored. No listener socket is bound, no tunnel is opened, and no memory structures are allocated. |
 
-### Server.oid_mapping
-Defines **per server** how the OID suffixes (Object Identifiers) extracted from certificates or JWT tokens are mapped to internal permission roles (Roles).
-Since this is now configured at the server level, the same certificate IDs (e.g., "1") can have completely different meanings depending on the server.
+---
 
-**Example:**
+### Network Binding & Dual Protocol
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `protocol` | String | Optional | `"http"` | `"http"` (plaintext HTTP/1.1 or cleartext HTTP/2) or `"https"` (TLS 1.3/1.2). If `"https"`, `[Server.server_certs]` is **mandatory**. |
+| `ip` | String | **Conditional** | *None* | IP address to bind. **Mandatory** unless `[Server.tunnel]` is configured. Options: `"0.0.0.0"` (all IPv4), `"::"` (IPv6), `"127.0.0.1"`, or `"local"` (resolves dynamically to host's primary local IP). |
+| `port` | Integer (`u16`) | **Conditional** | *None* | TCP listening port (e.g. `443`, `8080`). **Mandatory** unless `[Server.tunnel]` is configured. |
+
+#### HTTP/3 (QUIC) & Dual-Stack Binding:
+When `protocol = "https"`, Praeco automatically:
+1. Binds a standard non-blocking **TCP socket** on `ip:port` for HTTP/1.1 and HTTP/2.
+2. Simultaneously binds a **UDP socket** on the exact same `ip:port` for **HTTP/3 (QUIC)**.
+3. Configures ALPN on the TLS stack to advertise `h3`, `h2`, and `http/1.1` in preference order.
+4. Enables session resumption (`ServerSessionMemoryCache` with 1024 slots) to reduce TLS handshake overhead.
+
+---
+
+### Authentication Modes (`authentication`)
+
+Controls how clients are verified during the TLS handshake or request lifecycle:
+
+| Value | Handshake & Request Behavior | Use Case |
+| :--- | :--- | :--- |
+| `"None"` | Public access. No client certificate is requested during TLS. No JWT verification is performed unless explicitly added to `[Server.Layers]`. | Public APIs, static file downloads, health-check endpoints. |
+| `"ClientCert"` or `"mTLS"` | **Strict mutual TLS.** During the TLS handshake, Praeco's `WebPkiClientVerifier` demands a client certificate signed by a CA in `[[Server.client_certs]]`. If missing, expired, or revoked by a CRL, the connection is aborted with a TLS fatal alert before any HTTP data is exchanged. | Zero-Trust microservice communication, enterprise device backends. |
+| `"OptionalClientCert"` | **Permissive mutual TLS.** The server requests a client certificate during the TLS handshake (`allow_unauthenticated()`), but allows the connection to proceed if omitted. | **Identity Provider (IdP):** Allows browsers without client certs to load the HTML login page, while allowing mobile scanners to authenticate with device certs. |
+| `"JWT"` | Inbound HTTP requests must contain a valid JWT in `Authorization: Bearer <token>` or in a configured cookie fallback. Validates signature, `iss`, and `aud`. | Web application dashboards, mobile APIs. |
+
+---
+
+### Base Service Selection (`service`)
+
+Determines what handles the request once it passes all middleware layers:
+
+| Value | Base Service Description | Required Sibling Section |
+| :--- | :--- | :--- |
+| `"Echo"` | Reflects request method, URI, headers, and body back to client for load testing and latency measurement. | *None* |
+| `"StaticFiles"` | High-performance static asset server with SPA client-side routing fallback. | `[Server.StaticFilesParams]` |
+| `"Idp"` | Built-in Identity Provider issuing Ed25519-signed JWTs via QR-code or mTLS. | `[Server.IdpParams]` |
+| `"Router"` | Reverse proxy with upstream connection pooling, load balancing, health checks, and gRPC transcoding. | `[Server.ReverseRoutes]` |
+
+---
+
+### Outbound Zero-Trust Tunneling (`[Server.tunnel]`)
+
+Enables Praeco instances located in private subnets, behind NATs, or inside edge devices to serve public traffic without opening inbound firewall ports.
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Impact |
+| :--- | :--- | :--- | :--- | :--- |
+| `target_url` | String | **Mandatory** | *None* | Control-plane address of Relay Server (e.g. `"tls://relay.example.com:7001"`). |
+| `sni_domain` | String | **Mandatory** | *None* | Public SNI domain registered with Relay (e.g. `"api.example.com"`). Relay verifies that this SNI matches a SAN/CN in the gateway's certificate. |
+| `client_cert_path` | String | **Mandatory** | *None* | Path to PEM client certificate for mTLS against Relay. |
+| `client_key_path` | String | **Mandatory** | *None* | Path to unencrypted PEM private key. |
+| `ca_cert_path` | String | **Mandatory** | *None* | Path to PEM CA certificate that signed Relay's server certificate. |
+| `max_yamux_streams` | Integer | Optional | `4096` | Maximum concurrent multiplexed client streams over the tunnel connection. (Replaces Yamux default of 512). |
+| `proxy_protocol` | Boolean | Optional | `true` | Negotiates HAProxy PROXY-Protocol v2. Operates **strictly fail-closed**: if enabled, any stream lacking a valid 16-byte PROXY-v2 header signature is immediately aborted. Extracts real client IP before TLS handshake for rate limiting and logging. |
+
 ```toml
-[Server.oid_mapping]
-"1" = "Admin"
-"2" = "Seller"
-"3" = "Viewer"
-```
-Explanation: If a client certificate has the OID `1.3.6.1.4.1.65111.1` (where `1.3.6.1.4.1.65111` is the `pki_base_oid` from the global config), the user is assigned the role `Admin`. Any string can be used as a role name.
-
-### Certificate Configurations (TLS & mTLS)
-
-#### `[Server.server_certs]` (Required if `protocol = "https"`)
-* `ssl_certificate`: String. Path to the public certificate file (PEM or fullchain).
-* `ssl_certificate_key`: String. Path to the unencrypted private key file (PEM).
-
-#### `[[Server.client_certs]]` (Required if `authentication = "ClientCert"`)
-Array of tables (multiple CAs can be trusted).
-* `ssl_client_ca`: String. Path to the CA certificate to verify client certificates.
-* `ssl_client_crl`: String (Optional). Path to the Certificate Revocation List. On startup and hot-reload, Praeco parses the X.509 CRL and validates its `nextUpdate` timestamp, logging an explicit security warning if the CRL has expired.
-
-#### `[Server.client_cert_forwarding]` (Optional)
-This configuration controls the passing of verified client identities to backend servers.
-1. **Global Identity & Forwarding Header Sanitizing (Protection against Spoofing):**
-   Unconditionally — across **all** servers, protocols (HTTP/1.1, HTTP/2, HTTP/3), and routes, regardless of whether `client_cert_forwarding` is enabled — Praeco-rs removes all incoming client-supplied identity headers (`x-client-cert`, `x-client-san`, `x-client-roles`, `x-ssl-*`, etc.) as well as all untrusted client forwarding headers (`forwarded`, `x-forwarded-for`, `x-real-ip`, `x-forwarded-host`, `x-forwarded-proto`). Hop-by-hop headers per RFC 7230 §6.1 are removed, `X-Real-IP` and `X-Forwarded-*` (`For`, `Proto`, and `Host` including HTTP/2 & HTTP/3 `:authority` fallback) are authoritatively re-created from the verified socket or PROXY-v2 peer address, and backend `Server` headers are stripped from responses.
-2. **Verified Injection:**
-   If the client has successfully authenticated via mTLS, this section allows injecting the verified certificate, SAN, roles, or client IP under the specified header names into the request forwarded to the backend.
-
-* `header_cert`: String. HTTP header name for the URL-encoded client certificate.
-* `header_san`: String. HTTP header name for the SAN (Subject Alternative Name).
-* `header_roles`: String. HTTP header name for the forwarded user roles (e.g., `x-user-roles`).
-* `header_client_ip`: String. HTTP header name for the client IP address (e.g., `x-client-ip`).
-
-### Connection Limits (`[Server.connection_limits]`) (Optional)
-
-Protects against connection starvation, Slowloris, and socket exhaustion attacks across TCP, QUIC, and Yamux tunnel listeners. If omitted, secure defaults are applied automatically without requiring any manual configuration entries.
-
-* `max_connections`: Integer (Optional, **Default:** `10000`). Maximum number of simultaneous active client connections across TCP, QUIC, and tunnel listeners for this server instance.
-* `max_connections_per_ip`: Integer (Optional, **Default:** `100`). Maximum number of simultaneous active connections permitted from a single client IP or IPv6 `/64` subnet (`canonical_client_ip` unwraps IPv4-mapped IPv6 addresses and masks standard IPv6 addresses to their `/64` prefix so attackers cannot bypass per-IP limits by rotating interface identifiers within a `/64` allocation; unspecified addresses bypass the per-IP check and only count towards the global limit).
-
-```toml
-[Server.connection_limits]
-max_connections = 10000
-max_connections_per_ip = 100
-```
-
-> [!NOTE]
-> **Hardcoded Protocol Security Defaults (No Configuration Required):**
-> To keep configuration files slim while guaranteeing maximum resilience against known protocol-level attacks, low-level transport and protocol limits are enforced internally with secure defaults:
-> - **HTTP/2 Rapid Reset Mitigation (CVE-2023-44487):** `max_pending_accept_reset_streams = 20` (capped from hyper's default of 16,384), `max_concurrent_streams = 128` (capped from 1,024).
-> - **HTTP/2 Frame & Header Flood Mitigation:** `max_header_list_size = 65536` (64 KB, mitigates HPACK compression bombs), `max_frame_size = 16384` (16 KB standard frame cap).
-> - **HTTP/3 & QUIC Transport Hardening:** Stream receive window reduced to 1 MB and connection receive window to 8 MB (preventing unbounded memory exhaustion from oversized defaults); concurrent streams capped at 128; RFC 9000 §8 anti-amplification stateless address validation (`retry`) automatically active for unvalidated UDP peers; and concurrent request stream tasks bounded by a 128-permit semaphore.
-
-### Identity Provider (IdP) Configuration
-
-#### `[Server.IdpParams]` (Required if `service = "Idp"`)
-Configures the built-in Identity Provider, which issues JWTs based on mTLS or Device Authentication (QR-Code flow). When using this service, you should typically set `authentication = "OptionalClientCert"`.
-
-* `jwt_private_key`: String. Path to the Ed25519 or RSA private key (PEM format) used to sign the issued JWTs.
-* `jwt_public_key`: String. Path to the corresponding public key. Required to expose the `/.well-known/jwks.json` endpoint for dynamic key discovery by APIs.
-* `token_expiry_seconds`: Integer. Time to live (TTL) for the issued JWT in seconds.
-* `session_ttl_seconds`: Integer. Time to live for the QR-Code login session in seconds (how long the user has to scan the code).
-* `cookie_name`: String. The name of the cookie in which the JWT will be stored (e.g., `"__Host-jwt"`). If using a `__Host-` prefixed cookie, the `protocol` MUST be `"https"`.
-* `cookie_domain`: String *(optional)*. The domain for which the cookie is valid. Useful for sharing login sessions across subdomains (e.g. `".aweirich.eu"`). If omitted, the cookie is restricted to the exact hostname of the IdP. **Note:** If `cookie_name` starts with `__Host-`, RFC 6265bis mandates that no `Domain` attribute may be set; any configured `cookie_domain` will be safely ignored.
-* `redirect_after_login`: String. The URL path to which the user's browser is redirected after successfully obtaining the JWT via the `/auth/status` endpoint (e.g., `"/dashboard"`).
-* `issuer`: String. The issuer claim (`iss`) injected into the generated JWTs (default: `"praeco-idp"`).
-* `allowed_audiences`: Array of strings. A list of allowed target audiences (`aud`). If a client requests a specific audience via the `?aud=` query parameter, it must match one of the entries in this list. Any unlisted audience request is rejected with `400 Bad Request`.
-
-**Claims Webhook (Dynamic Role Resolution)**
-* `claims_webhook_url`: String *(optional)*. The HTTPS endpoint to POST to for dynamic claims resolution. Plain HTTP is strictly forbidden for remote endpoints to prevent credential/role tampering and is only permitted for local loopback (`http://127.0.0.1:...` or `http://localhost:...`). If set, Praeco calls this endpoint during login to fetch the current user roles from the backend database, replacing the OIDs baked into the certificate.
-* `claims_webhook_timeout_ms`: Integer. Overall timeout for the webhook HTTP call in milliseconds including connection, headers, and body collection (default: `3000`). Maximum allowed response body size is 64 KB.
-* `on_webhook_failure`: String. Behavior if the webhook fails, times out, or returns a non-200 status. Options: `"reject"` (default, fail-closed: denies the login with 503) or `"fallback_to_cert"` (fail-open: fallback to OIDs from the mTLS certificate).
-* `claims_webhook_client_cert`: String *(optional)*. Path to client certificate PEM for mTLS authentication against the webhook.
-* `claims_webhook_client_key`: String *(optional)*. Path to client private key for mTLS.
-* `claims_webhook_ca_cert`: String *(optional)*. Path to CA certificate for verifying the webhook server's certificate.
-
-> [!IMPORTANT]
-> **IdP Hardening (Quishing Protection, Webhook Pre-Validation & Revocation):**
-> - **Mandatory 6-Character `user_code` Verification:** `POST /auth/confirm?session=<id>&code=<user_code>` strictly requires the 6-character visual confirmation code displayed by the browser (`GET /auth/session_info?session=<id>` allows the mobile scanner to retrieve the code prior to confirmation). Verification is performed in constant time (`constant_time_eq`) **before** invoking any external `claims_webhook_url`, and the session is permanently invalidated after `3` failed attempts (`MAX_CONFIRM_ATTEMPTS = 3`).
-> - **mTLS-Protected Explicit JTI Revocation:** Calling `POST /auth/revoke?jti=<UUID>` to revoke an arbitrary token ID requires a valid mTLS client certificate (`401 Unauthorized` without mTLS), whereas standard browser logout via cookie or `Authorization: Bearer` header remains available to end-users. The in-memory `JwtRevocationStore` is bounded to `50,000` entries (`MAX_REVOKED_ENTRIES`) with throttled 30-second expiry cleanup.
-> - **Per-IP Session Limits:** `SessionStore` applies IPv6 `/64` prefix canonicalization (`canonical_client_ip`) to per-IP session creation quotas (`max 20 sessions/IP`, `10,000` global sessions).
-
-### Static File Server Configuration
-
-#### `[Server.StaticFilesParams]` (Required if `service = "StaticFiles"`)
-Configures the built-in Static File Server. This is highly optimized for serving Single Page Applications (SPAs) like React or Vue, as well as static assets (images, fonts, downloads) directly from the local disk without needing an external web server like Nginx.
-
-* `root`: String. The local directory path from which files should be served (e.g., `"./www"` or `"/var/www/frontend"`).
-* `fallback_to_index`: Boolean. If set to `true`, any request for a file that does not exist on disk will instead return the `index.html` file from the root directory. This is mandatory for Client-Side SPA Routing to work properly. (Default: `false`).
-
-### Outbound Zero-Trust Tunneling (SNI Relay)
-
-#### `[Server.tunnel]` (Optional)
-Configures this server instance to bypass opening a local listening port (ignores `ip` and `port`), and instead establish an outbound, multiplexed mTLS connection to a standalone Relay Server. The Relay Server handles incoming internet traffic and routes it back to this instance based on SNI (Server Name Indication).
-
-> **Note on `ip` and `port`:** When a `[Server.tunnel]` is configured, `ip` and `port` are completely optional and can be omitted. They are only mandatory for standalone servers that open a local TCP/UDP listener.
-
-* `target_url`: String. The URL of the relay server control plane (e.g., `"tls://relay.example.com:7001"`).
-* `sni_domain`: String. The domain name this server is responsible for. The relay server routes traffic for this SNI to this tunnel. (e.g., `"api.example.com"`).
-* `client_cert_path`: String. Path to the client certificate (PEM) used to authenticate against the relay.
-* `client_key_path`: String. Path to the client private key (PEM).
-* `ca_cert_path`: String. Path to the CA certificate (PEM) that signed the relay server's certificate.
-* `max_yamux_streams`: Integer (Optional). Maximum number of concurrent Yamux multiplexed streams over the tunnel connection. **Default:** `4096` (replaces Yamux default of `512`). Each forwarded public client connection occupies exactly 1 Yamux stream.
-* `proxy_protocol`: Boolean (Optional). Whether to negotiate HAProxy PROXY-Protocol v2 with the Relay Server to propagate the real client IP (IPv4 and IPv6). **Default:** `true`. When active, Praeco operates **strictly fail-closed** on the tunnel stream (terminating any stream that lacks a valid 16-byte PROXY-v2 header signature rather than falling back to an unattributed connection) and extracts the verified client IP before the TLS handshake for IP rate limiting, per-IP connection limits, access logging, and `X-Forwarded-For` / `X-Real-IP` headers.
-
-**Example without `ip` and `port`:**
-```toml
-[[Server]]
-name = "api_gateway"
-enabled = true
-protocol = "https"
-authentication = "ClientCert"
-service = "Router"
-
 [Server.tunnel]
 target_url = "tls://relay.example.com:7001"
 sni_domain = "api.example.com"
-client_cert_path = "certs/praeco_client.pem"
-client_key_path = "certs/praeco_client.key"
+client_cert_path = "certs/praeco_tunnel.pem"
+client_key_path = "certs/praeco_tunnel.key"
 ca_cert_path = "certs/relay_ca.pem"
 max_yamux_streams = 4096
 proxy_protocol = true
@@ -222,328 +361,746 @@ proxy_protocol = true
 
 ---
 
-## Middleware Layer (`[Server.Layers]`)
+### Connection Limits & Protocol Defense (`[Server.connection_limits]`)
 
-Defines the execution pipeline of the middleware. The layers are processed in the specified order.
+Defines layer-4 and layer-7 connection boundaries to prevent connection starvation and Slowloris attacks.
 
-* **`enabled`**: Array of strings. Defines the activated layers in the given order.
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Impact |
+| :--- | :--- | :--- | :--- | :--- |
+| `max_connections` | Integer | Optional | `10000` | Global connection cap for this server instance. Must be `> 0`. Excess connections are closed immediately. |
+| `max_connections_per_ip` | Integer | Optional | `100` | Maximum simultaneous active connections from a single IP or IPv6 `/64` subnet. Must be `> 0`. |
 
-### Available Middleware Layers
-Each layer takes over a specific task in the request lifecycle:
-
-| Layer Name | Brief Explanation |
-| :--- | :--- |
-| `"TraceId"` | Extracts or generates a W3C-compliant Trace ID and injects it into the request context for end-to-end tracing. Must be the FIRST layer! |
-| `"Timing"` | Measures the processing duration of each request (useful for metrics). |
-| `"Counter"` | Counts the number of currently processed requests. |
-| `"Logger"` | Logs details about the request and response (e.g., path, status code, IP). |
-| `"PathSanitizer"` | Enforces RFC 3986 path canonicalization (Option A). Rejects traversal (`..`, `%2e%2e`), encoded slashes (`%2f`), null bytes (`%00`), and backslashes (`\`) with 400 Bad Request. Automatically active on all servers! |
-| `"Inspection"` | Checks the URL path of the request against a regex whitelist and blocks unauthorized calls. |
-| `"Cors"` | Adds CORS headers (Cross-Origin Resource Sharing) and handles preflight requests. |
-| `"SecurityHeaders"` | Adds HTTP security headers (like CSP, HSTS, anti-sniffing) to the server response. |
-| `"Compression"` | Compresses HTTP responses (e.g., Gzip) to save bandwidth. Automatically skips already-compressed responses (`Content-Encoding`) and gRPC streams (`Content-Type: application/grpc*`) to preserve HTTP/2 trailers. |
-| `"Decompression"` | Decompresses the incoming request body (includes protection against "decompression bombs"). |
-| `"RateLimiter:Simple"` | Limits requests per second via a hard limit (Fixed-Window Algorithm). |
-| `"RateLimiter:TokenBucket"` | Allows short-term bursts and periodically refills the limit. |
-| `"Delay"` | Artificially delays each request by a defined time (for debugging / throttling). |
-| `"JwtAuth"` | Verifies authentication via a JSON Web Token in the `Authorization` header. |
-| `"ConcurrencyLimit"` | Limits the maximum number of concurrent connections in processing (overload protection). |
-| `"MaxPayload"` | Rejects requests whose request body exceeds a specified byte size. |
-| `"AltSvc"` | Injects the `Alt-Svc` header into responses to tell the client that HTTP/3 (QUIC) is available. |
-
-Additional configuration blocks for specific layers:
-
-#### `[Server.Layers.SecurityHeaders]`
-Defines the security headers that the proxy sends to the client. 
-**Note:** Even if `"SecurityHeaders"` is omitted from the `enabled` array, the proxy automatically injects `SecurityHeadersLayer` for your protection! If you have defined a custom `[Server.Layers.SecurityHeaders]` block on the server, those custom values are honored automatically; otherwise, strict API default values (e.g., `default-src 'none'`) are applied. When defining a custom `[Server.Layers.SecurityHeaders]` block, you must specify all 4 values.
-
-Here is an overview of the most useful values for configuration:
-
-* **`content_security_policy`** (CSP)
-  * **For APIs (Default):** `"default-src 'none'"` (Blocks loading of any external resources).
-  * **For Dashboards / Web Apps:** `"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"` (Allows resources from its own domain as well as inline scripts/styles and Base64 images).
-  * **Very strict Web App:** `"default-src 'self'"` (Only allows external files from its own domain, no inline scripts).
-
-* **`strict_transport_security`** (HSTS)
-  * **Recommended default:** `"max-age=63072000; includeSubDomains; preload"` (Enforces secure HTTPS for 2 years including all subdomains).
-  * **For testing:** `"max-age=86400"` (Enforces HTTPS only for 1 day without subdomains).
-
-* **`x_content_type_options`**
-  * **Always:** `"nosniff"` (Forbids the browser from guessing the file type. There is de facto no other sensible value for this).
-
-* **`x_frame_options`**
-  * **Highest Security:** `"DENY"` (Completely forbids embedding the page in iframes - protection against Clickjacking).
-  * **For Dashboards (if embedding is needed):** `"SAMEORIGIN"` (Allows embedding in iframes, but only on the exact same domain).
-
-#### `[Server.Layers.Cors]`
-* `allowed_origins`: Array of strings. List of allowed origins (e.g., `["https://admin.aweirich.eu", "http://localhost:3000"]`). Set `["*"]` to allow all.
-* `allowed_methods`: Array of strings. Allowed HTTP methods (e.g., `["GET", "POST", "OPTIONS"]`).
-* `allowed_headers`: Array of strings. Allowed HTTP headers (e.g., `["content-type", "authorization", "x-client-cert"]`).
-* `allow_credentials`: Boolean. Indicates whether credentials (e.g., cookies or mTLS headers) are allowed.
-
-> [!IMPORTANT]
-> **CORS Security Constraint:** In accordance with the W3C CORS specification, `allow_credentials = true` **cannot** be combined with a wildcard origin `allowed_origins = ["*"]`. Praeco validates this constraint during configuration finalization and rejects invalid combinations with a configuration error before any traffic or reload occurs.
-
-#### `[Server.Layers.Decompression]`
-* `max_decompressed_bytes`: Integer. Maximum size of the decompressed body in bytes (protection against Decompression Bombs).
-
-#### `[Server.Layers.MaxPayload]`
-* `max_bytes`: Integer. Maximum allowed request payload size in bytes.
-* *Header Fast-Path & Streaming Enforcement:* If `Content-Length` is present and exceeds `max_bytes`, the request is rejected immediately with `413 Payload Too Large`. For chunked or streaming uploads (REST and gRPC-Passthrough), bytes are tracked on the fly.
-* *Zero Upstream Blacklisting:* When a client exceeds `max_bytes` during a streaming upload, Praeco cleanly returns `413 Payload Too Large`. The error is isolated as a client-side fault (`ProxyErrorKind::PayloadTooLarge`); the upstream backend is **never** marked dead or removed from the load balancer pool.
-
-#### `[Server.Layers.ConcurrencyLimit]`
-* `max_concurrent_requests`: Integer. Maximum number of concurrent connections in processing. Must be strictly greater than `0`.
-* `load_shed`: Boolean *(optional, default: `true`)*. When enabled, requests arriving while at maximum capacity immediately fail fast with `503 Service Unavailable` and a `Retry-After: 1` header instead of queueing indefinitely into memory.
-* `queue_timeout_ms`: Integer *(optional)*. If `load_shed = false`, maximum duration in milliseconds to wait for an available permit before timing out with `503 Service Unavailable`.
-* *Body-Aware Permits:* Concurrency permits are retained across the entire duration of response body streaming (EOF or client disconnect) to accurately account for streaming resources.
-
-#### `[Server.Layers.JWT]`
-* `jwt_public_keys`: Array of strings. File paths to public keys (PEM, e.g. Ed25519) to verify JWT signatures. Keys are validated and parsed eagerly during startup and hot-reload.
-* `cookie_fallback`: String *(optional)*. The name of the HTTP cookie to read the JWT from if the `Authorization: Bearer <token>` header is absent (e.g. `"admin-jwt"`).
-* `redirect_on_failure`: String *(optional)*. The target URL to redirect the browser to (HTTP 302 / 307) if JWT authentication fails or is missing (e.g. `"https://localhost:1339/auth/login_page"`). Useful for redirecting unauthenticated users to the IdP login page.
-* `expected_issuer`: String. **Mandatory.** The JWT must contain an `iss` claim that matches one of the expected issuers (supports comma-separated lists).
-* `expected_audience`: String. **Mandatory.** The JWT must contain an `aud` claim that matches one of the expected audiences (supports comma-separated lists).
-* `revoke_on_paths`: Array of strings *(optional, default: `[]`)*. Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` claim is automatically added to the global `JwtRevocationStore` while still forwarding the request to the upstream backend (so the backend can clear browser cookies, while any subsequent replay of the token is rejected at the proxy edge with `401 Unauthorized`).
-
-#### `[Server.Layers.RateLimiter]` (Simple)
-* `requests_per_second`: Integer. Strict limit of requests per second. Must be strictly greater than `0`.
-* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy:
-  * `"identity"`: Keyed by authenticated user (`sub` from JWT or SAN from mTLS cert), falling back to canonicalized client IP (`canonical_client_ip`).
-  * `"ip"`: Keyed strictly by canonicalized client IP (`SocketAddr` / `PROXY_V2`). Standard IPv6 addresses are masked to their `/64` subnet prefix and IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped to IPv4 so attackers cannot bypass limits by rotating IPv6 interface identifiers.
-  * `"global"`: Server-wide shared bucket.
-* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys.
-* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning.
-* `trust_forwarded_headers`: Boolean *(optional, default: `false`)*. When `false` (default), `X-Forwarded-For` and `X-Real-IP` headers are ignored for rate-limiting key extraction to prevent IP spoofing, using only the verified socket / PROXY-v2 peer IP. Set to `true` only if Praeco runs behind a trusted L7 reverse proxy that does not use PROXY-Protocol v2.
-* *Performance & Anti-Cache-Thrashing (Fail-Closed):* Known keys are updated via an allocation-free $O(1)$ fast-path (`get_mut`), TTL cleanup is throttled to at most once every 10 seconds (`CLEANUP_INTERVAL_SECS = 10`), and when `entries.len() >= max_entries` is reached after TTL cleanup, requests from unknown keys fail closed with `429 Too Many Requests` (`Retry-After: 1`) without evicting active rate-limit buckets.
-* *RFC 6585 compliance:* Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
-
-#### `[Server.Layers.TokenBucketRateLimiter]`
-* `max_capacity`: Integer. Maximum burst size (number of tokens). Must be strictly greater than `0`.
-* `refill`: Integer. Number of added tokens per interval. Must be strictly greater than `0`.
-* `duration_micros`: Integer. Refill interval in microseconds. Must be strictly greater than `0`.
-* `key_by`: String *(optional, default: `"identity"`)*. Partitioning strategy (`"identity"`, `"ip"`, or `"global"`), using `canonical_client_ip` (IPv6 `/64` subnet aggregation and IPv4-mapped IPv6 unwrapping).
-* `max_entries`: Integer *(optional, default: `10000`)*. Maximum tracked client keys (fail-closed with `429 Too Many Requests` for unknown keys when at capacity, protecting existing buckets against cache-thrashing).
-* `ttl_seconds`: Integer *(optional, default: `300`)*. Inactive key time-to-live before pruning (throttled 10s sweep).
-* `trust_forwarded_headers`: Boolean *(optional, default: `false`)*. Whether to trust `X-Forwarded-For` / `X-Real-IP` headers for IP extraction (default `false`).
-* *Float-precision refill:* Eliminates token drift by preserving fractional intervals without truncation. Rejections (`429 Too Many Requests`) include a calculated `Retry-After: <seconds>` header.
-
-#### `[Server.Layers.Delay]`
-* `delay_micros`: Integer. Artificially delays each request (for debugging).
+#### Canonical Client IP Mechanics (`canonical_client_ip`):
+- **IPv4-Mapped IPv6:** Addresses like `::ffff:192.0.2.1` are automatically unwrapped to `192.0.2.1`.
+- **IPv6 Subnet Masking (`/64`):** An attacker with an IPv6 allocation can rotate interface identifiers (the lower 64 bits) across billions of IP addresses. Praeco masks all standard IPv6 addresses with a `/64` bitmask, aggregating all connections from that subnet into a single quota bucket.
 
 ---
 
-## Inspection Layer (Path Whitelist)
+### Role-Based Access Control & OID Mapping (`[Server.oid_mapping]`)
 
-When the `Inspection` layer is enabled, it acts as a lightweight Web Application Firewall (WAF). It checks the URL path (and query string) of each incoming request against regular expressions (regex). Only requests that are explicitly allowed pass through the layer. All others are immediately rejected with `403 Forbidden`.
-
-The configuration is divided by HTTP methods:
-* `[Server.AllowedPathes.GET]`
-* `[Server.AllowedPathes.POST]`
-* `[Server.AllowedPathes.PUT]`
-* `[Server.AllowedPathes.DELETE]`
-
-### Functionality & Syntax
-
-**Format:** `"/exact_path" = ["Regex1", "Regex2"]`
-
-1. **The Key (Left Side):** Must be the *exact* base path of the URL (without query parameters). The proxy looks in its internal map for exactly this string. If the path is not listed here, the request is immediately blocked.
-2. **The Value (Right Side):** Is an array of regular expressions. 
-3. **The Matching:** The proxy puts the base path and the query string back together (e.g., `/api/search?q=test`) and checks this complete string against all regular expressions defined in the array. As soon as *at least one* regex matches, the request is let through.
-
-> [!TIP]
-> **Why doesn't the key (Base-Path) allow Regex? (Performance)**
-> This is a deliberate architectural decision for extremely high performance. The keys are loaded into a so-called hash map (`HashMap`) at startup. An exact path match (`map.get(path)`) in a hash map requires almost `0` computation time ($O(1)$). If the server were to allow regex for the key, it would have to loop over *all* configured routes for *every* incoming request and perform compute-intensive regex operations ($O(N)$). Through the exact key, the correct regex list is found lightning fast, and only then the (more expensive) regex check is performed.
-
-### Examples
+Maps OID suffix numbers extracted from certificates or JWT claims to internal `UserRole` values:
 
 ```toml
-[Server.AllowedPathes.GET]
-# Allows the root path "/" and optionally a query parameter "name" (e.g., /?name=Fredi)
-"/" = ["^/?$", "^/\\?name=.*$"]
+[Server.oid_mapping]
+"1" = "Admin"
+"2" = "Seller"
+"3" = "Viewer"
+```
 
-# Allows the path "/name", but ONLY if a numerical ID is strictly passed (e.g., /name?id=123).
-# Explanation of the syntax "\\?id":
-# 1. '\\'   : In TOML, a backslash must be doubled.
-# 2. '\\?'  : Corresponds to '\?' in regex, which stands for a mandatory literal question mark (in the URL).
-"/name" = ["^/name\\?id=\\d+$"]
+- **Per-Server Scope:** Suffix `"1"` can map to `"Admin"` on an internal server, but to `"Customer"` on an external server.
+- **Fallback Role:** If a client presents a valid certificate containing no recognized OIDs, Praeco assigns the internal fallback role **`Guest`**.
 
-[Server.AllowedPathes.POST]
-# For gRPC calls, there are usually no query parameters.
-# ".*" here simply allows everything on this exact path.
-"/chat.ChatService/SendMessage" = [".*"]
+---
+
+### TLS & Client Certificate Verification
+
+#### Server TLS Certificates (`[Server.server_certs]`)
+**Mandatory** when `protocol = "https"`.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `ssl_certificate` | String | **Mandatory** | *None* | Path to PEM-encoded certificate chain (leaf certificate followed by any intermediate CAs). |
+| `ssl_certificate_key` | String | **Mandatory** | *None* | Path to unencrypted PEM private key (PKCS#8, RSA, or SEC1). |
+
+#### Client CA Certificates (`[[Server.client_certs]]`)
+**Mandatory** when `authentication = "ClientCert"` or `"OptionalClientCert"`. Multiple blocks can be defined to trust multiple independent CAs.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `ssl_client_ca` | String | **Mandatory** | *None* | Path to PEM-encoded CA certificate used to verify client certificates. |
+| `ssl_client_crl` | String | Optional | `None` | Path to PEM-encoded Certificate Revocation List (CRL). Parsed at startup and reload. Praeco validates the X.509 `nextUpdate` timestamp and logs an explicit security warning if the CRL has expired. |
+
+---
+
+### Client Certificate Header Forwarding & Anti-Spoofing (`[Server.client_cert_forwarding]`)
+
+Injects verified client identity attributes into headers forwarded to backend servers.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `header_cert` | String | Optional | `None` | Header name for the full URL-encoded DER client certificate (e.g. `"x-client-cert"`). |
+| `header_san` | String | Optional | `None` | Header name for the Subject Alternative Name (SAN) or CN (e.g. `"x-client-san"`). |
+| `header_roles` | String | Optional | `None` | Header name for mapped roles as a comma-separated list (e.g. `"x-user-roles"`). |
+| `header_client_ip` | String | Optional | `None` | Header name for the verified client IP address (e.g. `"x-client-ip"`). |
+
+> [!IMPORTANT]
+> **Anti-Spoofing Guarantee:**
+> Praeco unconditionally strips all incoming client-supplied headers matching `x-client-*`, `x-ssl-*`, `x-forwarded-*`, and `x-real-ip`. Upstream headers are authoritatively populated strictly from verified socket state or PROXY-v2 signatures.
+
+---
+
+## Base Services Deep-Dive
+
+### Echo Service (`service = "Echo"`)
+Reflects incoming request headers, method, path, and body back to the caller. Requires no sibling configuration blocks. Ideal for baseline throughput and latency benchmarking.
+
+---
+
+### Static File Server & SPA Routing (`service = "StaticFiles"`)
+
+Serves web applications directly from disk with chunked streaming and cache controls. Requires `[Server.StaticFilesParams]`.
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `root` | String | **Mandatory** | *None* | Filesystem directory to serve files from (e.g. `"./server/www"`). Validated at startup; logs a warning if directory does not exist yet. |
+| `fallback_to_index` | Boolean | Optional | `false` | When `true`, requests for nonexistent files return `index.html` with status `200 OK`. Essential for single-page applications (React, Vue, Angular) relying on client-side routing. |
+
+```toml
+[Server.StaticFilesParams]
+root = "./server/www"
+fallback_to_index = true
 ```
 
 ---
 
-## Reverse Proxy Routing (`[Server.ReverseRoutes."/prefix"]`)
+### Identity Provider (`service = "Idp"`)
 
-*This section is only active if `service = "Router"` is set for the server instance.*
+The built-in IdP issues Ed25519-signed JWTs via device mTLS authentication or visual QR-code login. Requires `[Server.IdpParams]`.
 
-A reverse proxy accepts incoming requests from clients and forwards them - completely transparently for the client - to one or more background servers (upstreams). The response from the background server is then played back to the client via the proxy. This is the heart of the gateway and enables central authentication, intelligent load balancing, and failover.
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `jwt_private_key` | String | **Mandatory** | *None* | Path to PEM-encoded Ed25519 or RSA private key used to sign issued JWTs. Validated at startup. |
+| `jwt_public_key` | String | Optional | `None` | Path to PEM-encoded public key. When configured, automatically exposed in RFC 7517 format at `/.well-known/jwks.json` for key rotation. |
+| `token_expiry_seconds` | Integer | Optional | `900` (15 mins) | Lifetime of issued JWTs in seconds (`exp` claim). |
+| `session_ttl_seconds` | Integer | Optional | `120` (2 mins) | Lifetime of QR-code login sessions. |
+| `cookie_name` | String | Optional | `"__Host-jwt"` | Name of auth cookie set upon login. If prefixed with `__Host-`, protocol **must** be `"https"` and `cookie_domain` must be omitted per RFC 6265bis. |
+| `cookie_domain` | String | Optional | `None` | Domain scope for cookie sharing across subdomains (e.g. `".example.com"`). Ignored if `cookie_name` starts with `__Host-`. |
+| `redirect_after_login` | String | Optional | `"/"` | Default redirect URL after successful browser login if no `?redirect=` parameter was provided. |
+| `debug_show_session_id` | Boolean | Optional | `false` | When `true`, displays raw session UUID on web UI for testing. |
+| `issuer` | String | Optional | `"praeco-idp"` | Issuer claim (`iss`) written into issued JWTs. |
+| `allowed_audiences` | Array of Strings | Optional | `[]` | Allowed audience values (`aud`). If client requests `?aud=...`, it must match an entry here; unlisted audiences return `400 Bad Request`. |
+| `claims_webhook_url` | String | Optional | `None` | HTTPS webhook URL for dynamic role resolution. Praeco POSTs to this endpoint during authentication to fetch current roles from a database, overriding certificate OIDs. Response body cap is 64 KB. |
+| `claims_webhook_timeout_ms`| Integer | Optional | `3000` (3s) | Network timeout in milliseconds for claims webhook execution. |
+| `on_webhook_failure` | String | Optional | `"reject"` | Failure handling: `"reject"` (fail-closed: denies login with 503) or `"fallback_to_cert"` (fail-open: falls back to certificate OIDs). |
+| `claims_webhook_client_cert`| String | Optional | `None` | Path to PEM client certificate for mTLS against webhook. |
+| `claims_webhook_client_key` | String | Optional | `None` | Path to PEM client private key for webhook mTLS. |
+| `claims_webhook_ca_cert` | String | Optional | `None` | Path to PEM CA certificate for verifying webhook server TLS. |
 
-### How does Prefix Routing work?
-Each block defines a route based on a URL prefix (the path inside the square brackets). When a request comes in, the proxy compares the path with all configured routes and **always selects the longest (most specific) match**.
+#### IdP Security & Endpoints:
+- `GET /auth/login_page`: Serves QR-code login page.
+- `GET /auth/session_info?session=<id>`: Retrieves session state.
+- `POST /auth/confirm?session=<id>&code=<user_code>`: Confirms session. Strictly requires 6-character visual confirmation code verified in constant time (`constant_time_eq`). Invalided after 3 failed attempts (`MAX_CONFIRM_ATTEMPTS = 3`).
+- `POST /auth/revoke?jti=<UUID>`: Revokes token ID in global `JwtRevocationStore` (50,000 entry cap). **Requires valid mTLS client certificate.**
 
-* **Example:** You configure two routes: `[Server.ReverseRoutes."/"]` (Catch-All) and `[Server.ReverseRoutes."/api/v1"]`.
-* A request to `/api/v1/users` is processed by the specific route `/api/v1`.
-* A request to `/help` falls back to the catch-all `/`.
+---
 
-### Core Functions per Route
-Each route acts isolated and offers four essential functions:
-1. **Load Balancing:** You can specify an array of backend servers (upstreams). Traffic is distributed among these according to a chosen strategy.
-2. **Health Checks:** The proxy can dynamically detect dead servers, pause them for a time (Cooldown), and automatically put them back into rotation when they are reachable again.
-3. **Authorization (RBAC):** You can restrict routes to specific roles (see `[oid_mapping]`).
-4. **URL Stripping:** The configured prefix is *removed* from the URL during forwarding and replaced by the path of the backend server.
-   * *Example:* A request to `/api/v1/users` (Prefix `/api/v1`) is forwarded to an upstream with the address `http://backend:8080/` as `http://backend:8080/users`. 
-   * A request to `/help` (Prefix `/`) goes to the backend as `/help` accordingly.
+### Reverse Proxy Router (`service = "Router"`)
 
-### Parameters of a Route
+Handles reverse proxying, load balancing, circuit breaking, and gRPC transcoding.
 
-| Parameter | Data Type | Description | Possible Values |
-| :--- | :--- | :--- | :--- |
-| `upstreams` | Array | List of backend server URLs. <br><br>**Note:** If more than one server is specified, the proxy automatically performs load balancing between these servers. | **Example:** `["https://backend1:50051", "https://backend2:50051"]` |
-| `strategy` | String | Load balancing strategy. | `"RoundRobin"` (Default, sequential)<br>`"LeastConnections"` (Fewest active connections)<br>`"Random"` (Random)<br>`"Sticky"` (Hash on client IP)<br>`"HighestScore"` (Based on health checks) |
-| `backend_type` | String | Type of the backend. | `"rest"` (Standard HTTP)<br>`"grpc_passthrough"` (Pure gRPC/HTTP2)<br>`"grpc"` (gRPC with JSON-Transcoding) |
-| `allowed_roles` | Array | **RBAC (Role-Based Access Control):** Determines which roles are allowed to access this route. <br><br>• If the array is **empty** `[]`, the route is completely public (authorization check is skipped).<br>• If roles are entered (e.g., `["Admin", "Operator"]`), the client must have been assigned exactly one of these roles. **Attention: The system is not hierarchical!** A client with role `"Admin"` may *not* automatically access routes where *only* `"Guest"` is stated, unless you explicitly enter `["Admin", "Guest"]`. | `["Admin", "Operator", "Viewer", "Guest"]` |
-| `active_health_check_interval` | Integer | Interval in seconds for active polling. `0` means disabled. | **Example:** `15` |
-| `grpc_pool_refresh_secs` | Integer | (Only for type `"grpc"`) How often the gRPC Reflection schema should be updated in the background. | `60` |
-| `cooldown_seconds` | Integer | Duration in seconds how long a dead node is not targeted. | **Default:** `10` |
-| `max_retries` | Integer | Maximum automatic retry attempts for failed requests. | **Default:** `2` |
+#### Route Definitions (`[Server.ReverseRoutes."/prefix"]`)
+Routes are matched using **longest prefix first**. The matched prefix is stripped from the request URI before forwarding to upstream servers.
 
-### Fine-Grained Path-Level RBAC (`[Server.rbac]`)
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `upstreams` | Array of Strings | **Mandatory** | *None* | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). |
+| `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
+| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), or `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap). |
+| `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
+| `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead upstream is benched after connection failure before being retried in half-open state. |
+| `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes before returning 502/504 to client. |
+| `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Polling interval in seconds. Proactively pings `/health` (REST) or gRPC `health` method. Expected score payload: `{"score": 100}` (REST) or field tag 1 integer (gRPC). Score 0 quarantines node. |
 
-While `allowed_roles` on a route prefix (`[Server.ReverseRoutes."..."]`) secures entire subtrees, modern APIs often require **fine-grained method- and path-level privilege separation** within the same reverse route (e.g. distinguishing between seller operations and super-admin commands under `/api/*`).
+#### Upstream Connection Parameters (`[Server.RouterParams]`)
 
-The `[Server.rbac]` table maps specific URI paths or wildcard patterns to required roles:
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `protocol` | String | Optional | `"http"` | Upstream transport protocol: `"http"` or `"https"`. |
+| `authentication` | String | Optional | `"None"` | Upstream authentication mode: `"None"`, `"ClientCert"` (mTLS to upstream), or `"JWT"`. |
+| `ssl_root_certificate` | String | Optional | `None` | Path to custom CA certificate for verifying upstream server certificates. **Strict Custom PKI Isolation:** Trusts *exclusively* this CA, completely isolating upstream traffic from public WebPKI roots. |
+| `ssl_client_certificate` | String | Optional | `None` | Path to PEM client certificate for upstream mTLS. |
+| `ssl_client_key` | String | Optional | `None` | Path to PEM client private key for upstream mTLS. |
+| `jwt` | String | Optional | `None` | Path to a file containing a JWT injected into `Authorization: Bearer <token>` on outbound requests. |
+| `connect_timeout_seconds` | Integer | Optional | `5` | TCP and TLS connection establishment deadline in seconds. |
+| `request_timeout_seconds` | Integer | Optional | `30` | Upstream response header deadline in seconds (`0` disables). Terminates stalling requests with `504 Gateway Timeout` and marks node dead. |
+| `idle_timeout_seconds` | Integer | Optional | `90` | Connection pool idle keepalive timeout in seconds. Sockets idle longer than this duration are evicted. |
+| `grpc_reflection_timeout_seconds`| Integer | Optional | `10` | Timeout in seconds for gRPC reflection schema discovery RPCs. |
+| `grpc_reflection_ttl_seconds` | Integer | Optional | `600` (10 mins) | Time-to-live for cached Protobuf descriptor pools before refreshing schema. |
+
+---
+
+## gRPC Architecture & Features Deep-Dive
+
+Praeco provides first-class, industrial-grade support for gRPC microservices. It can operate in two distinct modes depending on your architecture: **Pure Pass-Through** or **Dynamic JSON-to-gRPC Transcoding**.
+
+```text
+                               ┌────────────────────────────────────────────────────────┐
+                               │                     praeco-rs                          │
+Native gRPC Client             │                                                        │       gRPC Backend
+(iOS / Android / Go / Rust) ───┼─► [HTTP/2 + Protobuf] ────► grpc_passthrough ──────────┼─────► (Tonic / Go / Java)
+(speaks HTTP/2 + Protobuf)     │                                                        │       (speaks HTTP/2 + Protobuf)
+                               │                                                        │
+REST / Web Browser Client      │                                                        │
+(JavaScript / Fetch / cURL) ───┼─► [HTTP/1.1 or H2 + JSON] ─► grpc_transcoding (Web) ───┼─────► (Tonic / Go / Java)
+(speaks standard JSON)         │                                (Dynamic Schema Fetch   │       (speaks HTTP/2 + Protobuf)
+                               │                                 via Server Reflection) │
+                               └────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Mode Comparison: Passthrough vs. Transcoding
+
+| Feature / Behavior | Native Passthrough (`"grpc_passthrough"`) | Dynamic Transcoding (`"grpc"` / `"grpc_transcoding"`) |
+| :--- | :--- | :--- |
+| **Inbound Protocol** | HTTP/2 with binary Protobuf payloads (`application/grpc`) | Standard HTTP/1.1, HTTP/2, or HTTP/3 with JSON payloads (`application/json`) |
+| **Outbound Protocol** | Forced HTTP/2 with binary Protobuf (`application/grpc`) | Forced HTTP/2 with binary Protobuf (`application/grpc`) |
+| **Target Client** | Real gRPC client SDKs, mobile apps, backend microservices | Web browsers, Single Page Apps (SPAs), cURL, third-party REST consumers |
+| **Schema Requirement** | **None.** Operates at wire speed without inspecting message fields. | **Automatic Reflection.** Fetches protobuf definitions at runtime via gRPC Reflection v1. |
+| **Recompilation on Schema Change**| **Never.** Fully schema-agnostic. | **Never.** Automatically re-syncs schema based on `grpc_reflection_ttl_seconds`. |
+| **Streaming Support** | **Full:** Unary, Client-Streaming, Server-Streaming, Bidirectional | **Unary:** Request-Response (buffers request body and responses up to 16 MiB). |
+| **CPU & Memory Overhead** | **Zero-Copy / Wire-Speed.** Passes raw HTTP/2 frames directly. | **Minimal.** Performs dynamic JSON-to-Protobuf serialization via `prost-reflect`. |
+| **HTTP/2 Trailers (`grpc-status`)** | Preserved end-to-end to the client in trailing HEADERS frames. | Translated into HTTP status codes and JSON error responses. |
+
+---
+
+### Native gRPC Passthrough (`backend_type = "grpc_passthrough"`)
+
+Configured when you want Praeco to act as an edge reverse proxy and load balancer for native gRPC traffic while applying mTLS client certificate validation, OID-based RBAC, rate limiting, and connection limits.
+
+#### 1. Wire-Level Framing & Hop-by-Hop Header Sanitization
+- Praeco forces the outbound connection version to **HTTP/2** (`hyper::Version::HTTP_2`).
+- Hyper's strict HTTP/2 client rejects standard HTTP/1.1 hop-by-hop headers. Praeco automatically strips:
+  - `Connection`
+  - `Transfer-Encoding`
+  - `Upgrade`
+  - `TE`
+- **Crucial gRPC Exception:** In HTTP/2, the `TE` header is strictly forbidden *except* for the exact value `"trailers"`. Praeco authoritatively injects `TE: trailers` into the outgoing request:
+  ```rust
+  current_headers.remove(hyper::header::TE);
+  current_headers.insert(hyper::header::TE, hyper::header::HeaderValue::from_static("trailers"));
+  ```
+  This guarantees that backend gRPC servers transmit status codes and metadata in trailing HTTP/2 HEADERS frames instead of dropping them.
+
+#### 2. Streaming Integrity & Retry Semantics
+- **Non-Streaming Calls:** If an upstream node fails or times out before transmitting headers, Praeco automatically retries alternate healthy nodes up to `max_retries`.
+- **Streaming Calls (Client / Server / Bidi):** Streaming bodies (`RequestBody::Stream`) cannot be rewound once frames have been dispatched across the wire. If a stream fails midway, Praeco detects the consumed stream state and **aborts immediately** rather than attempting retries on a second node (which would send corrupted, partial payloads to the backend).
+
+#### 3. Client Fault Isolation (Zero Upstream Penalization)
+When proxying gRPC streams, failures can originate either from the backend or the client. Praeco isolates client errors:
+- If a client exceeds `max_bytes` during a streaming upload, Praeco cleanly returns `413 Payload Too Large`.
+- If a client abruptly terminates its TCP socket, Praeco terminates the upstream stream.
+- **Circuit Breaker Protection:** The backend upstream node is **not** penalized, marked dead, or removed from the load balancer pool when the client is at fault. Upstream nodes are quarantined *only* when the backend itself drops connection or exceeds `request_timeout_seconds`.
+
+```toml
+# Example Native gRPC Passthrough Route
+[Server.ReverseRoutes."/chat.ChatService"]
+upstreams = ["https://10.0.0.1:50051", "https://10.0.0.2:50051"]
+strategy = "LeastConnections"
+backend_type = "grpc_passthrough"
+allowed_roles = ["Admin", "Customer"]
+cooldown_seconds = 10
+max_retries = 2
+active_health_check_interval = 30
+```
+
+---
+
+### Dynamic JSON-to-gRPC Transcoding (`backend_type = "grpc"`)
+
+Enables web browsers, frontend applications, and standard HTTP clients to communicate directly with backend gRPC microservices without compiling `.proto` files into client-side code and without requiring Envoy or grpc-web proxies.
+
+#### The Transcoding Request Lifecycle
+
+```text
+Client (Browser)                      Praeco Router                      Backend (gRPC/Tonic)
+       │                                    │                                      │
+       │── POST /chat.ChatService/Send ────►│                                      │
+       │   Body: {"room_id":1, "msg":"hi"}  │                                      │
+       │                                    │── [Step 1: Check Schema Cache] ─────►│ (If expired, queries
+       │                                    │◄─ [gRPC Reflection v1 Schema] ───────│  ListServices/FileDesc)
+       │                                    │                                      │
+       │                                    │── [Step 2: Validate JSON types]      │
+       │                                    │── [Step 3: Encode Protobuf Bytes]    │
+       │                                    │── [Step 4: Prepend 5-byte Frame]     │
+       │                                    │                                      │
+       │                                    │── HTTP/2 POST /chat.ChatService/Send►│
+       │                                    │   content-type: application/grpc     │
+       │                                    │   [0x00][4-byte len][protobuf_bytes] │
+       │                                    │                                      │
+       │                                    │◄── HTTP/2 200 OK (gRPC Stream) ──────│
+       │                                    │    [0x00][4-byte len][res_protobuf]  │
+       │                                    │    trailers: grpc-status: 0          │
+       │                                    │                                      │
+       │                                    │── [Step 5: Enforce 16 MB Cap]        │
+       │                                    │── [Step 6: Decode Protobuf to JSON]  │
+       │                                    │                                      │
+       │◄─ HTTP 200 OK (application/json) ──│                                      │
+       │   Body: {"success":true}           │                                      │
+```
+
+1. **Path Routing:** Client sends `POST /<package>.<Service>/<Method>` with a standard JSON body.
+2. **Dynamic In-Memory Validation:** Praeco resolves the method in its `DescriptorPool`. It parses the client's JSON against the input message schema using `prost-reflect`. If a required field is missing or has the wrong type, Praeco rejects the call immediately with `400 Bad Request` and a descriptive JSON error, saving backend compute resources.
+3. **Protobuf Encoding & 5-Byte Framing:** Praeco encodes the validated dynamic message into raw Protobuf bytes and wraps it in a standard 5-byte gRPC frame:
+   - **Byte 0:** Compression flag (`0` = uncompressed, `1` = compressed).
+   - **Bytes 1–4:** Big-endian 32-bit unsigned integer representing the exact payload byte length (`u32::to_be_bytes`).
+4. **Header Injection:** Dispatches an HTTP/2 request with `content-type: application/grpc`, `te: trailers`, and propagated W3C `traceparent` headers.
+5. **Response Translation & 16 MiB Protection:**
+   - Praeco bounds response body collection to **16 MiB** (`http_body_util::Limited::new(res.body_mut(), 16 * 1024 * 1024)`). This prevents malfunctioning or malicious upstream services from causing out-of-memory (OOM) crashes in the gateway.
+   - Extracts the 5-byte gRPC frame, decodes the Protobuf response payload using `DynamicMessage::merge`, serializes it into a JSON string, and responds to the client with `200 OK` and `content-type: application/json`.
+
+```toml
+# Example Dynamic JSON-to-gRPC Route
+[Server.ReverseRoutes."/chat.ChatService"]
+upstreams = ["https://10.0.0.1:50051"]
+strategy = "RoundRobin"
+backend_type = "grpc" # Enables dynamic transcoding
+allowed_roles = ["Admin", "Seller"]
+```
+
+---
+
+### gRPC Server Reflection & Schema Caching
+
+When `backend_type = "grpc"` or when active health checking is enabled for gRPC, Praeco connects to the backend's gRPC Server Reflection service (v1 and v1alpha) to download the Protobuf schema.
+
+#### Configuration Parameters in `[Server.RouterParams]`
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `grpc_reflection_ttl_seconds` | Integer | Optional | `600` (10 mins) | Time-to-live for the cached in-memory `DescriptorPool`. When expired, the next incoming request lazily triggers a refresh from the upstream backend. |
+| `grpc_reflection_timeout_seconds` | Integer | Optional | `10` | Overall network timeout in seconds for executing the gRPC reflection discovery RPCs (`ListServices` and `FileContainingSymbol`). |
+
+#### Concurrency & High-Availability Protections:
+1. **Single-Flight Synchronization (`grpc_reflection_lock`):**
+   When a cached schema expires, hundreds of concurrent client requests might arrive simultaneously. Rather than triggering hundreds of parallel reflection queries against the backend (a thundering herd), Praeco acquires a single-flight asynchronous mutex (`grpc_reflection_lock.lock()`). Exactly **one** task executes the network discovery; all other tasks await the result and then immediately read the refreshed schema from memory.
+2. **Lock-Free Read Fast-Path:**
+   During ordinary operation, schema reads occur under a shared `RwLock::read` without holding any write locks, enabling thousands of requests per second with zero lock contention.
+3. **Stale-While-Revalidate Fallback:**
+   If a backend service is temporarily restarting or unreachable when the TTL expires, Praeco catches the reflection network error and **falls back to the existing stale schema**, logging a warning while continuing to serve client requests uninterrupted.
+4. **Custom PKI & mTLS Support:**
+   Reflection channels fully inherit the TLS configuration from `[Server.RouterParams]`. If your backend requires mutual TLS (`ssl_client_certificate` / `ssl_client_key`) and a private root CA (`ssl_root_certificate`), the reflection client connects using those exact certificates.
+
+---
+
+### Active Health Checking & Score Metrics for gRPC
+
+When `active_health_check_interval > 0` is configured on a route whose `backend_type` is `"grpc"` or `"grpc_passthrough"`, Praeco launches a dedicated background polling task for each upstream node.
+
+```text
+Praeco Background Task                         Backend gRPC Server
+        │                                              │
+        │── [Step 1: Discover /<Service>/health] ────►│ (Via Server Reflection)
+        │                                              │
+        │── POST /<Service>/health ───────────────────►│
+        │   Payload: [0x00, 0x00, 0x00, 0x00, 0x00]    │ (Empty gRPC Message Frame)
+        │                                              │
+        │◄── 200 OK + Health Score Message ────────────│
+        │    Protobuf: Tag 1 Varint = 85               │
+        │                                              │
+        │── [Score > 0: Mark Alive, Score = 85]        │
+```
+
+#### 1. Automatic Endpoint Discovery
+- Praeco inspects the loaded Protobuf schema for any service exposing an RPC method named **`health`** (e.g. `/system.HealthService/health` or `/chat.ChatService/health`).
+- Once discovered, Praeco remembers the fully qualified path (`/<package>.<Service>/health`).
+
+#### 2. Ping Framing
+Every interval (e.g. every 15 seconds), Praeco sends an HTTP/2 request with an empty gRPC frame:
+```text
+[0x00, 0x00, 0x00, 0x00, 0x00] (1 byte uncompressed + 4 bytes zero length)
+```
+
+#### 3. Health Score Decoding (Varint Wire Format)
+The backend service must return a Protobuf message whose **first field (Field Tag 1)** is an integer representing its health score:
+```protobuf
+message HealthResponse {
+  uint32 score = 1; // 0 = unhealthy, 1..100 = healthy
+}
+```
+- Praeco bounds the response body collection to 64 KB and decodes the Protobuf varint tag (`0x08`).
+- **Score Semantics:**
+  - `score == 0`: Node is immediately marked dead (`is_alive = false`) and removed from the load balancer rotation.
+  - `score > 0`: Node is marked alive (`is_alive = true`) and its atomic score is updated (`current_score.store(score)`).
+- **Load Balancing Integration (`strategy = "HighestScore"`):**
+  If your route uses `strategy = "HighestScore"`, Praeco forwards incoming client requests to the node reporting the highest health score (e.g. reporting available CPU or lowest latency).
+
+---
+
+### HTTP/2 Upstream Connection Pool & Keep-Alive Mechanics
+
+To handle massive concurrency with low latency, Praeco maintains persistent HTTP/2 connection pools for gRPC upstreams via `common::client::build_hyper_client`.
+
+#### Hardcoded Performance & Resilience Defaults:
+- **`http2_only = true`:** Eliminates HTTP/1.1 negotiation roundtrips. The client establishes direct HTTP/2 framing immediately.
+- **`http2_adaptive_window = true`:** Dynamically adjusts HTTP/2 stream and connection flow control windows based on throughput and network delay, preventing stream starvation on large file transfers.
+- **`http2_keep_alive_while_idle = true`:** Sends HTTP/2 `PING` frames every **30 seconds** with a **10-second acknowledgment timeout** even when no traffic is flowing. Sockets silently killed by stateful firewalls or cloud NAT gateways are pruned immediately rather than failing customer requests.
+- **`tcp_nodelay = true`:** Disables Nagle's algorithm on all upstream TCP sockets, ensuring small gRPC frames are transmitted without artificial buffering latency.
+- **`tcp_keepalive = 60s`:** Sets OS-level TCP keepalive probes.
+- **`pool_max_idle_per_host = 1024`:** Retains up to 1024 idle HTTP/2 multiplexed connections per upstream host.
+
+---
+
+### HTTP/2 Trailers Preservation & Compression Layer Bypass
+
+In HTTP/2 and gRPC, status codes are not transmitted in the HTTP status line; they are transmitted in trailing HEADERS frames (`grpc-status` and `grpc-message`).
+
+> [!WARNING]
+> **Why Compression Middleware Must Skip gRPC:**
+> If a standard HTTP compression layer (e.g. Gzip or Brotli) compresses a streaming gRPC response body, it buffers or wraps the stream, which strips or breaks HTTP/2 trailers.
+> 
+> **Praeco's Protection:**
+> The `Compression` middleware (`SrvCompressionLayer`) automatically inspects the response `Content-Type`. If it starts with `application/grpc`, compression is **unconditionally bypassed**:
+> ```rust
+> let is_grpc = resp.headers()
+>     .get(hyper::header::CONTENT_TYPE)
+>     .and_then(|v| v.to_str().ok())
+>     .is_some_and(|ct| ct.starts_with("application/grpc"));
+> 
+> if already_encoded || is_grpc {
+>     // Skip compression to preserve trailing HTTP/2 HEADERS frames!
+> }
+> ```
+> This guarantees that all gRPC clients correctly receive `grpc-status: 0` (OK) or specific error codes.
+
+---
+
+### gRPC Error Propagation & Gateway Status Codes
+
+When errors occur during gRPC proxying, Praeco maps them consistently to standard HTTP status codes:
+
+| Scenario | Gateway Response Status | Trigger & System Behavior |
+| :--- | :--- | :--- |
+| **Invalid Method / Path** | `400 Bad Request` | Request path does not conform to `/<package>.<Service>/<Method>` or HTTP method is not `POST`. |
+| **Malformed JSON (Transcoding)** | `400 Bad Request` | Request JSON body fails dynamic Protobuf schema deserialization. Descriptive JSON error returned. |
+| **Service Not Found in Schema** | `404 Not Found` | Requested service is not registered in backend's reflection schema. |
+| **Method Not Found in Schema** | `404 Not Found` | Requested method does not exist on the targeted service. |
+| **Payload Limit Exceeded** | `413 Payload Too Large` | Client payload exceeds `max_bytes` in `[Server.Layers.MaxPayload]`. Upstream node remains healthy. |
+| **Backend Unreachable** | `502 Bad Gateway` | TCP connection refused or backend closed connection before sending headers. Retries alternative nodes if configured. |
+| **Backend Timeout** | `504 Gateway Timeout` | Upstream backend accepted connection but failed to respond within `request_timeout_seconds`. |
+| **Upstream Response > 16 MB** | `502 Bad Gateway` | Transcoding response body exceeds the 16 MiB safety limit. Prevents memory exhaustion. |
+
+---
+
+## Granular Path-Level RBAC (`[Server.rbac]`)
+
+Enforces method- and path-level privilege separation within the same route prefix:
 
 ```toml
 [Server.rbac]
-# Exact path match (O(1) lookup)
-"/api/GetDatabaseTables"         = ["Admin"]
-"/api/GetTableContent"           = ["Admin"]
-"/api/AdminDeleteUser"           = ["Admin"]
+# Exact match (O(1) lookup)
+"/chat.ChatService/AdminDeleteUser"   = ["Admin"]
 
 # Wildcard prefix match (ends with '*')
-"/api/Admin*"                    = ["Admin"]
+"/chat.ChatService/Admin*"            = ["Admin"]
 
-# Specific exception (exact match takes precedence over wildcard prefix)
-"/api/AdminGetProducts"          = ["Admin", "Seller"]
+# Exact match overrides prefix match
+"/chat.ChatService/AdminGetProducts"  = ["Admin", "Seller"]
 
 # Explicit Deny-All (fail-closed: empty role list denies all callers)
-"/api/InternalSecret"            = []
+"/chat.ChatService/InternalSecret"    = []
 
-# Public override (wildcard role '*' permits all callers)
-"/api/PublicPing"                = ["*"]
+# Public override (wildcard '*' permits all callers)
+"/chat.ChatService/PublicPing"        = ["*"]
 ```
 
-#### Evaluation Order & Precedence:
-1. **Exact Path Match:** If the request URI matches an exact key in `[Server.rbac]`, that rule is enforced immediately.
-2. **Longest Prefix Wildcard Match:** If not matched exactly, keys ending with `*` are evaluated in order of descending prefix length (most specific prefix wins).
-3. **Empty Role List (`[]`) = Fail-Closed:** If a matched path rule has an empty role list, access is unconditionally denied with `403 Forbidden`.
-4. **Fallback to Route-Level `allowed_roles`:** If no path-specific rule in `[Server.rbac]` matches the request, authorization falls back to the enclosing route's `allowed_roles`. If the route's `allowed_roles` is empty `[]`, the route is unrestricted.
-
-
-#### Excursion: Backend Types (`backend_type`)
-The choice of backend type largely determines how the proxy handles data streams, especially if the backend is a gRPC server:
-
-* **`"rest"`:** Default behavior for classic web servers and REST APIs. The HTTP calls (incl. headers and body) are passed through 1:1.
-* **`"grpc_passthrough"`:** Pure pass-through of gRPC. 
-  * *Client:* Must be a real gRPC client (speaks HTTP/2 and Protobuf).
-  * *Behavior:* The proxy passes the pure gRPC frames on the TCP/HTTP2 level through to the backend without looking into the payload or modifying it. This is extremely fast and performant.
-* **`"grpc"` (JSON-Transcoding):** The proxy acts as a translator between the REST/JSON world and the gRPC world.
-  * *Client:* Can be a normal web browser, a frontend (JavaScript/Fetch), or `curl` that speaks normal HTTP(s) with JSON.
-  * *Behavior:* The proxy receives the JSON request, translates it "on the fly" into the binary Protobuf format (based on the schema loaded from the server via Reflection) and sends it via HTTP/2 to the gRPC server. The gRPC response of the server is translated back into readable JSON by the proxy and sent back to the client. This allows modern gRPC backends to be addressed without special client libraries.
-
-### Health Checks & Failover
-
-The proxy protects your applications through two combined monitoring systems to intercept failures of backend servers (upstreams) and intelligently reroute traffic:
-
-**1. Passive Health Checks (Circuit Breaker)**
-This system is always automatically active as soon as traffic flows.
-* If the proxy sends a request to a backend and it is unreachable (e.g., Connection Refused or Timeout), the error is registered immediately.
-* The backend is marked as "dead" and put on the "bench" for the duration of `cooldown_seconds` (Default: 10s). The load balancer does not route new requests there during this time.
-* After the cooldown phase has expired, the backend gets a new chance ("Half-Open" state) and the next regular request is tentatively routed there again.
-* **Failover (`max_retries`):** If a backend fails exactly during a customer request, the proxy does not simply abort. It catches the error and automatically sends the customer request to the next healthy backend in the list. The parameter `max_retries` (Default: 2) controls how often this is attempted. For the customer, the server failure is thus completely invisible.
-
-**2. Active Health Checks (Background Polling)**
-This feature is enabled by setting `active_health_check_interval` to a value greater than 0 (e.g., `15`).
-* The proxy then starts an asynchronous task in the background for each backend, which (in the example every 15 seconds) proactively checks reachability, even if there is currently no customer traffic.
-* **REST Backends:** An HTTP GET request is automatically sent to the `/health` path of the backend server.
-* **gRPC Backends:** The proxy uses "gRPC Server Reflection" to load the server's schema. It searches all offered services for a method that exactly carries the name `health` (e.g., `/MyService/health`). If it finds this method, it is cyclically pinged with an empty Protobuf payload. If it does not find such a method, the active health check is skipped for this node.
-* **Health Score (Important for the `HighestScore` strategy):** The proxy not only evaluates the HTTP status code, but also reads the payload of the health check response to assign a "score" to the servers.
-  * *For REST:* The backend must return a JSON object: `{"score": 100}`.
-  * *For gRPC:* The method must return a Protobuf message whose very first field (Field Tag 1) is an integer (e.g., `uint32 score = 1;`).
-  * *Meaning & Value Range:* A score of `0` immediately marks the server as dead (unhealthy). At a value `> 0` it is considered healthy. A **value range of 0 to 100** (e.g., analogous to percent) is **strongly recommended for both protocols**. (Note: For performance reasons, the internal gRPC parser currently only evaluates the Protobuf field from the first byte, which is why gRPC scores technically cannot be greater than 127 anyway).
-  * If you have chosen the strategy `"HighestScore"` for Load Balancing, the proxy always forwards new requests to the server that reported the highest value during the last check (useful to prioritize servers according to their current CPU load).
-* **Advantage:** Dead servers are detected even before a customer tries to access them. If a dead server is reachable again at the next proactive ping, it is immediately and without risk taken back into the load balancer.
-
-### Upstream Connection Parameters (`[Server.RouterParams]`)
-
-Configures the outgoing connection of the proxy to the backend servers.
-
-| Parameter | Data Type | Description | Possible Values / Example |
-| :--- | :--- | :--- | :--- |
-| `protocol` | String | Protocol for outgoing connections. | `"http"`, `"https"` |
-| `authentication` | String | Auth method that the proxy uses towards the backend. | `"None"`, `"ClientCert"`, `"JWT"` |
-| `ssl_root_certificate` | String | Path to the CA certificate for checking the backend certificate. | `"/path/to/ca.pem"` |
-| `ssl_client_certificate` | String | Proxy Client Certificate for mTLS to the backend. | `"/path/to/proxy-client.pem"` |
-| `ssl_client_key` | String | Proxy Private Key for mTLS to the backend. | `"/path/to/proxy-client.key"` |
-| `jwt` | String | Path to a JWT file, which is sent to the backend when `authentication = "JWT"`. | `"/path/to/token.jwt"` |
-| `connect_timeout_seconds` | Integer | TCP connect timeout to upstreams in seconds (default: 5). | `5` |
-| `request_timeout_seconds` | Integer | Request header timeout for upstream responses in seconds (default: 30, 0 = disabled). Returns 504 on expiry. | `30` |
-| `idle_timeout_seconds` | Integer | Connection pool idle keep-alive timeout in seconds (default: 90). | `90` |
-| `grpc_reflection_timeout_seconds` | Integer | gRPC reflection discovery RPC timeout in seconds (default: 10). | `10` |
-| `grpc_reflection_ttl_seconds` | Integer | Schema cache TTL in seconds before refreshing protobuf definitions (default: 600 / 10m). | `600` |
-
-#### Upstream Timeouts & Keep-Alive Mechanics (Zero-Hang Architecture)
-1. **Connect & Request Timeouts:**
-   - `connect_timeout_seconds`: Bound TCP and TLS connection establishment time. If a backend drops packets or stalls during the handshake, Praeco terminates the attempt after this duration instead of hanging indefinitely.
-   - `request_timeout_seconds`: Wraps REST, gRPC-Passthrough, and gRPC-Web (`backend_type = "grpc"`, which also enforces a 16 MiB upstream response body cap via `http_body_util::Limited`) requests in an asynchronous deadline. If an upstream server accepts the connection but fails to reply within the timeout, Praeco returns `504 Gateway Timeout` and marks that specific upstream dead.
-2. **TCP & HTTP/2 Keepalive:**
-   - Praeco enables `TCP_NODELAY` and sets TCP Keepalive probes to 60 seconds on all upstream sockets.
-   - For HTTP/2 connections, keepalive PING frames are transmitted every 30 seconds with a 10-second acknowledgment timeout. Both active requests and idle connections in the pool are probed (`http2_keep_alive_while_idle = true`), allowing broken connections or silent state-table drops by middleboxes/firewalls to be pruned immediately.
-   - All connection pools run an active Tokio timer (`builder.pool_timer` & `builder.timer`) ensuring idle connections older than `idle_timeout_seconds` are evicted cleanly from memory.
-3. **gRPC Reflection Schema Caching & Fail-Closed TLS:**
-   - **Non-blocking Async I/O:** gRPC-Web reflection fetches and TLS key/CA reads (`tokio::fs::read`) occur completely outside `RwLock` read/write locks using single-flight mutexes, preventing concurrent gRPC-Web client requests or Tokio worker threads from stalling during schema queries.
-   - **TTL Invalidation:** Schema reflection caches expire after `grpc_reflection_ttl_seconds` (default 10 minutes) to accommodate dynamic upstream proto updates. In case of transient upstream discovery errors while an expired schema is present, Praeco applies stale-while-revalidate to ensure continuous uptime.
-   - **Strict Custom PKI Isolation & Fail-Closed Security:** When a custom `ssl_root_certificate` is configured in `RouterParams`, Praeco trusts **exclusively** that custom CA (without merging public Mozilla WebPKI roots). If custom CA certificates or mTLS keys cannot be read from disk, reflection and upstream connections immediately fail closed with an error rather than silently degrading to system WebPKI trust stores.
-
+### Precedence:
+1. **Exact Path Match:** If request path matches an exact key, enforced immediately.
+2. **Longest Prefix Wildcard Match:** Evaluates keys ending with `*` in descending order of prefix length.
+3. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
+4. **Fallback to Route `allowed_roles`:** If no rule in `[Server.rbac]` matches, falls back to the enclosing route's `allowed_roles`.
 
 ---
 
-## Appendix: Certificates and Keys Overview
+## Lightweight WAF / Inspection Layer (`[Server.AllowedPathes]`)
 
-In a Zero-Trust architecture, `praeco-rs` relies heavily on various cryptographic keys and certificates. Here is a compact overview of what they do, where they are configured, and how to generate them.
+When `"Inspection"` is active, acts as a zero-allocation WAF allow-list. Unmatched requests are rejected with `403 Forbidden`.
 
-| Type | Used For | Parameter in `Config.toml` | How to Generate / Where to Get |
-| :--- | :--- | :--- | :--- |
-| **Server TLS Certificate (Public)** | Authenticates the server to incoming clients (HTTPS). Must be a fullchain/PEM. | `[Server.server_certs.ssl_certificate]` | Production: **Let's Encrypt** (Certbot).<br>Local/Test: OpenSSL or `rcgen`. |
-| **Server TLS Key (Private)** | Private key belonging to the server certificate. Must be unencrypted PEM. | `[Server.server_certs.ssl_certificate_key]` | Along with the Server TLS Certificate. |
-| **Root CA Certificate (Public)** | The Trust Anchor. Used by the proxy to verify incoming mTLS client certificates, or by the proxy to verify backend server certificates. | `[[Server.client_certs.ssl_client_ca]]`<br>`[Server.RouterParams.ssl_root_certificate]` | Created automatically by `./client_certs/generate_mtls_oid_certs.sh` (`ca.cert.pem`). |
-| **Client mTLS Certificate & Key** | Given to clients (Devices, iOS App) to authenticate themselves against the proxy. Contains OIDs for Role Mapping. | (Used by Clients)<br>For Proxy-to-Backend:<br>`ssl_client_certificate` / `key` | Use the provided script:<br>`./client_certs/generate_mtls_oid_certs.sh -c <name> -o <roles>` |
-| **JWT Private Key** | Used by the Identity Provider (`service = "Idp"`) to securely sign the issued JWTs. | `[Server.IdpParams.jwt_private_key]` | OpenSSL (Ed25519 recommended):<br>`openssl genpkey -algorithm ed25519 -out idp_private.pem` |
-| **JWT Public Key** | Used by Resource Servers (and the IdP's JWKS endpoint) to verify the signatures of the JWTs. | `[Server.IdpParams.jwt_public_key]`<br>`[Server.Layers.JWT.jwt_public_keys]` | Extracted from Private Key:<br>`openssl pkey -in idp_private.pem -pubout -out idp_public.pem` |
+Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
+
+```toml
+[Server.AllowedPathes.GET]
+# Exact match
+"/" = ["^/?$", "^/\\?name=.*$"]
+
+# Prefix wildcard match
+"/assets/*" = ["^/assets/[a-zA-Z0-9_.-]+\\.(js|css|png|svg)$"]
+
+[Server.AllowedPathes.POST]
+# Allows specific gRPC calls
+"/chat.ChatService/SendMessage" = ["^/chat\\.ChatService/SendMessage$"]
+
+# Prefix wildcard allowing all methods under ChatService
+"/chat.ChatService/*" = ["^/chat\\.ChatService/[a-zA-Z0-9]+$"]
+```
+
+- **Recombined Matching:** Recombines base path and query string (`path?query`) before testing regexes.
+- **HEAD & OPTIONS:** Requests with method `HEAD` automatically test against `HEAD` rules, falling back to `GET` rules. `OPTIONS` evaluates across all method tables.
+
+---
+
+## Middleware Layer Pipeline (`[Server.Layers]`)
+
+### Ordering Constraints & Execution Model
+1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0).
+2. **`Inspection` After `Decompression`:** If both are enabled, `"Inspection"` must appear after `"Decompression"`. Otherwise, the WAF inspects compressed bytes.
+3. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
+
+---
+
+### Detailed Layer Reference
+
+#### `[Server.Layers.MaxPayload]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `max_bytes` | Integer | **Mandatory** | *None* | Maximum allowed request payload in bytes. Rejects requests with `413 Payload Too Large`. Upstream nodes are **never** quarantined for client payload errors. |
+
+#### `[Server.Layers.Decompression]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `max_decompressed_bytes` | Integer | **Mandatory** | *None* | Maximum decompressed request body size in bytes. Prevents decompression bomb attacks from exhausting memory. |
+
+#### `[Server.Layers.Delay]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `delay_micros` | Integer | **Mandatory** | *None* | Microseconds of artificial delay injected before processing each request. |
+
+#### `[Server.Layers.ConcurrencyLimit]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `max_concurrent_requests` | Integer | **Mandatory** | *None* | Maximum concurrent in-flight requests. Must be `> 0`. Permits are retained across the entire duration of streaming response bodies. |
+| `load_shed` | Boolean | Optional | `true` | When `true`, requests arriving at capacity immediately fail fast with `503 Service Unavailable` and `Retry-After: 1`. |
+| `queue_timeout_ms` | Integer | Optional | `None` | If `load_shed = false`, maximum milliseconds to wait in queue before failing with 503. |
+
+#### `[Server.Layers.Cors]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `allowed_origins` | Array of Strings | Optional | `[]` | Allowed origins (e.g. `["https://app.example.com"]`) or `["*"]`. **Security Constraint:** Cannot combine wildcard `["*"]` with `allow_credentials = true`. |
+| `allowed_methods` | Array of Strings | Optional | `[]` | Allowed HTTP methods (e.g. `["GET", "POST", "OPTIONS"]`). |
+| `allowed_headers` | Array of Strings | Optional | `[]` | Allowed request headers. |
+| `allow_credentials` | Boolean | Optional | `false` | Whether credentials (cookies, auth headers) are exposed to cross-origin callers. |
+
+#### `[Server.Layers.SecurityHeaders]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `content_security_policy` | String | Optional | `"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"` | CSP header. For APIs, use `"default-src 'none'"`. |
+| `strict_transport_security` | String | Optional | `"max-age=63072000; includeSubDomains; preload"` | HSTS header enforcing HTTPS for 2 years. |
+| `x_content_type_options` | String | Optional | `"nosniff"` | Disables MIME sniffing. |
+| `x_frame_options` | String | Optional | `"DENY"` | Clickjacking protection: `"DENY"` or `"SAMEORIGIN"`. |
+| `referrer_policy` | String | Optional | `"strict-origin-when-cross-origin"` | Referrer policy header. |
+
+#### `[Server.Layers.JWT]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `jwt_public_keys` | Array of Strings | **Mandatory** | *None* | File paths to PEM-encoded Ed25519 or RSA public keys used to verify token signatures. |
+| `expected_issuer` | String | **Mandatory** | *None* | Expected `iss` claim. |
+| `expected_audience` | String | **Mandatory** | *None* | Expected `aud` claim. |
+| `cookie_fallback` | String | Optional | `None` | Cookie name to extract JWT if `Authorization` header is missing. |
+| `redirect_on_failure` | String | Optional | `None` | Target URL (HTTP 302/307) to redirect unauthenticated browser requests. |
+| `revoke_on_paths` | Array of Strings | Optional | `[]` | Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` is automatically added to the global `JwtRevocationStore`. |
+
+#### `[Server.Layers.RateLimiter]` (Simple Fixed-Window)
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `requests_per_second` | Integer | **Mandatory** | *None* | Maximum requests allowed per 1-second window. Must be `> 0`. |
+| `key_by` | String | Optional | `"identity"` | Partitioning strategy: `"identity"`, `"ip"`, or `"global"`. |
+| `max_entries` | Integer | Optional | `10000` | Maximum client keys tracked in memory. When full, unknown keys fail closed (`429 Too Many Requests`). |
+| `ttl_seconds` | Integer | Optional | `300` | Inactive key TTL in seconds before pruning. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust `X-Forwarded-For` / `X-Real-IP` headers for client IP extraction. |
+
+#### `[Server.Layers.TokenBucketRateLimiter]`
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `max_capacity` | Integer | **Mandatory** | *None* | Maximum burst capacity. Must be `> 0`. |
+| `refill` | Integer | **Mandatory** | *None* | Tokens replenished per interval. Must be `> 0`. |
+| `duration_micros` | Integer | **Mandatory** | *None* | Replenishment interval in microseconds. Must be `> 0`. |
+| `key_by` | String | Optional | `"identity"` | Partitioning strategy: `"identity"`, `"ip"`, or `"global"`. |
+| `max_entries` | Integer | Optional | `10000` | Maximum tracked client buckets in memory before fail-closed protection activates. |
+| `ttl_seconds` | Integer | Optional | `300` | Inactive bucket TTL in seconds. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust forwarded headers for client IP extraction. |
 
 ---
 
 ## Relay Server Configuration (`RelayConfig.toml`)
 
-The Praeco Relay Server operates as a standalone proxy (TCP/SNI router) and uses its own configuration file, typically named `RelayConfig.toml`. In addition to mTLS authentication, the Relay Server enforces **SAN-to-SNI authorization** on the Control Plane (a Praeco client certificate may only `REGISTER <sni>` if its X.509 SAN or CN matches the requested domain), generation-tagged routing entries, and IPv6 `/64` prefix canonicalization (`canonical_client_ip`) on the Data Plane.
+The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 
-| Parameter | Data Type | Description | Default Value |
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `control_plane_addr` | String | Optional | `"0.0.0.0:7001"` | Address where Relay listens for incoming mTLS tunnel connections from Praeco instances. |
+| `data_plane_addr` | String | Optional | `"0.0.0.0:443"` | Public address where Relay accepts incoming HTTPS internet traffic. |
+| `ca_cert_path` | String | Optional | `"server_certs/self_signed/myca.pem"` | Path to PEM CA certificate used to verify connecting Praeco backend instances. |
+| `server_cert_path` | String | Optional | `"server_certs/self_signed/fullchain_self.pem"` | Path to Relay's own server TLS certificate for the control-plane listener. |
+| `server_key_path` | String | Optional | `"server_certs/self_signed/privkey_self.pem"` | Path to Relay's private key for the control plane. |
+| `crl_path` | String | Optional | `None` | Path to Certificate Revocation List (CRL) for revoking compromised backend gateways. Parsed with `nextUpdate` expiration checks. |
+| `enable_opentelemetry` | Boolean | Optional | `false` | Enables OpenTelemetry tracing for Relay connection events. |
+| `jaeger_endpoint` | String | Optional | `"http://localhost:4317"` | OTLP gRPC endpoint for Relay traces. |
+| `otel_log_level` | String | Optional | `"info"` | Log level filter for exported Relay telemetry spans. |
+| `otel_sample_ratio` | Float (`f64`) | Optional | `1.0` | Sampling ratio for Relay traces (`0.0` to `1.0`). |
+| `rate_limit_connections_per_sec` | Integer | Optional | `50` | Maximum new TCP connections permitted per second per client IP / IPv6 `/64` subnet on the data plane (bounded to 100,000 active buckets). |
+| `rate_limit_burst` | Integer | Optional | `100` | Maximum burst of new TCP connections permitted per client IP / IPv6 `/64` subnet. |
+| `data_plane_idle_timeout_secs` | Integer | Optional | `1800` (30 mins) | Inactivity timeout in seconds for established data-plane connections (`0` disables). |
+| `tcp_keepalive_secs` | Integer | Optional | `60` | TCP keepalive probe interval on data-plane sockets. |
+| `max_concurrent_connections` | Integer | Optional | `10000` | Global maximum simultaneous public TCP connections on the data plane. |
+| `max_concurrent_connections_per_ip` | Integer | Optional | `100` | Maximum simultaneous public connections allowed from a single IP or IPv6 `/64` subnet. |
+| `client_hello_timeout_secs` | Integer | Optional | `10` | Timeout in seconds to read the complete TLS `ClientHello` record (handles TCP fragmentation up to 16 KB). Protects against slowloris SNI probing. |
+| `control_plane_handshake_timeout_secs`| Integer | Optional | `10` | Timeout in seconds for mTLS handshake and `REGISTER` command on the control plane. |
+| `max_yamux_streams` | Integer | Optional | `4096` | Maximum concurrent multiplexed Yamux streams per tunnel connection. |
+| `enable_proxy_protocol` | Boolean | Optional | `true` | When `true`, injects HAProxy PROXY-Protocol v2 headers into tunnel streams, propagating real client IPs to Praeco backend instances. |
+
+---
+
+## Appendix: Cryptographic Keys & Certificates Overview
+
+| Key / Certificate Type | Usage & Purpose | Configuration Parameter | Generation Tool / Source |
 | :--- | :--- | :--- | :--- |
-| `control_plane_addr` | String | The address where the Relay accepts incoming mTLS Yamux tunnels from Praeco backend instances. | `"0.0.0.0:7001"` |
-| `data_plane_addr` | String | The address where the Relay accepts public internet HTTPS traffic (SNI Routing). | `"0.0.0.0:443"` |
-| `ca_cert_path` | String | Path to the CA certificate used to verify the mTLS connections from backend instances. | `"../client_certs/ca.cert.pem"` |
-| `crl_path` | String *(optional)* | Path to a Certificate Revocation List (CRL) for revoking compromised tunnel client certificates; parsed at startup with X.509 `nextUpdate` expiration verification. | `None` |
-| `server_cert_path` | String | Path to the Relay's own public TLS certificate (for the control plane). | `"server.crt"` |
-| `server_key_path` | String | Path to the Relay's private key. | `"server.key"` |
-| `enable_opentelemetry` | Boolean | Enables Jaeger tracing for the Relay. | `false` |
-| `rate_limit_connections_per_sec` | Integer | Limits the number of new TCP connections allowed per second per IP / IPv6 `/64` subnet on the Data Plane (bounded to `100,000` active buckets). | `50` |
-| `rate_limit_burst` | Integer | The maximum burst of TCP connections allowed at once per IP / IPv6 `/64` subnet. | `100` |
-| `max_concurrent_connections` | Integer | Global maximum of simultaneous Data Plane TCP connections. | `10000` |
-| `max_concurrent_connections_per_ip` | Integer | Maximum simultaneous Data Plane TCP connections per client IP / IPv6 `/64` subnet. | `100` |
-| `client_hello_timeout_secs` | Integer | Maximum duration in seconds to receive and parse the complete TLS `ClientHello` record (handles TCP fragmentation up to 16 KB). | `10` |
-| `control_plane_handshake_timeout_secs` | Integer | Timeout in seconds for mTLS handshake and `REGISTER` command on the Control Plane. | `10` |
-| `max_yamux_streams` | Integer | Maximum concurrent Yamux streams per tunnel connection. | `4096` |
+| **Server TLS Certificate (Public)** | Authenticates the server to incoming HTTPS clients. Must be fullchain PEM. | `[Server.server_certs.ssl_certificate]` | Production: Let's Encrypt (Certbot).<br>Testing: OpenSSL or `rcgen`. |
+| **Server TLS Key (Private)** | Private key for the server certificate. Must be unencrypted PEM. | `[Server.server_certs.ssl_certificate_key]` | Generated with server CSR. |
+| **Client CA Certificate (Public)** | Trust anchor used by Praeco to authenticate client mTLS certificates. | `[[Server.client_certs.ssl_client_ca]]`<br>`[Server.RouterParams.ssl_root_certificate]` | Script: `./client_certs/generate_mtls_oid_certs.sh` |
+| **Client mTLS Certificate & Key** | Issued to clients (apps, microservices) to authenticate against Praeco. Contains OIDs for RBAC. | Used by client.<br>For Proxy-to-Upstream:<br>`ssl_client_certificate` / `key` | Script:<br>`./client_certs/generate_mtls_oid_certs.sh -c <cn> -o <roles>` |
+| **JWT Private Key** | Used by IdP (`service = "Idp"`) to sign issued JWTs. | `[Server.IdpParams.jwt_private_key]` | OpenSSL (Ed25519):<br>`openssl genpkey -algorithm ed25519 -out idp_private.pem` |
+| **JWT Public Key** | Used by resource servers (`JwtAuth` layer) to verify token signatures. | `[Server.IdpParams.jwt_public_key]`<br>`[Server.Layers.JWT.jwt_public_keys]` | OpenSSL:<br>`openssl pkey -in idp_private.pem -pubout -out idp_public.pem` |
+
+---
+
+## Complete Production Configuration Examples
+
+### Minimal High-Throughput REST Reverse Proxy (`Config.toml`)
+
+```toml
+tokio_threads = 16
+pki_base_oid = "1.3.6.1.4.1.65111"
+log_dir = "/var/log/praeco" # Logs to stdout AND /var/log/praeco/app.YYYY-MM-DD.log
+
+[[Server]]
+name = "api_gateway"
+ip = "0.0.0.0"
+port = 443
+enabled = true
+protocol = "https"
+authentication = "None"
+service = "Router"
+
+[Server.connection_limits]
+max_connections = 10000
+max_connections_per_ip = 100
+
+[Server.server_certs]
+ssl_certificate = "certs/fullchain.pem"
+ssl_certificate_key = "certs/privkey.pem"
+
+[Server.Layers]
+enabled = [
+    "TraceId",
+    "Logger",
+    "SecurityHeaders",
+    "PathSanitizer",
+    "MaxPayload",
+    "RateLimiter:TokenBucket",
+    "ConcurrencyLimit"
+]
+
+[Server.Layers.MaxPayload]
+max_bytes = 10485760 # 10 MB
+
+[Server.Layers.ConcurrencyLimit]
+max_concurrent_requests = 5000
+load_shed = true
+
+[Server.Layers.TokenBucketRateLimiter]
+max_capacity = 500
+refill = 50
+duration_micros = 1000000 # 50 req/sec with burst to 500
+key_by = "ip"
+
+[Server.ReverseRoutes."/"]
+upstreams = ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]
+strategy = "LeastConnections"
+backend_type = "rest"
+cooldown_seconds = 10
+max_retries = 2
+active_health_check_interval = 15
+```
+
+### Zero-Trust Outbound Tunnel with mTLS, Dynamic Claims & gRPC (`conf.d/api.toml`)
+
+```toml
+[[Server]]
+name = "secure_grpc_gateway"
+enabled = true
+protocol = "https"
+authentication = "ClientCert"
+service = "Router"
+
+# Outbound Yamux tunnel to Relay (no inbound open ports)
+[Server.tunnel]
+target_url = "tls://relay.example.com:7001"
+sni_domain = "api.example.com"
+client_cert_path = "certs/praeco_tunnel.pem"
+client_key_path = "certs/praeco_tunnel.key"
+ca_cert_path = "certs/relay_ca.pem"
+max_yamux_streams = 4096
+proxy_protocol = true
+
+[Server.server_certs]
+ssl_certificate = "certs/api_fullchain.pem"
+ssl_certificate_key = "certs/api_privkey.pem"
+
+[[Server.client_certs]]
+ssl_client_ca = "certs/client_root_ca.pem"
+ssl_client_crl = "certs/client_root_ca.crl.pem"
+
+[Server.oid_mapping]
+"1" = "Admin"
+"2" = "Seller"
+"3" = "Viewer"
+
+[Server.client_cert_forwarding]
+header_cert = "x-client-cert"
+header_san = "x-client-san"
+header_roles = "x-user-roles"
+header_client_ip = "x-client-ip"
+
+[Server.Layers]
+enabled = [
+    "TraceId",
+    "Logger",
+    "SecurityHeaders",
+    "PathSanitizer",
+    "Decompression",
+    "MaxPayload",
+    "Inspection",
+    "RateLimiter:TokenBucket",
+    "ConcurrencyLimit"
+]
+
+[Server.Layers.Decompression]
+max_decompressed_bytes = 10485760
+
+[Server.Layers.MaxPayload]
+max_bytes = 10485760
+
+[Server.Layers.ConcurrencyLimit]
+max_concurrent_requests = 10000
+load_shed = true
+
+[Server.Layers.TokenBucketRateLimiter]
+max_capacity = 1000
+refill = 50
+duration_micros = 10000
+key_by = "identity"
+
+[Server.AllowedPathes.POST]
+"/chat.ChatService/*" = ["^/chat\\.ChatService/[a-zA-Z0-9]+$"]
+
+[Server.rbac]
+"/chat.ChatService/Admin*" = ["Admin"]
+"/chat.ChatService/UpdateRoomProduct" = ["Admin", "Seller"]
+
+[Server.ReverseRoutes."/"]
+upstreams = ["https://127.0.0.1:50051"]
+strategy = "RoundRobin"
+backend_type = "grpc_passthrough"
+allowed_roles = ["Admin", "Seller", "Viewer"]
+active_health_check_interval = 60
+
+[Server.RouterParams]
+protocol = "https"
+authentication = "ClientCert"
+ssl_root_certificate = "certs/backend_internal_ca.pem"
+ssl_client_certificate = "certs/proxy_to_backend.pem"
+ssl_client_key = "certs/proxy_to_backend.key"
+connect_timeout_seconds = 5
+request_timeout_seconds = 30
+idle_timeout_seconds = 90
+```
