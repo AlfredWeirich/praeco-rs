@@ -92,13 +92,8 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_route(allowed_roles: Vec<&str>) -> ParsedRoute {
-        let node = crate::configuration::UpstreamNode {
-            uri: "http://127.0.0.1:8080".parse().unwrap(),
-            active_connections: std::sync::atomic::AtomicUsize::new(0),
-            is_alive: std::sync::atomic::AtomicBool::new(true),
-            last_failure_time: std::sync::atomic::AtomicU64::new(0),
-            current_score: std::sync::atomic::AtomicUsize::new(0),
-        };
+        let node =
+            crate::configuration::UpstreamNode::new("http://127.0.0.1:8080".parse().unwrap());
         ParsedRoute {
             prefix: "/".to_string(),
             target: Arc::new(crate::configuration::RouteTarget {
@@ -107,6 +102,8 @@ mod tests {
                 rr_counter: std::sync::atomic::AtomicUsize::new(0),
                 cooldown_seconds: 10,
                 max_retries: 2,
+                failure_threshold: 3,
+                max_retry_buffer_bytes: 65536,
                 active_health_check_interval: 0,
                 grpc_pool: tokio::sync::RwLock::new(None),
                 grpc_reflection_lock: tokio::sync::Mutex::new(()),

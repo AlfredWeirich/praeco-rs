@@ -710,7 +710,7 @@ mod tests {
         MethodDescriptorProto, ServiceDescriptorProto,
         field_descriptor_proto::{Label, Type},
     };
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     /// Builds a descriptor pool with `test.Echo/Say(test.Msg{text}) -> test.Msg`
@@ -772,19 +772,15 @@ mod tests {
     }
 
     fn test_route(port: u16) -> ParsedRoute {
-        let node = UpstreamNode {
-            uri: format!("http://127.0.0.1:{port}").parse().unwrap(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(format!("http://127.0.0.1:{port}").parse().unwrap());
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
             strategy: LbStrategy::RoundRobin,
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             // Pre-populated cache => handle_grpc_web never needs to perform reflection.
             grpc_pool: tokio::sync::RwLock::new(Some(CachedDescriptorPool {

@@ -28,7 +28,16 @@ pub async fn handle_http_proxy(
     request_timeout: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
-    let max_retries = route_info.target.max_retries;
+    let is_multi_node = route_info.target.upstreams.len() > 1;
+    // Fast-path: if only 1 backend is configured, disable failover retries (no alternate node exists)
+    let max_retries = if is_multi_node {
+        route_info
+            .target
+            .max_retries
+            .min(route_info.target.upstreams.len() - 1)
+    } else {
+        0
+    };
     let mut attempts = 0;
     let is_stream = matches!(request_body, RequestBody::Stream(_));
     let is_idempotent = matches!(
@@ -52,6 +61,12 @@ pub async fn handle_http_proxy(
             .target
             .next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
+        let mut probe_guard = is_multi_node.then(|| {
+            super::circuit_breaker::ProbeGuard::new(
+                upstream_node,
+                route_info.target.cooldown_seconds,
+            )
+        });
         upstream_node
             .active_connections
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -126,6 +141,9 @@ pub async fn handle_http_proxy(
                         "{}: Upstream request timed out after {:?} for {}",
                         server_name, timeout_dur, backend_base_uri
                     );
+                    if let Some(ref mut pg) = probe_guard {
+                        pg.complete();
+                    }
                     route_info.target.mark_dead(backend_base_uri);
                     failed_nodes.push(backend_base_uri.clone());
 
@@ -157,9 +175,51 @@ pub async fn handle_http_proxy(
 
         match resp_result {
             Ok(res) => {
-                if !upstream_node.is_alive.load(std::sync::atomic::Ordering::Relaxed) {
-                    upstream_node.mark_alive();
+                if let Some(ref mut pg) = probe_guard {
+                    pg.complete();
                 }
+                if super::circuit_breaker::is_outlier_status(res.status()) {
+                    let status = res.status();
+                    let tripped = route_info.target.record_failure(backend_base_uri);
+                    if is_multi_node {
+                        failed_nodes.push(backend_base_uri.clone());
+                    }
+
+                    if tripped {
+                        warn!(
+                            "{}: Upstream {} returned outlier status {} — circuit breaker tripped to OPEN",
+                            server_name, backend_base_uri, status
+                        );
+                    } else {
+                        warn!(
+                            "{}: Upstream {} returned outlier status {} (consecutive failures: {}/{})",
+                            server_name,
+                            backend_base_uri,
+                            status,
+                            upstream_node
+                                .consecutive_failures
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            route_info.target.failure_threshold
+                        );
+                    }
+
+                    if !is_stream && is_idempotent && attempts <= max_retries {
+                        warn!(
+                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after upstream {} from {}...",
+                            server_name, attempts, max_retries, status, backend_base_uri
+                        );
+                        continue;
+                    }
+
+                    let (mut res_parts, res_body) = res.into_parts();
+                    super::headers::clean_response_headers(&mut res_parts.headers);
+                    return Ok(Response::from_parts(
+                        res_parts,
+                        res_body.map_err(SrvError::from).boxed(),
+                    ));
+                }
+
+                upstream_node.record_success();
                 let (mut res_parts, res_body) = res.into_parts();
                 super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
@@ -215,13 +275,16 @@ pub async fn handle_http_proxy(
                             "{}: Backend connection failed to {}: {}",
                             server_name, backend_base_uri, e
                         );
+                        if let Some(ref mut pg) = probe_guard {
+                            pg.complete();
+                        }
                         route_info.target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
                         if !is_stream && is_idempotent && attempts <= max_retries {
                             warn!(
-                                "{}: Retrying request... (Attempt {}/{})",
-                                server_name, attempts, max_retries
+                                "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) switching away from {}...",
+                                server_name, attempts, max_retries, backend_base_uri
                             );
                             continue;
                         } else {
@@ -387,12 +450,13 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use crate::configuration::{LbStrategy, RouteBackendType, RouteTarget, UpstreamNode};
 
     #[tokio::test]
     async fn test_http_proxy_request_timeout_returns_504() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -407,13 +471,7 @@ mod tests {
         });
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -421,6 +479,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 10,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -480,13 +540,7 @@ mod tests {
         });
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -494,6 +548,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -560,13 +616,7 @@ mod tests {
         });
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -574,6 +624,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -628,6 +680,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_proxy_real_connect_failure_marks_node_dead_and_returns_502() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // Pick an unused port without starting a server
         let port = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -635,13 +688,7 @@ mod tests {
         };
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -649,6 +696,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -708,13 +757,7 @@ mod tests {
         });
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -722,6 +765,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -795,13 +840,7 @@ mod tests {
         });
 
         let upstream_uri: Uri = format!("http://127.0.0.1:{}", port).parse().unwrap();
-        let node = UpstreamNode {
-            uri: upstream_uri.clone(),
-            active_connections: AtomicUsize::new(0),
-            is_alive: AtomicBool::new(true),
-            last_failure_time: AtomicU64::new(0),
-            current_score: AtomicUsize::new(0),
-        };
+        let node = UpstreamNode::new(upstream_uri.clone());
 
         let target = Arc::new(RouteTarget {
             upstreams: vec![node],
@@ -809,6 +848,8 @@ mod tests {
             rr_counter: AtomicUsize::new(0),
             cooldown_seconds: 60,
             max_retries: 0,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
             active_health_check_interval: 0,
             grpc_pool: tokio::sync::RwLock::new(None),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
@@ -850,6 +891,121 @@ mod tests {
         assert!(
             !target.upstreams[0].is_alive.load(Ordering::Relaxed),
             "Upstream node MUST be marked dead when the upstream socket resets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_proxy_outlier_503_retries_on_healthy_node_and_trips_circuit_breaker() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Node 1 returns 503 Service Unavailable
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener1.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 11\r\n\r\nOverloaded!")
+                    .await;
+            }
+        });
+
+        // Node 2 returns 200 OK
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener2.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nrecovered")
+                    .await;
+            }
+        });
+
+        let node1 = UpstreamNode::new(format!("http://127.0.0.1:{}", port1).parse().unwrap());
+        let node2 = UpstreamNode::new(format!("http://127.0.0.1:{}", port2).parse().unwrap());
+
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node1, node2],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 60,
+            max_retries: 1,
+            failure_threshold: 2,
+            max_retry_buffer_bytes: 65536,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let route_info = ParsedRoute {
+            prefix: "/api".to_string(),
+            target: target.clone(),
+            allowed_roles: Vec::new(),
+            backend_type: RouteBackendType::Rest,
+        };
+
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let client = common::client::build_hyper_client(
+            tls_config,
+            common::client::ClientPoolConfig::default(),
+        );
+        let matched_params = matchit::Params::new();
+        let req_uri: Uri = "http://localhost/api/items".parse().unwrap();
+
+        // Request 1: hits node 1 (503) -> automatically retries on node 2 (200 OK)
+        let resp1 = handle_http_proxy(
+            &route_info,
+            RequestBody::Buffered(bytes::Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &req_uri,
+            &matched_params,
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp1.status(), StatusCode::OK);
+        assert_eq!(target.upstreams[0].consecutive_failures.load(Ordering::Relaxed), 1);
+        // Threshold is 2, so node 1 is still Closed after 1st 503
+        assert!(target.upstreams[0].is_alive.load(Ordering::Relaxed));
+
+        // Reset rr_counter to 0 so Request 2 hits node 1 again
+        target.rr_counter.store(0, Ordering::Relaxed);
+
+        // Request 2: hits node 1 (503 #2 -> trips circuit breaker to Open!) and retries on node 2 (200 OK)
+        let resp2 = handle_http_proxy(
+            &route_info,
+            RequestBody::Buffered(bytes::Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &req_uri,
+            &matched_params,
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp2.status(), StatusCode::OK);
+        assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "Node 1 circuit must be Open after reaching failure_threshold=2");
+        assert_eq!(
+            target.upstreams[0].circuit_state(),
+            super::super::circuit_breaker::CircuitState::Open
         );
     }
 }

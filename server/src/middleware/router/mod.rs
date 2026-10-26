@@ -26,6 +26,7 @@ use crate::{
 use common::{build_root_store, build_tls_client_config};
 
 // Submodules
+pub mod circuit_breaker;
 pub(crate) mod grpc_passthrough;
 pub(crate) mod grpc_web;
 pub(crate) mod headers;
@@ -289,14 +290,67 @@ impl Service<Request<SrvBody>> for RouterService {
 
             let is_transcoding = route_info.backend_type == RouteBackendType::GrpcTranscoding;
             let is_passthrough = route_info.backend_type == RouteBackendType::GrpcPassthrough;
-            let can_stream =
-                (route_info.target.max_retries == 0 || is_passthrough) && !is_transcoding;
+            let has_failover_nodes = route_info.target.upstreams.len() > 1;
+            let is_idempotent = matches!(
+                original_method,
+                hyper::Method::GET
+                    | hyper::Method::HEAD
+                    | hyper::Method::PUT
+                    | hyper::Method::DELETE
+                    | hyper::Method::OPTIONS
+            );
+
+            // Check if Content-Length already exceeds max_retry_buffer_bytes
+            let content_length_exceeds_retry_buf = prepared_headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|len| len > route_info.target.max_retry_buffer_bytes);
+
+            // Fast-path:
+            // - If there is only 1 upstream node (!has_failover_nodes) or max_retries == 0, always stream!
+            // - For REST routes, only buffer idempotent methods.
+            // - For gRPC passthrough routes (which always use HTTP POST), buffer up to max_retry_buffer_bytes
+            //   when failover nodes exist so unary & server-streaming calls (e.g. StreamGlobalEvents) can
+            //   seamlessly fail over to a healthy node on connection/outlier errors.
+            let can_stream = (!has_failover_nodes
+                || route_info.target.max_retries == 0
+                || (!is_passthrough && !is_idempotent)
+                || content_length_exceeds_retry_buf)
+                && !is_transcoding;
 
             let request_body = if can_stream {
                 RequestBody::Stream(body)
-            } else {
+            } else if is_transcoding {
                 match body.collect().await {
                     Ok(c) => RequestBody::Buffered(c.to_bytes()),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if matches!(e, SrvError::PayloadTooLarge { .. })
+                            || err_str.contains("Payload Limit Exceeded")
+                            || matches!(e, SrvError::DecompressionLimitExceeded { .. })
+                            || err_str.contains("Decompressed payload")
+                        {
+                            tracing::warn!("{}: Request body exceeded payload limit: {}", server_name, e);
+                            return Ok(build_error_response(
+                                "Payload Too Large",
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                            ));
+                        }
+                        error!("{}: Failed to read request body: {}", server_name, e);
+                        return Ok(build_error_response("Bad Request", StatusCode::BAD_REQUEST));
+                    }
+                }
+            } else {
+                // Bounded retry buffering: buffers up to max_retry_buffer_bytes (default 64 KiB)
+                // and seamlessly spills over into streaming mode for larger uploads.
+                match circuit_breaker::buffer_body_up_to(
+                    body,
+                    route_info.target.max_retry_buffer_bytes,
+                )
+                .await
+                {
+                    Ok(req_body) => req_body,
                     Err(e) => {
                         let err_str = e.to_string();
                         if matches!(e, SrvError::PayloadTooLarge { .. })
