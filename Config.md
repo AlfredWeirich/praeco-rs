@@ -909,6 +909,25 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 | `ttl_seconds` | Integer | Optional | `300` | Inactive bucket TTL in seconds. |
 | `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust forwarded headers for client IP extraction. |
 
+#### `[Server.Layers.IpFilter]` (CIDR Allowlist & Blocklist)
+Enforces zero-allocation bitwise IPv4 and IPv6 CIDR filtering (`IpCidr`). Recommended near the top of `[Server.Layers].enabled` (e.g. right after `TraceId` / `Logger`) so blocked IPs are rejected with `403 Forbidden` before JWT verification or upstream routing.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `allow_cidrs` | Array of Strings | Optional | `[]` | Allowed IPv4/IPv6 CIDR blocks or single host IPs (e.g. `["10.0.0.0/8", "192.168.1.0/24", "127.0.0.1/32", "::1/128"]`). If non-empty, any client IP not matching at least one entry is rejected with `403 Forbidden` (fail-closed if client IP is missing). If empty, all IPs not in `deny_cidrs` are permitted. |
+| `deny_cidrs` | Array of Strings | Optional | `[]` | Blocked IPv4/IPv6 CIDR blocks or single host IPs (e.g. `["10.99.0.0/16", "203.0.113.0/24"]`). **Evaluated first (`deny` takes precedence over `allow`)**, allowing sub-ranges to be carved out of a broader allowed network. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to fall back to `X-Forwarded-For` / `X-Real-IP` when the peer socket IP is unspecified (`0.0.0.0` / `::`). Note: Relay Server tunnels (`proxy_protocol = true`) already populate the verified peer `SocketAddr` directly without needing HTTP headers. |
+
+```toml
+[Server.Layers]
+enabled = ["TraceId", "Logger", "IpFilter", "PathSanitizer", "Inspection", "JwtAuth"]
+
+[Server.Layers.IpFilter]
+allow_cidrs = ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.1/32", "::1/128"]
+deny_cidrs  = ["10.99.0.0/16"]
+trust_forwarded_headers = false
+```
+
 ---
 
 ## Relay Server Configuration (`RelayConfig.toml`)

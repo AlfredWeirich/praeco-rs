@@ -572,6 +572,8 @@ pub enum MiddlewareLayer {
     SecurityHeaders(SecurityHeadersConfig),
     /// Enforces RFC 3986 path canonicalization and rejects traversal / illegal encodings.
     PathSanitizer,
+    /// Enforces IPv4 / IPv6 CIDR allowlist and blocklist rules.
+    IpFilter(IpFilterConfig),
 }
 
 /// Rate limiter algorithm selection.
@@ -617,6 +619,9 @@ pub struct Layers {
     /// Configuration for the [`SecurityHeaders`](MiddlewareLayer::SecurityHeaders) layer.
     #[serde(rename = "SecurityHeaders")]
     pub security_headers_config: Option<SecurityHeadersConfig>,
+    /// Configuration for the [`IpFilter`](MiddlewareLayer::IpFilter) layer.
+    #[serde(rename = "IpFilter")]
+    pub ip_filter_config: Option<IpFilterConfig>,
 }
 
 // --- Helper Structures for Configuration ---
@@ -944,6 +949,28 @@ pub struct SecurityHeadersConfig {
     pub x_frame_options: String,
     #[serde(default = "default_referrer_policy")]
     pub referrer_policy: String,
+}
+
+/// Configuration for the IP allowlist / blocklist (`IpFilter`) middleware layer.
+///
+/// Evaluates `deny_cidrs` first (explicit blocklist) and `allow_cidrs` second
+/// (when non-empty, only IPs matching at least one allowed CIDR are permitted).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IpFilterConfig {
+    /// Optional list of allowed IPv4/IPv6 CIDR blocks or single IPs
+    /// (e.g. `["10.0.0.0/8", "192.168.1.0/24", "127.0.0.1/32", "::1/128"]`).
+    /// If empty, all IPs not matching `deny_cidrs` are permitted.
+    #[serde(default)]
+    pub allow_cidrs: Vec<String>,
+    /// Optional list of blocked IPv4/IPv6 CIDR blocks or single IPs
+    /// (e.g. `["10.99.0.0/16", "203.0.113.0/24"]`).
+    /// Evaluated before `allow_cidrs` (`deny` takes precedence over `allow`).
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
+    /// Whether to trust `X-Forwarded-For` / `X-Real-IP` headers when the
+    /// underlying socket IP is unspecified (`0.0.0.0` / `::`) (default: `false`).
+    #[serde(default)]
+    pub trust_forwarded_headers: bool,
 }
 
 fn default_referrer_policy() -> String {
@@ -1759,6 +1786,30 @@ impl Layers {
                     Ok(MiddlewareLayer::RateLimiter(RateLimiter::TokenBucket(c.clone())))
                 }
                 "AltSvc" => Ok(MiddlewareLayer::AltSvc),
+                "IpFilter" => {
+                    let c = self
+                        .ip_filter_config
+                        .as_ref()
+                        .context("Layer 'IpFilter' enabled but [Server.Layers.IpFilter] section is missing")?;
+                    // Eagerly validate all CIDR entries during startup / SIGHUP reload
+                    for cidr_str in &c.allow_cidrs {
+                        crate::middleware::IpCidr::parse(cidr_str).map_err(|e| {
+                            Error::msg(format!(
+                                "{}: Layer 'IpFilter' invalid allow_cidrs entry '{}': {}",
+                                server_name, cidr_str, e
+                            ))
+                        })?;
+                    }
+                    for cidr_str in &c.deny_cidrs {
+                        crate::middleware::IpCidr::parse(cidr_str).map_err(|e| {
+                            Error::msg(format!(
+                                "{}: Layer 'IpFilter' invalid deny_cidrs entry '{}': {}",
+                                server_name, cidr_str, e
+                            ))
+                        })?;
+                    }
+                    Ok(MiddlewareLayer::IpFilter(c.clone()))
+                }
                 other => Err(Error::msg(format!("Unknown layer type: {}", other))),
             })
             .collect::<Result<_, _>>()?;
@@ -2350,6 +2401,46 @@ mod tests {
             assert!(idp_paths.is_allowed("POST", "/auth/revoke", ""));
             assert!(!idp_paths.is_allowed("GET", "/admin", ""));
         }
+    }
+
+    #[test]
+    fn test_ip_filter_config_validation() {
+        let valid_toml = r#"
+            name = "ip_filter_valid"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = ["IpFilter"]
+
+            [Layers.IpFilter]
+            allow_cidrs = ["10.0.0.0/8", "127.0.0.1/32", "::1/128"]
+            deny_cidrs = ["10.99.0.0/16"]
+        "#;
+        let mut srv_ok: ServerConfig = toml::from_str(valid_toml).unwrap();
+        assert!(srv_ok.finalize().is_ok());
+
+        let invalid_cidr_toml = r#"
+            name = "ip_filter_invalid"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [Layers]
+            enabled = ["IpFilter"]
+
+            [Layers.IpFilter]
+            allow_cidrs = ["10.0.0.0/99"]
+        "#;
+        let mut srv_bad: ServerConfig = toml::from_str(invalid_cidr_toml).unwrap();
+        let res = srv_bad.finalize();
+        assert!(res.is_err());
+        assert!(format!("{:#}", res.unwrap_err()).contains("invalid allow_cidrs entry"));
     }
 }
 
