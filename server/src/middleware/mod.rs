@@ -19,6 +19,7 @@
 //! | [`delay`] | [`DelayLayer`] | Artificial latency injection (testing / simulation). |
 //! | [`echo`] | — | Simple echo service (no layer; used as a base service). |
 //! | [`inspection`] | [`InspectionLayer`] | Regex-based path allow-listing (WAF-lite). |
+//! | [`ip_filter`] | [`IpFilterLayer`] | IPv4/IPv6 CIDR allowlist and blocklist enforcement. |
 //! | [`jwt`] | [`JwtAuthLayer`] | JWT bearer-token authentication and role mapping. |
 //! | [`limit`] | [`MaxPayloadLayer`] | Request body size enforcement (header + streaming). |
 //! | [`logger`] | [`LoggerLayer`] | Request/response logging with client IP and role info. |
@@ -44,6 +45,8 @@ pub mod idp;
 
 /// Regex-based request path inspection (allow-list enforcement).
 pub mod inspection;
+/// IPv4 and IPv6 CIDR allowlist / blocklist middleware.
+pub mod ip_filter;
 /// JWT bearer-token authentication middleware.
 pub mod jwt;
 /// Maximum request payload size enforcement.
@@ -70,6 +73,7 @@ pub use counter::CountingLayer;
 pub use delay::DelayLayer;
 pub use echo::EchoService;
 pub use inspection::InspectionLayer;
+pub use ip_filter::{IpCidr, IpFilterLayer, IpFilterService};
 pub use jwt::{JwtAuthLayer, JwtRevocationStore, get_jwt_revocation_store};
 pub use limit::{ConcurrencyLimitLayer, MaxPayloadLayer};
 pub use logger::LoggerLayer;

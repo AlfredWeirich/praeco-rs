@@ -1317,6 +1317,15 @@ fn apply_layers(
             MiddlewareLayer::SecurityHeaders(cfg) => {
                 SecurityHeadersLayer::new(cfg).layer(svc).boxed_clone_sync()
             }
+            MiddlewareLayer::IpFilter(cfg) => {
+                let layer = praeco_rs::middleware::IpFilterLayer::from_cidr_strings(
+                    &cfg.allow_cidrs,
+                    &cfg.deny_cidrs,
+                    cfg.trust_forwarded_headers,
+                    server_name,
+                )?;
+                layer.layer(svc).boxed_clone_sync()
+            }
         };
     }
     Ok(svc)
