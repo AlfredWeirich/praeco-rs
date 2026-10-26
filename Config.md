@@ -497,8 +497,10 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 | `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
 | `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), or `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap). |
 | `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
-| `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead upstream is benched after connection failure before being retried in half-open state. |
-| `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes before returning 502/504 to client. |
+| `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead (`CircuitState::Open`) upstream is benched before a single probe request is allowed in `HalfOpen` state. |
+| `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes (on TCP/timeout errors or `502`/`503`/`504` outlier responses) before returning to client. |
+| `failure_threshold` | Integer | Optional | `3` | Consecutive upstream `502`/`503`/`504` (or gRPC `14 UNAVAILABLE`) responses before the 3-State Circuit Breaker trips to `Open`. Hard TCP/timeout failures trip immediately; a single failure in `HalfOpen` re-opens immediately. |
+| `max_retry_buffer_bytes` | Integer | Optional | `65536` (64 KiB) | Maximum request body size buffered in RAM for automatic retries on idempotent requests. Payloads exceeding this cap seamlessly stream (`PrefixedStreamBody`) without buffering the full upload in memory. |
 | `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Polling interval in seconds. Proactively pings `/health` (REST) or gRPC `health` method. Expected score payload: `{"score": 100}` (REST) or field tag 1 integer (gRPC). Score 0 quarantines node. |
 
 #### Upstream Connection Parameters (`[Server.RouterParams]`)

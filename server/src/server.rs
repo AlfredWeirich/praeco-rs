@@ -682,6 +682,14 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                     // Spawn a dedicated Tokio task (green thread) for this specific upstream node
                     tokio::spawn(async move {
+                        // Startup grace period (10 seconds): allow co-started or manually launched
+                        // backend services (which may first fetch JWKS from Praeco's IdP) to bind
+                        // their listening ports before running the first active health check.
+                        tokio::select! {
+                            _ = token.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                        }
+
                         // Create a timer to fire repeatedly according to the configured interval
                         let mut ticker = tokio::time::interval(interval_dur);
                         // Set tick behavior so it doesn't burst/spam if delayed (e.g., due to CPU starvation)
@@ -702,44 +710,60 @@ fn spawn_router_health_checks(server_config: &Arc<ServerConfig>, cancel_token: C
 
                                     if is_grpc {
                                         // --- gRPC Health Check Resolution ---
-                                        // Lazily fetch the server's protobuf schema using gRPC reflection,
-                                        // and search it for an endpoint method named "health".
+                                        // Probe this specific node's gRPC reflection endpoint (`base_uri`).
+                                        // If reflection fails (e.g. ConnectionRefused on a dead port),
+                                        // immediately trip this node's circuit breaker to OPEN (`mark_dead`).
                                         if grpc_health_path.is_none() {
                                             reflection_attempts += 1;
 
-                                            // Acquire write lock to initialize the grpc reflection pool if empty
-                                            let mut pool_guard = target_arc.grpc_pool.write().await;
-                                            if pool_guard.is_none() {
-                                                match praeco_rs::middleware::router::build_grpc_pool(&base_uri, Some(&router_params)).await {
-                                                    Ok(p) => {
+                                            match praeco_rs::middleware::router::build_grpc_pool(&base_uri, Some(&router_params)).await {
+                                                Ok(p) => {
+                                                    // Search the node's schema for a dedicated "health" method
+                                                    for service in p.services() {
+                                                        for method in service.methods() {
+                                                            if method.name() == "health" {
+                                                                grpc_health_path = Some(format!("/{}/health", service.full_name()));
+                                                                break;
+                                                            }
+                                                        }
+                                                        if grpc_health_path.is_some() { break; }
+                                                    }
+
+                                                    // Populate shared descriptor pool if still empty
+                                                    let mut pool_guard = target_arc.grpc_pool.write().await;
+                                                    if pool_guard.is_none() {
                                                         *pool_guard = Some(praeco_rs::configuration::CachedDescriptorPool {
                                                             pool: p,
                                                             created_at: std::time::Instant::now(),
-                                                        })
+                                                        });
                                                     }
-                                                    Err(e) => {
-                                                        if reflection_attempts <= 3 || reflection_attempts % 10 == 0 {
-                                                            tracing::warn!("{}: Failed to load gRPC reflection schema for active health check: {:?}", server_name, e);
+                                                    drop(pool_guard);
+
+                                                    // If the backend does not define a custom `health` RPC method,
+                                                    // a successful gRPC reflection handshake itself proves the node is alive!
+                                                    if grpc_health_path.is_none() {
+                                                        if !target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                                                            info!("{}: gRPC reflection health check recovered '{}'", server_name, base_uri);
+                                                            target_arc.upstreams[idx].mark_alive();
                                                         }
+                                                        continue;
                                                     }
                                                 }
-                                            }
-
-                                            // Search the loaded schema specifically for a health check endpoint
-                                            if let Some(cached) = pool_guard.as_ref() {
-                                                for service in cached.pool.services() {
-                                                    for method in service.methods() {
-                                                        if method.name() == "health" {
-                                                            grpc_health_path = Some(format!("/{}/health", service.full_name()));
-                                                            break;
-                                                        }
+                                                Err(e) => {
+                                                    if target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed)
+                                                        || reflection_attempts <= 3
+                                                        || reflection_attempts % 10 == 0
+                                                    {
+                                                        tracing::warn!(
+                                                            "{}: Active health check failed to connect to gRPC upstream '{}': {:?} — marking node DEAD (Circuit OPEN)",
+                                                            server_name,
+                                                            base_uri,
+                                                            e
+                                                        );
                                                     }
-                                                    if grpc_health_path.is_some() { break; }
+                                                    target_arc.upstreams[idx].mark_dead();
+                                                    continue;
                                                 }
-                                            }
-
-                                            if grpc_health_path.is_none() && (reflection_attempts <= 3 || reflection_attempts % 10 == 0) {
-                                                tracing::warn!("{}: No 'health' method found in gRPC reflection schema for {}; will retry on next check", server_name, base_uri);
                                             }
                                         }
 

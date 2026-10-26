@@ -118,6 +118,11 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     upstreams = ["https://127.0.0.1:50051"]
     active_health_check_interval = 60
     backend_type = "grpc_passthrough"
+    # --- 3-State Circuit Breaker & Outlier-Detection (Defaults) ---
+    cooldown_seconds = 10          # Sperrzeit (OPEN), bevor 1 Probe-Request (HALF-OPEN) getestet wird
+    max_retries = 2                # Max. automatische Failover-Versuche auf gesunde Knoten
+    failure_threshold = 3          # Anzahl 502/503/504 (bzw. gRPC 14) in Folge bis Circuit -> OPEN
+    max_retry_buffer_bytes = 65536 # Max. Request-Body im RAM für Retries (64 KiB); größere Bodies streamen direkt
 
     [Server.RouterParams]
     protocol = "https"
@@ -183,6 +188,11 @@ pki_base_oid = "1.3.6.1.4.1.65111"
     [Server.ReverseRoutes."/"]
     upstreams = ["https://127.0.0.1:50052"]
     backend_type = "grpc_passthrough"
+    # --- 3-State Circuit Breaker & Outlier-Detection (Defaults) ---
+    cooldown_seconds = 10
+    max_retries = 2
+    failure_threshold = 3
+    max_retry_buffer_bytes = 65536
 
     [Server.RouterParams]
     protocol = "https"
@@ -350,6 +360,11 @@ pki_base_oid = "1.3.6.1.4.1.65111"
         upstreams = ["https://127.0.0.1:50053"]
         backend_type = "grpc_passthrough"
         allowed_roles = ["Admin", "Seller"]
+        # --- 3-State Circuit Breaker & Outlier-Detection (Defaults) ---
+        cooldown_seconds = 10
+        max_retries = 2
+        failure_threshold = 3
+        max_retry_buffer_bytes = 65536
     
     [Server.RouterParams]
         protocol = "https"
