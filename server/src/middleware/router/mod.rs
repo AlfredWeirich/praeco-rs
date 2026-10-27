@@ -260,6 +260,16 @@ impl Service<Request<SrvBody>> for RouterService {
                 return Ok(forbidden_response);
             }
 
+            // Internal Admin / Telemetry route (`backend_type = "admin"`) is answered directly in-memory
+            if route_info.backend_type == RouteBackendType::Admin {
+                return Ok(crate::middleware::admin::handle_admin_request(
+                    &parts.uri,
+                    &parts.method,
+                    &parts.headers,
+                    Some(&self_clone.config),
+                ));
+            }
+
             let original_method = parts.method;
             let mut prepared_headers = parts.headers;
 
@@ -423,6 +433,12 @@ impl Service<Request<SrvBody>> for RouterService {
                     )
                     .await
                 }
+                RouteBackendType::Admin => Ok(crate::middleware::admin::handle_admin_request(
+                    &parts.uri,
+                    &original_method,
+                    &prepared_headers,
+                    Some(&self_clone.config),
+                )),
             }
         })
     }

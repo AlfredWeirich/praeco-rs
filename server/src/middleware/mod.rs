@@ -30,6 +30,8 @@
 
 // ── Sub-module declarations ──────────────────────────────────────────────────
 
+/// Internal admin & telemetry status and Prometheus metrics service.
+pub mod admin;
 /// Injects the `Alt-Svc` HTTP header to advertise HTTP/3 support.
 pub mod alt_svc;
 /// Gzip / Brotli response compression and request decompression.
@@ -68,6 +70,7 @@ pub mod path_sanitizer;
 
 // ── Convenience re-exports ───────────────────────────────────────────────────
 
+pub use admin::AdminService;
 pub use alt_svc::AltSvcLayer;
 pub use counter::CountingLayer;
 pub use delay::DelayLayer;

@@ -334,6 +334,8 @@ mod tests {
             certified_key: None,
             rbac: None,
             compiled_rbac: None,
+            metrics: Default::default(),
+            pki_info: Default::default(),
         }
     }
 

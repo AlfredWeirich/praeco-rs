@@ -145,6 +145,7 @@ where
         let canonical_path = match crate::middleware::path_sanitizer::sanitize_and_normalize_path(path) {
             Ok(p) => p,
             Err(e) => {
+                crate::configuration::ServerMetrics::inc_blocked_inspection(server_name);
                 tracing::warn!(
                     target: "inspection",
                     "{}: InspectionService blocked request due to invalid path: {} (path: '{}')",
@@ -163,6 +164,7 @@ where
             let fut = self.inner.call(req);
             InspectionFuture::Allowed { inner: fut }
         } else {
+            crate::configuration::ServerMetrics::inc_blocked_inspection(server_name);
             // Log the failure
             let method_owned = method.to_string(); // Only allocate if we actually block
             let path_owned = path.to_string();

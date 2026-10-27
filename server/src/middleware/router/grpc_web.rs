@@ -101,27 +101,10 @@ pub async fn handle_grpc_web(
             .target
             .next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
-        upstream_node
-            .active_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        struct ConnectionGuard {
-            target: Arc<crate::configuration::RouteTarget>,
-            uri: Uri,
-        }
-        impl Drop for ConnectionGuard {
-            fn drop(&mut self) {
-                if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
-                    node.active_connections
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
-
-        let _conn_guard = ConnectionGuard {
-            target: route_info.target.clone(),
-            uri: backend_base_uri.clone(),
-        };
+        let _conn_guard = super::upstreams::ConnectionGuard::new(
+            route_info.target.clone(),
+            backend_base_uri.clone(),
+        );
 
         if let Some(auth) = backend_base_uri.authority() {
             if let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
@@ -357,6 +340,7 @@ pub async fn handle_grpc_web(
             })
             .unwrap_or(std::time::Duration::from_secs(30));
 
+        let req_start = std::time::Instant::now();
         let req_result = match tokio::time::timeout(req_timeout, grpc_client.request(proxy_req)).await {
             Ok(res) => res,
             Err(_) => {
@@ -373,6 +357,7 @@ pub async fn handle_grpc_web(
 
         match req_result {
             Ok(mut res) => {
+                upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
                 if res.status() != StatusCode::OK {
                     return Ok(build_error_response(
                         &format!("Backend Error: {}", res.status()),
@@ -462,6 +447,9 @@ pub async fn handle_grpc_web(
                 failed_nodes.push(backend_base_uri.clone());
 
                 if attempts <= max_retries {
+                    upstream_node
+                        .failover_retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     warn!(
                         "{}: Retrying gRPC request... (Attempt {}/{})",
                         server_name, attempts, max_retries

@@ -568,6 +568,7 @@ where
                 inner: self.inner.call(req),
             },
             Err(rejection) => {
+                crate::configuration::ServerMetrics::inc_blocked_ip_filter(self.server_name);
                 tracing::warn!(
                     target: "security",
                     "{}: Blocked request with 403 Forbidden due to IP filter: {} (method: {}, uri: '{}')",

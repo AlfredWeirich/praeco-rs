@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tracing::{error, warn};
 
-use super::upstreams::build_upstream_uri;
+use super::upstreams::{ConnectionGuard, TrackedBody, build_upstream_uri};
 use super::{RequestBody, build_error_response};
 use crate::{ServiceRespBody, SrvError, configuration::ParsedRoute};
 
@@ -67,27 +67,7 @@ pub async fn handle_http_proxy(
                 route_info.target.cooldown_seconds,
             )
         });
-        upstream_node
-            .active_connections
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        struct ConnectionGuard {
-            target: Arc<crate::configuration::RouteTarget>,
-            uri: Uri,
-        }
-        impl Drop for ConnectionGuard {
-            fn drop(&mut self) {
-                if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
-                    node.active_connections
-                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
-
-        let _conn_guard = ConnectionGuard {
-            target: route_info.target.clone(),
-            uri: backend_base_uri.clone(),
-        };
+        let conn_guard = ConnectionGuard::new(route_info.target.clone(), backend_base_uri.clone());
 
         let target_uri = build_upstream_uri(backend_base_uri, matched_params, original_uri)?;
 
@@ -132,6 +112,7 @@ pub async fn handle_http_proxy(
             );
         });
 
+        let req_start = std::time::Instant::now();
         let req_fut = client.request(proxy_req);
         let resp_result = if let Some(timeout_dur) = request_timeout {
             match tokio::time::timeout(timeout_dur, req_fut).await {
@@ -148,6 +129,9 @@ pub async fn handle_http_proxy(
                     failed_nodes.push(backend_base_uri.clone());
 
                     if !is_stream && is_idempotent && attempts <= max_retries {
+                        upstream_node
+                            .failover_retries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             "{}: Retrying timed-out idempotent request... (Attempt {}/{})",
                             server_name, attempts, max_retries
@@ -175,6 +159,7 @@ pub async fn handle_http_proxy(
 
         match resp_result {
             Ok(res) => {
+                upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
                 if let Some(ref mut pg) = probe_guard {
                     pg.complete();
                 }
@@ -204,6 +189,9 @@ pub async fn handle_http_proxy(
                     }
 
                     if !is_stream && is_idempotent && attempts <= max_retries {
+                        upstream_node
+                            .failover_retries
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(
                             "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after upstream {} from {}...",
                             server_name, attempts, max_retries, status, backend_base_uri
@@ -215,7 +203,7 @@ pub async fn handle_http_proxy(
                     super::headers::clean_response_headers(&mut res_parts.headers);
                     return Ok(Response::from_parts(
                         res_parts,
-                        res_body.map_err(SrvError::from).boxed(),
+                        TrackedBody::new(res_body.map_err(SrvError::from), conn_guard).boxed(),
                     ));
                 }
 
@@ -224,7 +212,7 @@ pub async fn handle_http_proxy(
                 super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
                     res_parts,
-                    res_body.map_err(SrvError::from).boxed(),
+                    TrackedBody::new(res_body.map_err(SrvError::from), conn_guard).boxed(),
                 ));
             }
             Err(e) => {
@@ -282,6 +270,9 @@ pub async fn handle_http_proxy(
                         failed_nodes.push(backend_base_uri.clone());
 
                         if !is_stream && is_idempotent && attempts <= max_retries {
+                            upstream_node
+                                .failover_retries
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             warn!(
                                 "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) switching away from {}...",
                                 server_name, attempts, max_retries, backend_base_uri

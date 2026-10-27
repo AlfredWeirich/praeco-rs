@@ -32,6 +32,7 @@ pub fn enforce_rbac(
         if let Some(required_roles) = rbac.match_path(path) {
             // Fail-closed: empty role list acts as explicit Deny-All
             if required_roles.is_empty() {
+                crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
                 warn!(
                     "{}: Forbidden: explicit empty RBAC rule for '{}' denies all requests",
                     server_name, path
@@ -50,6 +51,7 @@ pub fn enforce_rbac(
             };
 
             if !is_authorized {
+                crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
                 let user_roles = parts.extensions.get::<Arc<Vec<UserRole>>>();
                 warn!(
                     "{}: Forbidden: RBAC required one of {:?} for path '{}', but client has {:?}",
@@ -71,6 +73,7 @@ pub fn enforce_rbac(
         };
 
         if !is_authorized {
+            crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
             warn!(
                 "{}: Forbidden for roles {:?} at {} (required route roles: {:?})",
                 server_name,

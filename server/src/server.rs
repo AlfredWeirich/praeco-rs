@@ -113,6 +113,7 @@ use rustls::ServerConfig as RustlsServerConfig;
 /// 4. **Build Runtime**: Starts the Tokio runtime, which is the engine that drives all asynchronous tasks.
 /// 5. **Start Server**: Launches the main asynchronous loop.
 fn main() -> Result<(), Error> {
+    praeco_rs::middleware::admin::init_process_start_time();
     let arg = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "Config.toml".to_string());
@@ -1028,6 +1029,7 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
             EchoService::new(static_name).boxed_clone_sync()
         }
         ServiceType::Router => RouterService::new(server_config.clone())?.boxed_clone_sync(),
+        ServiceType::Admin => praeco_rs::middleware::AdminService::new(Some(server_config.clone())).boxed_clone_sync(),
         ServiceType::Idp => {
             let params = server_config
                 .idp_params
@@ -1093,7 +1095,8 @@ fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneSe
         })
         .layer(
             TraceLayer::new_for_http()
-                .make_span_with(|request: &hyper::Request<_>| {
+                .make_span_with(move |request: &hyper::Request<_>| {
+                    praeco_rs::configuration::ServerMetrics::inc_total_requests(static_name);
                     let path = request.uri().path();
                     let method = request.method();
                     let otel_name = format!("{} {}", method, path);
