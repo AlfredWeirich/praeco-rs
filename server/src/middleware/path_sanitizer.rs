@@ -325,6 +325,7 @@ where
                 PathSanitizerFuture::Allowed { inner: fut }
             }
             Err(e) => {
+                crate::configuration::ServerMetrics::inc_blocked_inspection(self.server_name);
                 tracing::warn!(
                     target: "security",
                     "{}: Blocked request with 400 Bad Request due to path sanitization: {} (URI: '{}')",

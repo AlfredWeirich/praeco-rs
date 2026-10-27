@@ -407,6 +407,7 @@ where
                 SimpleRateLimitFuture::Allowed { inner: fut }
             }
             Err(retry_after_secs) => {
+                crate::configuration::ServerMetrics::inc_rate_limited(server_name);
                 warn!("{}: Too Many Requests for key {} (simple limiter)", server_name, key);
                 let body: ServiceRespBody = Full::new(Bytes::from_static(b"Too Many Requests"))
                     .map_err(SrvError::from)
@@ -740,6 +741,7 @@ where
                 TokenBucketRateLimitFuture::Allowed { inner: fut }
             }
             Err(retry_after_secs) => {
+                crate::configuration::ServerMetrics::inc_rate_limited(server_name);
                 warn!(
                     "{}: Too Many Requests for key {} – bucket exhausted (bucket limiter)",
                     server_name, key

@@ -1,5 +1,86 @@
 use crate::SrvError;
 use hyper::http::uri::{PathAndQuery, Uri};
+use pin_project::pin_project;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+/// RAII guard that increments an upstream node's `active_connections` counter on creation
+/// and decrements it on drop.
+///
+/// When attached to a streaming response via [`TrackedBody`], the guard remains alive
+/// for the entire duration of the HTTP/2, gRPC, or SSE response stream rather than
+/// dropping prematurely as soon as the initial response headers arrive.
+pub struct ConnectionGuard {
+    target: Arc<crate::configuration::RouteTarget>,
+    uri: Uri,
+}
+
+impl ConnectionGuard {
+    pub fn new(target: Arc<crate::configuration::RouteTarget>, uri: Uri) -> Self {
+        if let Some(node) = target.upstreams.iter().find(|n| n.uri == uri) {
+            node.active_connections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            node.total_requests
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Self { target, uri }
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(node) = self.target.upstreams.iter().find(|n| n.uri == self.uri) {
+            node.active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// A response body wrapper that ties the lifetime of a [`ConnectionGuard`] to the
+/// underlying HTTP/gRPC response stream.
+///
+/// Ensures `active_connections` stays accurate for long-lived gRPC server streams
+/// (e.g. `StreamGlobalEvents`, `StreamMessages`) until the stream closes or the
+/// client disconnects.
+#[pin_project]
+pub struct TrackedBody<B> {
+    #[pin]
+    inner: B,
+    _guard: ConnectionGuard,
+}
+
+impl<B> TrackedBody<B> {
+    pub fn new(inner: B, guard: ConnectionGuard) -> Self {
+        Self {
+            inner,
+            _guard: guard,
+        }
+    }
+}
+
+impl<B> http_body::Body for TrackedBody<B>
+where
+    B: http_body::Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.project().inner.poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 /// Reconstructs the Request URI for the upstream server.
 ///
@@ -75,5 +156,39 @@ mod tests {
 
         let err = build_upstream_uri(&base, &matched.params, &orig).unwrap_err();
         assert!(err.to_string().contains("Suspicious path traversal"));
+    }
+
+    #[test]
+    fn test_tracked_body_holds_active_connection_until_dropped() {
+        use crate::configuration::{LbStrategy, RouteTarget, UpstreamNode};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let uri: Uri = "https://127.0.0.1:50051".parse().unwrap();
+        let node = UpstreamNode::new(uri.clone());
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 10,
+            max_retries: 2,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        assert_eq!(target.upstreams[0].active_connections.load(Ordering::Relaxed), 0);
+
+        let guard = ConnectionGuard::new(target.clone(), uri);
+        assert_eq!(target.upstreams[0].active_connections.load(Ordering::Relaxed), 1);
+
+        let tracked = TrackedBody::new(http_body_util::Empty::<bytes::Bytes>::new(), guard);
+        // Guard moved into TrackedBody -> active_connections must remain 1 while stream is open
+        assert_eq!(target.upstreams[0].active_connections.load(Ordering::Relaxed), 1);
+
+        drop(tracked);
+        // Once stream body is dropped -> active_connections drops back to 0
+        assert_eq!(target.upstreams[0].active_connections.load(Ordering::Relaxed), 0);
     }
 }

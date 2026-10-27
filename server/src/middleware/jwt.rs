@@ -327,6 +327,7 @@ where
                             // --- Revocation Check (jti Denylist) ---
                             if let Some(ref jti) = claims.jti {
                                 if get_jwt_revocation_store().is_revoked(jti) {
+                                    crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
                                     tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
                                     let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
                                     self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
@@ -392,6 +393,7 @@ where
                             // Loop around to poll the newly created Inner future
                         }
                         Err(e) => {
+                            crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
                             tracing::warn!("{}: Invalid JWT: {}", server_name, e);
                             let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
                             self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
@@ -499,6 +501,7 @@ where
                 }
             }
             None => {
+                crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
                 tracing::debug!("{}: Missing Authorization header or cookie", server_name);
                 JwtAuthFuture::Unauthorized {
                     response: Some(unauthorized_response::<()>(redirect.as_deref()).unwrap()),

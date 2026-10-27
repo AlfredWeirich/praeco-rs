@@ -77,6 +77,8 @@ pub enum ServiceType {
     Idp,
     /// A static file server for serving SPAs and assets directly from disk.
     StaticFiles,
+    /// An internal admin & telemetry service (`/status`, `/upstreams`, `/metrics`, `/healthz`).
+    Admin,
 }
 
 /// How clients authenticate with this server instance.
@@ -266,6 +268,96 @@ pub struct ServerConfig {
     /// [`ServerConfig::finalize`] if HTTPS matches.
     #[serde(skip)]
     pub certified_key: Option<Arc<CertifiedKey>>,
+
+    /// Per-server lock-free request and security block counters.
+    #[serde(skip)]
+    pub metrics: Arc<ServerMetrics>,
+
+    /// Cached X.509 certificate and CRL expiration metadata extracted in [`ServerConfig::finalize`].
+    #[serde(skip)]
+    pub pki_info: ServerPkiInfo,
+}
+
+static SERVER_METRICS_REGISTRY: OnceLock<dashmap::DashMap<String, Arc<ServerMetrics>>> =
+    OnceLock::new();
+
+fn metrics_registry() -> &'static dashmap::DashMap<String, Arc<ServerMetrics>> {
+    SERVER_METRICS_REGISTRY.get_or_init(dashmap::DashMap::new)
+}
+
+/// Lock-free per-server operational and security counters (`Ordering::Relaxed`).
+#[derive(Debug, Default)]
+pub struct ServerMetrics {
+    /// Total HTTP/gRPC requests received by this server instance.
+    pub total_requests: std::sync::atomic::AtomicU64,
+    /// Requests blocked by `IpFilterLayer` (`403 Forbidden`).
+    pub blocked_ip_filter: std::sync::atomic::AtomicU64,
+    /// Requests blocked by `InspectionLayer` or `PathSanitizer` (`400`/`403`).
+    pub blocked_inspection: std::sync::atomic::AtomicU64,
+    /// Requests rejected by `JwtAuthLayer` or `CompiledRbac` (`401`/`403`/`302`).
+    pub blocked_auth_rbac: std::sync::atomic::AtomicU64,
+    /// Requests shed by `SimpleRateLimiter` or `TokenBucketRateLimiter` (`429`).
+    pub rate_limited: std::sync::atomic::AtomicU64,
+}
+
+impl ServerMetrics {
+    /// Returns (or creates) the shared `Arc<ServerMetrics>` for `server_name`.
+    pub fn for_server(server_name: &str) -> Arc<Self> {
+        if let Some(existing) = metrics_registry().get(server_name) {
+            return existing.value().clone();
+        }
+        metrics_registry()
+            .entry(server_name.to_string())
+            .or_insert_with(|| Arc::new(Self::default()))
+            .value()
+            .clone()
+    }
+
+    #[inline]
+    pub fn inc_total_requests(server_name: &str) {
+        Self::for_server(server_name)
+            .total_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_blocked_ip_filter(server_name: &str) {
+        Self::for_server(server_name)
+            .blocked_ip_filter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_blocked_inspection(server_name: &str) {
+        Self::for_server(server_name)
+            .blocked_inspection
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_blocked_auth_rbac(server_name: &str) {
+        Self::for_server(server_name)
+            .blocked_auth_rbac
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_rate_limited(server_name: &str) {
+        Self::for_server(server_name)
+            .rate_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Cached X.509 certificate and CRL expiration metadata extracted during [`ServerConfig::finalize`].
+#[derive(Debug, Clone, Default)]
+pub struct ServerPkiInfo {
+    /// UNIX timestamp (seconds) when the server's leaf TLS certificate expires (`notAfter`).
+    pub server_cert_valid_until_unix: Option<i64>,
+    /// UNIX timestamp (seconds) of the earliest `nextUpdate` across configured client CRLs.
+    pub crl_next_update_unix: Option<i64>,
+    /// Total number of revoked certificate serials across configured client CRLs.
+    pub crl_revoked_certs_count: usize,
 }
 
 // ============================================================================
@@ -286,6 +378,8 @@ pub struct StaticFilesParams {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteConfig {
     /// The upstream backend addresses (e.g. `["127.0.0.1:8080", "127.0.0.1:8081"]`).
+    /// Can be omitted or empty (`[]`) when `backend_type = "admin"`.
+    #[serde(default)]
     pub upstreams: Vec<String>,
     /// The load balancing strategy to use for this route.
     #[serde(default)]
@@ -304,7 +398,7 @@ pub struct RouteConfig {
     pub max_retry_buffer_bytes: Option<usize>,
     /// Interval in seconds for actively polling the /health endpoint of upstreams. Defaults to 0 (disabled).
     pub active_health_check_interval: Option<u64>,
-    /// The type of backend this route proxies to (rest or grpc). Defaults to rest.
+    /// The type of backend this route proxies to (`rest`, `grpc_passthrough`, `grpc_transcoding`, or `admin`). Defaults to `rest`.
     #[serde(default)]
     pub backend_type: RouteBackendType,
 }
@@ -321,6 +415,9 @@ pub enum RouteBackendType {
     /// gRPC backend with automatic JSON-to-Protobuf transcoding.
     #[serde(alias = "grpc")]
     GrpcTranscoding,
+    /// Internal Praeco Admin & Telemetry handler (`status`, `upstreams`, `metrics`, `healthz`).
+    #[serde(alias = "praeco_admin")]
+    Admin,
 }
 
 /// A load balancing strategy for downstream forwarding.
@@ -354,6 +451,18 @@ pub struct UpstreamNode {
     pub circuit_state: std::sync::atomic::AtomicU8,
     /// True while a single `HalfOpen` probe request is actively testing node recovery.
     pub half_open_probe_in_flight: std::sync::atomic::AtomicBool,
+    /// Total number of requests dispatched to this upstream node since startup.
+    pub total_requests: std::sync::atomic::AtomicU64,
+    /// Total number of transport/timeout/outlier failures observed on this node since startup.
+    pub total_failures: std::sync::atomic::AtomicU64,
+    /// Total number of times the circuit breaker tripped to `Open` for this node.
+    pub circuit_trips: std::sync::atomic::AtomicU64,
+    /// Total number of requests that failed over away from this node to an alternate healthy node.
+    pub failover_retries: std::sync::atomic::AtomicU64,
+    /// Response header latency (in milliseconds) of the most recent request to this node.
+    pub last_response_ms: std::sync::atomic::AtomicU64,
+    /// Exponential moving average (EMA) of response header latency (in milliseconds).
+    pub ema_response_ms: std::sync::atomic::AtomicU64,
 }
 
 impl UpstreamNode {
@@ -370,7 +479,30 @@ impl UpstreamNode {
                 crate::middleware::router::circuit_breaker::CircuitState::Closed as u8,
             ),
             half_open_probe_in_flight: std::sync::atomic::AtomicBool::new(false),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            total_failures: std::sync::atomic::AtomicU64::new(0),
+            circuit_trips: std::sync::atomic::AtomicU64::new(0),
+            failover_retries: std::sync::atomic::AtomicU64::new(0),
+            last_response_ms: std::sync::atomic::AtomicU64::new(0),
+            ema_response_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Records the observed response header latency (in milliseconds) and updates the EMA.
+    #[inline]
+    pub fn record_latency_ms(&self, sample_ms: u64) {
+        self.last_response_ms
+            .store(sample_ms, std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .ema_response_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let next = if prev == 0 {
+            sample_ms
+        } else {
+            (prev.saturating_mul(3).saturating_add(sample_ms)) / 4
+        };
+        self.ema_response_ms
+            .store(next, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Returns the current [`CircuitState`](crate::middleware::router::circuit_breaker::CircuitState) of this node.
@@ -384,6 +516,8 @@ impl UpstreamNode {
     /// Immediately trips the circuit breaker to `Open`, marks the node as dead,
     /// releases any in-flight `HalfOpen` probe lock, and records the current failure timestamp.
     pub fn mark_dead(&self) {
+        self.total_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let was_alive = self
             .is_alive
             .swap(false, std::sync::atomic::Ordering::AcqRel);
@@ -403,6 +537,8 @@ impl UpstreamNode {
         if was_alive
             || prev_state != crate::middleware::router::circuit_breaker::CircuitState::Open as u8
         {
+            self.circuit_trips
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 "[CIRCUIT BREAKER] State -> OPEN (node marked dead): {}",
                 self.uri
@@ -472,6 +608,8 @@ impl UpstreamNode {
             self.mark_dead();
             true
         } else {
+            self.total_failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 "[CIRCUIT BREAKER] Outlier failure ({}/{}): {}",
                 failures,
@@ -1436,12 +1574,23 @@ impl ServerConfig {
     pub fn finalize(&mut self) -> Result<(), Error> {
         self.static_name = Some(Box::leak(self.name.clone().into_boxed_str()));
         let server_name = self.name.clone();
+        self.metrics = ServerMetrics::for_server(&server_name);
+
+        let mut pki_info = ServerPkiInfo::default();
 
         // Eagerly pre-load TLS CertifiedKey if HTTPS is enabled
         if self.protocol == Protocol::Https {
             if let Some(cert_config) = &self.server_certs {
                 let static_name = self.static_name.expect("static_name initialized");
                 let loaded_key = crate::tls_conf::load_certified_key(static_name, cert_config)?;
+                if let Some(leaf_der) = loaded_key.cert.first() {
+                    if let Ok((_, parsed_cert)) =
+                        x509_parser::parse_x509_certificate(leaf_der.as_ref())
+                    {
+                        pki_info.server_cert_valid_until_unix =
+                            Some(parsed_cert.validity().not_after.timestamp());
+                    }
+                }
                 self.certified_key = Some(loaded_key);
             } else {
                 return Err(Error::msg(format!(
@@ -1450,6 +1599,29 @@ impl ServerConfig {
                 )));
             }
         }
+
+        // Extract CRL metadata if client_certs are configured
+        if let Some(ref client_certs) = self.client_certs {
+            use rustls_pki_types::{CertificateRevocationListDer, pem::PemObject};
+            for cc in client_certs {
+                if let Some(ref crl_path) = cc.ssl_client_crl {
+                    if let Ok(crl_der) = CertificateRevocationListDer::from_pem_file(crl_path) {
+                        if let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
+                            pki_info.crl_revoked_certs_count +=
+                                parsed_crl.iter_revoked_certificates().count();
+                            if let Some(next_up) = parsed_crl.next_update() {
+                                let ts = next_up.timestamp();
+                                pki_info.crl_next_update_unix = match pki_info.crl_next_update_unix {
+                                    Some(existing) => Some(existing.min(ts)),
+                                    None => Some(ts),
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.pki_info = pki_info;
 
         // Validate network binding requirements: if no tunnel is configured, ip and port are mandatory
         if self.tunnel.is_none() {
@@ -1635,7 +1807,7 @@ impl ServerConfig {
             };
 
             for (prefix, cfg) in map {
-                if cfg.upstreams.is_empty() {
+                if cfg.upstreams.is_empty() && cfg.backend_type != RouteBackendType::Admin {
                     return Err(Error::msg(format!(
                         "Configuration error: Route '{}' has no upstreams defined.",
                         prefix
