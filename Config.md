@@ -436,6 +436,15 @@ Reflects incoming request headers, method, path, and body back to the caller. Re
 
 ---
 
+### Admin & Telemetry Service (`service = "Admin"` / `backend_type = "admin"`)
+Exposes real-time, lock-free gateway telemetry (server list, route configurations, upstream 3-State Circuit Breaker states `Closed` / `Open` / `HalfOpen`, active connections, consecutive failures, remaining cooldown timers, and process uptime) as well as Prometheus/OpenMetrics text metrics.
+
+Can be mounted in two ways:
+1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), and `/healthz`.
+2. **Internal Router Route (`backend_type = "admin"`):** Mounted under any custom path inside an existing `service = "Router"` server (e.g. `[Server.ReverseRoutes."/api/GetPraecoStatus"]`, `upstreams` may be omitted or `[]`), inheriting that server's SNI tunnel, TLS, JWT/mTLS authentication, and RBAC rules. Supports optional `POST` circuit control queries (`?action=mark_dead&upstream=<uri>` or `?action=mark_alive&upstream=<uri>`).
+
+---
+
 ### Static File Server & SPA Routing (`service = "StaticFiles"`)
 
 Serves web applications directly from disk with chunked streaming and cache controls. Requires `[Server.StaticFilesParams]`.
@@ -493,9 +502,9 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 
 | Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| `upstreams` | Array of Strings | **Mandatory** | *None* | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). |
+| `upstreams` | Array of Strings | **Mandatory** (except `admin`) | `[]` | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). Can be omitted or `[]` when `backend_type = "admin"`. |
 | `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
-| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), or `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap). |
+| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap), or `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint). |
 | `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
 | `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead (`CircuitState::Open`) upstream is benched before a single probe request is allowed in `HalfOpen` state. |
 | `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes (on TCP/timeout errors or `502`/`503`/`504` outlier responses) before returning to client. |
