@@ -336,7 +336,7 @@ where
                             }
 
                             // --- Role Mapping Logic ---
-                            let mut roles: Vec<crate::configuration::UserRole> = claims
+                            let mut roles: crate::configuration::RoleVec<6> = claims
                                 .oids
                                 .iter()
                                 .map(|suffix| {
@@ -384,7 +384,7 @@ where
                             request.extensions_mut().insert::<Claims>(claims);
                             request
                                 .extensions_mut()
-                                .insert::<Arc<Vec<crate::configuration::UserRole>>>(Arc::new(
+                                .insert::<Arc<crate::configuration::RoleVec<6>>>(Arc::new(
                                     roles,
                                 ));
 

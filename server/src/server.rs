@@ -1659,7 +1659,7 @@ async fn handle_h3_connection(
 
     // --- OPTIMIZATION START ---
     // Convert OIDs (Strings) to Roles (Enums) ONCE for the whole connection.
-    let mut roles: Vec<praeco_rs::configuration::UserRole> = oids
+    let mut roles: praeco_rs::configuration::RoleVec<6> = oids
         .iter()
         .map(|oid| {
             oid_mapping

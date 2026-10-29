@@ -1,8 +1,15 @@
 use hyper::{Response, StatusCode, header};
+use smallvec::SmallVec;
 use tracing::warn;
 
 use super::build_error_response;
-use crate::{ServiceRespBody, configuration::ServerConfig};
+use crate::{
+    ServiceRespBody,
+    configuration::{RoleVec, ServerConfig, UserRole},
+};
+
+/// Stack-allocated header vector: holds up to `N` (default 6) headers on the stack without heap allocation.
+pub type HeaderVec<const N: usize = 6> = SmallVec<[header::HeaderName; N]>;
 
 /// HTTP hop-by-hop headers that **must not** be forwarded by a proxy per RFC 7230 §6.1.
 static HOP_BY_HOP_HEADERS: [header::HeaderName; 9] = [
@@ -105,20 +112,20 @@ pub fn prepare_proxy_headers(
     );
 
     // 2. Strip Hop-by-Hop headers (including headers named in Connection header, RFC 7230 §6.1)
-    let custom_hops: Vec<header::HeaderName> = if let Some(conn_val) = original_headers.get(header::CONNECTION) {
+    let custom_hops: HeaderVec<6> = if let Some(conn_val) = original_headers.get(header::CONNECTION) {
         if let Ok(conn_str) = conn_val.to_str() {
             conn_str
                 .split(',')
                 .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
                 .collect()
         } else {
-            Vec::new()
+            SmallVec::new()
         }
     } else {
-        Vec::new()
+        SmallVec::new()
     };
-    for h in custom_hops {
-        original_headers.remove(&h);
+    for h in &custom_hops {
+        original_headers.remove(h);
     }
     for h in &HOP_BY_HOP_HEADERS {
         original_headers.remove(h);
@@ -238,9 +245,26 @@ pub fn prepare_proxy_headers(
             }
         }
         if let Some(header_roles) = &forward_config.header_roles {
-            if let Some(roles) = extensions.get::<std::sync::Arc<Vec<crate::configuration::UserRole>>>() {
+            let roles_slice = extensions
+                .get::<std::sync::Arc<RoleVec<6>>>()
+                .map(|r| r.as_slice())
+                .or_else(|| {
+                    extensions
+                        .get::<RoleVec<6>>()
+                        .map(|r| r.as_slice())
+                })
+                .or_else(|| {
+                    extensions
+                        .get::<std::sync::Arc<Vec<UserRole>>>()
+                        .map(|r| r.as_slice())
+                });
+            if let Some(roles) = roles_slice {
                 if !roles.is_empty() {
-                    let roles_str = roles.iter().map(|r| r.0.as_str()).collect::<Vec<_>>().join(", ");
+                    let roles_str = roles
+                        .iter()
+                        .map(|r| r.0.as_str())
+                        .collect::<SmallVec<[&str; 6]>>()
+                        .join(", ");
                     if let Ok(hdr_val) = header::HeaderValue::from_str(&roles_str) {
                         if let Ok(hdr_name) = header::HeaderName::from_bytes(header_roles.as_bytes()) {
                             tracing::trace!("Injecting User Roles into header: {}", hdr_name);
@@ -274,20 +298,20 @@ pub fn prepare_proxy_headers(
 /// `Server` header to prevent leaking internal backend implementation details.
 pub fn clean_response_headers(headers: &mut hyper::HeaderMap) {
     // 1. Strip headers named in Connection header
-    let custom_hops: Vec<header::HeaderName> = if let Some(conn_val) = headers.get(header::CONNECTION) {
+    let custom_hops: HeaderVec<6> = if let Some(conn_val) = headers.get(header::CONNECTION) {
         if let Ok(conn_str) = conn_val.to_str() {
             conn_str
                 .split(',')
                 .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
                 .collect()
         } else {
-            Vec::new()
+            SmallVec::new()
         }
     } else {
-        Vec::new()
+        SmallVec::new()
     };
-    for h in custom_hops {
-        headers.remove(&h);
+    for h in &custom_hops {
+        headers.remove(h);
     }
 
     // 2. Strip standard hop-by-hop headers

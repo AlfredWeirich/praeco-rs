@@ -293,7 +293,7 @@ pub struct ConnectionHandler {
     /// Wrapped in [`Arc`] so that cloning the handler for each request on
     /// the same connection is a cheap pointer bump instead of a `Vec` copy.
     /// Defaults to `[UserRole::Guest]` when no recognized OID is found.
-    client_roles: Arc<Vec<UserRole>>,
+    client_roles: Arc<crate::configuration::RoleVec<6>>,
 
     /// The client's full certificate in PEM format, URL-encoded.
     client_cert_pem: Option<String>,
@@ -336,7 +336,7 @@ impl ConnectionHandler {
         oid_mapping: Arc<std::collections::HashMap<String, UserRole>>,
     ) -> Self {
         // 1. Perform the expensive mapping ONCE per connection
-        let roles: Vec<UserRole> = oids
+        let roles: crate::configuration::RoleVec<6> = oids
             .iter()
             .map(|oid| {
                 oid_mapping
@@ -349,7 +349,9 @@ impl ConnectionHandler {
 
         // If you need Guest as fallback, handle it here
         let final_roles = if roles.is_empty() {
-            vec![UserRole::guest()]
+            let mut r = crate::configuration::RoleVec::new();
+            r.push(UserRole::guest());
+            r
         } else {
             roles
         };
@@ -379,7 +381,7 @@ impl ConnectionHandler {
     pub fn new_shared(
         service: BoxedCloneService,
         addr: SocketAddr,
-        roles: Arc<Vec<UserRole>>, // Pass roles, not OIDs
+        roles: Arc<crate::configuration::RoleVec<6>>, // Pass roles, not OIDs
         client_cert_pem: Option<String>,
         client_cert_san: Option<String>,
         client_oids: Arc<Vec<String>>,

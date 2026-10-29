@@ -244,8 +244,10 @@ where
             .unwrap_or_else(|| "Unknown IP".to_string());
 
         // 2. Extract User Roles
-        // Note: We must match the EXACT type inserted by ConnectionHandler: Arc<Vec<UserRole>>
-        let roles_str = if let Some(roles) = ext.get::<Arc<Vec<UserRole>>>() {
+        // Supports both stack-allocated RoleVec<6> and legacy Vec<UserRole>
+        let roles_str = if let Some(roles) = ext.get::<Arc<crate::configuration::RoleVec<6>>>() {
+            format!("{:?}", roles)
+        } else if let Some(roles) = ext.get::<Arc<Vec<UserRole>>>() {
             format!("{:?}", roles)
         } else {
             "No Roles".to_string()
