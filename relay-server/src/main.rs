@@ -11,6 +11,9 @@
 //! This preserves end-to-end encryption, as TLS is terminated at the backend Praeco
 //! server, not at the relay.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod config;
 
 use anyhow::{Context, Result};
