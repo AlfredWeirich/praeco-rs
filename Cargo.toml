@@ -99,6 +99,7 @@ urlencoding = "2.1"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
 mimalloc = { version = "0.1", features = ["v3"] }
 socket2 = "0.5"
+smallvec = { version = "1.14", features = ["const_generics"] }
 
 [profile.release]
 opt-level = 3

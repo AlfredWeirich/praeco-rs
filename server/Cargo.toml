@@ -89,6 +89,7 @@ num_cpus = { workspace = true }
 dashmap = { workspace = true }
 mimalloc = { workspace = true }
 uuid = { workspace = true }
+smallvec = { workspace = true }
 
 [[bin]]
 name = "praeco-rs"

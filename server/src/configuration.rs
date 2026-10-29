@@ -54,6 +54,9 @@ impl UserRole {
     }
 }
 
+/// Stack-allocated role vector: holds up to `N` (default 6) roles on the stack without heap allocation.
+pub type RoleVec<const N: usize = 6> = smallvec::SmallVec<[UserRole; N]>;
+
 /// The transport protocol for a server instance.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]

@@ -5,8 +5,32 @@ use tracing::warn;
 use super::build_error_response;
 use crate::{
     ServiceRespBody,
-    configuration::{CompiledRbac, ParsedRoute, UserRole},
+    configuration::{CompiledRbac, ParsedRoute, RoleVec, UserRole},
 };
+
+/// Extracts the client's assigned user roles from request extensions.
+///
+/// Supports stack-allocated [`RoleVec<6>`] (fast-path), [`Arc<RoleVec<6>>`],
+/// and legacy [`Arc<Vec<UserRole>>`].
+#[inline]
+pub fn extract_user_roles<'a>(parts: &'a hyper::http::request::Parts) -> Option<&'a [UserRole]> {
+    parts
+        .extensions
+        .get::<Arc<RoleVec<6>>>()
+        .map(|r| r.as_slice())
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<RoleVec<6>>()
+                .map(|r| r.as_slice())
+        })
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<Arc<Vec<UserRole>>>()
+                .map(|r| r.as_slice())
+        })
+}
 
 /// Enforces Role-Based Access Control (RBAC).
 ///
@@ -26,6 +50,7 @@ pub fn enforce_rbac(
     server_name: &str,
 ) -> Result<(), Response<ServiceRespBody>> {
     let path = parts.uri.path();
+    let user_roles = extract_user_roles(parts);
 
     // 1. Path-specific granular RBAC (Option B)
     if let Some(rbac) = compiled_rbac {
@@ -43,7 +68,6 @@ pub fn enforce_rbac(
             let is_authorized = if required_roles.iter().any(|r| r.0 == "*") {
                 true
             } else {
-                let user_roles = parts.extensions.get::<Arc<Vec<UserRole>>>();
                 match user_roles {
                     Some(roles) => roles.iter().any(|r| required_roles.contains(r)),
                     None => false,
@@ -52,7 +76,6 @@ pub fn enforce_rbac(
 
             if !is_authorized {
                 crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
-                let user_roles = parts.extensions.get::<Arc<Vec<UserRole>>>();
                 warn!(
                     "{}: Forbidden: RBAC required one of {:?} for path '{}', but client has {:?}",
                     server_name, required_roles, path, user_roles
@@ -66,7 +89,6 @@ pub fn enforce_rbac(
 
     // 2. Fallback: Route-level RBAC
     if !route_info.allowed_roles.is_empty() {
-        let user_roles = parts.extensions.get::<Arc<Vec<UserRole>>>();
         let is_authorized = match user_roles {
             Some(roles) => roles.iter().any(|r| route_info.allowed_roles.contains(r)),
             None => false,
@@ -122,7 +144,7 @@ mod tests {
             .body(())
             .unwrap();
         if let Some(r) = roles {
-            let role_objs: Vec<UserRole> = r.into_iter().map(|s| UserRole(s.to_string())).collect();
+            let role_objs: RoleVec<6> = r.into_iter().map(|s| UserRole(s.to_string())).collect();
             req.extensions_mut().insert(Arc::new(role_objs));
         }
         let (parts, _) = req.into_parts();
@@ -250,6 +272,30 @@ mod tests {
         // Unauthenticated request with no roles allowed by wildcard role
         let no_auth_parts = create_request("/public/assets/logo.png", None);
         assert!(enforce_rbac(&no_auth_parts, &route, Some(&compiled), "test_srv").is_ok());
+    }
+
+    #[test]
+    fn test_rbac_supports_smallvec_and_arc_and_legacy_vec() {
+        let route = create_test_route(vec!["Admin"]);
+
+        // 1. Stack RoleVec directly
+        let mut req1 = Request::builder().uri("/api/test").body(()).unwrap();
+        let mut rv: RoleVec<6> = RoleVec::new();
+        rv.push(UserRole("Admin".to_string()));
+        req1.extensions_mut().insert(rv);
+        assert!(enforce_rbac(&req1.into_parts().0, &route, None, "test_srv").is_ok());
+
+        // 2. Arc<RoleVec>
+        let mut req2 = Request::builder().uri("/api/test").body(()).unwrap();
+        let mut rv2: RoleVec<6> = RoleVec::new();
+        rv2.push(UserRole("Admin".to_string()));
+        req2.extensions_mut().insert(Arc::new(rv2));
+        assert!(enforce_rbac(&req2.into_parts().0, &route, None, "test_srv").is_ok());
+
+        // 3. Legacy Arc<Vec<UserRole>>
+        let mut req3 = Request::builder().uri("/api/test").body(()).unwrap();
+        req3.extensions_mut().insert(Arc::new(vec![UserRole("Admin".to_string())]));
+        assert!(enforce_rbac(&req3.into_parts().0, &route, None, "test_srv").is_ok());
     }
 }
 
