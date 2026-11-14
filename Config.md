@@ -172,7 +172,7 @@ tokio_threads = 16
 
 - **File Rotation & Naming:**
   - **Rotation Cadence:** Daily rotation (`Rotation::DAILY`).
-  - **Filename Convention:** Files are named `app.YYYY-MM-DD.log` inside the specified directory.
+  - **Filename Convention:** Files are named `praeco.YYYY-MM-DD.log` inside the specified directory.
   - **Formatting:** ANSI color codes are stripped (`with_ansi(false)`) so logs are clean for ingest by tools like Filebeat, Vector, Promtail, or Fluentbit.
 
 - **Log Level Filtering:**
@@ -180,7 +180,7 @@ tokio_threads = 16
 
 ```toml
 # Enable rolling daily logs in the /var/log/praeco directory
-# Logs will appear BOTH on stdout (with ANSI color) AND in /var/log/praeco/app.YYYY-MM-DD.log
+# Logs will appear BOTH on stdout (with ANSI color) AND in /var/log/praeco/praeco.YYYY-MM-DD.log
 log_dir = "/var/log/praeco"
 ```
 
@@ -957,6 +957,7 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `jaeger_endpoint` | String | Optional | `"http://localhost:4317"` | OTLP gRPC endpoint for Relay traces. |
 | `otel_log_level` | String | Optional | `"info"` | Log level filter for exported Relay telemetry spans. |
 | `otel_sample_ratio` | Float (`f64`) | Optional | `1.0` | Sampling ratio for Relay traces (`0.0` to `1.0`). |
+| `log_dir` | String | Optional | `None` (Stdout only) | Directory path for asynchronous, non-blocking daily rolling log files (`relay.YYYY-MM-DD.log`). |
 | `rate_limit_connections_per_sec` | Integer | Optional | `50` | Maximum new TCP connections permitted per second per client IP / IPv6 `/64` subnet on the data plane (bounded to 100,000 active buckets). |
 | `rate_limit_burst` | Integer | Optional | `100` | Maximum burst of new TCP connections permitted per client IP / IPv6 `/64` subnet. |
 | `data_plane_idle_timeout_secs` | Integer | Optional | `1800` (30 mins) | Inactivity timeout in seconds for established data-plane connections (`0` disables). |
@@ -990,7 +991,7 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 ```toml
 tokio_threads = 16
 pki_base_oid = "1.3.6.1.4.1.65111"
-log_dir = "/var/log/praeco" # Logs to stdout AND /var/log/praeco/app.YYYY-MM-DD.log
+log_dir = "/var/log/praeco" # Logs to stdout AND /var/log/praeco/praeco.YYYY-MM-DD.log
 
 [[Server]]
 name = "api_gateway"

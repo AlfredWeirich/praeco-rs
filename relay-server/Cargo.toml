@@ -28,6 +28,7 @@ tokio-util = { workspace = true, features = ["compat"] }
 toml = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
+tracing-appender = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 x509-parser = { workspace = true }

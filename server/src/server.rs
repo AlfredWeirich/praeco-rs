@@ -1979,7 +1979,7 @@ fn setup_tracing(
     if let Some(dir) = log_dir {
         let file_appender = RollingFileAppender::builder()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("app")
+            .filename_prefix("praeco")
             .filename_suffix("log")
             .build(dir)?;
 

@@ -31,7 +31,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::{FuturesAsyncWriteCompatExt, TokioAsyncReadCompatExt};
 use tracing::{debug, error, info, info_span, warn, Instrument};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Layer, Registry};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use opentelemetry::trace::TracerProvider as _;
@@ -314,9 +315,16 @@ struct TunnelRoute {
 /// Thread-safe map storing the active SNI-to-Control routing table.
 type SessionMap = Arc<DashMap<String, TunnelRoute>>;
 
-/// Configures tracing and OpenTelemetry (OTLP) based on the provided configuration.
-/// Returns the `SdkTracerProvider` so it isn't dropped prematurely.
-fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTracerProvider> {
+/// Configures tracing, daily rolling file logging (if `log_dir` is configured),
+/// and OpenTelemetry (OTLP) based on the provided configuration.
+///
+/// Returns a tuple containing:
+/// - An optional [`WorkerGuard`] that ensures buffered file logs are flushed on shutdown.
+/// - An optional [`opentelemetry_sdk::trace::SdkTracerProvider`] so background telemetry batch export is kept alive.
+fn setup_tracing(
+    config: &RelayConfig,
+) -> Result<(Option<WorkerGuard>, Option<opentelemetry_sdk::trace::SdkTracerProvider>)> {
+    let log_dir = config.log_dir.as_deref();
     let enable_otlp = config.enable_opentelemetry.unwrap_or(false);
     let jaeger_endpoint = config.jaeger_endpoint.as_deref().unwrap_or("http://localhost:4317");
     let otel_log_level = config.otel_log_level.as_deref().unwrap_or("info");
@@ -326,7 +334,7 @@ fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTr
     let console_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = tracing_subscriber::fmt::layer().with_ansi(true).with_filter(console_filter);
 
-    if enable_otlp {
+    let (telemetry_layer, tracer_provider) = if enable_otlp {
         let sampler = if (otel_sample_ratio - 1.0).abs() < f64::EPSILON {
             opentelemetry_sdk::trace::Sampler::AlwaysOn
         } else {
@@ -337,7 +345,7 @@ fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTr
             .with_tonic()
             .with_endpoint(jaeger_endpoint)
             .build()
-            .expect("Failed to initialize OTLP exporter");
+            .context("Failed to initialize OTLP exporter")?;
 
         let resource = Resource::builder()
             .with_service_name("praeco-relay")
@@ -356,18 +364,46 @@ fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTr
 
         let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer).with_filter(telemetry_filter);
 
-        tracing_subscriber::registry()
-            .with(stdout_layer)
-            .with(telemetry_layer)
-            .init();
-
-        Some(provider)
+        (Some(telemetry_layer), Some(provider))
     } else {
-        tracing_subscriber::registry()
-            .with(stdout_layer)
-            .init();
+        (None, None)
+    };
 
-        None
+    if let Some(dir) = log_dir {
+        let file_appender = RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("relay")
+            .filename_suffix("log")
+            .build(dir)
+            .with_context(|| format!("Failed to initialize RollingFileAppender in directory: '{}'", dir))?;
+
+        let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(non_blocking_appender)
+            .with_filter(
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            );
+
+        let subscriber = Registry::default()
+            .with(telemetry_layer)
+            .with(stdout_layer)
+            .with(file_layer);
+
+        tracing::subscriber::set_global_default(subscriber)
+            .context("Failed to set global tracing subscriber with file layer")?;
+
+        Ok((Some(guard), tracer_provider))
+    } else {
+        let subscriber = Registry::default()
+            .with(telemetry_layer)
+            .with(stdout_layer);
+
+        tracing::subscriber::set_global_default(subscriber)
+            .context("Failed to set global tracing subscriber")?;
+
+        Ok((None, tracer_provider))
     }
 }
 
@@ -379,7 +415,7 @@ fn setup_tracing(config: &RelayConfig) -> Option<opentelemetry_sdk::trace::SdkTr
 async fn main() -> Result<()> {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "RelayConfig.toml".to_string());
     let config = RelayConfig::load(&config_path)?;
-    let _tracer_provider = setup_tracing(&config);
+    let (_tracing_guard, _tracer_provider) = setup_tracing(&config)?;
     
     // Install default crypto provider for rustls
     rustls::crypto::ring::default_provider()
@@ -574,16 +610,15 @@ async fn run_control_plane(
 
             // --- Extract Client Certificate SANs (P0.2) ---
             let mut allowed_snis = Vec::new();
-            if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
-                if let Some(cert_der) = certs.first() {
-                    if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der) {
-                        for ext in cert.iter_extensions() {
-                            if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
-                                for name in &san.general_names {
-                                    if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
-                                        allowed_snis.push(dns.to_string());
-                                    }
-                                }
+            if let Some(certs) = tls_stream.get_ref().1.peer_certificates()
+                && let Some(cert_der) = certs.first()
+                && let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert_der)
+            {
+                for ext in cert.iter_extensions() {
+                    if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                        for name in &san.general_names {
+                            if let x509_parser::extensions::GeneralName::DNSName(dns) = name {
+                                allowed_snis.push(dns.to_string());
                             }
                         }
                     }
@@ -651,16 +686,16 @@ async fn run_control_plane(
 
             // --- Overwrite Protection (P0.3 / S-27) ---
             // Prevent hijacking/blackholing of an active healthy tunnel
-            if let Some(existing) = tunnels.get(&sni) {
-                if !existing.value().control.tx.is_closed() {
-                    warn!(
-                        target: "relay::control_plane",
-                        sni = %sni,
-                        client_ip = %client_addr,
-                        "Registration rejected: active healthy tunnel already registered for this SNI"
-                    );
-                    return;
-                }
+            if let Some(existing) = tunnels.get(&sni)
+                && !existing.value().control.tx.is_closed()
+            {
+                warn!(
+                    target: "relay::control_plane",
+                    sni = %sni,
+                    client_ip = %client_addr,
+                    "Registration rejected: active healthy tunnel already registered for this SNI"
+                );
+                return;
             }
 
             info!(target: "relay::control_plane", sni = %sni, proxy_v2 = supports_proxy_v2, "Praeco tunnel registered");
@@ -700,18 +735,18 @@ async fn run_control_plane(
 
             std::future::poll_fn(|cx| {
                 // 1. Check for new outbound requests (from Data Plane) if we don't have one pending
-                if pending_outbound.is_none() {
-                    if let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx) {
-                        pending_outbound = Some(resp_tx);
-                    }
+                if pending_outbound.is_none()
+                    && let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx)
+                {
+                    pending_outbound = Some(resp_tx);
                 }
 
                 // 2. Drive outbound stream opening if pending
-                if pending_outbound.is_some() {
-                    if let std::task::Poll::Ready(stream_res) = connection.poll_new_outbound(cx) {
-                        let resp_tx = pending_outbound.take().unwrap();
-                        let _ = resp_tx.send(stream_res);
-                    }
+                if pending_outbound.is_some()
+                    && let std::task::Poll::Ready(stream_res) = connection.poll_new_outbound(cx)
+                {
+                    let resp_tx = pending_outbound.take().unwrap();
+                    let _ = resp_tx.send(stream_res);
                 }
 
                 // 3. Drive inbound streams and connection progress (keeping multiplexing alive)
@@ -889,6 +924,7 @@ where
 /// Looks up the SNI in the `tunnels` map, opens a new stream over the corresponding
 /// Yamux connection, and forwards bidirectional TCP traffic with an activity-based idle timeout.
 /// Applies a Token-Bucket rate limit per client IP to mitigate L4 connection floods.
+#[allow(clippy::too_many_arguments)]
 async fn run_data_plane(
     tunnels: SessionMap,
     addr: &str,

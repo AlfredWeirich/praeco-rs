@@ -35,6 +35,10 @@ pub struct RelayConfig {
     /// Sampling ratio for OTLP traces (0.0 to 1.0).
     pub otel_sample_ratio: Option<f64>,
     
+    /// Optional directory path for persistent, non-blocking daily rolling log files.
+    /// If omitted or None, the relay server will only log to Standard Output (stdout).
+    pub log_dir: Option<String>,
+    
     /// Max allowed new TCP connections per second per IP.
     pub rate_limit_connections_per_sec: Option<u32>,
     /// Max allowed burst of TCP connections per IP.
@@ -73,6 +77,7 @@ impl Default for RelayConfig {
             jaeger_endpoint: Some("http://localhost:4317".into()),
             otel_log_level: Some("info".into()),
             otel_sample_ratio: Some(1.0),
+            log_dir: None,
             rate_limit_connections_per_sec: Some(50),
             rate_limit_burst: Some(100),
             data_plane_idle_timeout_secs: Some(1800),
@@ -105,5 +110,37 @@ impl RelayConfig {
         let content = fs::read_to_string(path).context("Failed to read Config.toml")?;
         let config: RelayConfig = toml::from_str(&content).context("Failed to parse Config.toml")?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relay_config_log_dir_parsing() {
+        let toml_str = r#"
+            control_plane_addr = "0.0.0.0:7001"
+            data_plane_addr = "0.0.0.0:443"
+            ca_cert_path = "ca.pem"
+            server_cert_path = "cert.pem"
+            server_key_path = "key.pem"
+            log_dir = "log/relay"
+        "#;
+        let config: RelayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.log_dir.as_deref(), Some("log/relay"));
+    }
+
+    #[test]
+    fn test_relay_config_log_dir_optional_default() {
+        let toml_str = r#"
+            control_plane_addr = "0.0.0.0:7001"
+            data_plane_addr = "0.0.0.0:443"
+            ca_cert_path = "ca.pem"
+            server_cert_path = "cert.pem"
+            server_key_path = "key.pem"
+        "#;
+        let config: RelayConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.log_dir, None);
     }
 }

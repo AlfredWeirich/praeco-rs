@@ -69,6 +69,9 @@ enable_opentelemetry = false
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
 
+# Asynchrones Datei-Logging (optional)
+# log_dir = "log" # Schreibt zusätzlich täglich rotierende, nicht-blockierende Logs in log/relay.YYYY-MM-DD.log
+
 # Concurrency & DoS Hardening (S-27)
 max_concurrent_connections = 10000
 max_concurrent_connections_per_ip = 100
@@ -78,7 +81,9 @@ max_yamux_streams = 4096
 ```
 
 ### Logging & Tracing
-Analog zu Praeco ist der Relay-Server in **OpenTelemetry** integriert. Sind die OTLP-Parameter konfiguriert und `enable_opentelemetry = true` gesetzt, schickt der Relay-Server seine strukturierten Kontext-Logs (wie z.B. SNI, Client IPs) direkt in das zentrale Jaeger-Backend. Das ermöglicht ein nahtloses Tracing über die gesamte Netzwerk-Infrastruktur hinweg!
+Analog zu Praeco unterstützt der Relay-Server sowohl asynchrones Datei-Logging als auch **OpenTelemetry**:
+- **Datei-Logging (`log_dir`):** Wird `log_dir` in `RelayConfig.toml` angegeben, schreibt der Relay-Server über `tracing_appender` täglich rotierende, nicht-blockierende Logs (`relay.YYYY-MM-DD.log`) ohne ANSI-Farbcodes parallel zur Standardausgabe. Durch die Entkopplung über einen separaten Worker-Thread kommt es zu keinem Log-Interleaving bei parallelen Verbindungen.
+- **OpenTelemetry:** Sind die OTLP-Parameter konfiguriert und `enable_opentelemetry = true` gesetzt, schickt der Relay-Server seine strukturierten Kontext-Logs (wie z.B. SNI, Client IPs) direkt in das zentrale Jaeger-Backend. Das ermöglicht ein nahtloses Tracing über die gesamte Netzwerk-Infrastruktur hinweg!
 
 ## Ausführen
 

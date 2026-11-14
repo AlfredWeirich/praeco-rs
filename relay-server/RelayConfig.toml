@@ -42,6 +42,10 @@ enable_opentelemetry = true
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
 
+# Directory path for persistent, non-blocking daily rolling log files.
+# If commented out or omitted, the application will only log to Standard Output (stdout).
+log_dir = "logs"
+
 # ==========================================
 # Connection & Timeout Settings
 # ==========================================
