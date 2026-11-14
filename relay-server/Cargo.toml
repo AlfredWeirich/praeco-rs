@@ -18,9 +18,9 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
 serde = { workspace = true }
+thiserror = { workspace = true }
 tls-parser = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }

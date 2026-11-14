@@ -2073,19 +2073,17 @@ async fn run_tunnel(
     let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     // 1. Prepare Outbound mTLS
+    use rustls::pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    let ca_file = std::fs::File::open(&tunnel.ca_cert_path)?;
-    for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(ca_file)) {
+    for cert in rustls::pki_types::CertificateDer::pem_file_iter(&tunnel.ca_cert_path)? {
         root_store.add(cert?)?;
     }
-    
-    let cert_file = std::fs::File::open(&tunnel.client_cert_path)?;
-    let certs: Vec<rustls::pki_types::CertificateDer> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()?;
-        
-    let key_file = std::fs::File::open(&tunnel.client_key_path)?;
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))?
-        .ok_or("No private key found")?;
+
+    let certs: Vec<rustls::pki_types::CertificateDer> =
+        rustls::pki_types::CertificateDer::pem_file_iter(&tunnel.client_cert_path)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_file(&tunnel.client_key_path)?;
 
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)

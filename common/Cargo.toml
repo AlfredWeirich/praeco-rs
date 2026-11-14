@@ -18,7 +18,6 @@ hyper-rustls = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio", "service", "client-legacy", "http1", "http2"] }
 jsonwebtoken = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }

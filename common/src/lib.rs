@@ -22,7 +22,7 @@ use anyhow::{Context, Error, anyhow};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 use rustls::{
     ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,7 +46,7 @@ pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'s
     let data = std::fs::read(path)
         .with_context(|| format!("{server_name}: Failed to read certificate file '{path}'"))?;
 
-    let certs = rustls_pemfile::certs(&mut &data[..])
+    let certs = CertificateDer::pem_slice_iter(&data)
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("{server_name}: Invalid certificate in '{path}'"))?;
 
@@ -65,29 +65,25 @@ pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'s
 /// # Arguments
 ///
 /// * `path` – File path to the PEM-encoded private key.
-/// * `_server_name` – Reserved for future logging (currently unused).
+/// * `server_name` – Label for error context.
 ///
 /// # Errors
 ///
 /// Returns an error if the file cannot be opened, contains no recognised key, or
 /// has a PEM parse error.
 pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'static>, Error> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("{server_name}: Cannot open key file '{path}'"))?;
-    let mut reader = std::io::BufReader::new(file);
-
-    // Use read_all to catch PKCS1, PKCS8, or SEC1 automatically.
-    // This is more robust than parsing only PKCS#8.
-    for item in rustls_pemfile::read_all(&mut reader) {
-        let item = item.with_context(|| format!("{server_name}: PEM parse error in '{path}'"))?;
-        match item {
-            rustls_pemfile::Item::Pkcs1Key(key) => return Ok(PrivateKeyDer::Pkcs1(key)),
-            rustls_pemfile::Item::Pkcs8Key(key) => return Ok(PrivateKeyDer::Pkcs8(key)),
-            rustls_pemfile::Item::Sec1Key(key) => return Ok(PrivateKeyDer::Sec1(key)),
-            _ => continue, // Skip non-key items (certificates, etc.)
+    match PrivateKeyDer::from_pem_file(path) {
+        Ok(key) => Ok(key),
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+            Err(anyhow!("{server_name}: No private key found in '{path}'"))
         }
+        Err(rustls::pki_types::pem::Error::Io(e)) => {
+            Err(e).with_context(|| format!("{server_name}: Cannot open key file '{path}'"))
+        }
+        Err(e) => Err(anyhow!(
+            "{server_name}: PEM parse error in '{path}': {e}"
+        )),
     }
-    Err(anyhow!("{server_name}: No private key found in '{path}'"))
 }
 
 /// JWT Claims payload for authentication and authorization.
@@ -394,10 +390,10 @@ mod tests {
         let token = sign_jwt(&claims, &enc_key).unwrap();
 
         // 1. Single matching audience
-        assert!(verify_jwt(&token, &[dec_key.clone()], "praeco-idp", "admin-dashboard").is_ok());
+        assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_ok());
 
         // 2. Comma-separated audience list including admin-dashboard
-        assert!(verify_jwt(&token, &[dec_key.clone()], "praeco-idp", "praeco-admin, admin-dashboard").is_ok());
+        assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), "praeco-idp", "praeco-admin, admin-dashboard").is_ok());
 
         // 3. Mismatched audience fails
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", "wrong-aud").is_err());
