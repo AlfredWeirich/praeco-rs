@@ -45,9 +45,16 @@ pub mod connection_tracker;
 pub mod error;
 /// Tower middleware layers (logging, Alt-Svc header injection, routing, …).
 pub mod middleware;
+/// Service stack assembly, TLS configuration builders, and stream runners.
+pub mod stack;
 /// TLS acceptor and `rustls` configuration helpers.
 pub mod tls_conf;
 pub use error::SrvError;
+pub use stack::{
+    apply_layers, build_rustls_config, build_service_stack, build_tunnel_tls_connector,
+    resolve_tunnel_peer, run_tunnel_over_stream, serve_http_connection, serve_tls_connection,
+    wrap_serve_dir,
+};
 
 // ── Type Aliases ─────────────────────────────────────────────────────────────
 

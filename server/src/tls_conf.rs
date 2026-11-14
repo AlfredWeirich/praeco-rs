@@ -60,22 +60,41 @@ pub fn load_certified_key(
 #[derive(Debug)]
 pub struct DynamicCertResolver {
     server_name: &'static str,
+    fallback_key: Option<Arc<CertifiedKey>>,
 }
 
 impl DynamicCertResolver {
     pub fn new(server_name: &'static str) -> Self {
-        Self { server_name }
+        Self {
+            server_name,
+            fallback_key: None,
+        }
+    }
+
+    /// Creates a [`DynamicCertResolver`] that prefers the hot-reloaded key from
+    /// [`Config::try_global`](crate::configuration::Config::try_global) and falls
+    /// back to `fallback_key` when the global config singleton is not initialized
+    /// or does not contain `server_name`.
+    pub fn with_fallback(server_name: &'static str, fallback_key: Arc<CertifiedKey>) -> Self {
+        Self {
+            server_name,
+            fallback_key: Some(fallback_key),
+        }
     }
 }
 
 impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let config = crate::configuration::Config::global();
-        config
-            .servers
-            .iter()
-            .find(|s| s.static_name == Some(self.server_name))
-            .and_then(|s| s.certified_key.clone())
+        if let Some(config) = crate::configuration::Config::try_global()
+            && let Some(key) = config
+                .servers
+                .iter()
+                .find(|s| s.static_name == Some(self.server_name))
+                .and_then(|s| s.certified_key.clone())
+        {
+            return Some(key);
+        }
+        self.fallback_key.clone()
     }
 }
 
@@ -113,10 +132,16 @@ impl ResolvesServerCert for DynamicCertResolver {
 /// (not expected if `load_certs`/`load_single_key` are implemented with Result).
 pub fn tls_config(
     server_name: &'static str,
-    _server_cert_config: &ServerCertConfig, // Kept for signature compatibility for now, but not used directly
+    server_cert_config: &ServerCertConfig,
     client_ca_configs: Option<&[ClientCertConfig]>,
     authentication_method: crate::configuration::AuthenticationMethod,
 ) -> Result<RustlsServerConfig, Error> {
+    let fallback_key = load_certified_key(server_name, server_cert_config)?;
+    let cert_resolver = Arc::new(DynamicCertResolver::with_fallback(
+        server_name,
+        fallback_key,
+    ));
+
     // Create a fresh Rustls config builder (TLS 1.3 by default)
     let config_builder = rustls::ServerConfig::builder();
 
@@ -181,13 +206,13 @@ pub fn tls_config(
 
         config_builder
             .with_client_cert_verifier(client_verifier)
-            .with_cert_resolver(Arc::new(DynamicCertResolver::new(server_name)))
+            .with_cert_resolver(cert_resolver)
     } else {
         // No client authentication; set up standard HTTPS only
 
         config_builder
             .with_no_client_auth()
-            .with_cert_resolver(Arc::new(DynamicCertResolver::new(server_name)))
+            .with_cert_resolver(cert_resolver)
     };
 
     let mut config = config;
