@@ -90,6 +90,9 @@ mimalloc = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
 
+[dev-dependencies]
+praeco-relay-server = { path = "../relay-server" }
+
 [[bin]]
 name = "praeco-rs"
 path = "src/server.rs"
