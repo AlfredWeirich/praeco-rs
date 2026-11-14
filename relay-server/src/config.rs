@@ -4,7 +4,7 @@
 //! configuration options for the Praeco Relay Server, including
 //! network addresses, TLS certificate paths, and OpenTelemetry settings.
 
-use anyhow::{Context, Result};
+use crate::RelayError;
 use serde::Deserialize;
 use std::fs;
 
@@ -94,21 +94,23 @@ impl Default for RelayConfig {
 
 impl RelayConfig {
     /// Loads the configuration from a TOML file at the specified path.
-    /// If the file does not exist, it falls back to `RelayConfig::default()`.
     /// 
     /// # Arguments
     /// 
     /// * `path` - The file path to the TOML configuration file.
     /// 
-    /// # Returns
+    /// # Errors
     /// 
-    /// Returns a parsed `RelayConfig` or an error if parsing fails.
-    pub fn load(path: &str) -> Result<Self> {
+    /// Returns a [`RelayError`] if the file does not exist, cannot be read, or fails to parse.
+    pub fn load(path: &str) -> Result<Self, RelayError> {
         if !std::path::Path::new(path).exists() {
-            anyhow::bail!("Configuration file not found at path: {}. A valid configuration is strictly required for secure Relay operation.", path);
+            return Err(RelayError::ConfigNotFound(path.to_string()));
         }
-        let content = fs::read_to_string(path).context("Failed to read Config.toml")?;
-        let config: RelayConfig = toml::from_str(&content).context("Failed to parse Config.toml")?;
+        let content = fs::read_to_string(path).map_err(|source| RelayError::ConfigRead {
+            path: path.to_string(),
+            source,
+        })?;
+        let config: RelayConfig = toml::from_str(&content)?;
         Ok(config)
     }
 }
