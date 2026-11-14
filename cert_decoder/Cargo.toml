@@ -13,5 +13,4 @@ categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
 asn1-rs = { workspace = true, features = ["bigint"] }
-pem = { workspace = true }
 x509-parser = { workspace = true }

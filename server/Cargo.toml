@@ -8,8 +8,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-keywords = ["grpc", "reverse-proxy", "zero-trust", "mtls", "tunnel"]
-categories = ["network-programming", "web-programming", "cryptography", "authentication", "asynchronous"]
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 # --- Core ---
