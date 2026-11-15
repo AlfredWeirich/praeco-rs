@@ -620,43 +620,103 @@ fn urlencoding_decode(input: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Handles an incoming Admin / Telemetry HTTP request (from either `ServiceType::Admin`
-/// or `RouteBackendType::Admin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminEndpoint {
+    Health,
+    Status,
+    Metrics,
+}
+
+/// Resolves an incoming Admin request path (optionally relative to a mounted router `mount_prefix`)
+/// into a supported [`AdminEndpoint`], or `None` if the path is unknown.
+fn resolve_admin_endpoint(path: &str, mount_prefix: Option<&str>) -> Option<AdminEndpoint> {
+    let subpath = match mount_prefix {
+        None => path,
+        Some(prefix) => {
+            let trimmed = prefix.trim_end_matches('/');
+            if trimmed.is_empty() {
+                if path == "/" {
+                    return Some(AdminEndpoint::Status);
+                }
+                path
+            } else {
+                let rest = path.strip_prefix(trimmed)?;
+                if rest.is_empty() || rest == "/" {
+                    return Some(AdminEndpoint::Status);
+                }
+                rest
+            }
+        }
+    };
+
+    match subpath {
+        "/healthz" | "/health" => Some(AdminEndpoint::Health),
+        "/metrics" => Some(AdminEndpoint::Metrics),
+        "/status" | "/upstreams" => Some(AdminEndpoint::Status),
+        _ => None,
+    }
+}
+
+fn build_admin_response(
+    status: StatusCode,
+    content_type: &'static str,
+    payload: Bytes,
+) -> Response<ServiceRespBody> {
+    let body = Full::new(payload).map_err(SrvError::from).boxed();
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body)
+        .expect("Response builder failed")
+}
+
+/// Handles an incoming Admin / Telemetry HTTP request for a standalone `ServiceType::Admin`
+/// listener.
 pub fn handle_admin_request(
     uri: &Uri,
     method: &Method,
     headers: &HeaderMap,
     fallback_server: Option<&ServerConfig>,
 ) -> Response<ServiceRespBody> {
+    handle_admin_request_with_prefix(uri, method, headers, fallback_server, None)
+}
+
+/// Handles an incoming Admin / Telemetry HTTP request (from either `ServiceType::Admin`
+/// with `mount_prefix = None`, or `RouteBackendType::Admin` mounted under `mount_prefix`).
+pub fn handle_admin_request_with_prefix(
+    uri: &Uri,
+    method: &Method,
+    headers: &HeaderMap,
+    fallback_server: Option<&ServerConfig>,
+    mount_prefix: Option<&str>,
+) -> Response<ServiceRespBody> {
     if *method != Method::GET && *method != Method::POST && *method != Method::HEAD {
-        let body = Full::new(Bytes::from_static(b"Method Not Allowed"))
-            .map_err(SrvError::from)
-            .boxed();
-        return Response::builder()
-            .status(StatusCode::METHOD_NOT_ALLOWED)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(body)
-            .expect("Response builder failed");
+        return build_admin_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "text/plain; charset=utf-8",
+            Bytes::from_static(b"Method Not Allowed"),
+        );
     }
 
     let path = uri.path();
     let query = uri.query().unwrap_or("");
 
+    let Some(endpoint) = resolve_admin_endpoint(path, mount_prefix) else {
+        return build_admin_response(
+            StatusCode::NOT_FOUND,
+            "application/json",
+            Bytes::from_static(br#"{"error":"Not Found"}"#),
+        );
+    };
+
     // Fast liveness check endpoint
-    if path.ends_with("/healthz") || path == "/health" {
+    if endpoint == AdminEndpoint::Health {
         let payload = format!(
             r#"{{"status":"ok","uptime_seconds":{}}}"#,
             uptime_seconds()
         );
-        let body = Full::new(Bytes::from(payload))
-            .map_err(SrvError::from)
-            .boxed();
-        return Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(body)
-            .expect("Response builder failed");
+        return build_admin_response(StatusCode::OK, "application/json", Bytes::from(payload));
     }
 
     // Optional circuit-breaker control action on POST requests (e.g. ?action=mark_dead&upstream=...)
@@ -667,7 +727,7 @@ pub fn handle_admin_request(
     let status_snapshot = collect_admin_status(fallback_server);
 
     // Check if Prometheus text format was requested via path, query parameter, or Accept header
-    let wants_prometheus = path.ends_with("/metrics")
+    let wants_prometheus = endpoint == AdminEndpoint::Metrics
         || query.contains("format=prometheus")
         || headers
             .get(header::ACCEPT)
@@ -676,29 +736,14 @@ pub fn handle_admin_request(
 
     if wants_prometheus {
         let text = format_prometheus_metrics(&status_snapshot);
-        let body = Full::new(Bytes::from(text))
-            .map_err(SrvError::from)
-            .boxed();
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(
-                header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(body)
-            .expect("Response builder failed")
+        build_admin_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4; charset=utf-8",
+            Bytes::from(text),
+        )
     } else {
         let json = serde_json::to_vec(&status_snapshot).unwrap_or_else(|_| b"{}".to_vec());
-        let body = Full::new(Bytes::from(json))
-            .map_err(SrvError::from)
-            .boxed();
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CACHE_CONTROL, "no-store")
-            .body(body)
-            .expect("Response builder failed")
+        build_admin_response(StatusCode::OK, "application/json", Bytes::from(json))
     }
 }
 
@@ -810,7 +855,13 @@ mod tests {
             .unwrap();
         let headers = HeaderMap::new();
 
-        let resp = handle_admin_request(&uri, &Method::POST, &headers, Some(&srv));
+        let resp = handle_admin_request_with_prefix(
+            &uri,
+            &Method::POST,
+            &headers,
+            Some(&srv),
+            Some("/api/GetPraecoStatus"),
+        );
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -871,5 +922,68 @@ mod tests {
         assert!(text.contains(
             r#"praeco_upstream_circuit_state{server="test_gateway",route="/",upstream="https://127.0.0.1:50051/"} 0"#
         ));
+    }
+
+    #[tokio::test]
+    async fn test_admin_unknown_paths_return_not_found() {
+        let srv = build_mock_server_config();
+        let headers = HeaderMap::new();
+
+        for invalid_uri in [
+            "http://127.0.0.1:9090/xstatusx",
+            "http://127.0.0.1:9090/",
+            "http://127.0.0.1:9090/status/extra",
+            "http://127.0.0.1:9090/foo/metrics",
+            "http://127.0.0.1:9090/foo/healthz",
+        ] {
+            let uri: Uri = invalid_uri.parse().unwrap();
+            let resp = handle_admin_request(&uri, &Method::GET, &headers, Some(&srv));
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected 404 for {invalid_uri}"
+            );
+            let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+            assert_eq!(json["error"], "Not Found");
+        }
+
+        // Valid standalone endpoints must still return 200 OK
+        for valid_uri in [
+            "http://127.0.0.1:9090/status",
+            "http://127.0.0.1:9090/upstreams",
+            "http://127.0.0.1:9090/healthz",
+            "http://127.0.0.1:9090/health",
+            "http://127.0.0.1:9090/metrics",
+        ] {
+            let uri: Uri = valid_uri.parse().unwrap();
+            let resp = handle_admin_request(&uri, &Method::GET, &headers, Some(&srv));
+            assert_eq!(resp.status(), StatusCode::OK, "expected 200 for {valid_uri}");
+        }
+
+        // Mounted RouteBackendType::Admin sub-paths
+        let bad_mounted: Uri = "https://example.com/api/GetPraecoStatus/xstatusx"
+            .parse()
+            .unwrap();
+        let resp = handle_admin_request_with_prefix(
+            &bad_mounted,
+            &Method::GET,
+            &headers,
+            Some(&srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let good_mounted_metrics: Uri = "https://example.com/api/GetPraecoStatus/metrics"
+            .parse()
+            .unwrap();
+        let resp = handle_admin_request_with_prefix(
+            &good_mounted_metrics,
+            &Method::GET,
+            &headers,
+            Some(&srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

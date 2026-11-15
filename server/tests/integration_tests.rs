@@ -318,6 +318,30 @@ async fn test_admin_and_telemetry_endpoints_integration() {
     assert!(metrics_text.contains("praeco_uptime_seconds"));
     assert!(metrics_text.contains("praeco_server_requests_total"));
 
+    // 4. GET /upstreams -> 200 OK
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/upstreams")
+        .header("host", "localhost:9090")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 5. GET /xstatusx -> 404 Not Found
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/xstatusx")
+        .header("host", "localhost:9090")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let not_found_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let not_found_json: serde_json::Value =
+        serde_json::from_slice(&not_found_bytes).expect("valid JSON error from /xstatusx");
+    assert_eq!(not_found_json["error"], "Not Found");
+
     cancel_token.cancel();
     drop(sender);
     let _ = conn_task.await;

@@ -262,12 +262,15 @@ impl Service<Request<SrvBody>> for RouterService {
 
             // Internal Admin / Telemetry route (`backend_type = "admin"`) is answered directly in-memory
             if route_info.backend_type == RouteBackendType::Admin {
-                return Ok(crate::middleware::admin::handle_admin_request(
-                    &parts.uri,
-                    &parts.method,
-                    &parts.headers,
-                    Some(&self_clone.config),
-                ));
+                return Ok(
+                    crate::middleware::admin::handle_admin_request_with_prefix(
+                        &parts.uri,
+                        &parts.method,
+                        &parts.headers,
+                        Some(&self_clone.config),
+                        Some(route_info.prefix.as_str()),
+                    ),
+                );
             }
 
             let original_method = parts.method;
@@ -433,12 +436,15 @@ impl Service<Request<SrvBody>> for RouterService {
                     )
                     .await
                 }
-                RouteBackendType::Admin => Ok(crate::middleware::admin::handle_admin_request(
-                    &parts.uri,
-                    &original_method,
-                    &prepared_headers,
-                    Some(&self_clone.config),
-                )),
+                RouteBackendType::Admin => Ok(
+                    crate::middleware::admin::handle_admin_request_with_prefix(
+                        &parts.uri,
+                        &original_method,
+                        &prepared_headers,
+                        Some(&self_clone.config),
+                        Some(route_info.prefix.as_str()),
+                    ),
+                ),
             }
         })
     }
