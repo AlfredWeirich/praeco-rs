@@ -1375,6 +1375,23 @@ async fn handle_h3_connection(
 
 // --- Logging Setup ---
 
+/// Distinct `FormatFields` newtype for the file `fmt::Layer` so its `FormattedFields<N>`
+/// span extension does not collide with `stdout_layer`'s `FormattedFields<DefaultFields>`
+/// (which otherwise causes `on_record` to append recorded fields like `traceparent` twice
+/// and leaks ANSI escapes into the file log).
+#[derive(Default)]
+struct FileFormatFields(fmt::format::DefaultFields);
+
+impl<'writer> fmt::FormatFields<'writer> for FileFormatFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
+
 /// Configures the global tracing subscriber for logging and OpenTelemetry tracing.
 ///
 /// # Arguments
@@ -1457,6 +1474,7 @@ fn setup_tracing(
         let (non_blocking_appender, _guard) = tracing_appender::non_blocking(file_appender);
 
         let file_layer = fmt::layer()
+            .fmt_fields(FileFormatFields::default())
             .with_ansi(false)
             .with_writer(non_blocking_appender)
             .with_filter(
@@ -1551,4 +1569,80 @@ async fn run_tunnel(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileFormatFields;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{Registry, fmt, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriter {
+        fn into_string(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn test_dual_fmt_layers_do_not_duplicate_recorded_traceparent() {
+        let stdout_buf = SharedWriter::default();
+        let file_buf = SharedWriter::default();
+
+        let stdout_layer = fmt::layer().with_ansi(true).with_writer(stdout_buf.clone());
+        let file_layer = fmt::layer()
+            .fmt_fields(FileFormatFields::default())
+            .with_ansi(false)
+            .with_writer(file_buf.clone());
+
+        let subscriber = Registry::default().with(stdout_layer).with(file_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "request",
+                http.method = "GET",
+                traceparent = tracing::field::Empty
+            );
+            let _enter = span.enter();
+            tracing::Span::current().record(
+                "traceparent",
+                "00-ac4746a75cdeaa2ef4f0be9bfa7bee9a-03fe4ad60e39c2cb-01",
+            );
+            tracing::info!("handled request");
+        });
+
+        let stdout_out = stdout_buf.into_string();
+        let file_out = file_buf.into_string();
+
+        let tp = "00-ac4746a75cdeaa2ef4f0be9bfa7bee9a-03fe4ad60e39c2cb-01";
+        assert_eq!(stdout_out.matches(tp).count(), 1, "stdout: {stdout_out}");
+        assert_eq!(file_out.matches("traceparent=").count(), 1, "file: {file_out}");
+        assert_eq!(file_out.matches(tp).count(), 1, "file: {file_out}");
+        assert!(
+            !file_out.contains('\x1b'),
+            "file log must not contain ANSI escapes: {file_out}"
+        );
+    }
 }
