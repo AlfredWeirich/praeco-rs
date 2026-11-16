@@ -27,6 +27,7 @@ pub struct ConnectionTracker {
     max_connections: usize,
     ip_counts: Arc<DashMap<IpAddr, u32>>,
     max_connections_per_ip: usize,
+    metrics: Option<Arc<crate::configuration::ServerMetrics>>,
 }
 
 impl ConnectionTracker {
@@ -37,6 +38,23 @@ impl ConnectionTracker {
             max_connections,
             ip_counts: Arc::new(DashMap::new()),
             max_connections_per_ip,
+            metrics: None,
+        }
+    }
+
+    /// Creates a new `ConnectionTracker` bound to `server_name` so active connections
+    /// and global/per-IP rejections are exported to [`ServerMetrics`](crate::configuration::ServerMetrics).
+    pub fn with_server_name(
+        max_connections: usize,
+        max_connections_per_ip: usize,
+        server_name: &str,
+    ) -> Self {
+        Self {
+            current_connections: Arc::new(AtomicUsize::new(0)),
+            max_connections,
+            ip_counts: Arc::new(DashMap::new()),
+            max_connections_per_ip,
+            metrics: Some(crate::configuration::ServerMetrics::for_server(server_name)),
         }
     }
 
@@ -51,6 +69,10 @@ impl ConnectionTracker {
         let current = self.current_connections.fetch_add(1, Ordering::SeqCst);
         if current >= self.max_connections {
             self.current_connections.fetch_sub(1, Ordering::SeqCst);
+            if let Some(m) = &self.metrics {
+                m.connections_rejected_global
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return Err(AcquireError::GlobalLimitReached {
                 current,
                 max: self.max_connections,
@@ -65,6 +87,9 @@ impl ConnectionTracker {
                     let cur_ip = *entry;
                     drop(entry);
                     self.current_connections.fetch_sub(1, Ordering::SeqCst);
+                    if let Some(m) = &self.metrics {
+                        m.connections_rejected_ip.fetch_add(1, Ordering::Relaxed);
+                    }
                     return Err(AcquireError::IpLimitReached {
                         ip: ip_addr,
                         current: cur_ip,
@@ -73,6 +98,10 @@ impl ConnectionTracker {
                 }
                 *entry += 1;
             }
+        }
+
+        if let Some(m) = &self.metrics {
+            m.active_connections.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(ConnectionGuard {
@@ -84,6 +113,9 @@ impl ConnectionTracker {
     /// Internal release function called by [`ConnectionGuard::drop`].
     fn release(&self, ip: Option<IpAddr>) {
         self.current_connections.fetch_sub(1, Ordering::SeqCst);
+        if let Some(m) = &self.metrics {
+            m.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
         if let Some(ip_addr) = ip.map(common::canonical_client_ip) {
             if !ip_addr.is_unspecified() {
                 if let dashmap::mapref::entry::Entry::Occupied(mut occ) = self.ip_counts.entry(ip_addr) {
@@ -138,6 +170,9 @@ impl ConnectionGuard {
         let mut entry = self.tracker.ip_counts.entry(ip).or_insert(0);
         if *entry as usize >= self.tracker.max_connections_per_ip {
             let cur_ip = *entry;
+            if let Some(m) = &self.tracker.metrics {
+                m.connections_rejected_ip.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(AcquireError::IpLimitReached {
                 ip,
                 current: cur_ip,
@@ -484,5 +519,49 @@ mod tests {
         drop(g2);
         assert_eq!(tracker.current_connections(), 0);
         assert_eq!(tracker.connections_for_ip(&ip), 0);
+    }
+
+    #[test]
+    fn test_connection_tracker_updates_server_metrics() {
+        let srv_name = "test_conn_tracker_metrics_srv";
+        let tracker = ConnectionTracker::with_server_name(2, 1, srv_name);
+        let metrics = crate::configuration::ServerMetrics::for_server(srv_name);
+        let ord = Ordering::Relaxed;
+
+        let ip1: IpAddr = Ipv4Addr::new(198, 51, 100, 10).into();
+        let ip2: IpAddr = Ipv4Addr::new(198, 51, 100, 11).into();
+        let ip3: IpAddr = Ipv4Addr::new(198, 51, 100, 12).into();
+
+        let g1 = tracker.acquire(Some(ip1)).expect("g1 ok");
+        assert_eq!(metrics.active_connections.load(ord), 1);
+
+        // Per-IP limit (1) exceeded -> increments connections_rejected_ip
+        let err_ip = tracker.acquire(Some(ip1)).expect_err("ip1 limit exceeded");
+        assert!(matches!(err_ip, AcquireError::IpLimitReached { .. }));
+        assert_eq!(metrics.connections_rejected_ip.load(ord), 1);
+        assert_eq!(metrics.active_connections.load(ord), 1);
+
+        // Second connection from ip2 succeeds -> reaches global limit (2)
+        let g2 = tracker.acquire(Some(ip2)).expect("g2 ok");
+        assert_eq!(metrics.active_connections.load(ord), 2);
+
+        // Global limit (2) exceeded -> increments connections_rejected_global
+        let err_global = tracker.acquire(Some(ip3)).expect_err("global limit exceeded");
+        assert!(matches!(err_global, AcquireError::GlobalLimitReached { .. }));
+        assert_eq!(metrics.connections_rejected_global.load(ord), 1);
+        assert_eq!(metrics.active_connections.load(ord), 2);
+
+        // Free one slot, acquire with None, and test bind_ip rejection
+        drop(g2);
+        assert_eq!(metrics.active_connections.load(ord), 1);
+        let mut g3 = tracker.acquire(None).expect("g3 ok");
+        assert_eq!(metrics.active_connections.load(ord), 2);
+        let err_bind = g3.bind_ip(ip1).expect_err("bind_ip should hit ip1 limit");
+        assert!(matches!(err_bind, AcquireError::IpLimitReached { .. }));
+        assert_eq!(metrics.connections_rejected_ip.load(ord), 2);
+
+        drop(g3);
+        drop(g1);
+        assert_eq!(metrics.active_connections.load(ord), 0);
     }
 }

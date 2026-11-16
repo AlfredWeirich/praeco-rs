@@ -115,6 +115,7 @@ where
                         if matches!(srv_err, SrvError::PayloadTooLarge { .. })
                             || srv_err.to_string().contains("Payload Limit Exceeded")
                         {
+                            crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
                             let msg = "Payload too large (Streaming check)";
                             tracing::warn!("{}: {}", server_name, msg);
                             Poll::Ready(Ok(build_413_response(msg)))
@@ -150,6 +151,7 @@ where
         if let Some(content_length_str) = req.headers().get(CONTENT_LENGTH) {
             if let Ok(content_length) = content_length_str.to_str().unwrap_or("").parse::<usize>() {
                 if content_length > max_bytes {
+                    crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
                     let msg = "Payload too large (Header check)";
                     tracing::warn!("{}: {}", server_name, msg);
                     return MaxPayloadFuture::HeaderRejected {
@@ -424,6 +426,7 @@ pub enum ConcurrencyLimitFuture<F, S, ReqBody> {
         acquire_task: Pin<Box<dyn Future<Output = Result<tokio::sync::OwnedSemaphorePermit, ()>> + Send>>,
         req: Option<Request<ReqBody>>,
         inner: S,
+        server_name: &'static str,
     },
     Immediate {
         response: Option<Response<SrvBody>>,
@@ -456,6 +459,7 @@ where
                     }
                 }
                 Err(_) => {
+                    crate::configuration::ServerMetrics::inc_concurrency_limited(self.server_name);
                     tracing::warn!("{}: Concurrency limit reached (load-shedding)", self.server_name);
                     ConcurrencyLimitFuture::Immediate {
                         response: Some(build_503_response()),
@@ -474,6 +478,7 @@ where
                 acquire_task,
                 req: Some(req),
                 inner: self.inner.clone(),
+                server_name: self.server_name,
             }
         } else {
             let sem = self.semaphore.clone();
@@ -484,6 +489,7 @@ where
                 acquire_task,
                 req: Some(req),
                 inner: self.inner.clone(),
+                server_name: self.server_name,
             }
         }
     }
@@ -505,7 +511,7 @@ where
                     let res = response.take().expect("polled after completion");
                     return Poll::Ready(Ok(res));
                 }
-                ConcurrencyLimitFutureProj::Waiting { acquire_task, req, inner } => {
+                ConcurrencyLimitFutureProj::Waiting { acquire_task, req, inner, server_name } => {
                     match acquire_task.poll(cx) {
                         Poll::Ready(Ok(permit)) => {
                             let request = req.take().expect("polled after completion");
@@ -517,6 +523,9 @@ where
                             continue;
                         }
                         Poll::Ready(Err(())) => {
+                            crate::configuration::ServerMetrics::inc_concurrency_limited(
+                                server_name,
+                            );
                             return Poll::Ready(Ok(build_503_response()));
                         }
                         Poll::Pending => return Poll::Pending,
@@ -619,6 +628,14 @@ mod tests {
         let req3 = Request::builder().uri("/test3").body(Full::new(Bytes::new())).unwrap();
         let resp3 = svc.ready().await.unwrap().call(req3).await.unwrap();
         assert_eq!(resp3.status(), StatusCode::OK);
+
+        let metrics = crate::configuration::ServerMetrics::for_server("test_concurrency");
+        assert_eq!(
+            metrics
+                .concurrency_limited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -811,5 +828,43 @@ mod tests {
 
         let resp = svc.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let metrics = crate::configuration::ServerMetrics::for_server("test_http_cumulative");
+        assert_eq!(
+            metrics
+                .payload_too_large
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_header_reject_records_metric() {
+        let inner_svc = service_fn(|_req: Request<SrvBody>| async move {
+            Ok::<Response<SrvBody>, SrvError>(Response::new(
+                Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed(),
+            ))
+        });
+
+        let layer = MaxPayloadLayer::new(16, "test_max_payload_header_metrics");
+        let mut svc = layer.layer(inner_svc);
+
+        let req = Request::builder()
+            .uri("/upload")
+            .header(CONTENT_LENGTH, "100")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let metrics =
+            crate::configuration::ServerMetrics::for_server("test_max_payload_header_metrics");
+        assert_eq!(
+            metrics
+                .payload_too_large
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }

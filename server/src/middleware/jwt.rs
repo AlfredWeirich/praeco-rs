@@ -327,7 +327,7 @@ where
                             // --- Revocation Check (jti Denylist) ---
                             if let Some(ref jti) = claims.jti {
                                 if get_jwt_revocation_store().is_revoked(jti) {
-                                    crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
+                                    crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
                                     tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
                                     let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
                                     self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
@@ -393,7 +393,7 @@ where
                             // Loop around to poll the newly created Inner future
                         }
                         Err(e) => {
-                            crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
+                            crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
                             tracing::warn!("{}: Invalid JWT: {}", server_name, e);
                             let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
                             self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
@@ -501,7 +501,7 @@ where
                 }
             }
             None => {
-                crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
+                crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
                 tracing::debug!("{}: Missing Authorization header or cookie", server_name);
                 JwtAuthFuture::Unauthorized {
                     response: Some(unauthorized_response::<()>(redirect.as_deref()).unwrap()),
@@ -880,6 +880,26 @@ mod tests {
             .unwrap();
         let resp_bob1 = pipeline.ready().await.unwrap().call(req_bob1).await.unwrap();
         assert_eq!(resp_bob1.status(), StatusCode::OK);
+
+        let metrics = crate::configuration::ServerMetrics::for_server("test-server");
+        assert!(
+            metrics
+                .blocked_jwt_auth
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 10
+        );
+        assert!(
+            metrics
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1
+        );
+        assert_eq!(
+            metrics
+                .blocked_auth_rbac
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }
 

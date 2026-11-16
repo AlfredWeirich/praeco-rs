@@ -437,11 +437,19 @@ Reflects incoming request headers, method, path, and body back to the caller. Re
 ---
 
 ### Admin & Telemetry Service (`service = "Admin"` / `backend_type = "admin"`)
-Exposes real-time, lock-free gateway telemetry (server list, route configurations, upstream 3-State Circuit Breaker states `Closed` / `Open` / `HalfOpen`, active connections, consecutive failures, remaining cooldown timers, and process uptime) as well as Prometheus/OpenMetrics text metrics.
+Exposes real-time, lock-free gateway telemetry (server list, connection limits, per-layer security/limit block counters, HTTP status-class counts, end-to-end latency, PKI expiration status, route configurations, upstream 3-State Circuit Breaker states `Closed` / `Open` / `HalfOpen`, active connections, consecutive failures, remaining cooldown timers, and process uptime) as well as Prometheus/OpenMetrics text metrics.
 
 Can be mounted in two ways:
-1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), and `/healthz`.
-2. **Internal Router Route (`backend_type = "admin"`):** Mounted under any custom path inside an existing `service = "Router"` server (e.g. `[Server.ReverseRoutes."/api/GetPraecoStatus"]`, `upstreams` may be omitted or `[]`), inheriting that server's SNI tunnel, TLS, JWT/mTLS authentication, and RBAC rules. Supports optional `POST` circuit control queries (`?action=mark_dead&upstream=<uri>` or `?action=mark_alive&upstream=<uri>`).
+1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) strictly serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), `/healthz`, and `/health`. Any unrecognized path returns `404 Not Found` (`{"error":"Not Found"}`).
+2. **Internal Router Route (`backend_type = "admin"`):** Mounted under any custom path inside an existing `service = "Router"` server (e.g. `[Server.ReverseRoutes."/api/GetPraecoStatus"]`, `upstreams` may be omitted or `[]`), inheriting that server's SNI tunnel, TLS, JWT/mTLS authentication, and RBAC rules. Accepts the mounted prefix itself (`/`), `/status`, `/upstreams`, `/metrics`, `/healthz`, and `/health` relative to the route prefix (`404 Not Found` for unknown sub-paths). Supports optional `POST` circuit control queries (`?action=mark_dead&upstream=<uri>` or `?action=mark_alive&upstream=<uri>`).
+
+#### Exposed Prometheus Metrics (`/metrics`)
+- **Process & Auth:** `praeco_uptime_seconds`, `praeco_revoked_jwt_tokens`
+- **Per-Server Traffic & Connections:** `praeco_server_requests_total`, `praeco_server_active_connections`, `praeco_server_connections_rejected_total{reason="global_limit|ip_limit"}`
+- **Per-Server Security & Limit Rejections (`praeco_server_blocked_requests_total`):** `reason` labels `ip_filter`, `inspection`, `path_sanitizer`, `jwt_auth`, `auth_rbac`, `rate_limited`, `concurrency_limit`, `payload_too_large`, `decompression_limit`
+- **Per-Server Responses & Latency:** `praeco_server_responses_total{status_class="2xx|3xx|4xx|5xx"}`, `praeco_server_last_response_ms`, `praeco_server_ema_response_ms`
+- **Per-Server PKI:** `praeco_server_cert_days_remaining`
+- **Per-Upstream:** `praeco_upstream_circuit_state`, `praeco_upstream_alive`, `praeco_upstream_active_connections`, `praeco_upstream_requests_total`, `praeco_upstream_failures_total`, `praeco_upstream_circuit_trips_total`, `praeco_upstream_ema_response_ms`, `praeco_upstream_consecutive_failures`
 
 ---
 

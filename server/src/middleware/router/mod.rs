@@ -222,6 +222,7 @@ impl Service<Request<SrvBody>> for RouterService {
                     parts.uri = clean_uri;
                 }
                 Err(e) => {
+                    crate::configuration::ServerMetrics::inc_blocked_path_sanitizer(server_name);
                     tracing::warn!(
                         target: "security",
                         "{}: RouterService rejected invalid path '{}': {}",

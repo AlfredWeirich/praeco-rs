@@ -64,23 +64,40 @@ pub struct AdminSummary {
     pub open_circuits: usize,
     pub half_open_circuits: usize,
     pub active_connections: usize,
+    pub active_server_connections: usize,
+    pub total_rejected_connections: u64,
     pub total_requests: u64,
     pub total_upstream_requests: u64,
     pub total_upstream_failures: u64,
     pub total_circuit_trips: u64,
     pub total_failover_retries: u64,
     pub total_blocked_requests: u64,
+    pub total_responses_5xx: u64,
     pub revoked_jwt_tokens: usize,
 }
 
-/// Per-server edge traffic & security/WAF block counters (Package 2).
+/// Per-server edge traffic, connection, latency & security/WAF block counters (Package 2).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AdminServerTrafficSecurity {
     pub total_requests: u64,
+    pub active_connections: usize,
+    pub connections_rejected_global: u64,
+    pub connections_rejected_ip: u64,
     pub blocked_ip_filter: u64,
     pub blocked_inspection: u64,
+    pub blocked_path_sanitizer: u64,
+    pub blocked_jwt_auth: u64,
     pub blocked_auth_rbac: u64,
     pub rate_limited: u64,
+    pub concurrency_limited: u64,
+    pub payload_too_large: u64,
+    pub decompression_limit_exceeded: u64,
+    pub responses_2xx: u64,
+    pub responses_3xx: u64,
+    pub responses_4xx: u64,
+    pub responses_5xx: u64,
+    pub last_response_ms: u64,
+    pub ema_response_ms: u64,
 }
 
 /// Per-server PKI, TLS leaf certificate & mTLS CRL expiration status (Package 3).
@@ -184,34 +201,63 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
             )
         };
 
-        // Package 2: Per-server edge traffic & security counters
+        // Package 2: Per-server edge traffic, connection, latency & security counters
         let srv_metrics = crate::configuration::ServerMetrics::for_server(&srv.name);
-        let srv_total_reqs = srv_metrics
-            .total_requests
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let srv_blocked_ip = srv_metrics
-            .blocked_ip_filter
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let srv_blocked_insp = srv_metrics
-            .blocked_inspection
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let srv_blocked_auth = srv_metrics
-            .blocked_auth_rbac
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let srv_rate_limited = srv_metrics
-            .rate_limited
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let ord = std::sync::atomic::Ordering::Relaxed;
+        let srv_total_reqs = srv_metrics.total_requests.load(ord);
+        let srv_active_conns = srv_metrics.active_connections.load(ord);
+        let srv_rej_global = srv_metrics.connections_rejected_global.load(ord);
+        let srv_rej_ip = srv_metrics.connections_rejected_ip.load(ord);
+        let srv_blocked_ip = srv_metrics.blocked_ip_filter.load(ord);
+        let srv_blocked_insp = srv_metrics.blocked_inspection.load(ord);
+        let srv_blocked_path = srv_metrics.blocked_path_sanitizer.load(ord);
+        let srv_blocked_jwt = srv_metrics.blocked_jwt_auth.load(ord);
+        let srv_blocked_rbac = srv_metrics.blocked_auth_rbac.load(ord);
+        let srv_rate_limited = srv_metrics.rate_limited.load(ord);
+        let srv_concurrency_limited = srv_metrics.concurrency_limited.load(ord);
+        let srv_payload_too_large = srv_metrics.payload_too_large.load(ord);
+        let srv_decompression_limit = srv_metrics.decompression_limit_exceeded.load(ord);
+        let srv_resp_2xx = srv_metrics.responses_2xx.load(ord);
+        let srv_resp_3xx = srv_metrics.responses_3xx.load(ord);
+        let srv_resp_4xx = srv_metrics.responses_4xx.load(ord);
+        let srv_resp_5xx = srv_metrics.responses_5xx.load(ord);
+        let srv_last_ms = srv_metrics.last_response_ms.load(ord);
+        let srv_ema_ms = srv_metrics.ema_response_ms.load(ord);
 
         summary.total_requests += srv_total_reqs;
-        summary.total_blocked_requests +=
-            srv_blocked_ip + srv_blocked_insp + srv_blocked_auth + srv_rate_limited;
+        summary.active_server_connections += srv_active_conns;
+        summary.total_rejected_connections += srv_rej_global + srv_rej_ip;
+        summary.total_responses_5xx += srv_resp_5xx;
+        summary.total_blocked_requests += srv_blocked_ip
+            + srv_blocked_insp
+            + srv_blocked_path
+            + srv_blocked_jwt
+            + srv_blocked_rbac
+            + srv_rate_limited
+            + srv_concurrency_limited
+            + srv_payload_too_large
+            + srv_decompression_limit;
 
         let traffic_and_security = AdminServerTrafficSecurity {
             total_requests: srv_total_reqs,
+            active_connections: srv_active_conns,
+            connections_rejected_global: srv_rej_global,
+            connections_rejected_ip: srv_rej_ip,
             blocked_ip_filter: srv_blocked_ip,
             blocked_inspection: srv_blocked_insp,
-            blocked_auth_rbac: srv_blocked_auth,
+            blocked_path_sanitizer: srv_blocked_path,
+            blocked_jwt_auth: srv_blocked_jwt,
+            blocked_auth_rbac: srv_blocked_rbac,
             rate_limited: srv_rate_limited,
+            concurrency_limited: srv_concurrency_limited,
+            payload_too_large: srv_payload_too_large,
+            decompression_limit_exceeded: srv_decompression_limit,
+            responses_2xx: srv_resp_2xx,
+            responses_3xx: srv_resp_3xx,
+            responses_4xx: srv_resp_4xx,
+            responses_5xx: srv_resp_5xx,
+            last_response_ms: srv_last_ms,
+            ema_response_ms: srv_ema_ms,
         };
 
         // Package 3: PKI / Certificate & CRL expiration monitoring
@@ -391,24 +437,87 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     }
     out.push('\n');
 
-    out.push_str("# HELP praeco_server_blocked_requests_total Blocked requests per server by security layer.\n");
-    out.push_str("# TYPE praeco_server_blocked_requests_total counter\n");
+    out.push_str("# HELP praeco_server_active_connections Active client connections per server.\n");
+    out.push_str("# TYPE praeco_server_active_connections gauge\n");
     for srv in &status.servers {
         out.push_str(&format!(
-            "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"ip_filter\"}} {}\n",
-            srv.name, srv.traffic_and_security.blocked_ip_filter
+            "praeco_server_active_connections{{server=\"{}\"}} {}\n",
+            srv.name, srv.traffic_and_security.active_connections
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("# HELP praeco_server_connections_rejected_total Connections rejected by connection limits.\n");
+    out.push_str("# TYPE praeco_server_connections_rejected_total counter\n");
+    for srv in &status.servers {
+        out.push_str(&format!(
+            "praeco_server_connections_rejected_total{{server=\"{}\",reason=\"global_limit\"}} {}\n",
+            srv.name, srv.traffic_and_security.connections_rejected_global
         ));
         out.push_str(&format!(
-            "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"inspection\"}} {}\n",
-            srv.name, srv.traffic_and_security.blocked_inspection
+            "praeco_server_connections_rejected_total{{server=\"{}\",reason=\"ip_limit\"}} {}\n",
+            srv.name, srv.traffic_and_security.connections_rejected_ip
         ));
+    }
+    out.push('\n');
+
+    out.push_str("# HELP praeco_server_blocked_requests_total Blocked requests per server by security or limit layer.\n");
+    out.push_str("# TYPE praeco_server_blocked_requests_total counter\n");
+    for srv in &status.servers {
+        let ts = &srv.traffic_and_security;
+        for (reason, count) in [
+            ("ip_filter", ts.blocked_ip_filter),
+            ("inspection", ts.blocked_inspection),
+            ("path_sanitizer", ts.blocked_path_sanitizer),
+            ("jwt_auth", ts.blocked_jwt_auth),
+            ("auth_rbac", ts.blocked_auth_rbac),
+            ("rate_limited", ts.rate_limited),
+            ("concurrency_limit", ts.concurrency_limited),
+            ("payload_too_large", ts.payload_too_large),
+            ("decompression_limit", ts.decompression_limit_exceeded),
+        ] {
+            out.push_str(&format!(
+                "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"{}\"}} {}\n",
+                srv.name, reason, count
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("# HELP praeco_server_responses_total Completed HTTP responses per server by status class.\n");
+    out.push_str("# TYPE praeco_server_responses_total counter\n");
+    for srv in &status.servers {
+        let ts = &srv.traffic_and_security;
+        for (status_class, count) in [
+            ("2xx", ts.responses_2xx),
+            ("3xx", ts.responses_3xx),
+            ("4xx", ts.responses_4xx),
+            ("5xx", ts.responses_5xx),
+        ] {
+            out.push_str(&format!(
+                "praeco_server_responses_total{{server=\"{}\",status_class=\"{}\"}} {}\n",
+                srv.name, status_class, count
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("# HELP praeco_server_last_response_ms Most recent observed request latency per server in milliseconds.\n");
+    out.push_str("# TYPE praeco_server_last_response_ms gauge\n");
+    for srv in &status.servers {
         out.push_str(&format!(
-            "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"auth_rbac\"}} {}\n",
-            srv.name, srv.traffic_and_security.blocked_auth_rbac
+            "praeco_server_last_response_ms{{server=\"{}\"}} {}\n",
+            srv.name, srv.traffic_and_security.last_response_ms
         ));
+    }
+    out.push('\n');
+
+    out.push_str("# HELP praeco_server_ema_response_ms Exponential moving average request latency per server in milliseconds.\n");
+    out.push_str("# TYPE praeco_server_ema_response_ms gauge\n");
+    for srv in &status.servers {
         out.push_str(&format!(
-            "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"rate_limited\"}} {}\n",
-            srv.name, srv.traffic_and_security.rate_limited
+            "praeco_server_ema_response_ms{{server=\"{}\"}} {}\n",
+            srv.name, srv.traffic_and_security.ema_response_ms
         ));
     }
     out.push('\n');
@@ -985,5 +1094,68 @@ mod tests {
             Some("/api/GetPraecoStatus"),
         );
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_admin_reports_extended_server_metrics() {
+        let srv = build_mock_server_config();
+        let m = crate::configuration::ServerMetrics::for_server("test_gateway");
+        m.active_connections
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+        m.connections_rejected_global
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        m.connections_rejected_ip
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        crate::configuration::ServerMetrics::inc_blocked_path_sanitizer("test_gateway");
+        crate::configuration::ServerMetrics::inc_blocked_jwt_auth("test_gateway");
+        crate::configuration::ServerMetrics::inc_concurrency_limited("test_gateway");
+        crate::configuration::ServerMetrics::inc_payload_too_large("test_gateway");
+        crate::configuration::ServerMetrics::inc_decompression_limit_exceeded("test_gateway");
+        crate::configuration::ServerMetrics::record_response("test_gateway", 200, 15);
+        crate::configuration::ServerMetrics::record_response("test_gateway", 502, 35);
+
+        let headers = HeaderMap::new();
+        let status_uri: Uri = "http://127.0.0.1:9090/status".parse().unwrap();
+        let status_resp = handle_admin_request(&status_uri, &Method::GET, &headers, Some(&srv));
+        assert_eq!(status_resp.status(), StatusCode::OK);
+        let status_bytes = status_resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&status_bytes).unwrap();
+
+        let ts = &json["servers"][0]["traffic_and_security"];
+        assert_eq!(ts["active_connections"], 7);
+        assert!(ts["connections_rejected_global"].as_u64().unwrap() >= 2);
+        assert!(ts["connections_rejected_ip"].as_u64().unwrap() >= 3);
+        assert!(ts["blocked_path_sanitizer"].as_u64().unwrap() >= 1);
+        assert!(ts["blocked_jwt_auth"].as_u64().unwrap() >= 1);
+        assert!(ts["concurrency_limited"].as_u64().unwrap() >= 1);
+        assert!(ts["payload_too_large"].as_u64().unwrap() >= 1);
+        assert!(ts["decompression_limit_exceeded"].as_u64().unwrap() >= 1);
+        assert!(ts["responses_2xx"].as_u64().unwrap() >= 1);
+        assert!(ts["responses_5xx"].as_u64().unwrap() >= 1);
+        assert!(ts["last_response_ms"].is_number());
+        assert!(ts["ema_response_ms"].is_number());
+
+        let metrics_uri: Uri = "http://127.0.0.1:9090/metrics".parse().unwrap();
+        let metrics_resp = handle_admin_request(&metrics_uri, &Method::GET, &headers, Some(&srv));
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+        let metrics_bytes = metrics_resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(metrics_bytes.to_vec()).unwrap();
+
+        for expected in [
+            r#"praeco_server_active_connections{server="test_gateway"} 7"#,
+            r#"praeco_server_connections_rejected_total{server="test_gateway",reason="global_limit"}"#,
+            r#"praeco_server_connections_rejected_total{server="test_gateway",reason="ip_limit"}"#,
+            r#"praeco_server_blocked_requests_total{server="test_gateway",reason="path_sanitizer"}"#,
+            r#"praeco_server_blocked_requests_total{server="test_gateway",reason="jwt_auth"}"#,
+            r#"praeco_server_blocked_requests_total{server="test_gateway",reason="concurrency_limit"}"#,
+            r#"praeco_server_blocked_requests_total{server="test_gateway",reason="payload_too_large"}"#,
+            r#"praeco_server_blocked_requests_total{server="test_gateway",reason="decompression_limit"}"#,
+            r#"praeco_server_responses_total{server="test_gateway",status_class="2xx"}"#,
+            r#"praeco_server_responses_total{server="test_gateway",status_class="5xx"}"#,
+            r#"praeco_server_last_response_ms{server="test_gateway"}"#,
+            r#"praeco_server_ema_response_ms{server="test_gateway"}"#,
+        ] {
+            assert!(text.contains(expected), "missing metric line: {expected}");
+        }
     }
 }

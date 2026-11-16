@@ -215,8 +215,9 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
             .boxed_clone_sync()
     };
 
-    use tower_http::trace::{DefaultOnResponse, TraceLayer};
+    use tower_http::trace::{DefaultOnResponse, OnResponse, TraceLayer};
 
+    let default_on_response = DefaultOnResponse::new().level(Level::INFO);
     let traced = tower::ServiceBuilder::new()
         .map_response(|res: hyper::Response<_>| {
             res.map(|b| http_body_util::BodyExt::map_err(b, SrvError::from).boxed())
@@ -249,7 +250,18 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
                     });
                     span
                 })
-                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+                .on_response(
+                    move |response: &hyper::Response<_>,
+                          latency: Duration,
+                          span: &tracing::Span| {
+                        ServerMetrics::record_response(
+                            static_name,
+                            response.status().as_u16(),
+                            latency.as_millis() as u64,
+                        );
+                        default_on_response.on_response(response, latency, span);
+                    },
+                ),
         )
         .service(sanitized);
 

@@ -342,6 +342,37 @@ async fn test_admin_and_telemetry_endpoints_integration() {
         serde_json::from_slice(&not_found_bytes).expect("valid JSON error from /xstatusx");
     assert_eq!(not_found_json["error"], "Not Found");
 
+    // 6. Verify TraceLayer recorded response status classes (2xx and 4xx) in /metrics
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .header("host", "localhost:9090")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let metrics_text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(metrics_text.contains(
+        r#"praeco_server_responses_total{server="IntegrationAdminServer",status_class="2xx"} 4"#
+    ));
+    assert!(metrics_text.contains(
+        r#"praeco_server_responses_total{server="IntegrationAdminServer",status_class="4xx"} 1"#
+    ));
+    assert!(metrics_text.contains(
+        r#"praeco_server_last_response_ms{server="IntegrationAdminServer"}"#
+    ));
+    assert!(metrics_text.contains(
+        r#"praeco_server_ema_response_ms{server="IntegrationAdminServer"}"#
+    ));
+
     cancel_token.cancel();
     drop(sender);
     let _ = conn_task.await;

@@ -325,7 +325,7 @@ where
                 PathSanitizerFuture::Allowed { inner: fut }
             }
             Err(e) => {
-                crate::configuration::ServerMetrics::inc_blocked_inspection(self.server_name);
+                crate::configuration::ServerMetrics::inc_blocked_path_sanitizer(self.server_name);
                 tracing::warn!(
                     target: "security",
                     "{}: Blocked request with 400 Bad Request due to path sanitization: {} (URI: '{}')",
@@ -577,5 +577,19 @@ mod tests {
         let req = Request::builder().uri("/public\\admin").body(Full::new(Bytes::new())).unwrap();
         let resp = svc.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let metrics = crate::configuration::ServerMetrics::for_server("test_server");
+        assert!(
+            metrics
+                .blocked_path_sanitizer
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 5
+        );
+        assert_eq!(
+            metrics
+                .blocked_inspection
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 }

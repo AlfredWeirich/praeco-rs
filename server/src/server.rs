@@ -366,9 +366,10 @@ async fn start_single_server(
     }
 
     let oid_mapping = Arc::new(server_config.oid_mapping.clone());
-    let connection_tracker = Arc::new(ConnectionTracker::new(
+    let connection_tracker = Arc::new(ConnectionTracker::with_server_name(
         server_config.connection_limits.max_connections,
         server_config.connection_limits.max_connections_per_ip,
+        &server_config.name,
     ));
 
     if let Some(tunnel) = &server_config.tunnel {

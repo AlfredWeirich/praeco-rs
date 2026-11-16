@@ -404,35 +404,9 @@ where
 
             // 2. Decompress & Wrap in LimitedReader for bomb protection
             let new_body: SrvBody = if encoding == "gzip" {
-                let decoder = GzipDecoder::new(body_reader);
-                let limited = LimitedReader::new(decoder, max_bytes);
-                let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
-
-                StreamBody::new(stream)
-                    .map_err(move |e: io::Error| {
-                        let msg = e.to_string();
-                        if msg.contains("Decompressed payload exceeds maximum allowed size") {
-                            SrvError::DecompressionLimitExceeded { max: max_bytes }
-                        } else {
-                            SrvError::Other(msg)
-                        }
-                    })
-                    .boxed()
+                wrap_decompressed_reader(GzipDecoder::new(body_reader), max_bytes, server_name)
             } else {
-                let decoder = BrotliDecoder::new(body_reader);
-                let limited = LimitedReader::new(decoder, max_bytes);
-                let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
-
-                StreamBody::new(stream)
-                    .map_err(move |e: io::Error| {
-                        let msg = e.to_string();
-                        if msg.contains("Decompressed payload exceeds maximum allowed size") {
-                            SrvError::DecompressionLimitExceeded { max: max_bytes }
-                        } else {
-                            SrvError::Other(msg)
-                        }
-                    })
-                    .boxed()
+                wrap_decompressed_reader(BrotliDecoder::new(body_reader), max_bytes, server_name)
             };
 
             // Rebuild the request with the decompressed body and remove
@@ -447,6 +421,29 @@ where
         let fut = self.inner.call(req);
         SrvDecompressionFuture { inner: fut }
     }
+}
+
+/// Wraps a decompressor [`AsyncRead`] in [`LimitedReader`] and converts limit errors
+/// into [`SrvError::DecompressionLimitExceeded`] while recording [`ServerMetrics`].
+fn wrap_decompressed_reader<R: AsyncRead + Send + Sync + 'static>(
+    decoder: R,
+    max_bytes: usize,
+    server_name: &'static str,
+) -> SrvBody {
+    let limited = LimitedReader::new(decoder, max_bytes);
+    let stream = ReaderStream::new(limited).map(|res| res.map(Frame::data));
+
+    StreamBody::new(stream)
+        .map_err(move |e: io::Error| {
+            let msg = e.to_string();
+            if msg.contains("Decompressed payload exceeds maximum allowed size") {
+                crate::configuration::ServerMetrics::inc_decompression_limit_exceeded(server_name);
+                SrvError::DecompressionLimitExceeded { max: max_bytes }
+            } else {
+                SrvError::Other(msg)
+            }
+        })
+        .boxed()
 }
 
 // ============================================================================
@@ -618,5 +615,43 @@ mod tests {
     async fn test_no_accept_encoding_leaves_response_untouched() {
         let resp = run(Some("application/json"), None, "", full_body(PAYLOAD)).await;
         assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_decompression_bomb_limit_records_metric() {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt;
+
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(&[b'A'; 512]).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        let compressed = encoder.into_inner();
+
+        let inner = service_fn(|mut req: Request<SrvBody>| async move {
+            let _ = req.body_mut().collect().await?;
+            Ok::<Response<SrvBody>, SrvError>(Response::new(full_body(b"OK")))
+        });
+
+        let srv_name = "test_decompression_bomb_metrics";
+        let svc = SrvDecompressionLayer::new(srv_name, 64).layer(inner);
+        let req = Request::builder()
+            .header(CONTENT_ENCODING, "gzip")
+            .body(
+                Full::new(Bytes::from(compressed))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let err = svc.oneshot(req).await.expect_err("must abort decompression bomb");
+        assert!(matches!(err, SrvError::DecompressionLimitExceeded { max: 64 }));
+
+        let metrics = crate::configuration::ServerMetrics::for_server(srv_name);
+        assert_eq!(
+            metrics
+                .decompression_limit_exceeded
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 }

@@ -288,19 +288,64 @@ fn metrics_registry() -> &'static dashmap::DashMap<String, Arc<ServerMetrics>> {
     SERVER_METRICS_REGISTRY.get_or_init(dashmap::DashMap::new)
 }
 
+/// Updates a `last` latency sample and its exponential moving average (`alpha = 0.25`).
+#[inline]
+fn update_ema_ms(
+    last: &std::sync::atomic::AtomicU64,
+    ema: &std::sync::atomic::AtomicU64,
+    sample_ms: u64,
+) {
+    last.store(sample_ms, std::sync::atomic::Ordering::Relaxed);
+    let prev = ema.load(std::sync::atomic::Ordering::Relaxed);
+    let next = if prev == 0 {
+        sample_ms
+    } else {
+        (prev.saturating_mul(3).saturating_add(sample_ms)) / 4
+    };
+    ema.store(next, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Lock-free per-server operational and security counters (`Ordering::Relaxed`).
 #[derive(Debug, Default)]
 pub struct ServerMetrics {
     /// Total HTTP/gRPC requests received by this server instance.
     pub total_requests: std::sync::atomic::AtomicU64,
+    /// Active TCP/QUIC/Tunnel connections currently tracked by `ConnectionTracker`.
+    pub active_connections: std::sync::atomic::AtomicUsize,
+    /// Connections dropped because the global connection limit was reached.
+    pub connections_rejected_global: std::sync::atomic::AtomicU64,
+    /// Connections dropped because the per-IP connection limit was reached.
+    pub connections_rejected_ip: std::sync::atomic::AtomicU64,
     /// Requests blocked by `IpFilterLayer` (`403 Forbidden`).
     pub blocked_ip_filter: std::sync::atomic::AtomicU64,
-    /// Requests blocked by `InspectionLayer` or `PathSanitizer` (`400`/`403`).
+    /// Requests blocked by `InspectionLayer` (`403 Forbidden`).
     pub blocked_inspection: std::sync::atomic::AtomicU64,
-    /// Requests rejected by `JwtAuthLayer` or `CompiledRbac` (`401`/`403`/`302`).
+    /// Requests blocked by `PathSanitizerLayer` or router URI canonicalization (`400 Bad Request`).
+    pub blocked_path_sanitizer: std::sync::atomic::AtomicU64,
+    /// Requests rejected by `JwtAuthLayer` (`401 Unauthorized` / `302 Redirect`).
+    pub blocked_jwt_auth: std::sync::atomic::AtomicU64,
+    /// Requests rejected by `CompiledRbac` or route-level RBAC (`403 Forbidden`).
     pub blocked_auth_rbac: std::sync::atomic::AtomicU64,
     /// Requests shed by `SimpleRateLimiter` or `TokenBucketRateLimiter` (`429`).
     pub rate_limited: std::sync::atomic::AtomicU64,
+    /// Requests shed or timed out by `ConcurrencyLimitLayer` (`503`).
+    pub concurrency_limited: std::sync::atomic::AtomicU64,
+    /// Requests rejected by `MaxPayloadLayer` (`413`).
+    pub payload_too_large: std::sync::atomic::AtomicU64,
+    /// Compressed request streams aborted by `SrvDecompressionLayer` bomb protection.
+    pub decompression_limit_exceeded: std::sync::atomic::AtomicU64,
+    /// Completed responses with HTTP `2xx` status.
+    pub responses_2xx: std::sync::atomic::AtomicU64,
+    /// Completed responses with HTTP `3xx` status.
+    pub responses_3xx: std::sync::atomic::AtomicU64,
+    /// Completed responses with HTTP `4xx` status.
+    pub responses_4xx: std::sync::atomic::AtomicU64,
+    /// Completed responses with HTTP `5xx` status.
+    pub responses_5xx: std::sync::atomic::AtomicU64,
+    /// Most recent observed request latency in milliseconds.
+    pub last_response_ms: std::sync::atomic::AtomicU64,
+    /// Exponential moving average request latency in milliseconds.
+    pub ema_response_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ServerMetrics {
@@ -338,6 +383,20 @@ impl ServerMetrics {
     }
 
     #[inline]
+    pub fn inc_blocked_path_sanitizer(server_name: &str) {
+        Self::for_server(server_name)
+            .blocked_path_sanitizer
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_blocked_jwt_auth(server_name: &str) {
+        Self::for_server(server_name)
+            .blocked_jwt_auth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn inc_blocked_auth_rbac(server_name: &str) {
         Self::for_server(server_name)
             .blocked_auth_rbac
@@ -349,6 +408,57 @@ impl ServerMetrics {
         Self::for_server(server_name)
             .rate_limited
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_concurrency_limited(server_name: &str) {
+        Self::for_server(server_name)
+            .concurrency_limited
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_payload_too_large(server_name: &str) {
+        Self::for_server(server_name)
+            .payload_too_large
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_decompression_limit_exceeded(server_name: &str) {
+        Self::for_server(server_name)
+            .decompression_limit_exceeded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records the HTTP status class and end-to-end latency for a completed response.
+    #[inline]
+    pub fn record_response(server_name: &str, status_code: u16, latency_ms: u64) {
+        let metrics = Self::for_server(server_name);
+        match status_code {
+            200..=299 => {
+                metrics
+                    .responses_2xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            300..=399 => {
+                metrics
+                    .responses_3xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            400..=499 => {
+                metrics
+                    .responses_4xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            500..=599 => {
+                metrics
+                    .responses_5xx
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        update_ema_ms(&metrics.last_response_ms, &metrics.ema_response_ms, latency_ms);
     }
 }
 
@@ -494,18 +604,7 @@ impl UpstreamNode {
     /// Records the observed response header latency (in milliseconds) and updates the EMA.
     #[inline]
     pub fn record_latency_ms(&self, sample_ms: u64) {
-        self.last_response_ms
-            .store(sample_ms, std::sync::atomic::Ordering::Relaxed);
-        let prev = self
-            .ema_response_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let next = if prev == 0 {
-            sample_ms
-        } else {
-            (prev.saturating_mul(3).saturating_add(sample_ms)) / 4
-        };
-        self.ema_response_ms
-            .store(next, std::sync::atomic::Ordering::Relaxed);
+        update_ema_ms(&self.last_response_ms, &self.ema_response_ms, sample_ms);
     }
 
     /// Returns the current [`CircuitState`](crate::middleware::router::circuit_breaker::CircuitState) of this node.
