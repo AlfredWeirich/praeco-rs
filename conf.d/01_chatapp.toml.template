@@ -305,6 +305,7 @@ pki_base_oid = "1.3.6.1.4.1.65111"
         "/api/AdminGetRideBookings" = ["^/api/AdminGetRideBookings$"]
         "/api/AdminDeleteRide" = ["^/api/AdminDeleteRide$"]
         "/api/AdminDeleteRideReq" = ["^/api/AdminDeleteRideReq$"]
+        "/api/GetChatStatus" = ["^/api/GetChatStatus$"]
 
     [Server.rbac]
         # Default-Deny für Nicht-Admins auf allen /api/*-Routen (Fail-Closed):
@@ -329,6 +330,7 @@ pki_base_oid = "1.3.6.1.4.1.65111"
 
         # Explizite Admin-Endpunkte (zusätzlich durch "/api/*" = ["Admin"] abgesichert):
         "/api/GetPraecoStatus"           = ["Admin"]
+        "/api/GetChatStatus"             = ["Admin"]
         "/api/GetDatabaseTables"         = ["Admin"]
         "/api/GetTableContent"           = ["Admin"]
         "/api/GetUsers"                  = ["Admin"]
