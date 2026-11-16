@@ -14,10 +14,13 @@
 //!
 //! ## Module re-exports
 //!
-//! The crate publicly exposes four sub-modules:
+//! The crate publicly exposes its core building blocks:
 //! - [`configuration`] – TOML-driven server configuration and route parsing.
+//! - [`connection_tracker`] – Global and per-IP connection limits.
 //! - [`error`] – The unified [`SrvError`] error type.
 //! - [`middleware`] – Tower layers (logging, Alt-Svc, JWT, routing, …).
+//! - [`runner`] – Transport listeners (HTTP/1.1, H2, H3/QUIC), health checks, and tunnel client.
+//! - [`stack`] – Service stack assembly, TLS configuration builders, and stream runners.
 //! - [`tls_conf`] – TLS acceptor construction for `rustls`.
 
 use bytes::Buf;
@@ -45,11 +48,16 @@ pub mod connection_tracker;
 pub mod error;
 /// Tower middleware layers (logging, Alt-Svc header injection, routing, …).
 pub mod middleware;
+/// Transport listeners, active upstream health checks, and outbound relay tunnel runner.
+pub mod runner;
 /// Service stack assembly, TLS configuration builders, and stream runners.
 pub mod stack;
 /// TLS acceptor and `rustls` configuration helpers.
 pub mod tls_conf;
 pub use error::SrvError;
+pub use runner::{
+    run_dual_stack, run_servers, run_tunnel, spawn_router_health_checks, start_single_server,
+};
 pub use stack::{
     apply_layers, build_rustls_config, build_service_stack, build_tunnel_tls_connector,
     resolve_tunnel_peer, run_tunnel_over_stream, serve_http_connection, serve_tls_connection,

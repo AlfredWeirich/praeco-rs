@@ -158,6 +158,33 @@ cargo run -p praeco-rs --release
 
 By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process. Reloads are crash-safe: the new configuration and TLS certificates are fully validated in an isolated dry-run before activating, keeping the existing configuration intact if errors are found.
 
+**Option 3: Embed `praeco-rs` as a Library Crate**
+You can embed Praeco's gateway stack, Tower middlewares, or full dual-stack / tunnel listeners inside your own Rust application without pulling in CLI-only dependencies (`mimalloc`, `tracing-subscriber`, `tracing-appender`, `opentelemetry-otlp`, `opentelemetry_sdk`, `num_cpus`) by disabling the default `cli` feature:
+
+```toml
+[dependencies]
+praeco-rs = { version = "0.5.4", default-features = false }
+```
+
+Key library entry points re-exported at the crate root:
+- `praeco_rs::runner` (`run_servers`, `start_single_server`, `run_dual_stack`, `run_tunnel`, `spawn_router_health_checks`) – full TCP (HTTP/1.1, HTTP/2), UDP/QUIC (HTTP/3), active health-check loops, and outbound mTLS/Yamux tunnel orchestration.
+- `praeco_rs::stack` (`build_service_stack`, `apply_layers`, `build_rustls_config`, `serve_http_connection`, `serve_tls_connection`, `run_tunnel_over_stream`) – composable Tower pipelines and stream-level runners.
+- `praeco_rs::middleware` & `praeco_rs::configuration` – standalone Tower layers (`IpFilterLayer`, `JwtAuthLayer`, `TokenBucketRateLimiterLayer`, `RouterService`, …) and TOML config parsing/finalization.
+
+```rust,no_run
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let config = praeco_rs::configuration::Config::load("Config.toml")?;
+    let cancel = CancellationToken::new();
+    praeco_rs::run_servers(config, cancel).await;
+    Ok(())
+}
+```
+
 
 ### Attachment:
 Here is a **FULL example** of a `Config.toml` from a productiove system:

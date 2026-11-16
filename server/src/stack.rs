@@ -8,8 +8,8 @@
 //! [`run_tunnel_over_stream`]).
 //!
 //! Keeping these functions in the library crate decouples protocol and
-//! middleware orchestration from raw OS socket binding in the binary entry
-//! point (`src/server.rs`), enabling deterministic in-memory integration and
+//! middleware orchestration from listener/signal management (`src/runner.rs`,
+//! `src/server.rs`), enabling deterministic in-memory integration and
 //! end-to-end testing via `tokio::io::duplex`.
 
 use std::collections::HashMap;

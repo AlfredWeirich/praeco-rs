@@ -11,6 +11,17 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = ["cli"]
+cli = [
+    "dep:mimalloc",
+    "dep:num_cpus",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-appender",
+    "dep:tracing-subscriber",
+]
+
 [dependencies]
 # --- Core ---
 anyhow = { workspace = true }
@@ -61,11 +72,11 @@ base64 = { workspace = true }
 
 # --- OpenTelemetry, Tracing & Logging ---
 tracing = { workspace = true }
-tracing-appender = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true }
-opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry-http = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 
@@ -84,15 +95,18 @@ regex = { workspace = true }
 glob = { workspace = true }
 arc-swap = { workspace = true }
 rand = { workspace = true }
-num_cpus = { workspace = true }
+num_cpus = { workspace = true, optional = true }
 dashmap = { workspace = true }
-mimalloc = { workspace = true }
+mimalloc = { workspace = true, optional = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true }
 praeco-relay-server = { path = "../relay-server" }
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "praeco-rs"
 path = "src/server.rs"
+required-features = ["cli"]

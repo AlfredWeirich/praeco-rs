@@ -21,7 +21,8 @@ use praeco_rs::{
     ConnectionHandler, build_rustls_config, build_service_stack,
     configuration::{Config, ServerConfig, TunnelConfig},
     connection_tracker::ConnectionTracker,
-    run_tunnel_over_stream, serve_http_connection, serve_tls_connection,
+    run_dual_stack, run_servers, run_tunnel_over_stream, serve_http_connection,
+    serve_tls_connection,
 };
 
 static INIT_CRYPTO: Once = Once::new();
@@ -967,4 +968,254 @@ async fn test_mtls_client_cert_and_static_files_integration() {
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+/// Helper to pick an ephemeral localhost port free on both TCP and UDP.
+async fn reserve_free_dual_stack_port() -> u16 {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tcp.local_addr().unwrap().port();
+    let udp = std::net::UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    drop(udp);
+    drop(tcp);
+    port
+}
+
+/// 7. Embedded Library Runner Test (`run_servers`).
+///
+/// Verifies that `praeco_rs::run_servers`:
+/// 1. Starts enabled `[[Server]]` instances and skips `enabled = false` instances.
+/// 2. Serves real TCP HTTP/1.1 requests through the assembled service stack.
+/// 3. Exits cleanly when the `CancellationToken` is triggered.
+#[tokio::test]
+async fn test_run_servers_http_listener_and_graceful_shutdown() {
+    ensure_crypto_provider();
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let toml_str = format!(
+        r#"
+        [[Server]]
+        name = "embedded_http_echo"
+        ip = "127.0.0.1"
+        port = {port}
+        protocol = "http"
+        authentication = "None"
+        service = "Echo"
+        enabled = true
+
+        [Server.AllowedPathes.GET]
+        "/*" = ["^/.*$"]
+
+        [Server.Layers]
+        enabled = ["TraceId", "Inspection"]
+
+        [[Server]]
+        name = "disabled_server"
+        ip = "127.0.0.1"
+        port = 1
+        protocol = "http"
+        service = "Echo"
+        enabled = false
+
+        [Server.Layers]
+        enabled = []
+    "#
+    );
+
+    let mut config: Config = toml::from_str(&toml_str).expect("valid TOML");
+    for srv in config.servers.iter_mut() {
+        srv.finalize().expect("finalize");
+    }
+    let config = Arc::new(config);
+
+    let token = CancellationToken::new();
+    let runner_token = token.clone();
+    let runner_handle = tokio::spawn(async move {
+        run_servers(config, runner_token).await;
+    });
+
+    // Wait briefly for listener bind
+    let stream = loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    };
+
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .expect("HTTP/1.1 handshake");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/health")
+        .header("host", format!("127.0.0.1:{port}"))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = sender.send_request(req).await.expect("HTTP/1.1 request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!body.is_empty());
+
+    token.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner_handle)
+        .await
+        .expect("run_servers must shut down within timeout")
+        .expect("run_servers task must not panic");
+}
+
+/// 8. Dual-Stack HTTPS (TCP HTTP/2 + UDP HTTP/3 QUIC) Integration Test (`run_dual_stack`).
+///
+/// Verifies that `praeco_rs::run_dual_stack` binds TCP and UDP on the same port and
+/// serves both TLS 1.3 HTTP/2 requests and QUIC HTTP/3 requests through `ConnectionHandler`.
+#[tokio::test]
+async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
+    let port = reserve_free_dual_stack_port().await;
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+
+    let toml_str = format!(
+        r#"
+        [[Server]]
+        name = "dual_stack_test"
+        ip = "127.0.0.1"
+        port = {port}
+        protocol = "https"
+        authentication = "None"
+        service = "Echo"
+        enabled = true
+
+        [Server.server_certs]
+        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
+        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+
+        [Server.AllowedPathes.GET]
+        "/*" = ["^/.*$"]
+
+        [Server.Layers]
+        enabled = ["TraceId", "SecurityHeaders", "Inspection"]
+
+        [Server.Layers.SecurityHeaders]
+        content_security_policy = "default-src 'self'"
+        strict_transport_security = "max-age=63072000; includeSubDomains"
+        x_content_type_options = "nosniff"
+        x_frame_options = "DENY"
+    "#
+    );
+
+    let srv_cfg = parse_server_config(&toml_str);
+    let tls_cfg = build_rustls_config(&srv_cfg).expect("build_rustls_config");
+    let stack = build_service_stack(&srv_cfg).expect("build_service_stack");
+    let dynamic_stack = Arc::new(ArcSwap::from_pointee(stack));
+    let oid_mapping = Arc::new(srv_cfg.oid_mapping.clone());
+    let static_name = srv_cfg.static_name.unwrap();
+    let tracker = Arc::new(ConnectionTracker::new(32, 32));
+    let token = CancellationToken::new();
+
+    run_dual_stack(
+        addr,
+        tls_cfg,
+        dynamic_stack,
+        token.clone(),
+        static_name,
+        oid_mapping,
+        tracker,
+    )
+    .await
+    .expect("run_dual_stack must bind TCP and UDP");
+
+    // --- Part A: TCP + TLS 1.3 + HTTP/2 ---
+    let connector = build_public_tls_connector(vec![b"h2".to_vec()]);
+    let tcp_stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP connect to dual-stack");
+    let sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
+    let tls_stream = connector.connect(sni, tcp_stream).await.expect("TLS connect");
+    assert_eq!(tls_stream.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+
+    let (mut h2_sender, h2_conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls_stream))
+            .await
+            .expect("H2 handshake");
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    let h2_req = Request::builder()
+        .method(Method::GET)
+        .uri("https://wurzelwerk.api.aweirich.eu/health")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let h2_resp = h2_sender.send_request(h2_req).await.expect("H2 request");
+    assert_eq!(h2_resp.status(), StatusCode::OK);
+    assert_eq!(
+        h2_resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let h2_body = h2_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!h2_body.is_empty());
+
+    // --- Part B: UDP + QUIC + HTTP/3 ---
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in
+        CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem").unwrap()
+    {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let mut quic_client_tls = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    quic_client_tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic_crypto =
+        quinn::crypto::rustls::QuicClientConfig::try_from(quic_client_tls).unwrap();
+    let mut client_endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
+
+    let quic_conn = client_endpoint
+        .connect(addr, "wurzelwerk.api.aweirich.eu")
+        .unwrap()
+        .await
+        .expect("QUIC connect");
+
+    let (mut h3_driver, mut h3_send_req) =
+        h3::client::new(h3_quinn::Connection::new(quic_conn))
+            .await
+            .expect("H3 client init");
+    tokio::spawn(async move {
+        let _ = futures::future::poll_fn(|cx| h3_driver.poll_close(cx)).await;
+    });
+
+    let h3_req = Request::builder()
+        .method(Method::GET)
+        .uri("https://wurzelwerk.api.aweirich.eu/name")
+        .body(())
+        .unwrap();
+    let mut h3_req_stream = h3_send_req.send_request(h3_req).await.expect("H3 send_request");
+    h3_req_stream.finish().await.expect("H3 finish");
+    let h3_resp = h3_req_stream.recv_response().await.expect("H3 recv_response");
+    assert_eq!(h3_resp.status(), StatusCode::OK);
+    assert_eq!(
+        h3_resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    let mut h3_body = Vec::new();
+    while let Some(mut chunk) = h3_req_stream.recv_data().await.expect("H3 recv_data") {
+        use bytes::Buf;
+        h3_body.extend_from_slice(chunk.chunk());
+        chunk.advance(chunk.remaining());
+    }
+    assert!(!h3_body.is_empty());
+
+    drop(h3_req_stream);
+    drop(h3_send_req);
+    token.cancel();
+    client_endpoint.close(0u32.into(), b"done");
+    tokio::time::timeout(std::time::Duration::from_secs(5), client_endpoint.wait_idle())
+        .await
+        .expect("QUIC client endpoint must close cleanly");
 }

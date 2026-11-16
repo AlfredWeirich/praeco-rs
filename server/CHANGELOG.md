@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.4] - 2026-11-16
+
+Library/CLI decoupling (Stage 1) and dual-stack / HTTP/3 test coverage.
+
+### Added
+* **Library Runner Module (`src/runner.rs`):**
+  * Extracted listener and lifecycle orchestration (`run_servers`, `start_single_server`, `run_dual_stack`, `spawn_router_health_checks`, `run_tunnel`, plus HTTP/3 QUIC listener/connection handling) from `src/server.rs` into `praeco_rs::runner` and re-exported them at the crate root.
+  * Extracted pure health-check score decoders (`parse_grpc_health_score`, `parse_rest_health_score`) and `record_health_check_failure` for deterministic unit testing and cleaner error propagation (`SrvError`).
+* **`cli` Feature Gate (`Cargo.toml`):**
+  * Added `default = ["cli"]` with `required-features = ["cli"]` on `[[bin]] name = "praeco-rs"`.
+  * Made binary-only dependencies (`mimalloc`, `num_cpus`, `opentelemetry-otlp`, `opentelemetry_sdk`, `tracing-appender`, `tracing-subscriber`) optional so external Rust applications can depend on `praeco-rs = { version = "0.5.4", default-features = false }` without global allocator, tracing subscriber, or OTLP exporter side effects.
+* **Runner & HTTP/3 Dual-Stack Tests (`src/runner.rs`, `tests/integration_tests.rs`):**
+  * Added unit tests for gRPC/REST health-check payload parsing, health-check failure transitions, missing `static_name` handling, `run_dual_stack` port-bind conflict reporting, and `run_tunnel` error paths.
+  * Added end-to-end integration tests for `run_servers` lifecycle/graceful shutdown and `run_dual_stack` serving both TLS 1.3 HTTP/2 (TCP) and HTTP/3 over QUIC (UDP) on the same port.
+
+### Changed
+* **Thin Binary Entry Point (`src/server.rs`):**
+  * Reduced `src/server.rs` to CLI argument parsing, `mimalloc` global allocator setup, `tracing`/`OTLP` subscriber initialization, Tokio runtime creation, and `Ctrl-C`/`SIGHUP` signal orchestration.
+
+---
+
 ## [0.5.3] - 2026-11-14
 
 Architecture modularization, comprehensive integration & cross-crate End-to-End (E2E) test suites, zero-allocation RBAC/routing optimizations, and security dependency hardening.

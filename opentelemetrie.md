@@ -28,7 +28,7 @@ A **Trace** consists of a tree of **Spans**.
 We leverage the Rust ecosystem around `tracing`, `tower-http`, and `opentelemetry`.
 
 1. **The Root Span & Edge Context Extraction (Entry):** 
-   - **Outer `TraceLayer` (`server.rs`):** The `tower-http` `TraceLayer` intercepts every incoming HTTP request and constructs the root `"request"` span (e.g., `POST /chat.ChatService/StreamMessages`). Before the span is entered, `make_span_with` extracts any client-supplied W3C `traceparent` header via `opentelemetry_http::HeaderExtractor` and attaches it via `OpenTelemetrySpanExt::set_parent`.
+   - **Outer `TraceLayer` (`stack.rs`):** The `tower-http` `TraceLayer` intercepts every incoming HTTP request and constructs the root `"request"` span (e.g., `POST /chat.ChatService/StreamMessages`). Before the span is entered, `make_span_with` extracts any client-supplied W3C `traceparent` header via `opentelemetry_http::HeaderExtractor` and attaches it via `OpenTelemetrySpanExt::set_parent`.
    - **`TraceIdLayer` (`middleware/trace_id.rs`):** Extracts an existing `traceparent` (or `x-trace-id` fallback), or synthesizes a fresh W3C `00-{trace-id}-{span-id}-01` identifier if none was sent by the client. It stores the identifier in the HTTP request extensions, ensures the `traceparent` header is present on the request, attaches the extracted W3C `SpanContext` to a dedicated `trace_id` span **prior to first entry** (avoiding `SetParentError::AlreadyStarted`), and instruments the inner service future (`Instrumented<S::Future>`) with zero heap boxing overhead.
 
 2. **Downstream Propagation (`HeaderInjector`):**

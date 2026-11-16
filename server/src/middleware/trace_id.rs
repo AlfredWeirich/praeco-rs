@@ -96,7 +96,7 @@ where
     /// prior to first entry, and instruments the inner service future with that span.
     fn call(&mut self, mut req: Request<SrvBody>) -> Self::Future {
         // Inspect the active OpenTelemetry span context (e.g. from the outer `TraceLayer`
-        // `"request"` span in `server.rs`) so that when no incoming `traceparent` header is
+        // `"request"` span in `stack.rs`) so that when no incoming `traceparent` header is
         // present, we reuse the outer span's Trace ID instead of splitting the trace.
         let current_otel_cx = tracing::Span::current().context();
         let current_sc = current_otel_cx.span().span_context().clone();
@@ -148,7 +148,7 @@ where
         }
 
         // 4. Attach the W3C OpenTelemetry context to the active span hierarchy:
-        //    - In production (`server.rs`), `TraceLayer::make_span_with` has ALREADY extracted
+        //    - In production (`stack.rs`), `TraceLayer::make_span_with` has ALREADY extracted
         //      `traceparent` and linked the outer `"request"` span (`GET /...` or `POST /...`)
         //      prior to entry. In that case (`current_sc.is_valid() && current_sc.trace_id() == parent_sc.trace_id()`),
         //      we record `traceparent` directly on `Span::current()` and reuse it so all downstream
