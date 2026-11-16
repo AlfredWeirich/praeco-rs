@@ -16,12 +16,12 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 ---
 
 **Newly Added**: 
-* **Built-in Identity Provider (IdP)**: Issues signed JWTs by leveraging the gateway's existing mTLS infrastructure. The IdP securely manages identities and issues tokens containing strict `iss` (Issuer) and `aud` (Audience) claims to prevent confused-deputy attacks across services.
-* **Dynamic Claims Webhook**: The IdP can query a backend webhook in real-time during the auth flow to fetch dynamic user roles, allowing role updates without reissuing underlying mTLS certificates.
-* **Dynamic Key Discovery (JWKS)**: The IdP exposes a standard `/.well-known/jwks.json` endpoint to serve its public keys dynamically. This enables downstream Resource Servers to fetch and verify JWT signatures automatically, supporting seamless, zero-downtime key rotation.
-* **Advanced Role Mapping (RBAC)**: Extracted custom Object Identifiers (OIDs) from mTLS client certificates are mapped to internal roles (`UserRole`), extending the strict access control directly into the JWTs issued by the IdP.
-* **Outbound Zero-Trust Tunneling (SNI Relay)**: Enables Praeco instances to run behind strict NATs or firewalls without opening local ports. Instances establish outbound multiplexed mTLS connections (`yamux`) to a standalone Relay Server, which routes incoming internet traffic securely back to the correct instance using SNI (Server Name Indication).
-* **Built-in Static File Server**: A highly performant static file server built right into the gateway. It supports native SPA routing (automatic fallback to `index.html`), completely eliminating the need for Nginx when serving frontends alongside your APIs.
+* **Embeddable Library Crate & `cli` Feature Gate (`v0.5.4`)**: Decoupled listener/lifecycle orchestration (`praeco_rs::runner`) and stream-generic Tower stack assembly (`praeco_rs::stack`) from the CLI binary (`src/server.rs`). External Rust applications can depend on `praeco-rs = { version = "0.5.4", default-features = false }` without pulling in `mimalloc`, `tracing-subscriber`, or OTLP exporters, and run full gateway pipelines over TCP, QUIC, Yamux tunnels, or in-memory `tokio::io::duplex` streams.
+* **Built-in Admin & Telemetry Service (`Admin`)**: Dedicated `service = "Admin"` listener or router-mounted `backend_type = "admin"` exposing `/healthz` (`/health`), `/status`, `/upstreams`, and Prometheus `/metrics` with strict `404` routing, per-layer security block counters, circuit-breaker telemetry, response latency EMA, and X.509 certificate / CRL expiration monitoring.
+* **3-State Circuit Breaker, Outlier Detection & Bounded Retry Buffering**: Lock-free `Closed` $\rightarrow$ `Open` $\rightarrow$ `HalfOpen` (single-probe) circuit breaking with passive `502`/`503`/`504` & gRPC `UNAVAILABLE` outlier detection and configurable `max_retry_buffer_bytes` (default 64 KiB).
+* **Zero-Allocation `IpFilterLayer` & RFC 3986 `PathSanitizerLayer`**: Pre-compiled IPv4/IPv6 CIDR allowlists/blocklists (`deny`-before-`allow`, `PROXY v2` aware) plus mandatory URI canonicalization and path-traversal rejection.
+* **Built-in Identity Provider (IdP), Claims Webhook & JWKS**: Issues signed Ed25519 JWTs from mTLS identities (with `OptionalClientCert` support, `iss`/`aud` enforcement, live role-fetching webhooks, `/.well-known/jwks.json`, and `revoke_on_paths` automatic JTI revocation).
+* **Outbound Zero-Trust Tunneling (SNI Relay) & Static File Server**: Multiplexed outbound mTLS (`yamux`) reverse tunnels with fail-closed `PROXY v2` client IP propagation, plus a native SPA-capable static file server (`StaticFiles`).
 
 ---
 
@@ -30,14 +30,15 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 | Feature | `praeco-rs` | Pingora (Cloudflare) | Sōzu |
 | :--- | :--- | :--- | :--- |
 | **Primary Architecture** | Tokio, Hyper v1, Tower, Rustls | Custom Async Runtime & State Machine | Custom Event Loop (Mio) |
-| **HTTP Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC) | HTTP/1.1, HTTP/2 (H3 in progress) | HTTP/1.1, HTTP/2 |
-| **Security & Auth** | Deep mTLS OID-extraction (RBAC), JWT | Pluggable, but requires custom code | Standard TLS, SNI routing |
-| **gRPC Support** | **Full (with JSON Transcoding via Reflection)** | Basic Proxying | Basic Proxying |
-| **Observability** | Native OpenTelemetry (OTLP) Tracing | Pluggable via Rust code | Pluggable via Rust code |
-| **Middleware Model** | Declarative `tower::Service` stack via TOML | Callbacks / Traits on Session | Custom Filters |
-| **WAF / Inspection** | Built-in Regex Path/Query Allow-Listing | Pluggable / Scriptable | Custom Filters |
-| **Configuration** | Hot-Reloadable (SIGHUP + ArcSwap) | Programmable (in Rust) | Dynamic (Zero-Downtime Hot-Reload) |
-| **Load Balancing** | Advanced (RoundRobin, LeastConn, Sticky, Random, HighestScore) | Advanced (Consistent Hash, Least Conn) | Advanced |
+| **HTTP Protocols** | HTTP/1.1, HTTP/2, HTTP/3 (QUIC) + `Alt-Svc` | HTTP/1.1, HTTP/2 (H3 in progress) | HTTP/1.1, HTTP/2 |
+| **Security & Auth** | mTLS (`ClientCert` / `OptionalClientCert`) OID RBAC, JWT (`revoke_on_paths`), Built-in IdP (JWKS/Webhook), CIDR `IpFilter`, RFC 3986 `PathSanitizer` | Pluggable, but requires custom code | Standard TLS, SNI routing |
+| **gRPC Support** | **Full (Passthrough & JSON Transcoding via Reflection)** | Basic Proxying | Basic Proxying |
+| **Observability** | OpenTelemetry (OTLP + W3C `traceparent`), Prometheus `/metrics`, Admin JSON (`/status`, `/upstreams`, `/healthz`) | Pluggable via Rust code | Pluggable via Rust code |
+| **Middleware Model** | Declarative `tower::Service` stack via TOML (with order validation) | Callbacks / Traits on Session | Custom Filters |
+| **WAF / Inspection** | Built-in Regex Path/Query Allow-Listing + Decompression Bomb & Payload Limits | Pluggable / Scriptable | Custom Filters |
+| **Configuration** | Hot-Reloadable (SIGHUP + ArcSwap + Dry-Run) | Programmable (in Rust) | Dynamic (Zero-Downtime Hot-Reload) |
+| **Load Balancing** | Advanced (RoundRobin, LeastConn, Sticky, Random, HighestScore) + 3-State Circuit Breaker | Advanced (Consistent Hash, Least Conn) | Advanced |
+| **Library / Embedding** | **Embeddable (`runner` + `stack`, `cli` feature gate, `AsyncRead + AsyncWrite` generic)** | Library-first (Rust) | Binary daemon |
 
 ---
 
@@ -46,23 +47,25 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 > [!TIP]
 > **Why choose `praeco-rs`?** It shines in highly secure, zero-trust enterprise environments where gRPC interoperability, advanced load distribution, and strict rate control are primary requirements.
 
-- **Declarative Middleware Pipeline**: The entire middleware stack (Timeout, Concurrency Limits, Rate Limiting, IP CIDR Filtering, Compression, CORS, OTLP Tracing) can be configured, reordered, and toggled on/off in `Config.toml` in seconds, **without writing or recompiling any Rust code**.
+- **Declarative Middleware Pipeline & Automatic Security Baselines**: The entire middleware stack (`TraceId`, `Logger`, `IpFilter`, `Decompression`, `MaxPayload`, `Inspection`, `JwtAuth`, `RateLimiter`, `ConcurrencyLimit`, `Compression`, `Cors`, `SecurityHeaders`, `AltSvc`, `Timing`, `Counter`, `Delay`) can be configured, reordered, and toggled on/off in `Config.toml` in seconds **without writing or recompiling Rust code**. Startup/reload validation enforces safe ordering (`TraceId` first, `Inspection` after `Decompression`) and automatically injects `PathSanitizerLayer` and `SecurityHeadersLayer` so even short-circuit responses (`401`/`403`/`429`/`503`) carry hardened headers.
 - **Zero-Allocation IP Allowlist / Blocklist (`IpFilter` Layer)**: Pre-compiles IPv4 (`u32`) and IPv6 (`u128`) CIDR masks (`allow_cidrs` and `deny_cidrs`) with strict `deny`-before-`allow` precedence, dual-stack `::ffff:a.b.c.d` canonicalization, and full compatibility with Relay Server `PROXY v2` client IP propagation—allowing administrative or internal servers to be locked down to VPN/office subnets at the edge with `403 Forbidden`.
-- **Native OpenTelemetry (OTLP) Integration**: `praeco-rs` integrates directly with the `tracing` and `opentelemetry` ecosystem, exporting distributed traces to Jaeger, Zipkin, or Datadog via standard OTLP out of the box. Incoming W3C `traceparent` (or `x-trace-id`) headers are extracted at the edge (`TraceIdLayer` & `TraceLayer`), linked as the OpenTelemetry parent context prior to span entry, and automatically propagated (`traceparent` + `x-trace-id`) across REST, gRPC passthrough, and dynamic JSON-to-gRPC transcoding hops.
-- **Lightweight WAF (Inspection Layer)**: Includes a highly optimized Regex-based inspection middleware that validates the `(method, path, query)` against a configured allow-list. It operates with zero heap allocations on the happy path, dropping malicious requests before they consume downstream resources.
+- **Native OpenTelemetry (OTLP) Integration**: `praeco-rs` integrates directly with the `tracing` and `opentelemetry` ecosystem, exporting distributed traces to Jaeger, Zipkin, or Datadog via standard OTLP out of the box with configurable sampling (`otel_sample_ratio`). Incoming W3C `traceparent` (or `x-trace-id`) headers are extracted at the edge (`TraceIdLayer` & `TraceLayer`), linked as the OpenTelemetry parent context prior to span entry, and automatically propagated (`traceparent` + `x-trace-id`) across REST, gRPC passthrough, and dynamic JSON-to-gRPC transcoding hops.
+- **Lightweight WAF, Decompression Bomb & Payload Protection**: Includes a Regex-based `InspectionLayer` validating `(method, path, query)` against an allow-list with zero heap allocations on the happy path, paired with `SrvDecompressionLayer` (`max_decompressed_bytes`) bomb protection and streaming `MaxPayloadLayer` (`max_bytes`) enforcement.
 - **Strict RFC 3986 Path Sanitization & Traversal Protection**: Enforces canonical URI paths across all layers and upstream dispatch. Rejects directory traversal attempts (`..`, `%2e%2e`), encoded slashes (`%2f`), null bytes (`%00`), and backslashes with `400 Bad Request`, and collapses multi-slashes (`//`) to eliminate semantic desync and RBAC/WAF bypasses.
 - **Out-of-the-box REST to gRPC Gateway**: Unlike Pingora or Sōzu, `praeco-rs` can dynamically reflect backend gRPC schemas and translate incoming REST/JSON requests into binary Protobuf on the fly (JSON-to-gRPC transcoding) with non-blocking async I/O, upstream deadlines (`request_timeout_seconds`), a 16 MiB response cap, and automatic compression bypass for `application/grpc*` streams to preserve HTTP/2 trailers. This eliminates the need for separate sidecars like Envoy for transcoding.
-- **Bespoke Zero-Trust RBAC via Custom OIDs**: The proxy natively extracts custom Object Identifiers (OIDs) directly from mTLS client certificates (or JWTs) and maps them to internal `UserRole`s (e.g., Admin, Operator, Seller).
+- **Bespoke Zero-Trust RBAC via Custom OIDs & Flexible Auth Modes**: The proxy natively extracts custom Object Identifiers (OIDs) directly from mTLS client certificates (`ClientCert` or `OptionalClientCert` for mixed authenticated/guest endpoints) or JWTs and maps them to internal `UserRole`s (e.g., Admin, Operator, Seller) using stack-allocated `SmallVec<[UserRole; 6]>` slices to avoid per-request heap allocations.
   * **Dual-Tier Protection (Route & Path RBAC)**: Define coarse-grained route permissions (`allowed_roles = ["Admin", "Seller"]`) and fine-grained method/path rules (`[Server.rbac] "/api/*" = ["Admin"]` with explicit `["Admin", "Seller"]` endpoint exceptions and fail-close empty deny-rules `[]`). The proxy acts as a strict Policy Enforcement Point (PEP), rejecting unauthorized calls at the edge with 403 Forbidden before backend resources are consumed.
-  * **Identity Forwarding & Edge Header Sanitization**: Unconditionally strips client-supplied `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, and `x-client-*` headers across HTTP/1.1, HTTP/2, and HTTP/3, re-populating `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` (including `:authority`) authoritatively from the verified socket/PROXY-v2 peer. If the upstream server needs to know who the caller is, the proxy forwards the verified roles, SAN, or client certificate (`client_cert_forwarding`).
+  * **Identity Forwarding & Edge Header Sanitization**: Unconditionally strips client-supplied `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, and `x-client-*` headers across HTTP/1.1, HTTP/2, and HTTP/3, re-populating `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Proto`, and `X-Forwarded-Host` (including `:authority`) authoritatively from the verified socket/PROXY-v2 peer. If the upstream server needs to know who the caller is, the proxy forwards verified roles (`header_roles`), client IP (`header_client_ip`), SAN (`header_san`), or the client certificate (`header_cert`) via `[Server.client_cert_forwarding]`.
 - **Advanced Upstream Management & 3-State Circuit Breaker**: Built-in support for multiple load-balancing strategies (`RoundRobin`, `Random`, `LeastConnections`, `Sticky`, `HighestScore`) combined with **Active Health Checking**, **Outlier Detection (`502`/`503`/`504` & gRPC `UNAVAILABLE`)**, a lock-free **3-State Circuit Breaker (`Closed` $\rightarrow$ `Open` $\rightarrow$ `HalfOpen` single-probe)**, and **Bounded Retry Buffering (`max_retry_buffer_bytes`, default 64 KiB)** ensures traffic is only routed to healthy nodes without thundering-herd probes or unbounded RAM buffering on large uploads. Client-side errors (payload limits, decompression bombs, client aborts on request bodies) are cleanly isolated from upstream transport failures so healthy upstreams are never blacklisted by malicious or broken clients.
 - **Built-in Rate Limiting & Traffic Shaping**: Includes flexible token-bucket and fixed-window rate limiting strategies, global concurrency limits, and request timeouts. Rate limiters feature IPv6 `/64` subnet canonicalization (`canonical_client_ip`), ignore spoofed `X-Forwarded-For` headers by default (`trust_forwarded_headers = false`), use an allocation-free $O(1)$ fast-path with throttled 10s TTL sweeps, and enforce a **fail-closed `max_entries` cap** (`429 Too Many Requests` for unknown keys at capacity without evicting active buckets) to defeat cache-thrashing attacks.
-- **Connection Limits & DoS / Protocol-Hardening**: Protects against Slowloris, socket exhaustion, and HTTP/2 Rapid-Reset attacks (CVE-2023-44487) via global and per-IP (IPv6 `/64`-aggregated) connection limits, strict stream caps (128 concurrent streams, max 20 pending reset streams), 64 KB header limits, bounded QUIC transport buffers with stateless address validation (`retry`), and Tokio task fault isolation (`panic = "unwind"` and `overflow-checks = true` in release builds).
+- **Connection Limits & DoS / Protocol-Hardening**: Protects against Slowloris, socket exhaustion, and HTTP/2 Rapid-Reset attacks (CVE-2023-44487) via global and per-IP (IPv6 `/64`-aggregated) connection limits, strict stream caps (128 concurrent streams, max 20 pending reset streams), 64 KB header limits, bounded QUIC transport buffers with stateless address validation (`retry`), and Tokio task fault isolation (`panic = "unwind"` in release builds).
+- **Built-in Admin & Telemetry Service (`Admin`)**: Exposes `/healthz`, `/status`, `/upstreams`, and Prometheus `/metrics` either on a dedicated internal listener (`service = "Admin"`) or mounted behind mTLS/JWT/RBAC inside a router (`backend_type = "admin"`), including per-layer security block counters, circuit-breaker states, and X.509 leaf certificate / CRL expiration monitoring.
 - **Crash-Safe Zero-Downtime Configuration Reloads**: `praeco-rs` listens for `SIGHUP` signals to dynamically reload `Config.toml` and rebuild its routing tables and TLS contexts on the fly using `ArcSwap`, without dropping active connections. Reloads run through an isolated validation and dry-run phase: if a syntax, route, or certificate error is detected, the old working configuration is preserved and the process continues safely without crashing.
 - **End-to-End mTLS Bridging & Strict PKI Isolation**: In addition to mTLS termination at the gateway (with X.509 CRL `nextUpdate` expiration verification), the proxy can establish a completely **new mTLS connection to the upstream servers** using strictly isolated custom Root CAs (never polluting private PKI trust stores with public WebPKI roots).
-- **Built-in Identity Provider (IdP)**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support QR-code-based cross-device logins protected by a mandatory 6-character visual confirmation code (`user_code`, verified in constant time with a 3-attempt lockout **before** invoking external Claims Webhooks), mTLS-authenticated explicit JTI revocation (`POST /auth/revoke?jti=...`), and a bounded `JwtRevocationStore` (`50,000` entries).
+- **Built-in Identity Provider (IdP) & JWT Revocation**: `praeco-rs` can act as a standalone Identity Provider, issuing its own signed JWTs directly to clients for downstream use. It utilizes its own mTLS capabilities to securely authenticate devices and support QR-code-based cross-device logins protected by a mandatory 6-character visual confirmation code (`user_code`, verified in constant time with a 3-attempt lockout **before** invoking external Claims Webhooks), mTLS-authenticated explicit JTI revocation (`POST /auth/revoke?jti=...`), automatic logout-path revocation (`revoke_on_paths` in `[Server.Layers.JWT]`), and a bounded `JwtRevocationStore` (`50,000` entries).
 - **Built-in Static File Server**: Beyond proxying and Identity Provider functions, Praeco can act as a highly performant static file server. It supports SPA-Routing (fallback to `index.html`) out of the box, completely eliminating the need for Nginx when serving React, Vue, or WebAssembly (e.g. Iced) frontends alongside your APIs.
-- **HTTP/3 Native**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3`, providing better performance on unreliable networks.
+- **HTTP/3 Native & `Alt-Svc` Advertisement**: Full support for HTTP/3 over QUIC out of the box using `quinn` and `h3` on dual-stack HTTPS listeners (with optional `AltSvc` header advertisement), providing better performance on unreliable networks.
+- **High-Throughput Runtime & Modular Embedding**: The CLI binary uses `mimalloc` (gated behind the default `cli` feature) and supports modular multi-file `includes` (`conf.d/*.toml`) as well as automatic local LAN binding (`ip = "local"`). Library consumers can disable `cli` (`default-features = false`) and embed `praeco_rs::runner` or `praeco_rs::stack` (`AsyncRead + AsyncWrite` generic) directly, including deterministic in-memory testing via `tokio::io::duplex`.
 - **Outbound Zero-Trust Tunneling (SNI Relay)**: For deployments behind restrictive NATs or firewalls, `praeco-rs` can bypass local port binding entirely. Instead, it establishes an outbound, multiplexed mTLS connection (via Yamux) to a standalone Relay Server. The Relay Server verifies client certificate SAN-to-SNI authorization on `REGISTER`, propagates the real client IP via fail-closed HAProxy PROXY-Protocol v2 (`proxy_protocol = true`), and routes incoming internet traffic (Port 443) strictly via SNI to the corresponding Praeco instance with complete End-to-End TLS.
 
 ---
@@ -84,12 +87,8 @@ To elevate `praeco-rs` even further, the following points remain on the roadmap:
 ### 1. Distributed Caching
 Implementing an HTTP response caching layer (e.g., using Redis or an in-memory TinyLFU cache with Singleflight request coalescing) for specific routes to reduce backend load, similar to what Pingora offers out of the box for CDN use-cases.
 
-### 2. Circuit Breaking
-Currently, the proxy regularly checks in the background (Health Checks) whether a backend is still alive. If it is dead, no more traffic is sent there.
-A **Circuit Breaker** would go one step further: If a backend suddenly becomes extremely slow or throws errors (even though the last health check was still "OK"), the circuit "trips" immediately. The proxy instantly blocks further traffic to this node to prevent a complete traffic jam in the system (Cascading Failure).
-
-### 3. Pluggable End-Services (Beyond Routing)
-Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), a `StaticFiles` service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
+### 2. Pluggable End-Services (Beyond Routing)
+Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), a `StaticFiles` service, an `Admin` telemetry service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
 - **Aggregator / Fan-Out Service**: Accepting a single client request and internally fanning it out to multiple backend microservices, assembling their JSON responses into a single cohesive payload before returning it to the client.
@@ -119,16 +118,20 @@ enabled = true
 upstreams = ["http://127.0.0.1:8080"]
 backend_type = "rest"
 
+[Server.RouterParams]
+protocol = "http"
+authentication = "None"
+
 [Server.Layers]
 enabled = ["Logger", "Compression", "ConcurrencyLimit"]
 
 [Server.Layers.ConcurrencyLimit]
-max_requests = 1000
+max_concurrent_requests = 1000
 ```
 
 > **Full Configuration Reference:**
 > The proxy offers extensive settings for mTLS, RBAC OIDs, JSON-to-gRPC transcoding, and rate limiting. 
-> **See the [Config.md](Config.md) file for a complete documentation of all available parameters.**
+> **See [Config.md](https://github.com/AlfredWeirich/praeco-rs/blob/main/Config.md) for a complete documentation of all available parameters.**
 
 ### Installation & Running
 
@@ -136,7 +139,7 @@ max_requests = 1000
 If you just want to run the proxy, you can install the pre-compiled executable directly from GitHub. Cargo will automatically download the source and compile it in release mode:
 
 ```bash
-cargo install --git https://github.com/AlfredWeirich/praeco-rs.git
+cargo install --git https://github.com/AlfredWeirich/praeco-rs.git --package praeco-rs
 ```
 
 Then start the proxy by simply calling the executable (it looks for `Config.toml` in the current directory, or you can pass the path):
@@ -153,7 +156,7 @@ If you cloned the repository and want to run it directly from the source code:
 ```bash
 cargo run -p praeco-rs --release
 # OR using the provided start script:
-./start_server.sh
+./start_praeco.sh
 ```
 
 By default, it will look for `Config.toml` in the current working directory. You can instantly reload configuration changes at runtime without dropping connections by sending a `SIGHUP` signal to the process. Reloads are crash-safe: the new configuration and TLS certificates are fully validated in an isolated dry-run before activating, keeping the existing configuration intact if errors are found.
@@ -172,13 +175,14 @@ Key library entry points re-exported at the crate root:
 - `praeco_rs::middleware` & `praeco_rs::configuration` – standalone Tower layers (`IpFilterLayer`, `JwtAuthLayer`, `TokenBucketRateLimiterLayer`, `RouterService`, …) and TOML config parsing/finalization.
 
 ```rust,no_run
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider().install_default().ok();
-    let config = praeco_rs::configuration::Config::load("Config.toml")?;
+    // Use Config::init (instead of Config::load) to also populate the global config
+    // singleton used by mTLS OID extraction and the Admin telemetry service.
+    let config = praeco_rs::configuration::Config::init("Config.toml")?;
     let cancel = CancellationToken::new();
     praeco_rs::run_servers(config, cancel).await;
     Ok(())
@@ -187,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
 
 
 ### Attachment:
-Here is a **FULL example** of a `Config.toml` from a productiove system:
+Here is a **FULL example** of a `Config.toml` from a production system:
 
 ```toml
 ###############################################################################
@@ -196,7 +200,7 @@ Here is a **FULL example** of a `Config.toml` from a productiove system:
 ###############################################################################
 
 # The number of worker threads for the Tokio async runtime.
-# Default: (Available CPU Cores * 2). 
+# Default: number of logical CPU cores (num_cpus::get()).
 # Manual override is useful for high-performance tuning on dedicated hardware.
 tokio_threads = 50
 
@@ -205,18 +209,19 @@ tokio_threads = 50
 enable_opentelemetry = true
 jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
+# otel_sample_ratio = 1.0  # Trace sampling ratio (0.0 to 1.0, default: 1.0)
 
 # The Base Object Identifier (OID) used for security validation.
 # This acts as the root for interpreting client certificate extensions and JWT claims.
 # Private Enterprise Number (PEN)
 pki_base_oid = "1.3.6.1.4.1.65111"
 
-# Automatically include all server configurations from the apps.d directory
-includes = ["./apps.d/*.toml"]
+# Automatically include all server configurations from the conf.d directory
+includes = ["conf.d/*.toml"]
 
 # Directory path for persistent log files.
 # If commented out or omitted, the application will only log to Standard Output (stdout).
-log_dir = "log"
+log_dir = "logs"
 
 # =============================================================================
 # XYZ_APP CONFIGURATION
@@ -236,10 +241,19 @@ log_dir = "log"
     service = "Router"
 
     [Server.Layers]
-    enabled = ["Decompression", "MaxPayload", "Logger", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+
+    [Server.Layers.IpFilter]
+    allow_cidrs = []
+    deny_cidrs = []
+    trust_forwarded_headers = false
 
     [Server.Layers.Decompression]
     max_decompressed_bytes = 10485760  # 10 MB limit
+
+    [Server.connection_limits]
+    max_connections = 10000
+    max_connections_per_ip = 100
 
     [Server.server_certs]
     ssl_certificate = "PATH_TO_CERT/fullchain12.pem"
@@ -262,7 +276,7 @@ log_dir = "log"
     [Server.AllowedPathes.POST]
     "/ENDPOINT.ABC_Service/GetConversations" = ["^/ENDPOINT\\.ABC_Service/GetConversations$"]
     "/ENDPOINT.ABC_Service/GetMessages" = ["^/ENDPOINT\\.ABC_Service/GetMessages$"]
-   ...
+    # ...
     "/ENDPOINT.ABC_Service/UpdateMemberRole" = ["^/ENDPOINT\\.ABC_Service/UpdateMemberRole$"]
     "/ENDPOINT.ABC_Service/GetOrders" = ["^/ENDPOINT\\.ABC_Service/GetOrders$"]
     "/ENDPOINT.ABC_Service/UpdateOrderStatus" = ["^/ENDPOINT\\.ABC_Service/UpdateOrderStatus$"]
@@ -271,6 +285,10 @@ log_dir = "log"
     upstreams = ["https://127.0.0.1:50051"]
     active_health_check_interval = 60
     backend_type = "grpc_passthrough"
+    cooldown_seconds = 10
+    max_retries = 2
+    failure_threshold = 3
+    max_retry_buffer_bytes = 65536
 
     [Server.RouterParams]
     protocol = "https"
@@ -278,9 +296,6 @@ log_dir = "log"
     ssl_client_certificate = "PATH_TO_CERT/proxy-client.pem"
     ssl_client_key = "PATH_TO_CERT/proxy-client.key"
     ssl_root_certificate = "PATH_TO_CERT/ca.pem"
-
-    [Server.Layers.RateLimiter]
-    requests_per_second = 500000
 
     [Server.Layers.TokenBucketRateLimiter]
     max_capacity = 1000     
@@ -364,7 +379,7 @@ log_dir = "log"
         header_san = "x-client-san"
     
     [Server.Layers]
-        enabled = ["Logger",  "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+        enabled = ["Logger", "SecurityHeaders", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
     
     [Server.Layers.SecurityHeaders]
         content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'"
@@ -399,7 +414,7 @@ log_dir = "log"
         "/api/GetUsers" = ["^/api/GetUsers$"]
         "/api/GetAdminDevices" = ["^/api/GetAdminDevices$"]
         "/api/AdminBlockDevice" = ["^/api/AdminBlockDevice$"]
-        ...
+        # ...
         "/api/AdminAddMember" = ["^/api/AdminAddMember$"]
         "/api/AdminUpdateProductCreator" = ["^/api/AdminUpdateProductCreator$"]
         "/api/AdminCreateChannel" = ["^/api/AdminCreateChannel$"]
@@ -422,4 +437,34 @@ log_dir = "log"
         ssl_client_certificate = "PATH_TO_CERT/proxy-client.pem"
         ssl_client_key = "PATH_TO_CERT/proxy-client.key"
         ssl_root_certificate = "PATH_TO_CERT/ca.pem"
-```toml
+
+[[Server]]
+# =============================================================================
+# Local Admin & Prometheus Telemetry Server (/healthz, /status, /metrics)
+# Tip: Can also be mounted behind mTLS/RBAC on a Router via backend_type = "admin"
+# =============================================================================
+    name = "local_admin"
+    ip = "127.0.0.1"
+    port = 9090
+    enabled = true
+    protocol = "http"
+    authentication = "None"
+    service = "Admin"
+
+    [Server.Layers]
+    enabled = []
+```
+
+---
+
+## Workspace Crates
+
+This repository is organized as a Cargo workspace containing `praeco-rs` and companion crates/tools:
+
+* [`server/` (`praeco-rs`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/server/Cargo.toml) – Core Zero-Trust API Gateway, library crate (`runner` + `stack`), and CLI binary.
+* [`relay-server/` (`praeco-relay-server`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/relay-server/README.md) – Standalone Layer-4 SNI Relay Server for outbound zero-trust reverse tunnels (`yamux` + `PROXY v2`).
+* [`common/` (`praeco-common`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/common/Readme.md) – Shared JWT helpers, TLS/PKI builders, HTTP client pool, and `PROXY v2` parser/encoder.
+* [`jwt_creator/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/jwt_creator/Readme.md) – CLI utility for generating Ed25519 keys and signing test JWTs.
+* [`cert_decoder/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/cert_decoder/Readme.md) – Helper tool to inspect X.509 certificates and custom PKI OIDs.
+* [`grpc_reflection/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/grpc_reflection/Readme.md) – Example gRPC backend with Server Reflection for testing JSON-to-gRPC transcoding.
+* [`client/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/client/Readme.md) – Example mTLS and gRPC test clients.
