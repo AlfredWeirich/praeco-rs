@@ -135,6 +135,7 @@ mod tests {
             }),
             allowed_roles: allowed_roles.into_iter().map(|s| UserRole(s.to_string())).collect(),
             backend_type: crate::configuration::RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         }
     }
 

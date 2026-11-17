@@ -782,6 +782,7 @@ mod tests {
             target,
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcTranscoding,
+            aggregate_targets: Vec::new(),
         }
     }
 

@@ -349,16 +349,28 @@ pub fn spawn_router_health_checks(
     };
 
     // --- 3. Active Health Check Initialization ---
+    let mut monitored_targets: Vec<(&RouteBackendType, &Arc<crate::configuration::RouteTarget>)> =
+        Vec::new();
     for route in &server_config.parsed_routes {
-        let interval = route.target.active_health_check_interval;
+        if route.backend_type == RouteBackendType::Aggregate {
+            for sub in &route.aggregate_targets {
+                monitored_targets.push((&sub.backend_type, &sub.target));
+            }
+        } else {
+            monitored_targets.push((&route.backend_type, &route.target));
+        }
+    }
+
+    for (backend_type, target_ref) in monitored_targets {
+        let interval = target_ref.active_health_check_interval;
         if interval == 0 {
             continue;
         }
 
-        let is_grpc = route.backend_type == RouteBackendType::GrpcTranscoding
-            || route.backend_type == RouteBackendType::GrpcPassthrough;
+        let is_grpc = *backend_type == RouteBackendType::GrpcTranscoding
+            || *backend_type == RouteBackendType::GrpcPassthrough;
 
-        for (idx, node) in route.target.upstreams.iter().enumerate() {
+        for (idx, node) in target_ref.upstreams.iter().enumerate() {
             let client = if is_grpc {
                 grpc_client.clone()
             } else {
@@ -396,7 +408,7 @@ pub fn spawn_router_health_checks(
 
             let server_name = server_config.static_name.unwrap_or("unknown");
             let interval_dur = Duration::from_secs(interval);
-            let target_arc = route.target.clone();
+            let target_arc = target_ref.clone();
             let auth_header = jwt_token.clone();
             let router_params = router_params.clone();
 

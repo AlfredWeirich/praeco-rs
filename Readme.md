@@ -22,6 +22,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 * **Zero-Allocation `IpFilterLayer` & RFC 3986 `PathSanitizerLayer`**: Pre-compiled IPv4/IPv6 CIDR allowlists/blocklists (`deny`-before-`allow`, `PROXY v2` aware) plus mandatory URI canonicalization and path-traversal rejection.
 * **Built-in Identity Provider (IdP), Claims Webhook & JWKS**: Issues signed Ed25519 JWTs from mTLS identities (with `OptionalClientCert` support, `iss`/`aud` enforcement, live role-fetching webhooks, `/.well-known/jwks.json`, and `revoke_on_paths` automatic JTI revocation).
 * **Outbound Zero-Trust Tunneling (SNI Relay) & Static File Server**: Multiplexed outbound mTLS (`yamux`) reverse tunnels with fail-closed `PROXY v2` client IP propagation, plus a native SPA-capable static file server (`StaticFiles`).
+* **Parallel Fan-Out / Aggregator Routes (`backend_type = "aggregate"`)**: Accepts a single `GET` or `POST` client request, fans out concurrently across mixed `grpc_transcoding` (via Reflection) and `rest` targets with independent circuit breakers, `required = false` graceful degradation (`null` + `_errors`), and zero-copy `BytesMut` JSON assembly.
 
 ---
 
@@ -88,10 +89,9 @@ To elevate `praeco-rs` even further, the following points remain on the roadmap:
 Implementing an HTTP response caching layer (e.g., using Redis or an in-memory TinyLFU cache with Singleflight request coalescing) for specific routes to reduce backend load, similar to what Pingora offers out of the box for CDN use-cases.
 
 ### 2. Pluggable End-Services (Beyond Routing)
-Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying), an `Idp` (Identity Provider), a `StaticFiles` service, an `Admin` telemetry service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
+Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying and `aggregate` fan-out routes), an `Idp` (Identity Provider), a `StaticFiles` service, an `Admin` telemetry service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
-- **Aggregator / Fan-Out Service**: Accepting a single client request and internally fanning it out to multiple backend microservices, assembling their JSON responses into a single cohesive payload before returning it to the client.
 
 ---
 

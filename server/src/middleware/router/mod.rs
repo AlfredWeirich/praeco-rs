@@ -26,6 +26,7 @@ use crate::{
 use common::{build_root_store, build_tls_client_config};
 
 // Submodules
+pub(crate) mod aggregator;
 pub mod circuit_breaker;
 pub(crate) mod grpc_passthrough;
 pub(crate) mod grpc_web;
@@ -164,13 +165,23 @@ impl RouterService {
 
         let mut any_alive = false;
         for route in &config.parsed_routes {
-            for node in &route.target.upstreams {
-                if node.is_available(route.target.cooldown_seconds) {
+            if route.backend_type == RouteBackendType::Aggregate {
+                if route.aggregate_targets.iter().any(|sub| {
+                    sub.target
+                        .upstreams
+                        .iter()
+                        .any(|node| node.is_available(sub.target.cooldown_seconds))
+                }) {
                     any_alive = true;
                     break;
                 }
-            }
-            if any_alive {
+            } else if route
+                .target
+                .upstreams
+                .iter()
+                .any(|node| node.is_available(route.target.cooldown_seconds))
+            {
+                any_alive = true;
                 break;
             }
         }
@@ -302,7 +313,10 @@ impl Service<Request<SrvBody>> for RouterService {
                 parts.version
             };
 
-            let is_transcoding = route_info.backend_type == RouteBackendType::GrpcTranscoding;
+            let is_buffered_only = matches!(
+                route_info.backend_type,
+                RouteBackendType::GrpcTranscoding | RouteBackendType::Aggregate
+            );
             let is_passthrough = route_info.backend_type == RouteBackendType::GrpcPassthrough;
             let has_failover_nodes = route_info.target.upstreams.len() > 1;
             let is_idempotent = matches!(
@@ -331,11 +345,11 @@ impl Service<Request<SrvBody>> for RouterService {
                 || route_info.target.max_retries == 0
                 || (!is_passthrough && !is_idempotent)
                 || content_length_exceeds_retry_buf)
-                && !is_transcoding;
+                && !is_buffered_only;
 
             let request_body = if can_stream {
                 RequestBody::Stream(body)
-            } else if is_transcoding {
+            } else if is_buffered_only {
                 match body.collect().await {
                     Ok(c) => RequestBody::Buffered(c.to_bytes()),
                     Err(e) => {
@@ -446,6 +460,23 @@ impl Service<Request<SrvBody>> for RouterService {
                         Some(route_info.prefix.as_str()),
                     ),
                 ),
+                RouteBackendType::Aggregate => {
+                    aggregator::handle_aggregate(
+                        route_info,
+                        request_body,
+                        original_method,
+                        original_version,
+                        prepared_headers,
+                        &parts.uri,
+                        client_addr,
+                        server_name,
+                        &client,
+                        &grpc_client,
+                        &self_clone.config,
+                        request_timeout,
+                    )
+                    .await
+                }
             }
         })
     }

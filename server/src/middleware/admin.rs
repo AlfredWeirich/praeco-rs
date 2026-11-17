@@ -284,111 +284,27 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
             if route.backend_type == RouteBackendType::Admin {
                 continue;
             }
-            summary.total_routes += 1;
-
-            let cooldown = route.target.cooldown_seconds;
-            let mut upstreams = Vec::with_capacity(route.target.upstreams.len());
-            let mut route_failover_retries = 0u64;
-
-            for node in &route.target.upstreams {
-                summary.total_upstreams += 1;
-
-                let state = node.circuit_state();
-                let is_alive = node.is_alive.load(std::sync::atomic::Ordering::Acquire);
-                let is_available = node.is_available(cooldown);
-                let active_conn = node
-                    .active_connections
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let total_reqs = node
-                    .total_requests
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let total_fails = node
-                    .total_failures
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let circuit_trips = node
-                    .circuit_trips
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let node_failover_retries = node
-                    .failover_retries
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let last_response_ms = node
-                    .last_response_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let ema_response_ms = node
-                    .ema_response_ms
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let consecutive_failures = node
-                    .consecutive_failures
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let last_failure_time = node
-                    .last_failure_time
-                    .load(std::sync::atomic::Ordering::Acquire);
-                let half_open_probe = node
-                    .half_open_probe_in_flight
-                    .load(std::sync::atomic::Ordering::Acquire);
-                let health_score = node
-                    .current_score
-                    .load(std::sync::atomic::Ordering::Relaxed);
-
-                let cooldown_remaining_secs = if !is_alive && last_failure_time > 0 {
-                    (last_failure_time + cooldown).saturating_sub(now_unix)
-                } else {
-                    0
-                };
-
-                let state_str = match state {
-                    CircuitState::Closed => {
-                        summary.healthy_upstreams += 1;
-                        "Closed"
-                    }
-                    CircuitState::Open => {
-                        summary.open_circuits += 1;
-                        "Open"
-                    }
-                    CircuitState::HalfOpen => {
-                        summary.half_open_circuits += 1;
-                        "HalfOpen"
-                    }
-                };
-                summary.active_connections += active_conn;
-                summary.total_upstream_requests += total_reqs;
-                summary.total_upstream_failures += total_fails;
-                summary.total_circuit_trips += circuit_trips;
-                summary.total_failover_retries += node_failover_retries;
-                route_failover_retries += node_failover_retries;
-
-                upstreams.push(AdminUpstreamStatus {
-                    uri: node.uri.to_string(),
-                    circuit_state: state_str,
-                    is_alive,
-                    is_available,
-                    active_connections: active_conn,
-                    total_requests: total_reqs,
-                    total_failures: total_fails,
-                    circuit_trips,
-                    failover_retries: node_failover_retries,
-                    last_response_ms,
-                    ema_response_ms,
-                    consecutive_failures,
-                    last_failure_time,
-                    cooldown_remaining_secs,
-                    half_open_probe_in_flight: half_open_probe,
-                    health_score,
-                });
+            if route.backend_type == RouteBackendType::Aggregate {
+                for sub in &route.aggregate_targets {
+                    summary.total_routes += 1;
+                    routes.push(collect_route_target_status(
+                        format!("{} [target:{}]", route.prefix, sub.key),
+                        &sub.backend_type,
+                        &sub.target,
+                        now_unix,
+                        &mut summary,
+                    ));
+                }
+                continue;
             }
-
-            routes.push(AdminRouteStatus {
-                prefix: route.prefix.clone(),
-                backend_type: format!("{:?}", route.backend_type),
-                strategy: format!("{:?}", route.target.strategy),
-                cooldown_seconds: cooldown,
-                max_retries: route.target.max_retries,
-                failure_threshold: route.target.failure_threshold,
-                max_retry_buffer_bytes: route.target.max_retry_buffer_bytes,
-                active_health_check_interval: route.target.active_health_check_interval,
-                failover_retries: route_failover_retries,
-                upstreams,
-            });
+            summary.total_routes += 1;
+            routes.push(collect_route_target_status(
+                route.prefix.clone(),
+                &route.backend_type,
+                &route.target,
+                now_unix,
+                &mut summary,
+            ));
         }
 
         servers.push(AdminServerStatus {
@@ -687,7 +603,13 @@ fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerCon
 
     for srv in &servers_iter {
         for route in &srv.parsed_routes {
-            for node in &route.target.upstreams {
+            let nodes = route.target.upstreams.iter().chain(
+                route
+                    .aggregate_targets
+                    .iter()
+                    .flat_map(|sub| sub.target.upstreams.iter()),
+            );
+            for node in nodes {
                 let node_uri_str = node.uri.to_string();
                 if node_uri_str == up_str
                     || node_uri_str.trim_end_matches('/') == up_str.trim_end_matches('/')
@@ -700,6 +622,119 @@ fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerCon
                 }
             }
         }
+    }
+}
+
+/// Collects circuit-breaker and telemetry status for a single [`RouteTarget`].
+fn collect_route_target_status(
+    prefix: String,
+    backend_type: &RouteBackendType,
+    target: &crate::configuration::RouteTarget,
+    now_unix: u64,
+    summary: &mut AdminSummary,
+) -> AdminRouteStatus {
+    let cooldown = target.cooldown_seconds;
+    let mut upstreams = Vec::with_capacity(target.upstreams.len());
+    let mut route_failover_retries = 0u64;
+
+    for node in &target.upstreams {
+        summary.total_upstreams += 1;
+
+        let state = node.circuit_state();
+        let is_alive = node.is_alive.load(std::sync::atomic::Ordering::Acquire);
+        let is_available = node.is_available(cooldown);
+        let active_conn = node
+            .active_connections
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_reqs = node
+            .total_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let total_fails = node
+            .total_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let circuit_trips = node
+            .circuit_trips
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let node_failover_retries = node
+            .failover_retries
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_response_ms = node
+            .last_response_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ema_response_ms = node
+            .ema_response_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let consecutive_failures = node
+            .consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_failure_time = node
+            .last_failure_time
+            .load(std::sync::atomic::Ordering::Acquire);
+        let half_open_probe = node
+            .half_open_probe_in_flight
+            .load(std::sync::atomic::Ordering::Acquire);
+        let health_score = node
+            .current_score
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let cooldown_remaining_secs = if !is_alive && last_failure_time > 0 {
+            (last_failure_time + cooldown).saturating_sub(now_unix)
+        } else {
+            0
+        };
+
+        let state_str = match state {
+            CircuitState::Closed => {
+                summary.healthy_upstreams += 1;
+                "Closed"
+            }
+            CircuitState::Open => {
+                summary.open_circuits += 1;
+                "Open"
+            }
+            CircuitState::HalfOpen => {
+                summary.half_open_circuits += 1;
+                "HalfOpen"
+            }
+        };
+        summary.active_connections += active_conn;
+        summary.total_upstream_requests += total_reqs;
+        summary.total_upstream_failures += total_fails;
+        summary.total_circuit_trips += circuit_trips;
+        summary.total_failover_retries += node_failover_retries;
+        route_failover_retries += node_failover_retries;
+
+        upstreams.push(AdminUpstreamStatus {
+            uri: node.uri.to_string(),
+            circuit_state: state_str,
+            is_alive,
+            is_available,
+            active_connections: active_conn,
+            total_requests: total_reqs,
+            total_failures: total_fails,
+            circuit_trips,
+            failover_retries: node_failover_retries,
+            last_response_ms,
+            ema_response_ms,
+            consecutive_failures,
+            last_failure_time,
+            cooldown_remaining_secs,
+            half_open_probe_in_flight: half_open_probe,
+            health_score,
+        });
+    }
+
+    AdminRouteStatus {
+        prefix,
+        backend_type: format!("{:?}", backend_type),
+        strategy: format!("{:?}", target.strategy),
+        cooldown_seconds: cooldown,
+        max_retries: target.max_retries,
+        failure_threshold: target.failure_threshold,
+        max_retry_buffer_bytes: target.max_retry_buffer_bytes,
+        active_health_check_interval: target.active_health_check_interval,
+        failover_retries: route_failover_retries,
+        upstreams,
     }
 }
 
@@ -929,6 +964,7 @@ mod tests {
             target,
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
+            aggregate_targets: Vec::new(),
         };
 
         let toml_str = r#"
@@ -1157,5 +1193,61 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing metric line: {expected}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_admin_upstreams_reports_and_controls_aggregate_targets() {
+        let toml_str = r#"
+            name = "agg_admin_test"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+
+            [Layers]
+            enabled = []
+
+            [ReverseRoutes."/api/dashboard"]
+            backend_type = "aggregate"
+
+            [[ReverseRoutes."/api/dashboard".targets]]
+            key = "user"
+            backend_type = "grpc_transcoding"
+            upstreams = ["http://127.0.0.1:50051"]
+            path = "/user.UserService/GetUser"
+
+            [[ReverseRoutes."/api/dashboard".targets]]
+            key = "notifications"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:8081"]
+            path = "/v1/notifications"
+        "#;
+        let mut srv: ServerConfig = toml::from_str(toml_str).unwrap();
+        srv.finalize().unwrap();
+
+        let status = collect_admin_status(Some(&srv));
+        assert_eq!(status.summary.total_routes, 2);
+        assert_eq!(status.summary.total_upstreams, 2);
+        let routes = &status.servers[0].routes;
+        assert_eq!(routes[0].prefix, "/api/dashboard [target:user]");
+        assert_eq!(routes[1].prefix, "/api/dashboard [target:notifications]");
+
+        // Mark gRPC sub-target dead via admin control endpoint
+        let headers = HeaderMap::new();
+        let mark_dead_uri: Uri =
+            "http://127.0.0.1:9090/upstreams?action=mark_dead&upstream=http://127.0.0.1:50051/"
+                .parse()
+                .unwrap();
+        let resp = handle_admin_request(&mark_dead_uri, &Method::POST, &headers, Some(&srv));
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !srv.parsed_routes[0].aggregate_targets[0].target.upstreams[0]
+                .is_alive
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
     }
 }

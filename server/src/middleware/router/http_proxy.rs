@@ -482,6 +482,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -551,6 +552,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -627,6 +629,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -699,6 +702,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -768,6 +772,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -851,6 +856,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -938,6 +944,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Rest,
+            aggregate_targets: Vec::new(),
         };
 
         let tls_config = rustls::ClientConfig::builder()

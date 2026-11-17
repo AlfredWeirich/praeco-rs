@@ -22,11 +22,16 @@
 
 use anyhow::{Context, Error};
 use arc_swap::ArcSwap;
-use hyper::Uri;
+use hyper::{Method, Uri};
 use regex::Regex;
 use rustls::sign::CertifiedKey;
 use serde::Deserialize;
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 
 /// The global singleton holder for the parsed configuration.
 ///
@@ -491,7 +496,7 @@ pub struct StaticFilesParams {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RouteConfig {
     /// The upstream backend addresses (e.g. `["127.0.0.1:8080", "127.0.0.1:8081"]`).
-    /// Can be omitted or empty (`[]`) when `backend_type = "admin"`.
+    /// Can be omitted or empty (`[]`) when `backend_type = "admin"` or `"aggregate"`.
     #[serde(default)]
     pub upstreams: Vec<String>,
     /// The load balancing strategy to use for this route.
@@ -511,9 +516,46 @@ pub struct RouteConfig {
     pub max_retry_buffer_bytes: Option<usize>,
     /// Interval in seconds for actively polling the /health endpoint of upstreams. Defaults to 0 (disabled).
     pub active_health_check_interval: Option<u64>,
-    /// The type of backend this route proxies to (`rest`, `grpc_passthrough`, `grpc_transcoding`, or `admin`). Defaults to `rest`.
+    /// The type of backend this route proxies to (`rest`, `grpc_passthrough`, `grpc_transcoding`, `admin`, or `aggregate`). Defaults to `rest`.
     #[serde(default)]
     pub backend_type: RouteBackendType,
+    /// Sub-requests for fan-out aggregation when `backend_type = "aggregate"`.
+    #[serde(default)]
+    pub targets: Vec<AggregateTargetConfig>,
+}
+
+/// Configuration for a single fan-out target within an `aggregate` route.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AggregateTargetConfig {
+    /// JSON key under which this target's response is placed in the aggregated object.
+    pub key: String,
+    /// Backend protocol for this sub-request (`rest` or `grpc_transcoding`). Defaults to `rest`.
+    #[serde(default)]
+    pub backend_type: RouteBackendType,
+    /// Upstream backend addresses for this target.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
+    /// Target URI path (e.g. `"/v1/notifications"` for REST or `"/pkg.Service/Method"` for gRPC).
+    pub path: String,
+    /// Optional HTTP method override for REST sub-requests (gRPC transcoding always uses `POST`).
+    pub method: Option<String>,
+    /// Whether failure of this target aborts the entire aggregated request (default: `true`).
+    /// When `false`, failures set `"<key>": null` and add an entry under `"_errors"`.
+    #[serde(default = "default_true")]
+    pub required: bool,
+    /// Load balancing strategy for this target's upstreams.
+    #[serde(default)]
+    pub strategy: LbStrategy,
+    /// How many seconds a node stays dead after a connection failure. Defaults to 10.
+    pub cooldown_seconds: Option<u64>,
+    /// Maximum number of automatic retries on another node. Defaults to 2.
+    pub max_retries: Option<usize>,
+    /// Number of consecutive upstream 502/503/504 outlier responses before opening the circuit breaker. Defaults to 3.
+    pub failure_threshold: Option<usize>,
+    /// Maximum request body size (in bytes) buffered in RAM for automatic retries. Defaults to 65536.
+    pub max_retry_buffer_bytes: Option<usize>,
+    /// Interval in seconds for actively polling the health endpoint of upstreams. Defaults to 0 (disabled).
+    pub active_health_check_interval: Option<u64>,
 }
 
 /// The type of backend service being routed to.
@@ -531,6 +573,9 @@ pub enum RouteBackendType {
     /// Internal Praeco Admin & Telemetry handler (`status`, `upstreams`, `metrics`, `healthz`).
     #[serde(alias = "praeco_admin")]
     Admin,
+    /// Parallel fan-out aggregator across multiple REST and gRPC-transcoding backends.
+    #[serde(alias = "fanout")]
+    Aggregate,
 }
 
 /// A load balancing strategy for downstream forwarding.
@@ -955,6 +1000,23 @@ impl RouteTarget {
     }
 }
 
+/// A compiled fan-out sub-target within an aggregate [`ParsedRoute`].
+#[derive(Debug, Clone)]
+pub struct ParsedAggregateTarget {
+    /// Output JSON field name (and optional input payload sub-key).
+    pub key: String,
+    /// Sub-request backend protocol (`Rest` or `GrpcTranscoding`).
+    pub backend_type: RouteBackendType,
+    /// Load-balanced upstream pool and circuit breaker for this sub-target.
+    pub target: Arc<RouteTarget>,
+    /// Parsed target path and optional query string (e.g. `"/pkg.Service/Method"` or `"/v1/items"`).
+    pub target_uri: Uri,
+    /// Optional HTTP method override for REST sub-requests.
+    pub method: Option<Method>,
+    /// Whether failure of this sub-target aborts the whole aggregated response.
+    pub required: bool,
+}
+
 /// A processed reverse-proxy route ready for use by the router.
 ///
 /// Created from [`RouteConfig`] during [`ServerConfig::finalize`].
@@ -966,8 +1028,10 @@ pub struct ParsedRoute {
     pub target: Arc<RouteTarget>,
     /// Roles permitted to access this route.
     pub allowed_roles: Vec<UserRole>,
-    /// The type of backend (rest or grpc).
+    /// The type of backend (rest, grpc, admin, or aggregate).
     pub backend_type: RouteBackendType,
+    /// Fan-out sub-targets populated when `backend_type == RouteBackendType::Aggregate`.
+    pub aggregate_targets: Vec<ParsedAggregateTarget>,
 }
 
 // --- Middleware Layer Structures ---
@@ -1890,6 +1954,178 @@ impl ServerConfig {
             .with_context(|| format!("Invalid address: {}:{}", ip_str, port))
     }
 
+    /// Builds a [`RouteTarget`] from upstream strings and resilience parameters.
+    #[allow(clippy::too_many_arguments)]
+    fn build_route_target(
+        upstreams: &[String],
+        proto_str: &str,
+        strategy: LbStrategy,
+        cooldown_seconds: Option<u64>,
+        max_retries: Option<usize>,
+        failure_threshold: Option<usize>,
+        max_retry_buffer_bytes: Option<usize>,
+        active_health_check_interval: Option<u64>,
+    ) -> Result<RouteTarget, Error> {
+        let mut upstream_nodes = Vec::with_capacity(upstreams.len());
+        for upstream in upstreams {
+            let uri_str = if upstream.starts_with("http://") || upstream.starts_with("https://") {
+                upstream.to_string()
+            } else {
+                format!("{proto_str}://{upstream}")
+            };
+
+            let uri = uri_str
+                .parse::<Uri>()
+                .with_context(|| format!("Invalid upstream URI: {uri_str}"))?;
+
+            upstream_nodes.push(UpstreamNode::new(uri));
+        }
+
+        Ok(RouteTarget {
+            upstreams: upstream_nodes,
+            strategy,
+            rr_counter: std::sync::atomic::AtomicUsize::new(0),
+            cooldown_seconds: cooldown_seconds.unwrap_or(10),
+            max_retries: max_retries.unwrap_or(2),
+            failure_threshold: failure_threshold.unwrap_or(3).max(1),
+            max_retry_buffer_bytes: max_retry_buffer_bytes.unwrap_or(65_536),
+            active_health_check_interval: active_health_check_interval.unwrap_or(0),
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Validates and compiles fan-out sub-targets for an `aggregate` route.
+    fn parse_aggregate_targets(
+        prefix: &str,
+        cfg: &RouteConfig,
+        proto_str: &str,
+    ) -> Result<Vec<ParsedAggregateTarget>, Error> {
+        if !cfg.upstreams.is_empty() {
+            return Err(Error::msg(format!(
+                "Configuration error: Aggregate route '{}' must define 'targets' instead of top-level 'upstreams'.",
+                prefix
+            )));
+        }
+        if cfg.targets.is_empty() {
+            return Err(Error::msg(format!(
+                "Configuration error: Aggregate route '{}' must define at least one target.",
+                prefix
+            )));
+        }
+
+        let mut seen_keys = HashSet::with_capacity(cfg.targets.len());
+        let mut parsed = Vec::with_capacity(cfg.targets.len());
+
+        for t in &cfg.targets {
+            let key = t.key.trim();
+            if key.is_empty() || key == "_errors" {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' has invalid target key '{}'.",
+                    prefix, t.key
+                )));
+            }
+            if !seen_keys.insert(key.to_string()) {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' has duplicate target key '{}'.",
+                    prefix, key
+                )));
+            }
+            if !matches!(
+                t.backend_type,
+                RouteBackendType::Rest | RouteBackendType::GrpcTranscoding
+            ) {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' target '{}' only supports backend_type 'rest' or 'grpc_transcoding'.",
+                    prefix, key
+                )));
+            }
+            if t.upstreams.is_empty() {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' target '{}' has no upstreams defined.",
+                    prefix, key
+                )));
+            }
+            if !t.path.starts_with('/') {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' target '{}' path '{}' must start with '/'.",
+                    prefix, key, t.path
+                )));
+            }
+
+            let target_uri: Uri = t.path.parse().with_context(|| {
+                format!(
+                    "Configuration error: Aggregate route '{}' target '{}' has invalid path '{}'",
+                    prefix, key, t.path
+                )
+            })?;
+            if target_uri.scheme().is_some() || target_uri.authority().is_some() {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' target '{}' path '{}' must be a relative path without scheme or host.",
+                    prefix, key, t.path
+                )));
+            }
+
+            if t.backend_type == RouteBackendType::GrpcTranscoding {
+                let segments: Vec<&str> = target_uri
+                    .path()
+                    .trim_start_matches('/')
+                    .split('/')
+                    .collect();
+                if segments.len() != 2 || segments[0].is_empty() || segments[1].is_empty() {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Aggregate route '{}' gRPC target '{}' path '{}' must match '/<Package.Service>/<Method>'.",
+                        prefix, key, t.path
+                    )));
+                }
+            }
+
+            let method = match &t.method {
+                Some(raw_method) => {
+                    let trimmed = raw_method.trim().to_ascii_uppercase();
+                    let parsed_method = Method::from_bytes(trimmed.as_bytes()).with_context(|| {
+                        format!(
+                            "Configuration error: Aggregate route '{}' target '{}' has invalid HTTP method '{}'",
+                            prefix, key, raw_method
+                        )
+                    })?;
+                    if t.backend_type == RouteBackendType::GrpcTranscoding
+                        && parsed_method != Method::POST
+                    {
+                        return Err(Error::msg(format!(
+                            "Configuration error: Aggregate route '{}' gRPC target '{}' only supports POST method (got '{}').",
+                            prefix, key, parsed_method
+                        )));
+                    }
+                    Some(parsed_method)
+                }
+                None => None,
+            };
+
+            let route_target = Self::build_route_target(
+                &t.upstreams,
+                proto_str,
+                t.strategy.clone(),
+                t.cooldown_seconds,
+                t.max_retries,
+                t.failure_threshold,
+                t.max_retry_buffer_bytes,
+                t.active_health_check_interval,
+            )?;
+
+            parsed.push(ParsedAggregateTarget {
+                key: key.to_string(),
+                backend_type: t.backend_type.clone(),
+                target: Arc::new(route_target),
+                target_uri,
+                method,
+                required: t.required,
+            });
+        }
+
+        Ok(parsed)
+    }
+
     /// Parses the raw reverse route configuration into structured [`ParsedRoute`] objects.
     ///
     /// Routes are sorted by prefix length (longest first) so that the most
@@ -1909,6 +2145,35 @@ impl ServerConfig {
             };
 
             for (prefix, cfg) in map {
+                if cfg.backend_type == RouteBackendType::Aggregate {
+                    let aggregate_targets =
+                        Self::parse_aggregate_targets(prefix, cfg, proto_str)?;
+                    let empty_target = Self::build_route_target(
+                        &[],
+                        proto_str,
+                        cfg.strategy.clone(),
+                        cfg.cooldown_seconds,
+                        cfg.max_retries,
+                        cfg.failure_threshold,
+                        cfg.max_retry_buffer_bytes,
+                        cfg.active_health_check_interval,
+                    )?;
+                    rules.push(ParsedRoute {
+                        prefix: prefix.clone(),
+                        target: Arc::new(empty_target),
+                        allowed_roles: cfg.allowed_roles.clone(),
+                        backend_type: cfg.backend_type.clone(),
+                        aggregate_targets,
+                    });
+                    continue;
+                }
+
+                if !cfg.targets.is_empty() {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Route '{}' defines 'targets', which is only valid for backend_type = \"aggregate\".",
+                        prefix
+                    )));
+                }
                 if cfg.upstreams.is_empty() && cfg.backend_type != RouteBackendType::Admin {
                     return Err(Error::msg(format!(
                         "Configuration error: Route '{}' has no upstreams defined.",
@@ -1916,40 +2181,23 @@ impl ServerConfig {
                     )));
                 }
 
-                let mut upstream_nodes = Vec::with_capacity(cfg.upstreams.len());
-                for upstream in &cfg.upstreams {
-                    let uri_str =
-                        if upstream.starts_with("http://") || upstream.starts_with("https://") {
-                            upstream.to_string()
-                        } else {
-                            format!("{proto_str}://{upstream}")
-                        };
-
-                    let uri = uri_str
-                        .parse::<Uri>()
-                        .with_context(|| format!("Invalid upstream URI: {uri_str}"))?;
-
-                    upstream_nodes.push(UpstreamNode::new(uri));
-                }
-
-                let target = RouteTarget {
-                    upstreams: upstream_nodes,
-                    strategy: cfg.strategy.clone(),
-                    rr_counter: std::sync::atomic::AtomicUsize::new(0),
-                    cooldown_seconds: cfg.cooldown_seconds.unwrap_or(10),
-                    max_retries: cfg.max_retries.unwrap_or(2),
-                    failure_threshold: cfg.failure_threshold.unwrap_or(3).max(1),
-                    max_retry_buffer_bytes: cfg.max_retry_buffer_bytes.unwrap_or(65_536),
-                    active_health_check_interval: cfg.active_health_check_interval.unwrap_or(0),
-                    grpc_pool: tokio::sync::RwLock::new(None),
-                    grpc_reflection_lock: tokio::sync::Mutex::new(()),
-                };
+                let target = Self::build_route_target(
+                    &cfg.upstreams,
+                    proto_str,
+                    cfg.strategy.clone(),
+                    cfg.cooldown_seconds,
+                    cfg.max_retries,
+                    cfg.failure_threshold,
+                    cfg.max_retry_buffer_bytes,
+                    cfg.active_health_check_interval,
+                )?;
 
                 rules.push(ParsedRoute {
                     prefix: prefix.clone(),
-                    target: std::sync::Arc::new(target),
+                    target: Arc::new(target),
                     allowed_roles: cfg.allowed_roles.clone(),
                     backend_type: cfg.backend_type.clone(),
+                    aggregate_targets: Vec::new(),
                 });
             }
         }
@@ -2905,6 +3153,162 @@ mod tests {
         let res = srv_bad.finalize();
         assert!(res.is_err());
         assert!(format!("{:#}", res.unwrap_err()).contains("invalid allow_cidrs entry"));
+    }
+
+    #[test]
+    fn test_aggregate_route_config_validation() {
+        let valid_toml = r#"
+            name = "agg_valid"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+            authentication = "None"
+
+            [Layers]
+            enabled = []
+
+            [ReverseRoutes."/api/dashboard"]
+            backend_type = "aggregate"
+            allowed_roles = ["Admin"]
+
+            [[ReverseRoutes."/api/dashboard".targets]]
+            key = "user"
+            backend_type = "grpc_transcoding"
+            upstreams = ["127.0.0.1:50051"]
+            path = "/user.UserService/GetUser"
+            required = true
+
+            [[ReverseRoutes."/api/dashboard".targets]]
+            key = "notifications"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:8081"]
+            path = "/v1/notifications"
+            method = "GET"
+            required = false
+        "#;
+        let mut srv_ok: ServerConfig = toml::from_str(valid_toml).unwrap();
+        assert!(srv_ok.finalize().is_ok());
+        assert_eq!(srv_ok.parsed_routes.len(), 1);
+        let route = &srv_ok.parsed_routes[0];
+        assert_eq!(route.backend_type, RouteBackendType::Aggregate);
+        assert_eq!(route.aggregate_targets.len(), 2);
+        assert_eq!(route.aggregate_targets[0].key, "user");
+        assert!(route.aggregate_targets[0].required);
+        assert_eq!(route.aggregate_targets[1].key, "notifications");
+        assert!(!route.aggregate_targets[1].required);
+        assert_eq!(
+            route.aggregate_targets[1].method,
+            Some(hyper::Method::GET)
+        );
+
+        let invalid_cases = [
+            (
+                "empty targets",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "aggregate"
+                "#,
+                "must define at least one target",
+            ),
+            (
+                "reserved _errors key",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "aggregate"
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "_errors"
+                    upstreams = ["127.0.0.1:8081"]
+                    path = "/v1/test"
+                "#,
+                "invalid target key",
+            ),
+            (
+                "duplicate target key",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "aggregate"
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "user"
+                    upstreams = ["127.0.0.1:8081"]
+                    path = "/v1/a"
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "user"
+                    upstreams = ["127.0.0.1:8082"]
+                    path = "/v1/b"
+                "#,
+                "duplicate target key",
+            ),
+            (
+                "invalid grpc path",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "aggregate"
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "user"
+                    backend_type = "grpc_transcoding"
+                    upstreams = ["127.0.0.1:50051"]
+                    path = "/OnlyService"
+                "#,
+                "must match '/<Package.Service>/<Method>'",
+            ),
+            (
+                "non-POST grpc method",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "aggregate"
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "user"
+                    backend_type = "grpc_transcoding"
+                    upstreams = ["127.0.0.1:50051"]
+                    path = "/user.UserService/GetUser"
+                    method = "GET"
+                "#,
+                "only supports POST method",
+            ),
+            (
+                "targets on rest route",
+                r#"
+                    [ReverseRoutes."/api/agg"]
+                    backend_type = "rest"
+                    upstreams = ["127.0.0.1:8081"]
+                    [[ReverseRoutes."/api/agg".targets]]
+                    key = "user"
+                    upstreams = ["127.0.0.1:8082"]
+                    path = "/v1/a"
+                "#,
+                "only valid for backend_type = \"aggregate\"",
+            ),
+        ];
+
+        for (label, route_toml, expected_err) in invalid_cases {
+            let full_toml = format!(
+                r#"
+                    name = "agg_bad"
+                    enabled = true
+                    protocol = "http"
+                    service = "Router"
+                    ip = "127.0.0.1"
+                    port = 8080
+                    [RouterParams]
+                    protocol = "http"
+                    [Layers]
+                    enabled = []
+                    {route_toml}
+                "#
+            );
+            let mut srv_bad: ServerConfig = toml::from_str(&full_toml).unwrap();
+            let err = srv_bad.finalize().unwrap_err();
+            let err_msg = format!("{:#}", err);
+            assert!(
+                err_msg.contains(expected_err),
+                "Case '{label}' failed: expected '{expected_err}' in '{err_msg}'"
+            );
+        }
     }
 }
 

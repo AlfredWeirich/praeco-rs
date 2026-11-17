@@ -367,6 +367,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -468,6 +469,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();
@@ -553,6 +555,7 @@ mod tests {
             target: target.clone(),
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
+            aggregate_targets: Vec::new(),
         };
 
         let root_store = rustls::RootCertStore::empty();

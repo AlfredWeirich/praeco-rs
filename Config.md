@@ -510,9 +510,10 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 
 | Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
 | :--- | :--- | :--- | :--- | :--- |
-| `upstreams` | Array of Strings | **Mandatory** (except `admin`) | `[]` | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). Can be omitted or `[]` when `backend_type = "admin"`. |
+| `upstreams` | Array of Strings | **Mandatory** (except `admin`, `aggregate`) | `[]` | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). Must be omitted or `[]` when `backend_type = "admin"` or `"aggregate"`. |
 | `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
-| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap), or `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint). |
+| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap), `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint), or `"aggregate"` / `"fanout"` (parallel fan-out aggregator across REST and gRPC-transcoding sub-targets). |
+| `targets` | Array of Tables | **Mandatory** for `aggregate` | `[]` | Sub-target definitions (`[[Server.ReverseRoutes."/path".targets]]`) when `backend_type = "aggregate"`. Each target specifies `key`, `backend_type` (`"rest"` or `"grpc_transcoding"`), `upstreams`, `path`, optional `method`, and `required` (default `true`). |
 | `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
 | `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead (`CircuitState::Open`) upstream is benched before a single probe request is allowed in `HalfOpen` state. |
 | `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes (on TCP/timeout errors or `502`/`503`/`504` outlier responses) before returning to client. |
@@ -665,6 +666,35 @@ upstreams = ["https://10.0.0.1:50051"]
 strategy = "RoundRobin"
 backend_type = "grpc" # Enables dynamic transcoding
 allowed_roles = ["Admin", "Seller"]
+```
+
+#### Parallel Fan-Out Aggregator (`backend_type = "aggregate"`)
+
+An `aggregate` route accepts a single client `GET` or `POST` request, fans it out concurrently to multiple `rest` and `grpc_transcoding` backend targets (each with its own load balancer, 3-state circuit breaker, active health checks, and reflection cache), and assembles their JSON payloads into one response object keyed by `target.key`.
+
+- **`POST` payloads:** If the request JSON is an object containing keys matching `target.key` (e.g. `{"user": {"user_id": "42"}}`), each target receives its sub-object; otherwise all targets receive the full JSON payload.
+- **`GET` query parameters:** Passed to `rest` targets as query parameters and automatically converted to a JSON object (e.g. `?user_id=42` $\rightarrow$ `{"user_id": "42"}`) for `grpc_transcoding` targets.
+- **Partial failures:** Targets with `required = true` (default) abort remaining sub-requests immediately on failure and return `502`/`504`. Targets with `required = false` degrade gracefully with `"<key>": null` and an `"_errors": { "<key>": { "status": ..., "message": ... } }` entry.
+
+```toml
+[Server.ReverseRoutes."/api/dashboard"]
+backend_type = "aggregate"
+allowed_roles = ["Admin", "Seller"]
+
+[[Server.ReverseRoutes."/api/dashboard".targets]]
+key = "user"
+backend_type = "grpc_transcoding"
+upstreams = ["https://127.0.0.1:50051"]
+path = "/user.UserService/GetUser"
+required = true
+
+[[Server.ReverseRoutes."/api/dashboard".targets]]
+key = "notifications"
+backend_type = "rest"
+upstreams = ["http://127.0.0.1:8081"]
+path = "/v1/notifications"
+method = "GET"
+required = false
 ```
 
 ---
