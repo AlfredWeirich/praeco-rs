@@ -1,38 +1,20 @@
-use http_body_util::{BodyExt, Full};
-use hyper::{Method, Request, Response, StatusCode, Uri, header};
+use hyper::{Method, Response, Uri};
 use hyper_util::client::legacy::Client;
 use std::sync::Arc;
-use tracing::{error, warn};
 
-use super::upstreams::{ConnectionGuard, TrackedBody, build_upstream_uri};
 use super::RequestBody;
-use crate::{ServiceRespBody, SrvError, configuration::ParsedRoute};
+use super::http_proxy::{ProxyMode, forward_with_failover};
+use crate::{ServiceRespBody, SrvError, configuration::RouteTarget};
 
-/// Builds a gRPC-compliant Trailers-Only error response (`content-type: application/grpc`,
-/// `grpc-status`, `grpc-message`, and an empty body) so native gRPC clients (e.g. Tonic)
-/// never attempt to parse a plain-text error string as a 5-byte length-prefixed Protobuf frame.
-fn build_grpc_error_response(
-    msg: &str,
-    http_status: StatusCode,
-    grpc_status_code: &'static str,
-) -> Response<ServiceRespBody> {
-    let body = http_body_util::Empty::<bytes::Bytes>::new()
-        .map_err(SrvError::from)
-        .boxed();
-    Response::builder()
-        .status(http_status)
-        .header(header::CONTENT_TYPE, "application/grpc")
-        .header("grpc-status", grpc_status_code)
-        .header("grpc-message", msg)
-        .body(body)
-        .expect("gRPC error response builder failed")
-}
-
+/// Forwards a binary HTTP/2 gRPC request (`backend_type = "grpc_passthrough"`) through the
+/// shared failover/circuit-breaker proxy engine with `HTTP/2` enforcement, `TE: trailers`,
+/// gRPC outlier detection, and gRPC Trailers-Only error responses.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_grpc_passthrough(
-    route_info: &ParsedRoute,
-    mut request_body: RequestBody,
+    target: &Arc<RouteTarget>,
+    request_body: RequestBody,
     original_method: Method,
-    mut prepared_headers: hyper::HeaderMap,
+    prepared_headers: hyper::HeaderMap,
     original_uri: &Uri,
     matched_params: &matchit::Params<'_, '_>,
     client_addr: Option<std::net::SocketAddr>,
@@ -43,293 +25,30 @@ pub async fn handle_grpc_passthrough(
     >,
     request_timeout: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
-    let mut failed_nodes = Vec::new();
-    let is_multi_node = route_info.target.upstreams.len() > 1;
-    let max_retries = if is_multi_node {
-        route_info
-            .target
-            .max_retries
-            .min(route_info.target.upstreams.len() - 1)
-    } else {
-        0
-    };
-    let mut attempts = 0;
-    let is_stream = matches!(request_body, RequestBody::Stream(_));
-
-    loop {
-        let mut current_headers = if attempts == max_retries {
-            std::mem::take(&mut prepared_headers)
-        } else {
-            prepared_headers.clone()
-        };
-        attempts += 1;
-
-        let upstream_node = route_info
-            .target
-            .next_upstream(client_addr.as_ref(), &failed_nodes);
-        let backend_base_uri = &upstream_node.uri;
-        let mut probe_guard = is_multi_node.then(|| {
-            super::circuit_breaker::ProbeGuard::new(
-                upstream_node,
-                route_info.target.cooldown_seconds,
-            )
-        });
-        let conn_guard = ConnectionGuard::new(route_info.target.clone(), backend_base_uri.clone());
-
-        let target_uri = build_upstream_uri(backend_base_uri, matched_params, original_uri)?;
-
-        if let Some(auth) = target_uri.authority() {
-            if let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
-                current_headers.insert(header::HOST, host_val);
-            }
-        }
-
-        let body_error = Arc::new(std::sync::Mutex::new(None));
-        let boxed_body: ServiceRespBody = match &mut request_body {
-            RequestBody::Stream(_b) => {
-                let mut temp_body = RequestBody::Buffered(bytes::Bytes::new());
-                std::mem::swap(&mut temp_body, &mut request_body);
-                if let RequestBody::Stream(taken_body) = temp_body {
-                    super::http_proxy::BodyErrorTracker {
-                        inner: taken_body,
-                        last_error: body_error.clone(),
-                    }
-                    .boxed()
-                } else {
-                    unreachable!()
-                }
-            }
-            RequestBody::Buffered(bytes) => {
-                Full::new(bytes.clone()).map_err(SrvError::from).boxed()
-            }
-        };
-
-        let mut proxy_req = Request::new(boxed_body);
-        *proxy_req.method_mut() = original_method.clone();
-        *proxy_req.uri_mut() = target_uri;
-
-        *proxy_req.version_mut() = hyper::Version::HTTP_2;
-        // Strip hop-by-hop headers that hyper's HTTP/2 client strictly rejects
-        current_headers.remove(hyper::header::CONNECTION);
-        current_headers.remove(hyper::header::TRANSFER_ENCODING);
-        current_headers.remove(hyper::header::UPGRADE);
-        current_headers.remove(hyper::header::TE); // TE is allowed in HTTP/2 only if it is "trailers"
-        current_headers.insert(
-            hyper::header::TE,
-            hyper::header::HeaderValue::from_static("trailers"),
-        );
-
-        *proxy_req.headers_mut() = current_headers;
-
-        // Inject OpenTelemetry context (e.g., traceparent) into the outgoing request headers.
-        opentelemetry::global::get_text_map_propagator(|propagator| {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            propagator.inject_context(
-                &tracing::Span::current().context(),
-                &mut opentelemetry_http::HeaderInjector(proxy_req.headers_mut()),
-            );
-        });
-
-        let req_start = std::time::Instant::now();
-        let req_fut = grpc_client.request(proxy_req);
-        let resp_result = if let Some(timeout_dur) = request_timeout {
-            match tokio::time::timeout(timeout_dur, req_fut).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    error!(
-                        "{}: Upstream gRPC request timed out after {:?} for {}",
-                        server_name, timeout_dur, backend_base_uri
-                    );
-                    if let Some(ref mut pg) = probe_guard {
-                        pg.complete();
-                    }
-                    route_info.target.mark_dead(backend_base_uri);
-                    failed_nodes.push(backend_base_uri.clone());
-
-                    if !is_stream && attempts <= max_retries {
-                        upstream_node
-                            .failover_retries
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(
-                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after timed-out gRPC request on {}...",
-                            server_name, attempts, max_retries, backend_base_uri
-                        );
-                        continue;
-                    } else {
-                        if is_stream && attempts <= max_retries {
-                            warn!(
-                                "{}: Streaming gRPC request timed out on {}; cannot retry consumed stream",
-                                server_name, backend_base_uri
-                            );
-                        }
-                        return Ok(build_grpc_error_response(
-                            "Gateway Timeout",
-                            StatusCode::GATEWAY_TIMEOUT,
-                            "4", // DEADLINE_EXCEEDED
-                        ));
-                    }
-                }
-            }
-        } else {
-            req_fut.await
-        };
-
-        match resp_result {
-            Ok(res) => {
-                upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
-                if let Some(ref mut pg) = probe_guard {
-                    pg.complete();
-                }
-                if super::circuit_breaker::is_grpc_outlier_response(res.status(), res.headers()) {
-                    let status = res.status();
-                    let tripped = route_info.target.record_failure(backend_base_uri);
-                    if is_multi_node {
-                        failed_nodes.push(backend_base_uri.clone());
-                    }
-
-                    if tripped {
-                        warn!(
-                            "{}: Upstream gRPC {} returned outlier status (HTTP {}, grpc-status {:?}) — circuit breaker tripped to OPEN",
-                            server_name,
-                            backend_base_uri,
-                            status,
-                            res.headers().get("grpc-status")
-                        );
-                    } else {
-                        warn!(
-                            "{}: Upstream gRPC {} returned outlier status (HTTP {}, grpc-status {:?})",
-                            server_name,
-                            backend_base_uri,
-                            status,
-                            res.headers().get("grpc-status")
-                        );
-                    }
-
-                    if !is_stream && attempts <= max_retries {
-                        upstream_node
-                            .failover_retries
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        warn!(
-                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after upstream outlier from {}...",
-                            server_name, attempts, max_retries, backend_base_uri
-                        );
-                        continue;
-                    }
-
-                    let (mut res_parts, res_body) = res.into_parts();
-                    super::headers::clean_response_headers(&mut res_parts.headers);
-                    return Ok(Response::from_parts(
-                        res_parts,
-                        TrackedBody::new(res_body.map_err(SrvError::from), conn_guard).boxed(),
-                    ));
-                }
-
-                upstream_node.record_success();
-                let (mut res_parts, res_body) = res.into_parts();
-                super::headers::clean_response_headers(&mut res_parts.headers);
-                return Ok(Response::from_parts(
-                    res_parts,
-                    TrackedBody::new(res_body.map_err(SrvError::from), conn_guard).boxed(),
-                ));
-            }
-            Err(e) => {
-                let client_error = body_error.lock().ok().and_then(|mut g| g.take());
-                let error_kind = if let Some(srv_err) = client_error {
-                    match srv_err {
-                        SrvError::PayloadTooLarge { .. } => super::http_proxy::ProxyErrorKind::PayloadTooLarge,
-                        SrvError::DecompressionLimitExceeded { .. } => {
-                            super::http_proxy::ProxyErrorKind::DecompressionLimitExceeded
-                        }
-                        SrvError::ClientAborted(reason) => super::http_proxy::ProxyErrorKind::ClientAborted(reason),
-                        _ => super::http_proxy::ProxyErrorKind::ClientAborted("Client stream error".to_string()),
-                    }
-                } else {
-                    super::http_proxy::classify_proxy_error(&e)
-                };
-                match error_kind {
-                    super::http_proxy::ProxyErrorKind::PayloadTooLarge => {
-                        warn!(
-                            "{}: Client gRPC request payload exceeded limit during proxying to {}",
-                            server_name, backend_base_uri
-                        );
-                        return Ok(build_grpc_error_response(
-                            "Payload Too Large",
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "8", // RESOURCE_EXHAUSTED
-                        ));
-                    }
-                    super::http_proxy::ProxyErrorKind::DecompressionLimitExceeded => {
-                        warn!(
-                            "{}: Client gRPC request decompressed payload exceeded limit during proxying to {}",
-                            server_name, backend_base_uri
-                        );
-                        return Ok(build_grpc_error_response(
-                            "Payload Too Large",
-                            StatusCode::PAYLOAD_TOO_LARGE,
-                            "8", // RESOURCE_EXHAUSTED
-                        ));
-                    }
-                    super::http_proxy::ProxyErrorKind::ClientAborted(ref reason) => {
-                        warn!(
-                            "{}: Client aborted gRPC request stream during proxying to {}: {}",
-                            server_name, backend_base_uri, reason
-                        );
-                        return Ok(build_grpc_error_response(
-                            "Client Closed Request",
-                            StatusCode::BAD_REQUEST,
-                            "1", // CANCELLED
-                        ));
-                    }
-                    super::http_proxy::ProxyErrorKind::UpstreamFailure => {
-                        error!(
-                            "{}: Backend connection failed to {}: {}",
-                            server_name, backend_base_uri, e
-                        );
-                        if let Some(ref mut pg) = probe_guard {
-                            pg.complete();
-                        }
-                        route_info.target.mark_dead(backend_base_uri);
-                        failed_nodes.push(backend_base_uri.clone());
-
-                        if !is_stream && attempts <= max_retries {
-                            upstream_node
-                                .failover_retries
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            warn!(
-                                "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) switching away from {}...",
-                                server_name, attempts, max_retries, backend_base_uri
-                            );
-                            continue;
-                        } else {
-                            if is_stream && attempts <= max_retries {
-                                warn!(
-                                    "{}: Streaming gRPC request failed on {}; cannot retry consumed stream",
-                                    server_name, backend_base_uri
-                                );
-                            }
-                            error!(
-                                "{}: Max retries reached or stream not retryable. Returning 502 Bad Gateway.",
-                                server_name
-                            );
-                            return Ok(build_grpc_error_response(
-                                "Bad Gateway",
-                                StatusCode::BAD_GATEWAY,
-                                "14", // UNAVAILABLE
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    forward_with_failover(
+        ProxyMode::GrpcPassthrough,
+        target,
+        request_body,
+        original_method,
+        prepared_headers,
+        original_uri,
+        matched_params,
+        client_addr,
+        server_name,
+        grpc_client,
+        request_timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configuration::{LbStrategy, RouteTarget, UpstreamNode};
+    use http_body_util::BodyExt;
+    use hyper::StatusCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use crate::configuration::{LbStrategy, RouteBackendType, RouteTarget, UpstreamNode};
 
     #[tokio::test]
     async fn test_grpc_passthrough_request_timeout_returns_504() {
@@ -362,13 +81,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/chat.ChatService".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::GrpcPassthrough,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -385,7 +97,7 @@ mod tests {
         let matched_params = matchit::Params::new();
 
         let response = handle_grpc_passthrough(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::POST,
             prepared_headers,
@@ -464,13 +176,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/chat.ChatService".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::GrpcPassthrough,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -490,7 +195,7 @@ mod tests {
         let grpc_frame = bytes::Bytes::from_static(&[0, 0, 0, 0, 0]);
 
         let response = handle_grpc_passthrough(
-            &route_info,
+            &target,
             RequestBody::Buffered(grpc_frame),
             Method::POST,
             prepared_headers,
@@ -550,13 +255,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/chat.ChatService".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::GrpcPassthrough,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -580,7 +278,7 @@ mod tests {
         let body: ServiceRespBody = http_body_util::StreamBody::new(err_stream).boxed();
 
         let response = handle_grpc_passthrough(
-            &route_info,
+            &target,
             RequestBody::Stream(body),
             Method::POST,
             prepared_headers,

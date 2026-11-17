@@ -22,6 +22,7 @@
 
 use anyhow::{Context, Error};
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use hyper::{Method, Uri};
 use regex::Regex;
 use rustls::sign::CertifiedKey;
@@ -75,6 +76,7 @@ pub enum Protocol {
 
 /// The base service type that sits at the bottom of the middleware stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[non_exhaustive]
 pub enum ServiceType {
     /// A diagnostic echo service for load testing.
     #[default]
@@ -527,7 +529,7 @@ pub struct StaticFilesParams {
 }
 
 /// A single reverse-proxy route definition from the TOML config.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct RouteConfig {
     /// The upstream backend addresses (e.g. `["127.0.0.1:8080", "127.0.0.1:8081"]`).
     /// Can be omitted or empty (`[]`) when `backend_type = "admin"` or `"aggregate"`.
@@ -556,6 +558,44 @@ pub struct RouteConfig {
     /// Sub-requests for fan-out aggregation when `backend_type = "aggregate"`.
     #[serde(default)]
     pub targets: Vec<AggregateTargetConfig>,
+    /// How incoming `POST` bodies are distributed across fan-out targets (`keyed` or `broadcast`).
+    /// Defaults to `keyed` (fail-closed: each target only receives `body[target.key]`).
+    #[serde(default)]
+    pub payload_mode: AggregatePayloadMode,
+    /// Whether raw upstream error response bodies may be reflected to clients on `aggregate` routes.
+    /// Defaults to `false` (only sanitized HTTP reason phrases are returned; details go to server logs).
+    #[serde(default)]
+    pub expose_upstream_errors: bool,
+    /// Optional overall deadline in milliseconds for completing an `aggregate` route fan-out.
+    /// When exceeded, unfinished optional targets degrade to `504` in `_errors`; unfinished
+    /// required targets abort the route with `504 Gateway Timeout`.
+    pub deadline_ms: Option<u64>,
+    /// Maximum incoming request body size in bytes buffered in RAM for buffered-only routes
+    /// (`grpc_transcoding` and `aggregate`). Defaults to 4 MiB.
+    pub max_request_bytes: Option<usize>,
+    /// Maximum cumulative response bytes buffered across all sub-targets of an `aggregate` route.
+    /// Defaults to 16 MiB.
+    pub max_response_bytes: Option<usize>,
+}
+
+/// Default maximum request body size buffered in RAM for `grpc_transcoding` and `aggregate` routes (4 MiB).
+pub const DEFAULT_MAX_BUFFERED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Default maximum cumulative response size buffered across all targets of an `aggregate` route (16 MiB).
+pub const DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Controls how incoming `POST` request bodies are distributed across fan-out targets
+/// on an `aggregate` route.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AggregatePayloadMode {
+    /// Each target receives strictly `body[target.key]`. Targets whose key is absent
+    /// receive `{}` (never sibling target payloads), and unknown top-level keys are
+    /// rejected with `400 Bad Request`.
+    #[default]
+    Keyed,
+    /// Every target receives the full incoming request body unchanged.
+    Broadcast,
 }
 
 /// Configuration for a single fan-out target within an `aggregate` route.
@@ -577,6 +617,17 @@ pub struct AggregateTargetConfig {
     /// When `false`, failures set `"<key>": null` and add an entry under `"_errors"`.
     #[serde(default = "default_true")]
     pub required: bool,
+    /// Optional allowlist of client query parameter names forwarded to this target.
+    /// When omitted (`None`), all client query params *not* already pinned in `path` are forwarded.
+    /// When `Some([])`, no client query params are forwarded. Operator-pinned params in `path` always take precedence.
+    #[serde(default)]
+    pub forward_query: Option<Vec<String>>,
+    /// Client credential header names explicitly permitted to be forwarded to this target
+    /// (e.g. `["authorization"]` or `["cookie"]`). Case-insensitive. Defaults to `[]` (credentials stripped).
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+    /// Optional per-target timeout in milliseconds (overrides router `request_timeout_seconds` for this target).
+    pub timeout_ms: Option<u64>,
     /// Load balancing strategy for this target's upstreams.
     #[serde(default)]
     pub strategy: LbStrategy,
@@ -595,6 +646,7 @@ pub struct AggregateTargetConfig {
 /// The type of backend service being routed to.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RouteBackendType {
     /// Standard HTTP/REST backend (default).
     #[default]
@@ -614,6 +666,7 @@ pub enum RouteBackendType {
 
 /// A load balancing strategy for downstream forwarding.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LbStrategy {
     #[default]
     RoundRobin,
@@ -1036,25 +1089,37 @@ impl RouteTarget {
 
 /// A compiled fan-out sub-target within an aggregate [`ParsedRoute`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParsedAggregateTarget {
     /// Output JSON field name (and optional input payload sub-key).
     pub key: String,
+    /// Pre-serialized JSON object key prefix (`"\"<escaped_key>\":"`) for zero-copy response assembly.
+    pub json_key_prefix: Bytes,
     /// Sub-request backend protocol (`Rest` or `GrpcTranscoding`).
     pub backend_type: RouteBackendType,
     /// Load-balanced upstream pool and circuit breaker for this sub-target.
     pub target: Arc<RouteTarget>,
     /// Parsed target path and optional query string (e.g. `"/pkg.Service/Method"` or `"/v1/items"`).
     pub target_uri: Uri,
+    /// Pre-parsed query parameter names pinned in `target_uri` (operator precedence over client query).
+    pub pinned_query_keys: HashSet<String>,
     /// Optional HTTP method override for REST sub-requests.
     pub method: Option<Method>,
     /// Whether failure of this sub-target aborts the whole aggregated response.
     pub required: bool,
+    /// Optional allowlist of client query parameter names forwarded to this sub-target.
+    pub forward_query: Option<HashSet<String>>,
+    /// Lowercased client credential header names explicitly allowed to be forwarded to this sub-target.
+    pub forward_headers: HashSet<String>,
+    /// Optional per-target timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 /// A processed reverse-proxy route ready for use by the router.
 ///
 /// Created from [`RouteConfig`] during [`ServerConfig::finalize`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParsedRoute {
     /// The path prefix that triggers this route (e.g. `"/api"`).
     pub prefix: String,
@@ -1065,7 +1130,40 @@ pub struct ParsedRoute {
     /// The type of backend (rest, grpc, admin, or aggregate).
     pub backend_type: RouteBackendType,
     /// Fan-out sub-targets populated when `backend_type == RouteBackendType::Aggregate`.
-    pub aggregate_targets: Vec<ParsedAggregateTarget>,
+    pub aggregate_targets: Vec<Arc<ParsedAggregateTarget>>,
+    /// Payload distribution mode for `aggregate` routes (`Keyed` or `Broadcast`).
+    pub aggregate_payload_mode: AggregatePayloadMode,
+    /// Whether raw upstream error texts may be exposed to clients on `aggregate` routes.
+    pub expose_upstream_errors: bool,
+    /// Optional overall deadline in milliseconds for `aggregate` routes.
+    pub aggregate_deadline_ms: Option<u64>,
+    /// Maximum incoming request body size buffered in RAM for buffered-only routes.
+    pub max_request_bytes: usize,
+    /// Maximum cumulative response bytes buffered across all sub-targets of an `aggregate` route.
+    pub max_response_bytes: usize,
+}
+
+impl ParsedRoute {
+    /// Iterates over all active backend targets owned by this route without allocating.
+    ///
+    /// For regular single-target routes this yields one entry `(None, &self.backend_type, &self.target)`;
+    /// for [`RouteBackendType::Aggregate`] routes it yields one entry
+    /// `(Some(sub.key.as_str()), &sub.backend_type, &sub.target)` per configured sub-target.
+    pub fn iter_targets(
+        &self,
+    ) -> impl Iterator<Item = (Option<&str>, &RouteBackendType, &Arc<RouteTarget>)> {
+        let is_aggregate = self.backend_type == RouteBackendType::Aggregate;
+        let single = (!is_aggregate).then_some((None, &self.backend_type, &self.target));
+        let aggregate = is_aggregate
+            .then(|| {
+                self.aggregate_targets
+                    .iter()
+                    .map(|sub| (Some(sub.key.as_str()), &sub.backend_type, &sub.target))
+            })
+            .into_iter()
+            .flatten();
+        single.into_iter().chain(aggregate)
+    }
 }
 
 // --- Middleware Layer Structures ---
@@ -1075,6 +1173,7 @@ pub struct ParsedRoute {
 /// Each variant corresponds to a string in the `[Layers].enabled` TOML list
 /// and may carry configuration data extracted from sibling TOML sections.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MiddlewareLayer {
     /// Injects a Trace ID into requests for observability.
     TraceId,
@@ -1772,6 +1871,11 @@ impl ServerConfig {
     /// Returns an error on any validation failure, with a message identifying
     /// the offending server by name.
     pub fn finalize(&mut self) -> Result<(), Error> {
+        if self.name.trim().is_empty() {
+            return Err(Error::msg(
+                "Configuration error: Server 'name' must not be empty.",
+            ));
+        }
         self.static_name = Some(Box::leak(self.name.clone().into_boxed_str()));
         let server_name = self.name.clone();
         self.metrics = ServerMetrics::for_server(&server_name);
@@ -2034,7 +2138,7 @@ impl ServerConfig {
         prefix: &str,
         cfg: &RouteConfig,
         proto_str: &str,
-    ) -> Result<Vec<ParsedAggregateTarget>, Error> {
+    ) -> Result<Vec<Arc<ParsedAggregateTarget>>, Error> {
         if !cfg.upstreams.is_empty() {
             return Err(Error::msg(format!(
                 "Configuration error: Aggregate route '{}' must define 'targets' instead of top-level 'upstreams'.",
@@ -2147,14 +2251,53 @@ impl ServerConfig {
                 t.active_health_check_interval,
             )?;
 
-            parsed.push(ParsedAggregateTarget {
+            if t.timeout_ms == Some(0) {
+                return Err(Error::msg(format!(
+                    "Configuration error: Aggregate route '{}' target '{}' timeout_ms must be greater than 0.",
+                    prefix, key
+                )));
+            }
+
+            let forward_query = t
+                .forward_query
+                .as_ref()
+                .map(|list| list.iter().map(|s| s.trim().to_string()).collect());
+            let forward_headers = t
+                .forward_headers
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let escaped_key = serde_json::to_string(key).with_context(|| {
+                format!(
+                    "Configuration error: Aggregate route '{}' target '{}' key could not be JSON-encoded",
+                    prefix, key
+                )
+            })?;
+            let json_key_prefix = Bytes::from(format!("{escaped_key}:"));
+            let pinned_query_keys: HashSet<String> = target_uri
+                .query()
+                .filter(|q| !q.is_empty())
+                .map(|tq| {
+                    url::form_urlencoded::parse(tq.as_bytes())
+                        .map(|(k, _)| k.into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            parsed.push(Arc::new(ParsedAggregateTarget {
                 key: key.to_string(),
+                json_key_prefix,
                 backend_type: t.backend_type.clone(),
                 target: Arc::new(route_target),
                 target_uri,
+                pinned_query_keys,
                 method,
                 required: t.required,
-            });
+                forward_query,
+                forward_headers,
+                timeout_ms: t.timeout_ms,
+            }));
         }
 
         Ok(parsed)
@@ -2179,6 +2322,31 @@ impl ServerConfig {
             };
 
             for (prefix, cfg) in map {
+                if cfg.deadline_ms == Some(0) {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Route '{}' deadline_ms must be greater than 0.",
+                        prefix
+                    )));
+                }
+                if cfg.max_request_bytes == Some(0) {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Route '{}' max_request_bytes must be greater than 0.",
+                        prefix
+                    )));
+                }
+                if cfg.max_response_bytes == Some(0) {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Route '{}' max_response_bytes must be greater than 0.",
+                        prefix
+                    )));
+                }
+                let max_request_bytes = cfg
+                    .max_request_bytes
+                    .unwrap_or(DEFAULT_MAX_BUFFERED_REQUEST_BYTES);
+                let max_response_bytes = cfg
+                    .max_response_bytes
+                    .unwrap_or(DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES);
+
                 if cfg.backend_type == RouteBackendType::Aggregate {
                     let aggregate_targets =
                         Self::parse_aggregate_targets(prefix, cfg, proto_str)?;
@@ -2198,6 +2366,11 @@ impl ServerConfig {
                         allowed_roles: cfg.allowed_roles.clone(),
                         backend_type: cfg.backend_type.clone(),
                         aggregate_targets,
+                        aggregate_payload_mode: cfg.payload_mode,
+                        expose_upstream_errors: cfg.expose_upstream_errors,
+                        aggregate_deadline_ms: cfg.deadline_ms,
+                        max_request_bytes,
+                        max_response_bytes,
                     });
                     continue;
                 }
@@ -2232,6 +2405,11 @@ impl ServerConfig {
                     allowed_roles: cfg.allowed_roles.clone(),
                     backend_type: cfg.backend_type.clone(),
                     aggregate_targets: Vec::new(),
+                    aggregate_payload_mode: AggregatePayloadMode::default(),
+                    expose_upstream_errors: false,
+                    aggregate_deadline_ms: None,
+                    max_request_bytes,
+                    max_response_bytes,
                 });
             }
         }
@@ -3347,6 +3525,13 @@ mod tests {
 
     #[test]
     fn test_server_config_default_and_programmatic_finalize() {
+        let mut empty_name = ServerConfig {
+            ip: Some("127.0.0.1".into()),
+            port: Some(8080),
+            ..Default::default()
+        };
+        assert!(empty_name.finalize().is_err());
+
         let mut cfg = ServerConfig {
             name: "programmatic_test".into(),
             ip: Some("127.0.0.1".into()),

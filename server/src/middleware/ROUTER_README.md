@@ -52,7 +52,7 @@ Each incoming request passes through the `call()` method:
 5. **RBAC Enforcement** — Delegates to `rbac::enforce_rbac()`, evaluating fine-grained `[Server.rbac]` path rules (exact first, then longest-prefix) before falling back to route-level `allowed_roles`. Returns `403 Forbidden` on denial.
 6. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers, unconditionally strip untrusted client identity headers (`x-client-cert`, `x-client-roles`, etc.), sanitize `X-Forwarded-*` / `Forwarded`, and inject verified identity tokens.
 7. **Buffering Decision** — Determines if the request body should be streamed or buffered in memory (required for retries or transcoding).
-8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, or `grpc_web` based on the configured `RouteBackendType`.
+8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, `grpc_web`, `aggregator` (fan-out), or the built-in admin handler based on the configured `RouteBackendType`.
 
 ## Struct & API Reference
 
@@ -81,8 +81,9 @@ pub struct RouterService {
 
 | Module | Purpose |
 |--------|---------|
-| `http_proxy` | Handles standard REST/HTTP forwarding, URI rewrites, and retries. |
-| `grpc_passthrough` | Proxies pure gRPC traffic, fixing `te: trailers` and managing streaming. |
+| `http_proxy` | Handles standard REST/HTTP forwarding, URI rewrites, and retries. Hosts the shared failover engine `forward_with_failover` (retry loop, `ProbeGuard`/`ConnectionGuard`, outlier detection, OTel injection, client-fault isolation) parameterized by `ProxyMode::{Http, GrpcPassthrough}`. |
+| `grpc_passthrough` | Thin wrapper around `forward_with_failover(ProxyMode::GrpcPassthrough, …)`: enforces HTTP/2, strips hop-by-hop headers, sets `te: trailers`, retries any buffered request, applies gRPC outlier detection, and returns gRPC Trailers-Only error responses (`grpc-status`). |
+| `aggregator` | Fan-out route (`backend_type = "aggregate"`): splits a `GET`/`POST` request into concurrent `rest` / `grpc_transcoding` sub-requests (zero-copy keyed payload slicing, per-target query/header policies, `required` vs. optional targets, cumulative response cap) and assembles the JSON result (`null` + `_errors` for failed optional targets) via a zero-copy chunked body. Delegates the actual upstream calls to `http_proxy` and `grpc_web`. |
 | `grpc_web` | Handles dynamic JSON-to-Protobuf transcoding using non-blocking async reflection (`tokio::fs::read`), preserving `content-type: application/grpc` and `te: trailers`, propagating W3C `traceparent` (`HeaderInjector`) and `x-trace-id` headers end-to-end, enforcing `request_timeout_seconds`, and bounding upstream responses to `16 MiB` (`http_body_util::Limited`). |
 | `rbac` | Enforces Role-Based Access Control logic based on configured OIDs. |
 | `headers` | Prepares proxy headers, unconditionally strips client identity and forwarding headers, strips hop-by-hop headers, authoritatively sets `X-Forwarded-*` / `X-Real-IP`, and cleans upstream responses. |

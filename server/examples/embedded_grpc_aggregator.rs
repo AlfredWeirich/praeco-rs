@@ -14,11 +14,12 @@
 //!   Praeco Listener (`start_single_server`)
 //!          │  ├── ConnectionHandler (`cache-control: no-store`, peer IP, OID roles)
 //!          │  ├── PathSanitizerLayer (RFC 3986 traversal protection)
+//!          │  ├── TraceLayer         (OpenTelemetry spans & `ServerMetrics`)
 //!          │  ├── TraceIdLayer       (generates W3C `traceparent` / `x-trace-id`)
 //!          │  ├── IpFilterLayer      (CIDR allowlist `127.0.0.1/32`)
 //!          │  └── MaxPayloadLayer    (1 MiB body limit)
 //!          ▼
-//!   `wrap_tonic_routes` (`SyncBody` bridges `tonic::body::Body` -> `ServiceRespBody`)
+//!   `praeco_rs::wrap_tonic_routes` (bridges `tonic::body::Body` -> `ServiceRespBody`)
 //!          │
 //!          ▼
 //!   `AggregatorService` (`aggregator.DashboardService/GetDashboard`)
@@ -38,10 +39,10 @@
 //!    `..Default::default()` with `TraceId`, `IpFilter`, and `MaxPayload` layers
 //!    and validates/finalizes it via [`ServerConfig::finalize`].
 //! 3. **Assemble the Tower stack:** Wraps `tonic::service::Routes` in a
-//!    [`BoxedCloneService`] via [`wrap_tonic_routes`] (using [`SyncBody`] so
-//!    streaming `tonic` bodies satisfy Praeco's `Send + Sync` body bound),
-//!    applies the configured layers with [`apply_layers`], and places
-//!    [`PathSanitizerLayer`] on the outside (matching `build_service_stack`).
+//!    [`praeco_rs::BoxedCloneService`] via [`praeco_rs::wrap_tonic_routes`] and
+//!    applies the full Praeco hardening pipeline (configured layers,
+//!    `TraceLayer`/`ServerMetrics`, and `PathSanitizerLayer`) in a single call
+//!    to [`praeco_rs::build_service_stack_with_base`].
 //! 4. **Run the embedded gateway:** Starts [`start_single_server`] inside an
 //!    `ArcSwap` stack holder so hot-reloads remain possible at runtime.
 //! 5. **Send a real typed gRPC call:** Calls `/aggregator.DashboardService/GetDashboard`
@@ -81,7 +82,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use http_body_util::BodyExt;
 use hyper::{Request, Response};
 use prost::Message;
 use tokio::net::TcpListener;
@@ -93,13 +93,12 @@ use tonic::service::Routes;
 use tonic::transport::Endpoint;
 use tonic::{Request as TonicRequest, Response as TonicResponse, Status};
 use tonic_prost::ProstCodec;
-use tower::{Layer, Service};
+use tower::Service;
 
 use praeco_rs::{
-    BoxCloneSyncServiceExt, BoxedCloneService, ServiceRespBody, SrvBody, SrvError, apply_layers,
+    build_service_stack_with_base,
     configuration::{IpFilterConfig, Layers, MaxPayloadConfig, Protocol, ServerConfig},
-    middleware::PathSanitizerLayer,
-    start_single_server,
+    start_single_server, wrap_tonic_routes,
 };
 
 // ============================================================================
@@ -349,77 +348,6 @@ impl Service<Request<TonicBody>> for AggregatorService {
 }
 
 // ============================================================================
-//  Bridge: tonic::service::Routes <-> praeco_rs::BoxedCloneService
-// ============================================================================
-
-/// Zero-cost `Sync` adapter for `tonic::body::Body` (which wraps `UnsyncBoxBody`),
-/// allowing streaming gRPC responses to fit `praeco_rs::ServiceRespBody` (`Send + Sync`).
-struct SyncBody<B>(std::sync::Mutex<B>);
-
-impl<B> http_body::Body for SyncBody<B>
-where
-    B: http_body::Body + Unpin + Send,
-    B::Error: std::fmt::Display,
-{
-    type Data = B::Data;
-    type Error = SrvError;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let inner = self
-            .get_mut()
-            .0
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        Pin::new(inner)
-            .poll_frame(cx)
-            .map_err(|e| SrvError::Other(e.to_string()))
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.0
-            .lock()
-            .map(|b| b.is_end_stream())
-            .unwrap_or(false)
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.0
-            .lock()
-            .map(|b| b.size_hint())
-            .unwrap_or_default()
-    }
-}
-
-/// Adapts a `tonic::service::Routes` router into a [`BoxedCloneService`] compatible
-/// with Praeco's [`apply_layers`] pipeline.
-///
-/// Converts `SrvBody` -> `tonic::body::Body` on the way in and wraps the resulting
-/// `tonic::body::Body` in [`SyncBody`] on the way out so gRPC responses stream
-/// without full-message buffering.
-fn wrap_tonic_routes(routes: Routes) -> BoxedCloneService {
-    let svc = routes.prepare();
-    tower::service_fn(move |req: Request<SrvBody>| {
-        let mut svc = svc.clone();
-        async move {
-            let (parts, body) = req.into_parts();
-            let tonic_body =
-                TonicBody::new(body.map_err(|e| Status::internal(e.to_string())));
-            let tonic_req = Request::from_parts(parts, tonic_body);
-
-            let res = svc.call(tonic_req).await.unwrap_or_else(|e| match e {});
-            let (res_parts, res_body) = res.into_parts();
-            let boxed_resp: ServiceRespBody =
-                SyncBody(std::sync::Mutex::new(res_body)).boxed();
-            Ok::<_, SrvError>(Response::from_parts(res_parts, boxed_resp))
-        }
-    })
-    .boxed_clone_sync()
-}
-
-// ============================================================================
 //  Helpers to spawn local backend tonic servers & pick a free port
 // ============================================================================
 
@@ -498,31 +426,14 @@ async fn main() -> anyhow::Result<()> {
     cfg.finalize()?;
     let server_cfg = Arc::new(cfg);
 
-    let static_name = server_cfg.static_name.expect("set by finalize()");
-    let layers = server_cfg.layers.build_middleware_layers(&server_cfg.name)?;
-    let allowed_paths = server_cfg
-        .compiled_allowed_pathes
-        .as_ref()
-        .expect("set by finalize()")
-        .clone();
-
-    // 3. Wrap the typed tonic aggregator with Praeco's middleware stack
+    // 3. Wrap the typed tonic aggregator with Praeco's full middleware stack
+    //    (configured layers + TraceLayer/ServerMetrics + PathSanitizerLayer)
     let routes = Routes::new(AggregatorService {
         user_channel,
         order_channel,
     });
     let base_svc = wrap_tonic_routes(routes);
-    let stacked = apply_layers(
-        base_svc,
-        layers,
-        static_name,
-        allowed_paths,
-        gateway_port,
-        Arc::new(server_cfg.oid_mapping.clone()),
-    )?;
-    let hardened = PathSanitizerLayer::new(static_name)
-        .layer(stacked)
-        .boxed_clone_sync();
+    let hardened = build_service_stack_with_base(&server_cfg, base_svc)?;
 
     // 4. Start Praeco's listener via start_single_server
     let dynamic_stack = Arc::new(ArcSwap::from_pointee(hardened));

@@ -112,21 +112,94 @@ where
     BoxCloneSyncService::new(svc)
 }
 
-/// Builds the complete `tower::Service` stack for a single server instance.
+/// Zero-cost `Sync` adapter for `tonic::body::Body` (which wraps `UnsyncBoxBody`),
+/// allowing streaming gRPC responses to fit [`ServiceRespBody`] (`Send + Sync`).
+struct TonicSyncBody<B>(std::sync::Mutex<B>);
+
+impl<B> http_body::Body for TonicSyncBody<B>
+where
+    B: http_body::Body + Unpin + Send,
+    B::Error: std::fmt::Display,
+{
+    type Data = B::Data;
+    type Error = SrvError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let inner = self
+            .get_mut()
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::pin::Pin::new(inner)
+            .poll_frame(cx)
+            .map_err(|e| SrvError::Other(e.to_string()))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0
+            .lock()
+            .map(|b| b.is_end_stream())
+            .unwrap_or(false)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.0
+            .lock()
+            .map(|b| b.size_hint())
+            .unwrap_or_default()
+    }
+}
+
+/// Adapts a `tonic::service::Routes` router into a [`BoxedCloneService`] compatible
+/// with [`build_service_stack_with_base`] and [`apply_layers`].
 ///
-/// This function takes a finalized [`ServerConfig`] and constructs a [`BoxedCloneService`]
-/// by instantiating the configured base service (`Echo`, `Router`, `Admin`, `Idp`, or
-/// `StaticFiles`), wrapping it with all configured middleware layers via [`apply_layers`],
-/// enforcing RFC 3986 path canonicalization via [`PathSanitizerLayer`], and attaching
-/// OpenTelemetry request tracing.
+/// Maps Praeco's `PayloadTooLarge` and `DecompressionLimitExceeded` errors to gRPC
+/// `RESOURCE_EXHAUSTED` (status code 8) and streams response bodies via an internal
+/// `Sync` adapter without full-message buffering.
+pub fn wrap_tonic_routes(routes: tonic::service::Routes) -> BoxedCloneService {
+    use tower::Service;
+
+    let svc = routes.prepare();
+    tower::service_fn(move |req: hyper::Request<SrvBody>| {
+        let mut svc = svc.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let tonic_body = tonic::body::Body::new(body.map_err(|e| match e {
+                SrvError::PayloadTooLarge { .. } | SrvError::DecompressionLimitExceeded { .. } => {
+                    tonic::Status::resource_exhausted(e.to_string())
+                }
+                SrvError::ClientAborted(msg) => tonic::Status::cancelled(msg),
+                other => tonic::Status::internal(other.to_string()),
+            }));
+            let tonic_req = hyper::Request::from_parts(parts, tonic_body);
+
+            let res = svc.call(tonic_req).await.unwrap_or_else(|e| match e {});
+            let (res_parts, res_body) = res.into_parts();
+            let boxed_resp: crate::ServiceRespBody =
+                TonicSyncBody(std::sync::Mutex::new(res_body)).boxed();
+            Ok::<_, SrvError>(hyper::Response::from_parts(res_parts, boxed_resp))
+        }
+    })
+    .boxed_clone_sync()
+}
+
+/// Wraps an arbitrary custom `base_service` (e.g. a [`wrap_tonic_routes`]-adapted `tonic`
+/// server) with Praeco's complete middleware pipeline: configured [`apply_layers`],
+/// mandatory [`PathSanitizerLayer`], OpenTelemetry parent-context `TraceLayer`, and
+/// [`ServerMetrics`] request/response telemetry.
 ///
 /// # Errors
 ///
 /// Returns [`SrvError::Other`] if the configuration is not finalized (e.g. missing
-/// `compiled_allowed_pathes` or `static_name`) or if any middleware/service fails to
-/// initialize.
+/// `compiled_allowed_pathes` or `static_name`) or if any middleware fails to initialize.
 #[tracing::instrument(skip_all, fields(server = %server_config.name), err)]
-pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneService, SrvError> {
+pub fn build_service_stack_with_base(
+    server_config: &Arc<ServerConfig>,
+    base_service: BoxedCloneService,
+) -> Result<BoxedCloneService, SrvError> {
     let layers = server_config
         .layers
         .build_middleware_layers(&server_config.name)
@@ -145,54 +218,6 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
     let static_name = server_config
         .static_name
         .ok_or_else(|| SrvError::Other(format!("{}: static_name missing", server_config.name)))?;
-
-    let base_service = match server_config.service {
-        ServiceType::Echo => EchoService::new(static_name).boxed_clone_sync(),
-        ServiceType::Router => RouterService::new(server_config.clone())
-            .map_err(|e| SrvError::Other(e.to_string()))?
-            .boxed_clone_sync(),
-        ServiceType::Admin => AdminService::new(Some(server_config.clone())).boxed_clone_sync(),
-        ServiceType::Idp => {
-            let params = server_config
-                .idp_params
-                .as_ref()
-                .ok_or_else(|| SrvError::Other(format!("{}: IdpParams missing", server_config.name)))?
-                .clone();
-            let idp_service = IdpService::new(params, static_name)
-                .map_err(|e| SrvError::Other(e.to_string()))?;
-            BoxCloneSyncService::new(idp_service)
-        }
-        ServiceType::StaticFiles => {
-            let params = server_config
-                .static_files_params
-                .as_ref()
-                .ok_or_else(|| {
-                    SrvError::Other(format!("{}: StaticFilesParams missing", server_config.name))
-                })?
-                .clone();
-
-            let abs_root = std::fs::canonicalize(&params.root)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&params.root));
-
-            info!(
-                "Static File Server '{}' serving from: {} (fallback_to_index: {})",
-                server_config.name,
-                abs_root.display(),
-                params.fallback_to_index
-            );
-
-            let serve_dir = tower_http::services::ServeDir::new(&params.root);
-
-            if params.fallback_to_index {
-                let index_path = format!("{}/index.html", params.root.trim_end_matches('/'));
-                let fallback =
-                    serve_dir.fallback(tower_http::services::ServeFile::new(index_path));
-                wrap_serve_dir(fallback)
-            } else {
-                wrap_serve_dir(serve_dir)
-            }
-        }
-    };
 
     let has_sanitizer = layers
         .iter()
@@ -266,6 +291,77 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
         .service(sanitized);
 
     Ok(traced.boxed_clone_sync())
+}
+
+/// Builds the complete `tower::Service` stack for a single server instance.
+///
+/// This function takes a finalized [`ServerConfig`] and constructs a [`BoxedCloneService`]
+/// by instantiating the built-in base service selected by `server_config.service`
+/// (`Echo`, `Router`, `Admin`, `Idp`, or `StaticFiles`) and delegating to
+/// [`build_service_stack_with_base`], which wraps it with all configured middleware layers
+/// via [`apply_layers`], enforces RFC 3986 path canonicalization via [`PathSanitizerLayer`],
+/// and attaches OpenTelemetry request tracing and [`ServerMetrics`] telemetry.
+///
+/// # Errors
+///
+/// Returns [`SrvError::Other`] if the configuration is not finalized (e.g. missing
+/// `compiled_allowed_pathes` or `static_name`) or if any middleware/service fails to
+/// initialize.
+#[tracing::instrument(skip_all, fields(server = %server_config.name), err)]
+pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedCloneService, SrvError> {
+    let static_name = server_config
+        .static_name
+        .ok_or_else(|| SrvError::Other(format!("{}: static_name missing", server_config.name)))?;
+
+    let base_service = match server_config.service {
+        ServiceType::Echo => EchoService::new(static_name).boxed_clone_sync(),
+        ServiceType::Router => RouterService::new(server_config.clone())
+            .map_err(|e| SrvError::Other(e.to_string()))?
+            .boxed_clone_sync(),
+        ServiceType::Admin => AdminService::new(Some(server_config.clone())).boxed_clone_sync(),
+        ServiceType::Idp => {
+            let params = server_config
+                .idp_params
+                .as_ref()
+                .ok_or_else(|| SrvError::Other(format!("{}: IdpParams missing", server_config.name)))?
+                .clone();
+            let idp_service = IdpService::new(params, static_name)
+                .map_err(|e| SrvError::Other(e.to_string()))?;
+            BoxCloneSyncService::new(idp_service)
+        }
+        ServiceType::StaticFiles => {
+            let params = server_config
+                .static_files_params
+                .as_ref()
+                .ok_or_else(|| {
+                    SrvError::Other(format!("{}: StaticFilesParams missing", server_config.name))
+                })?
+                .clone();
+
+            let abs_root = std::fs::canonicalize(&params.root)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&params.root));
+
+            info!(
+                "Static File Server '{}' serving from: {} (fallback_to_index: {})",
+                server_config.name,
+                abs_root.display(),
+                params.fallback_to_index
+            );
+
+            let serve_dir = tower_http::services::ServeDir::new(&params.root);
+
+            if params.fallback_to_index {
+                let index_path = format!("{}/index.html", params.root.trim_end_matches('/'));
+                let fallback =
+                    serve_dir.fallback(tower_http::services::ServeFile::new(index_path));
+                wrap_serve_dir(fallback)
+            } else {
+                wrap_serve_dir(serve_dir)
+            }
+        }
+    };
+
+    build_service_stack_with_base(server_config, base_service)
 }
 
 /// Applies the configured middleware layers to the base service.

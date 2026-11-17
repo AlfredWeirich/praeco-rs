@@ -349,19 +349,11 @@ pub fn spawn_router_health_checks(
     };
 
     // --- 3. Active Health Check Initialization ---
-    let mut monitored_targets: Vec<(&RouteBackendType, &Arc<crate::configuration::RouteTarget>)> =
-        Vec::new();
-    for route in &server_config.parsed_routes {
-        if route.backend_type == RouteBackendType::Aggregate {
-            for sub in &route.aggregate_targets {
-                monitored_targets.push((&sub.backend_type, &sub.target));
-            }
-        } else {
-            monitored_targets.push((&route.backend_type, &route.target));
-        }
-    }
-
-    for (backend_type, target_ref) in monitored_targets {
+    for (_, backend_type, target_ref) in server_config
+        .parsed_routes
+        .iter()
+        .flat_map(|route| route.iter_targets())
+    {
         let interval = target_ref.active_health_check_interval;
         if interval == 0 {
             continue;

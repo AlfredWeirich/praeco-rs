@@ -672,13 +672,22 @@ allowed_roles = ["Admin", "Seller"]
 
 An `aggregate` route accepts a single client `GET` or `POST` request, fans it out concurrently to multiple `rest` and `grpc_transcoding` backend targets (each with its own load balancer, 3-state circuit breaker, active health checks, and reflection cache), and assembles their JSON payloads into one response object keyed by `target.key`.
 
-- **`POST` payloads:** If the request JSON is an object containing keys matching `target.key` (e.g. `{"user": {"user_id": "42"}}`), each target receives its sub-object; otherwise all targets receive the full JSON payload.
-- **`GET` query parameters:** Passed to `rest` targets as query parameters and automatically converted to a JSON object (e.g. `?user_id=42` $\rightarrow$ `{"user_id": "42"}`) for `grpc_transcoding` targets.
-- **Partial failures:** Targets with `required = true` (default) abort remaining sub-requests immediately on failure and return `502`/`504`. Targets with `required = false` degrade gracefully with `"<key>": null` and an `"_errors": { "<key>": { "status": ..., "message": ... } }` entry.
+- **`POST` payloads (`payload_mode`):** Defaults to `"keyed"` (fail-closed: the request body must be a JSON object whose top-level keys match configured `target.key` values; each target receives only `body[target.key]`, and targets whose key is omitted receive `{}` — never sibling targets' payloads). Set `payload_mode = "broadcast"` to forward the full request body unchanged to all targets.
+- **`GET` query parameters & `forward_query`:** Operator-pinned query parameters in `target.path` always take precedence (conflicting client query keys are dropped to prevent parameter pollution). Optionally set `forward_query = ["user_id"]` per target to restrict forwarded client params (`[]` disables forwarding). For `grpc_transcoding` targets, effective query parameters are automatically converted to a JSON object (e.g. `?user_id=42` $\rightarrow$ `{"user_id": "42"}`).
+- **Headers & credentials (`forward_headers`):** Conditional/range headers (`If-None-Match`, `If-Modified-Since`, `Range`, …) are always stripped so no single sub-request turns the aggregate into `304`/`206`. Client `Authorization` and `Cookie` headers are stripped by default unless explicitly listed in a target's `forward_headers` (gateway-injected `[Server.RouterParams].jwt` tokens are preserved).
+- **Partial failures (`expose_upstream_errors`):** Targets with `required = true` (default) abort remaining sub-requests immediately on failure and return `502`/`504`. Targets with `required = false` degrade gracefully with `"<key>": null` and an `"_errors": { "<key>": { "status": ..., "message": ... } }` entry. Raw upstream error texts are logged on the server and replaced with canonical HTTP reason phrases by default (`expose_upstream_errors = false`).
+
+- **Deadlines & Memory Limits (`timeout_ms`, `deadline_ms`, `max_request_bytes`, `max_response_bytes`):** Set `timeout_ms` per target and/or `deadline_ms` on the route so slow optional targets degrade to `504` instead of holding back the whole response. Incoming buffered request bodies are capped by `max_request_bytes` (default: 4 MiB, returning `413 Payload Too Large`), and cumulative sub-responses across all targets are capped by `max_response_bytes` (default: 16 MiB).
+- **gRPC Status Mapping:** For `grpc_transcoding` targets, non-zero `grpc-status` headers/trailers (both Trailers-Only and trailing error frames after data) are mapped to HTTP statuses (`NOT_FOUND` $\rightarrow$ `404`, `UNAVAILABLE` $\rightarrow$ `503`, `DEADLINE_EXCEEDED` $\rightarrow$ `504`, `PERMISSION_DENIED` $\rightarrow$ `403`, `UNAUTHENTICATED` $\rightarrow$ `401`, etc.) and reported with `"grpc_status"` inside `"_errors"`.
 
 ```toml
 [Server.ReverseRoutes."/api/dashboard"]
 backend_type = "aggregate"
+payload_mode = "keyed"          # "keyed" (default) or "broadcast"
+expose_upstream_errors = false  # default: sanitized HTTP reason phrases only
+deadline_ms = 2000              # optional route-wide deadline
+max_request_bytes = 1048576     # optional request cap (default: 4 MiB)
+max_response_bytes = 8388608    # optional cumulative response cap (default: 16 MiB)
 allowed_roles = ["Admin", "Seller"]
 
 [[Server.ReverseRoutes."/api/dashboard".targets]]
@@ -686,14 +695,18 @@ key = "user"
 backend_type = "grpc_transcoding"
 upstreams = ["https://127.0.0.1:50051"]
 path = "/user.UserService/GetUser"
+timeout_ms = 1000
 required = true
 
 [[Server.ReverseRoutes."/api/dashboard".targets]]
 key = "notifications"
 backend_type = "rest"
 upstreams = ["http://127.0.0.1:8081"]
-path = "/v1/notifications"
+path = "/v1/notifications?tenant=acme"
 method = "GET"
+timeout_ms = 500
+forward_query = ["limit"]       # optional allowlist (never overrides tenant=acme)
+forward_headers = []            # optional credential allowlist (e.g. ["authorization"])
 required = false
 ```
 

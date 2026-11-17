@@ -284,27 +284,20 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
             if route.backend_type == RouteBackendType::Admin {
                 continue;
             }
-            if route.backend_type == RouteBackendType::Aggregate {
-                for sub in &route.aggregate_targets {
-                    summary.total_routes += 1;
-                    routes.push(collect_route_target_status(
-                        format!("{} [target:{}]", route.prefix, sub.key),
-                        &sub.backend_type,
-                        &sub.target,
-                        now_unix,
-                        &mut summary,
-                    ));
-                }
-                continue;
-            }
             summary.total_routes += 1;
-            routes.push(collect_route_target_status(
-                route.prefix.clone(),
-                &route.backend_type,
-                &route.target,
-                now_unix,
-                &mut summary,
-            ));
+            for (sub_key, backend_type, target) in route.iter_targets() {
+                let display_prefix = match sub_key {
+                    Some(k) => format!("{} [target:{}]", route.prefix, k),
+                    None => route.prefix.clone(),
+                };
+                routes.push(collect_route_target_status(
+                    display_prefix,
+                    backend_type,
+                    target,
+                    now_unix,
+                    &mut summary,
+                ));
+            }
         }
 
         servers.push(AdminServerStatus {
@@ -603,21 +596,17 @@ fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerCon
 
     for srv in &servers_iter {
         for route in &srv.parsed_routes {
-            let nodes = route.target.upstreams.iter().chain(
-                route
-                    .aggregate_targets
-                    .iter()
-                    .flat_map(|sub| sub.target.upstreams.iter()),
-            );
-            for node in nodes {
-                let node_uri_str = node.uri.to_string();
-                if node_uri_str == up_str
-                    || node_uri_str.trim_end_matches('/') == up_str.trim_end_matches('/')
-                {
-                    match act {
-                        "mark_dead" | "open" => node.mark_dead(),
-                        "mark_alive" | "close" | "reset" => node.mark_alive(),
-                        _ => {}
+            for (_, _, target) in route.iter_targets() {
+                for node in &target.upstreams {
+                    let node_uri_str = node.uri.to_string();
+                    if node_uri_str == up_str
+                        || node_uri_str.trim_end_matches('/') == up_str.trim_end_matches('/')
+                    {
+                        match act {
+                            "mark_dead" | "open" => node.mark_dead(),
+                            "mark_alive" | "close" | "reset" => node.mark_alive(),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -965,6 +954,11 @@ mod tests {
             allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
             aggregate_targets: Vec::new(),
+            aggregate_payload_mode: crate::configuration::AggregatePayloadMode::default(),
+            expose_upstream_errors: false,
+            aggregate_deadline_ms: None,
+            max_request_bytes: crate::configuration::DEFAULT_MAX_BUFFERED_REQUEST_BYTES,
+            max_response_bytes: crate::configuration::DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES,
         };
 
         let toml_str = r#"
@@ -1230,7 +1224,7 @@ mod tests {
         srv.finalize().unwrap();
 
         let status = collect_admin_status(Some(&srv));
-        assert_eq!(status.summary.total_routes, 2);
+        assert_eq!(status.summary.total_routes, 1);
         assert_eq!(status.summary.total_upstreams, 2);
         let routes = &status.servers[0].routes;
         assert_eq!(routes[0].prefix, "/api/dashboard [target:user]");

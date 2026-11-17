@@ -47,32 +47,83 @@ use tracing::{error, warn};
 use super::{RequestBody, build_error_response};
 use crate::{
     ServiceRespBody, SrvError,
-    configuration::{ParsedRoute, ServerConfig},
+    configuration::{RouteTarget, ServerConfig},
 };
 
-/// Transcodes an incoming HTTP/JSON request into a binary HTTP/2 gRPC call,
-/// dispatches it to a load-balanced upstream node, and translates the binary
-/// Protobuf response back into `application/json`.
+/// Maps a canonical gRPC status code to an HTTP status code.
+fn map_grpc_status_to_http(code: u32) -> StatusCode {
+    match code {
+        0 => StatusCode::OK,
+        3 | 9 | 11 => StatusCode::BAD_REQUEST,       // INVALID_ARGUMENT, FAILED_PRECONDITION, OUT_OF_RANGE
+        4 => StatusCode::GATEWAY_TIMEOUT,            // DEADLINE_EXCEEDED
+        5 => StatusCode::NOT_FOUND,                  // NOT_FOUND
+        6 | 10 => StatusCode::CONFLICT,              // ALREADY_EXISTS, ABORTED
+        7 => StatusCode::FORBIDDEN,                  // PERMISSION_DENIED
+        8 => StatusCode::TOO_MANY_REQUESTS,          // RESOURCE_EXHAUSTED
+        12 => StatusCode::NOT_IMPLEMENTED,           // UNIMPLEMENTED
+        14 => StatusCode::SERVICE_UNAVAILABLE,       // UNAVAILABLE
+        16 => StatusCode::UNAUTHORIZED,              // UNAUTHENTICATED
+        _ => StatusCode::BAD_GATEWAY,                // CANCELLED, UNKNOWN, INTERNAL, DATA_LOSS, etc.
+    }
+}
+
+/// Extracts `(grpc-status, optional decoded grpc-message)` from an HTTP/2 header or trailer map.
+fn extract_grpc_status(headers: &hyper::HeaderMap) -> Option<(u32, Option<String>)> {
+    let code = headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())?;
+    let message = headers
+        .get("grpc-message")
+        .and_then(|v| v.to_str().ok())
+        .map(|raw| {
+            urlencoding::decode(raw)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| raw.to_string())
+        })
+        .filter(|s| !s.is_empty());
+    Some((code, message))
+}
+
+/// Builds a synthetic HTTP error response for a non-zero gRPC status code and preserves
+/// the numeric `grpc-status` header for downstream inspection (e.g. `aggregator.rs`).
+fn build_grpc_status_error(code: u32, message: Option<String>) -> Response<ServiceRespBody> {
+    let http_status = map_grpc_status_to_http(code);
+    let body_text = message.unwrap_or_else(|| {
+        http_status
+            .canonical_reason()
+            .unwrap_or("gRPC Error")
+            .to_string()
+    });
+    let mut resp = build_error_response(&body_text, http_status);
+    if let Ok(hv) = header::HeaderValue::from_str(&code.to_string()) {
+        resp.headers_mut().insert("grpc-status", hv);
+    }
+    resp
+}
+
+/// Handles a single JSON-to-gRPC transcoded request (`backend_type = "grpc_transcoding"`).
 ///
 /// # Arguments
 ///
-/// * `route_info` – The matched [`ParsedRoute`] containing upstream nodes, retry policy,
-///   and the RwLock-protected gRPC reflection [`DescriptorPool`] cache.
-/// * `request_body` – The buffered JSON request payload from the client.
-/// * `original_method` – The HTTP method of the incoming request (must be `POST`).
-/// * `prepared_headers` – Sanitized proxy headers (including forwarded identity and trace headers).
-/// * `original_uri` – The original request URI whose path identifies `/<Service>/<Method>`.
+/// * `target` – Upstream pool (`RouteTarget`) with load balancer and cached reflection `DescriptorPool`.
+/// * `request_body` – Buffered JSON payload from the client.
+/// * `original_method` – Incoming HTTP method (must be `POST`).
+/// * `prepared_headers` – Sanitized proxy headers including trace and identity headers.
+/// * `original_uri` – Incoming URI encoding `/<Package.Service>/<Method>`.
 /// * `client_addr` – Optional peer socket address used for sticky load-balancing.
 /// * `server_name` – Static server identifier for structured logging and diagnostics.
 /// * `grpc_client` – Shared HTTP/2-only Hyper client configured with upstream TLS/mTLS.
 /// * `config` – Reference to the enclosing [`ServerConfig`] for timeout and reflection parameters.
+/// * `timeout_override` – Optional per-call deadline overriding `config.router_params.request_timeout_seconds`.
 ///
 /// # Returns
 ///
 /// Returns an HTTP [`Response<ServiceRespBody>`] with `content-type: application/json` on success,
-/// or an appropriate synthetic HTTP error status (`400`, `404`, `502`, `504`) on failure.
+/// or an appropriate synthetic HTTP error status (`400`, `401`, `403`, `404`, `409`, `429`, `501`, `502`, `503`, `504`) on failure.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_grpc_web(
-    route_info: &ParsedRoute,
+    target: &Arc<RouteTarget>,
     request_body: RequestBody, // not mut since GrpcWeb buffers only
     original_method: Method,
     mut prepared_headers: hyper::HeaderMap,
@@ -84,9 +135,10 @@ pub async fn handle_grpc_web(
         ServiceRespBody,
     >,
     config: &ServerConfig,
+    timeout_override: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
-    let max_retries = route_info.target.max_retries;
+    let max_retries = target.max_retries;
     let mut attempts = 0;
 
     loop {
@@ -97,14 +149,10 @@ pub async fn handle_grpc_web(
         };
         attempts += 1;
 
-        let upstream_node = route_info
-            .target
-            .next_upstream(client_addr.as_ref(), &failed_nodes);
+        let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
-        let _conn_guard = super::upstreams::ConnectionGuard::new(
-            route_info.target.clone(),
-            backend_base_uri.clone(),
-        );
+        let _conn_guard =
+            super::upstreams::ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
         if let Some(auth) = backend_base_uri.authority() {
             if let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
@@ -120,7 +168,7 @@ pub async fn handle_grpc_web(
 
         // 1. Fast path: check if cached pool is valid under read lock
         let mut pool_opt = {
-            let read_guard = route_info.target.grpc_pool.read().await;
+            let read_guard = target.grpc_pool.read().await;
             if let Some(cached) = &*read_guard {
                 if cached.created_at.elapsed() < reflection_ttl {
                     Some(cached.pool.clone())
@@ -134,11 +182,11 @@ pub async fn handle_grpc_web(
 
         // 2. Slow path: fetch reflection without holding write lock across network I/O
         if pool_opt.is_none() {
-            let _fetch_guard = route_info.target.grpc_reflection_lock.lock().await;
+            let _fetch_guard = target.grpc_reflection_lock.lock().await;
 
             // Double check if another task refreshed it while we waited for the fetch lock
             let recheck = {
-                let read_guard = route_info.target.grpc_pool.read().await;
+                let read_guard = target.grpc_pool.read().await;
                 if let Some(cached) = &*read_guard {
                     if cached.created_at.elapsed() < reflection_ttl {
                         Some(cached.pool.clone())
@@ -155,7 +203,7 @@ pub async fn handle_grpc_web(
             } else {
                 match build_grpc_pool(&upstream_node.uri, config.router_params.as_ref()).await {
                     Ok(new_pool) => {
-                        let mut write_guard = route_info.target.grpc_pool.write().await;
+                        let mut write_guard = target.grpc_pool.write().await;
                         *write_guard = Some(crate::configuration::CachedDescriptorPool {
                             pool: new_pool.clone(),
                             created_at: std::time::Instant::now(),
@@ -168,7 +216,7 @@ pub async fn handle_grpc_web(
                             server_name, e
                         );
                         // Stale-while-revalidate fallback: if we have an expired pool, use it rather than failing
-                        let read_guard = route_info.target.grpc_pool.read().await;
+                        let read_guard = target.grpc_pool.read().await;
                         if let Some(cached) = &*read_guard {
                             warn!(
                                 "{}: Using stale gRPC reflection schema due to upstream fetch failure",
@@ -241,18 +289,16 @@ pub async fn handle_grpc_web(
             }
         };
 
-        let mut protobuf_payload = BytesMut::new();
-        if let Err(e) = dynamic_req_msg.encode(&mut protobuf_payload) {
+        let encoded_len = dynamic_req_msg.encoded_len();
+        let mut grpc_frame = BytesMut::with_capacity(5 + encoded_len);
+        grpc_frame.put_u8(0);
+        grpc_frame.put_u32(encoded_len as u32);
+        if let Err(e) = dynamic_req_msg.encode(&mut grpc_frame) {
             return Ok(build_error_response(
                 &format!("Encode error: {}", e),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
-
-        let mut grpc_frame = BytesMut::with_capacity(5 + protobuf_payload.len());
-        grpc_frame.put_u8(0);
-        grpc_frame.put_u32(protobuf_payload.len() as u32);
-        grpc_frame.put_slice(&protobuf_payload);
 
         let boxed_body: ServiceRespBody = Full::new(grpc_frame.freeze())
             .map_err(SrvError::from)
@@ -331,14 +377,16 @@ pub async fn handle_grpc_web(
             proxy_req.headers_mut().entry("x-trace-id").or_insert(trace_id);
         }
 
-        let req_timeout = config
-            .router_params
-            .as_ref()
-            .and_then(|p| {
-                (p.request_timeout_seconds > 0)
-                    .then(|| std::time::Duration::from_secs(p.request_timeout_seconds))
-            })
-            .unwrap_or(std::time::Duration::from_secs(30));
+        let req_timeout = timeout_override.unwrap_or_else(|| {
+            config
+                .router_params
+                .as_ref()
+                .and_then(|p| {
+                    (p.request_timeout_seconds > 0)
+                        .then(|| std::time::Duration::from_secs(p.request_timeout_seconds))
+                })
+                .unwrap_or(std::time::Duration::from_secs(30))
+        });
 
         let req_start = std::time::Instant::now();
         let req_result = match tokio::time::timeout(req_timeout, grpc_client.request(proxy_req)).await {
@@ -365,15 +413,27 @@ pub async fn handle_grpc_web(
                     ));
                 }
 
+                // Check Trailers-Only gRPC error status in initial HTTP/2 response headers
+                if let Some((grpc_code, grpc_msg)) = extract_grpc_status(res.headers())
+                    && grpc_code != 0
+                {
+                    if grpc_code == 14 {
+                        target.record_failure(backend_base_uri);
+                    }
+                    return Ok(build_grpc_status_error(grpc_code, grpc_msg));
+                }
+
                 const MAX_GRPC_WEB_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+                let remaining_timeout = req_timeout.saturating_sub(req_start.elapsed());
                 let collect_res = tokio::time::timeout(
-                    req_timeout,
-                    http_body_util::Limited::new(res.body_mut(), MAX_GRPC_WEB_RESPONSE_BYTES).collect(),
+                    remaining_timeout,
+                    http_body_util::Limited::new(res.body_mut(), MAX_GRPC_WEB_RESPONSE_BYTES)
+                        .collect(),
                 )
                 .await;
 
-                let res_body_bytes = match collect_res {
-                    Ok(Ok(c)) => c.to_bytes(),
+                let collected = match collect_res {
+                    Ok(Ok(c)) => c,
                     Ok(Err(e)) => {
                         return Ok(build_error_response(
                             &format!("Failed to read gRPC body: {}", e),
@@ -387,6 +447,19 @@ pub async fn handle_grpc_web(
                         ));
                     }
                 };
+
+                // Check gRPC status in HTTP/2 trailing headers BEFORE accepting body data frames
+                if let Some(trailers) = collected.trailers()
+                    && let Some((grpc_code, grpc_msg)) = extract_grpc_status(trailers)
+                    && grpc_code != 0
+                {
+                    if grpc_code == 14 {
+                        target.record_failure(backend_base_uri);
+                    }
+                    return Ok(build_grpc_status_error(grpc_code, grpc_msg));
+                }
+
+                let res_body_bytes = collected.to_bytes();
 
                 if res_body_bytes.len() < 5 {
                     return Ok(build_error_response(
@@ -418,8 +491,8 @@ pub async fn handle_grpc_web(
                     ));
                 }
 
-                let response_json = match serde_json::to_string(&dynamic_res_msg) {
-                    Ok(s) => s,
+                let response_json = match serde_json::to_vec(&dynamic_res_msg) {
+                    Ok(v) => v,
                     Err(e) => {
                         return Ok(build_error_response(
                             &format!("JSON encode error: {}", e),
@@ -443,7 +516,7 @@ pub async fn handle_grpc_web(
                     "{}: Backend connection failed to {}: {}",
                     server_name, backend_base_uri, e
                 );
-                route_info.target.mark_dead(backend_base_uri);
+                target.mark_dead(backend_base_uri);
                 failed_nodes.push(backend_base_uri.clone());
 
                 if attempts <= max_retries {
@@ -690,9 +763,7 @@ mod tests {
     //  End-to-end tests for the JSON -> gRPC transcoding path ([F-09])
     // ------------------------------------------------------------------------
 
-    use crate::configuration::{
-        CachedDescriptorPool, LbStrategy, RouteBackendType, RouteTarget, UpstreamNode,
-    };
+    use crate::configuration::{CachedDescriptorPool, LbStrategy, RouteTarget, UpstreamNode};
     use prost_reflect::prost_types::{
         DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
         MethodDescriptorProto, ServiceDescriptorProto,
@@ -759,9 +830,9 @@ mod tests {
         toml::from_str(&toml_str).expect("valid test server config")
     }
 
-    fn test_route(port: u16) -> ParsedRoute {
+    fn test_target(port: u16) -> Arc<RouteTarget> {
         let node = UpstreamNode::new(format!("http://127.0.0.1:{port}").parse().unwrap());
-        let target = Arc::new(RouteTarget {
+        Arc::new(RouteTarget {
             upstreams: vec![node],
             strategy: LbStrategy::RoundRobin,
             rr_counter: AtomicUsize::new(0),
@@ -776,14 +847,7 @@ mod tests {
                 created_at: std::time::Instant::now(),
             })),
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
-        });
-        ParsedRoute {
-            prefix: "/".to_string(),
-            target,
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::GrpcTranscoding,
-            aggregate_targets: Vec::new(),
-        }
+        })
     }
 
     /// Spawns a one-shot HTTP/2 (h2c) mock upstream that serves the given handler.
@@ -811,7 +875,7 @@ mod tests {
     }
 
     async fn call_grpc_web(
-        route: &ParsedRoute,
+        target: &Arc<RouteTarget>,
         config: &ServerConfig,
         headers: hyper::HeaderMap,
     ) -> Response<ServiceRespBody> {
@@ -828,7 +892,7 @@ mod tests {
         );
         let uri: Uri = "http://localhost/test.Echo/Say".parse().unwrap();
         handle_grpc_web(
-            route,
+            target,
             RequestBody::Buffered(Bytes::from_static(br#"{"text":"hello"}"#)),
             Method::POST,
             headers,
@@ -837,6 +901,7 @@ mod tests {
             "test_server",
             &client,
             config,
+            None,
         )
         .await
         .unwrap()
@@ -861,7 +926,7 @@ mod tests {
         })
         .await;
 
-        let route = test_route(port);
+        let target = test_target(port);
         let config = test_server_config(5);
 
         let mut headers = hyper::HeaderMap::new();
@@ -869,7 +934,7 @@ mod tests {
         headers.insert(header::CONTENT_LENGTH, "9999".parse().unwrap());
         headers.insert(header::CONNECTION, "keep-alive".parse().unwrap());
 
-        let resp = call_grpc_web(&route, &config, headers).await;
+        let resp = call_grpc_web(&target, &config, headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("hi"));
@@ -894,11 +959,11 @@ mod tests {
         })
         .await;
 
-        let route = test_route(port);
+        let target = test_target(port);
         let config = test_server_config(1);
 
         let started = std::time::Instant::now();
-        let resp = call_grpc_web(&route, &config, hyper::HeaderMap::new()).await;
+        let resp = call_grpc_web(&target, &config, hyper::HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(
             started.elapsed() < Duration::from_secs(4),
@@ -916,10 +981,10 @@ mod tests {
         })
         .await;
 
-        let route = test_route(port);
+        let target = test_target(port);
         let config = test_server_config(30);
 
-        let resp = call_grpc_web(&route, &config, hyper::HeaderMap::new()).await;
+        let resp = call_grpc_web(&target, &config, hyper::HeaderMap::new()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -941,14 +1006,14 @@ mod tests {
         })
         .await;
 
-        let route = test_route(port);
+        let target = test_target(port);
         let config = test_server_config(5);
 
         let expected_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
         let mut headers = hyper::HeaderMap::new();
         headers.insert("traceparent", expected_tp.parse().unwrap());
 
-        let resp = call_grpc_web(&route, &config, headers).await;
+        let resp = call_grpc_web(&target, &config, headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let seen = captured

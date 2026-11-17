@@ -9,13 +9,143 @@ use tracing::{error, warn};
 
 use super::upstreams::{ConnectionGuard, TrackedBody, build_upstream_uri};
 use super::{RequestBody, build_error_response};
-use crate::{ServiceRespBody, SrvError, configuration::ParsedRoute};
+use crate::{ServiceRespBody, SrvError, configuration::RouteTarget};
 
+/// Protocol-specific behavior differences between HTTP/REST proxying and raw HTTP/2 gRPC passthrough.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ProxyMode {
+    /// Standard HTTP/REST reverse proxying preserving the negotiated HTTP version.
+    Http(Version),
+    /// Binary HTTP/2 gRPC passthrough enforcing `HTTP/2`, `TE: trailers`, and gRPC Trailers-Only error frames.
+    GrpcPassthrough,
+}
+
+impl ProxyMode {
+    #[inline]
+    fn label(self) -> &'static str {
+        match self {
+            Self::Http(_) => "HTTP",
+            Self::GrpcPassthrough => "gRPC",
+        }
+    }
+
+    #[inline]
+    fn can_retry(self, is_stream: bool, is_idempotent: bool, attempts: usize, max_retries: usize) -> bool {
+        match self {
+            Self::Http(_) => !is_stream && is_idempotent && attempts <= max_retries,
+            Self::GrpcPassthrough => !is_stream && attempts <= max_retries,
+        }
+    }
+
+    #[inline]
+    fn is_outlier(self, status: StatusCode, headers: &hyper::HeaderMap) -> bool {
+        match self {
+            Self::Http(_) => super::circuit_breaker::is_outlier_status(status),
+            Self::GrpcPassthrough => super::circuit_breaker::is_grpc_outlier_response(status, headers),
+        }
+    }
+
+    fn apply_protocol_headers(self, req: &mut Request<ServiceRespBody>) {
+        match self {
+            Self::Http(version) => {
+                *req.version_mut() = version;
+            }
+            Self::GrpcPassthrough => {
+                *req.version_mut() = Version::HTTP_2;
+                let headers = req.headers_mut();
+                // Strip hop-by-hop headers that hyper's HTTP/2 client strictly rejects
+                headers.remove(header::CONNECTION);
+                headers.remove(header::TRANSFER_ENCODING);
+                headers.remove(header::UPGRADE);
+                headers.remove(header::TE);
+                headers.insert(header::TE, header::HeaderValue::from_static("trailers"));
+            }
+        }
+    }
+
+    fn build_error(
+        self,
+        msg: &str,
+        http_status: StatusCode,
+        grpc_status_code: &'static str,
+    ) -> Response<ServiceRespBody> {
+        match self {
+            Self::Http(_) => build_error_response(msg, http_status),
+            Self::GrpcPassthrough => build_grpc_error_response(msg, http_status, grpc_status_code),
+        }
+    }
+}
+
+/// Builds a gRPC-compliant Trailers-Only error response (`content-type: application/grpc`,
+/// `grpc-status`, `grpc-message`, and an empty body) so native gRPC clients (e.g. Tonic)
+/// never attempt to parse a plain-text error string as a 5-byte length-prefixed Protobuf frame.
+fn build_grpc_error_response(
+    msg: &str,
+    http_status: StatusCode,
+    grpc_status_code: &'static str,
+) -> Response<ServiceRespBody> {
+    let body = http_body_util::Empty::<bytes::Bytes>::new()
+        .map_err(SrvError::from)
+        .boxed();
+    let mut res = Response::new(body);
+    *res.status_mut() = http_status;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/grpc"),
+    );
+    if let Ok(code_val) = header::HeaderValue::from_str(grpc_status_code) {
+        headers.insert("grpc-status", code_val);
+    }
+    if let Ok(msg_val) = header::HeaderValue::from_str(msg) {
+        headers.insert("grpc-message", msg_val);
+    }
+    res
+}
+
+/// Forwards an HTTP/REST request to a load-balanced upstream pool with 3-state circuit breaking,
+/// passive outlier detection, idempotent failover retries, and client-error isolation.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_http_proxy(
-    route_info: &ParsedRoute,
-    mut request_body: RequestBody,
+    target: &Arc<RouteTarget>,
+    request_body: RequestBody,
     original_method: Method,
     original_version: Version,
+    prepared_headers: hyper::HeaderMap,
+    original_uri: &Uri,
+    matched_params: &matchit::Params<'_, '_>,
+    client_addr: Option<std::net::SocketAddr>,
+    server_name: &str,
+    client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    request_timeout: Option<std::time::Duration>,
+) -> Result<Response<ServiceRespBody>, SrvError> {
+    forward_with_failover(
+        ProxyMode::Http(original_version),
+        target,
+        request_body,
+        original_method,
+        prepared_headers,
+        original_uri,
+        matched_params,
+        client_addr,
+        server_name,
+        client,
+        request_timeout,
+    )
+    .await
+}
+
+/// Shared upstream forwarding engine used by both HTTP/REST proxying (`handle_http_proxy`)
+/// and binary HTTP/2 gRPC passthrough (`handle_grpc_passthrough`).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn forward_with_failover(
+    mode: ProxyMode,
+    target: &Arc<RouteTarget>,
+    mut request_body: RequestBody,
+    original_method: Method,
     mut prepared_headers: hyper::HeaderMap,
     original_uri: &Uri,
     matched_params: &matchit::Params<'_, '_>,
@@ -28,13 +158,10 @@ pub async fn handle_http_proxy(
     request_timeout: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
-    let is_multi_node = route_info.target.upstreams.len() > 1;
+    let is_multi_node = target.upstreams.len() > 1;
     // Fast-path: if only 1 backend is configured, disable failover retries (no alternate node exists)
     let max_retries = if is_multi_node {
-        route_info
-            .target
-            .max_retries
-            .min(route_info.target.upstreams.len() - 1)
+        target.max_retries.min(target.upstreams.len() - 1)
     } else {
         0
     };
@@ -42,12 +169,9 @@ pub async fn handle_http_proxy(
     let is_stream = matches!(request_body, RequestBody::Stream(_));
     let is_idempotent = matches!(
         original_method,
-        hyper::Method::GET
-            | hyper::Method::HEAD
-            | hyper::Method::PUT
-            | hyper::Method::DELETE
-            | hyper::Method::OPTIONS
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
     );
+    let proto_label = mode.label();
 
     loop {
         let mut current_headers = if attempts == max_retries {
@@ -57,51 +181,43 @@ pub async fn handle_http_proxy(
         };
         attempts += 1;
 
-        let upstream_node = route_info
-            .target
-            .next_upstream(client_addr.as_ref(), &failed_nodes);
+        let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
         let mut probe_guard = is_multi_node.then(|| {
-            super::circuit_breaker::ProbeGuard::new(
-                upstream_node,
-                route_info.target.cooldown_seconds,
-            )
+            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds)
         });
-        let conn_guard = ConnectionGuard::new(route_info.target.clone(), backend_base_uri.clone());
+        let conn_guard = ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
         let target_uri = build_upstream_uri(backend_base_uri, matched_params, original_uri)?;
 
-        if let Some(auth) = target_uri.authority() {
-            if let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
-                current_headers.insert(header::HOST, host_val);
-            }
+        if let Some(auth) = target_uri.authority()
+            && let Ok(host_val) = header::HeaderValue::from_str(auth.as_str())
+        {
+            current_headers.insert(header::HOST, host_val);
         }
 
         let body_error = Arc::new(std::sync::Mutex::new(None));
-        let boxed_body: ServiceRespBody = match &mut request_body {
-            RequestBody::Stream(_b) => {
-                let mut temp_body = RequestBody::Buffered(bytes::Bytes::new());
-                std::mem::swap(&mut temp_body, &mut request_body);
-                if let RequestBody::Stream(taken_body) = temp_body {
-                    BodyErrorTracker {
-                        inner: taken_body,
-                        last_error: body_error.clone(),
-                    }
-                    .boxed()
-                } else {
-                    unreachable!()
-                }
+        let boxed_body: ServiceRespBody = match std::mem::replace(
+            &mut request_body,
+            RequestBody::Buffered(bytes::Bytes::new()),
+        ) {
+            RequestBody::Stream(taken_body) => BodyErrorTracker {
+                inner: taken_body,
+                last_error: body_error.clone(),
             }
+            .boxed(),
             RequestBody::Buffered(bytes) => {
-                Full::new(bytes.clone()).map_err(SrvError::from).boxed()
+                let boxed = Full::new(bytes.clone()).map_err(SrvError::from).boxed();
+                request_body = RequestBody::Buffered(bytes);
+                boxed
             }
         };
 
         let mut proxy_req = Request::new(boxed_body);
         *proxy_req.method_mut() = original_method.clone();
         *proxy_req.uri_mut() = target_uri;
-        *proxy_req.version_mut() = original_version;
         *proxy_req.headers_mut() = current_headers;
+        mode.apply_protocol_headers(&mut proxy_req);
 
         // Inject OpenTelemetry context (e.g., traceparent) into the outgoing request headers.
         opentelemetry::global::get_text_map_propagator(|propagator| {
@@ -119,37 +235,44 @@ pub async fn handle_http_proxy(
                 Ok(res) => res,
                 Err(_elapsed) => {
                     error!(
-                        "{}: Upstream request timed out after {:?} for {}",
-                        server_name, timeout_dur, backend_base_uri
+                        "{}: Upstream {} request timed out after {:?} for {}",
+                        server_name, proto_label, timeout_dur, backend_base_uri
                     );
                     if let Some(ref mut pg) = probe_guard {
                         pg.complete();
                     }
-                    route_info.target.mark_dead(backend_base_uri);
+                    target.mark_dead(backend_base_uri);
                     failed_nodes.push(backend_base_uri.clone());
 
-                    if !is_stream && is_idempotent && attempts <= max_retries {
+                    if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
                         upstream_node
                             .failover_retries
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(
-                            "{}: Retrying timed-out idempotent request... (Attempt {}/{})",
-                            server_name, attempts, max_retries
+                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after timed-out {} request on {}...",
+                            server_name, attempts, max_retries, proto_label, backend_base_uri
                         );
                         continue;
                     } else {
-                        if !is_idempotent && attempts <= max_retries {
+                        if matches!(mode, ProxyMode::Http(_))
+                            && !is_idempotent
+                            && attempts <= max_retries
+                        {
                             warn!(
                                 "{}: Non-idempotent {} request timed out on {}; skipping retry to prevent side-effects",
                                 server_name, original_method, backend_base_uri
                             );
                         } else if is_stream && attempts <= max_retries {
                             warn!(
-                                "{}: Streaming request timed out on {}; cannot retry consumed stream",
-                                server_name, backend_base_uri
+                                "{}: Streaming {} request timed out on {}; cannot retry consumed stream",
+                                server_name, proto_label, backend_base_uri
                             );
                         }
-                        return Ok(build_error_response("Gateway Timeout", StatusCode::GATEWAY_TIMEOUT));
+                        return Ok(mode.build_error(
+                            "Gateway Timeout",
+                            StatusCode::GATEWAY_TIMEOUT,
+                            "4", // DEADLINE_EXCEEDED
+                        ));
                     }
                 }
             }
@@ -163,37 +286,42 @@ pub async fn handle_http_proxy(
                 if let Some(ref mut pg) = probe_guard {
                     pg.complete();
                 }
-                if super::circuit_breaker::is_outlier_status(res.status()) {
+                if mode.is_outlier(res.status(), res.headers()) {
                     let status = res.status();
-                    let tripped = route_info.target.record_failure(backend_base_uri);
+                    let tripped = target.record_failure(backend_base_uri);
                     if is_multi_node {
                         failed_nodes.push(backend_base_uri.clone());
                     }
 
                     if tripped {
                         warn!(
-                            "{}: Upstream {} returned outlier status {} — circuit breaker tripped to OPEN",
-                            server_name, backend_base_uri, status
+                            "{}: Upstream {} {} returned outlier status (HTTP {}, grpc-status {:?}) — circuit breaker tripped to OPEN",
+                            server_name,
+                            proto_label,
+                            backend_base_uri,
+                            status,
+                            res.headers().get("grpc-status")
                         );
                     } else {
                         warn!(
-                            "{}: Upstream {} returned outlier status {} (consecutive failures: {}/{})",
+                            "{}: Upstream {} {} returned outlier status {} (consecutive failures: {}/{})",
                             server_name,
+                            proto_label,
                             backend_base_uri,
                             status,
                             upstream_node
                                 .consecutive_failures
                                 .load(std::sync::atomic::Ordering::Relaxed),
-                            route_info.target.failure_threshold
+                            target.failure_threshold
                         );
                     }
 
-                    if !is_stream && is_idempotent && attempts <= max_retries {
+                    if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
                         upstream_node
                             .failover_retries
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         warn!(
-                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after upstream {} from {}...",
+                            "{}: [CIRCUIT BREAKER] Failover retry ({}/{}) after upstream {} outlier from {}...",
                             server_name, attempts, max_retries, status, backend_base_uri
                         );
                         continue;
@@ -220,7 +348,9 @@ pub async fn handle_http_proxy(
                 let error_kind = if let Some(srv_err) = client_error {
                     match srv_err {
                         SrvError::PayloadTooLarge { .. } => ProxyErrorKind::PayloadTooLarge,
-                        SrvError::DecompressionLimitExceeded { .. } => ProxyErrorKind::DecompressionLimitExceeded,
+                        SrvError::DecompressionLimitExceeded { .. } => {
+                            ProxyErrorKind::DecompressionLimitExceeded
+                        }
                         SrvError::ClientAborted(reason) => ProxyErrorKind::ClientAborted(reason),
                         _ => ProxyErrorKind::ClientAborted("Client stream error".to_string()),
                     }
@@ -230,32 +360,35 @@ pub async fn handle_http_proxy(
                 match error_kind {
                     ProxyErrorKind::PayloadTooLarge => {
                         warn!(
-                            "{}: Client request payload exceeded limit during proxying to {}",
-                            server_name, backend_base_uri
+                            "{}: Client {} request payload exceeded limit during proxying to {}",
+                            server_name, proto_label, backend_base_uri
                         );
-                        return Ok(build_error_response(
+                        return Ok(mode.build_error(
                             "Payload Too Large",
                             StatusCode::PAYLOAD_TOO_LARGE,
+                            "8", // RESOURCE_EXHAUSTED
                         ));
                     }
                     ProxyErrorKind::DecompressionLimitExceeded => {
                         warn!(
-                            "{}: Client request decompressed payload exceeded limit during proxying to {}",
-                            server_name, backend_base_uri
+                            "{}: Client {} request decompressed payload exceeded limit during proxying to {}",
+                            server_name, proto_label, backend_base_uri
                         );
-                        return Ok(build_error_response(
+                        return Ok(mode.build_error(
                             "Payload Too Large",
                             StatusCode::PAYLOAD_TOO_LARGE,
+                            "8", // RESOURCE_EXHAUSTED
                         ));
                     }
                     ProxyErrorKind::ClientAborted(ref reason) => {
                         warn!(
-                            "{}: Client aborted request stream during proxying to {}: {}",
-                            server_name, backend_base_uri, reason
+                            "{}: Client aborted {} request stream during proxying to {}: {}",
+                            server_name, proto_label, backend_base_uri, reason
                         );
-                        return Ok(build_error_response(
+                        return Ok(mode.build_error(
                             "Client Closed Request",
                             StatusCode::BAD_REQUEST,
+                            "1", // CANCELLED
                         ));
                     }
                     ProxyErrorKind::UpstreamFailure => {
@@ -266,10 +399,10 @@ pub async fn handle_http_proxy(
                         if let Some(ref mut pg) = probe_guard {
                             pg.complete();
                         }
-                        route_info.target.mark_dead(backend_base_uri);
+                        target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
-                        if !is_stream && is_idempotent && attempts <= max_retries {
+                        if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
                             upstream_node
                                 .failover_retries
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -279,22 +412,29 @@ pub async fn handle_http_proxy(
                             );
                             continue;
                         } else {
-                            if !is_idempotent && attempts <= max_retries {
+                            if matches!(mode, ProxyMode::Http(_))
+                                && !is_idempotent
+                                && attempts <= max_retries
+                            {
                                 warn!(
                                     "{}: Non-idempotent {} request failed on {}; skipping retry to prevent duplicate side-effects",
                                     server_name, original_method, backend_base_uri
                                 );
                             } else if is_stream && attempts <= max_retries {
                                 warn!(
-                                    "{}: Streaming request failed on {}; cannot retry consumed stream",
-                                    server_name, backend_base_uri
+                                    "{}: Streaming {} request failed on {}; cannot retry consumed stream",
+                                    server_name, proto_label, backend_base_uri
                                 );
                             }
                             error!(
-                                "{}: Max retries reached or request not retryable (stream={}, idempotent={}). Returning 502 Bad Gateway.",
-                                server_name, is_stream, is_idempotent
+                                "{}: Max retries reached or request not retryable (proto={}, stream={}, idempotent={}). Returning 502 Bad Gateway.",
+                                server_name, proto_label, is_stream, is_idempotent
                             );
-                            return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));
+                            return Ok(mode.build_error(
+                                "Bad Gateway",
+                                StatusCode::BAD_GATEWAY,
+                                "14", // UNAVAILABLE
+                            ));
                         }
                     }
                 }
@@ -443,7 +583,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
-    use crate::configuration::{LbStrategy, RouteBackendType, RouteTarget, UpstreamNode};
+    use crate::configuration::{LbStrategy, RouteTarget, UpstreamNode};
 
     #[tokio::test]
     async fn test_http_proxy_request_timeout_returns_504() {
@@ -477,13 +617,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -498,7 +631,7 @@ mod tests {
 
         // Send with a short timeout of 50ms (mock server sleeps 300ms)
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::GET,
             Version::HTTP_11,
@@ -547,13 +680,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -573,7 +699,7 @@ mod tests {
         let body: ServiceRespBody = http_body_util::StreamBody::new(err_stream).boxed();
 
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Stream(body),
             Method::POST,
             Version::HTTP_11,
@@ -624,13 +750,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -650,7 +769,7 @@ mod tests {
         let body: ServiceRespBody = http_body_util::StreamBody::new(err_stream).boxed();
 
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Stream(body),
             Method::POST,
             Version::HTTP_11,
@@ -697,13 +816,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -716,7 +828,7 @@ mod tests {
         let prepared_headers = hyper::HeaderMap::new();
 
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::GET,
             Version::HTTP_11,
@@ -767,13 +879,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -792,7 +897,7 @@ mod tests {
         let body: ServiceRespBody = http_body_util::StreamBody::new(err_stream).boxed();
 
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Stream(body),
             Method::POST,
             Version::HTTP_11,
@@ -851,13 +956,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
@@ -869,7 +967,7 @@ mod tests {
         let req_uri: Uri = "http://localhost/api/reset".parse().unwrap();
 
         let response = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::GET,
             Version::HTTP_11,
@@ -939,13 +1037,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-        let route_info = ParsedRoute {
-            prefix: "/api".to_string(),
-            target: target.clone(),
-            allowed_roles: Vec::new(),
-            backend_type: RouteBackendType::Rest,
-            aggregate_targets: Vec::new(),
-        };
 
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
@@ -959,7 +1050,7 @@ mod tests {
 
         // Request 1: hits node 1 (503) -> automatically retries on node 2 (200 OK)
         let resp1 = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::GET,
             Version::HTTP_11,
@@ -984,7 +1075,7 @@ mod tests {
 
         // Request 2: hits node 1 (503 #2 -> trips circuit breaker to Open!) and retries on node 2 (200 OK)
         let resp2 = handle_http_proxy(
-            &route_info,
+            &target,
             RequestBody::Buffered(bytes::Bytes::new()),
             Method::GET,
             Version::HTTP_11,
@@ -1005,6 +1096,65 @@ mod tests {
             target.upstreams[0].circuit_state(),
             super::super::circuit_breaker::CircuitState::Open
         );
+    }
+
+    /// Retry policy matrix of the shared proxy engine: HTTP retries only idempotent, buffered
+    /// requests; gRPC passthrough retries any buffered request; neither retries consumed streams
+    /// nor exceeds `max_retries`.
+    #[test]
+    fn test_proxy_mode_retry_policy_matrix() {
+        let http = ProxyMode::Http(Version::HTTP_11);
+        let grpc = ProxyMode::GrpcPassthrough;
+
+        // (is_stream, is_idempotent, attempts, max_retries)
+        assert!(http.can_retry(false, true, 1, 2), "HTTP idempotent buffered => retry");
+        assert!(!http.can_retry(false, false, 1, 2), "HTTP non-idempotent => never retry");
+        assert!(!http.can_retry(true, true, 1, 2), "HTTP stream => never retry");
+        assert!(!http.can_retry(false, true, 3, 2), "HTTP retries exhausted");
+
+        assert!(grpc.can_retry(false, false, 1, 2), "gRPC buffered POST => retry");
+        assert!(grpc.can_retry(false, true, 2, 2), "gRPC last permitted retry");
+        assert!(!grpc.can_retry(true, false, 1, 2), "gRPC stream => never retry");
+        assert!(!grpc.can_retry(false, false, 3, 2), "gRPC retries exhausted");
+    }
+
+    /// Protocol header rules: HTTP preserves the negotiated version and headers untouched;
+    /// gRPC passthrough enforces HTTP/2, strips hop-by-hop headers and sets `TE: trailers`.
+    #[test]
+    fn test_proxy_mode_protocol_headers_and_error_format() {
+        let make_req = || {
+            let body: ServiceRespBody = Full::new(bytes::Bytes::new()).map_err(SrvError::from).boxed();
+            let mut req = Request::new(body);
+            *req.version_mut() = Version::HTTP_11;
+            for (k, v) in [("connection", "keep-alive"), ("upgrade", "h2c"), ("te", "gzip")] {
+                req.headers_mut().insert(
+                    header::HeaderName::from_static(k),
+                    header::HeaderValue::from_static(v),
+                );
+            }
+            req
+        };
+
+        let mut http_req = make_req();
+        ProxyMode::Http(Version::HTTP_11).apply_protocol_headers(&mut http_req);
+        assert_eq!(http_req.version(), Version::HTTP_11);
+        assert!(http_req.headers().contains_key(header::CONNECTION));
+
+        let mut grpc_req = make_req();
+        ProxyMode::GrpcPassthrough.apply_protocol_headers(&mut grpc_req);
+        assert_eq!(grpc_req.version(), Version::HTTP_2);
+        assert!(!grpc_req.headers().contains_key(header::CONNECTION));
+        assert!(!grpc_req.headers().contains_key(header::UPGRADE));
+        assert_eq!(grpc_req.headers().get(header::TE).unwrap(), "trailers");
+
+        // Error format: plain HTTP vs. gRPC Trailers-Only.
+        let http_err = ProxyMode::Http(Version::HTTP_11).build_error("Bad Gateway", StatusCode::BAD_GATEWAY, "14");
+        assert_eq!(http_err.status(), StatusCode::BAD_GATEWAY);
+        assert!(!http_err.headers().contains_key("grpc-status"));
+
+        let grpc_err = ProxyMode::GrpcPassthrough.build_error("Bad Gateway", StatusCode::BAD_GATEWAY, "14");
+        assert_eq!(grpc_err.headers().get("grpc-status").unwrap(), "14");
+        assert_eq!(grpc_err.headers().get(header::CONTENT_TYPE).unwrap(), "application/grpc");
     }
 }
 

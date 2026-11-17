@@ -18,8 +18,9 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 
 use praeco_rs::{
-    ConnectionHandler, build_rustls_config, build_service_stack,
-    configuration::{Config, ServerConfig, TunnelConfig},
+    BoxCloneSyncServiceExt, ConnectionHandler, ServiceRespBody, SrvBody, SrvError,
+    build_rustls_config, build_service_stack, build_service_stack_with_base,
+    configuration::{Config, Layers, Protocol, SecurityHeadersConfig, ServerConfig, ServerMetrics, TunnelConfig},
     connection_tracker::ConnectionTracker,
     run_dual_stack, run_servers, run_tunnel_over_stream, serve_http_connection,
     serve_tls_connection,
@@ -1280,6 +1281,7 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
         [Server.ReverseRoutes."/api/dashboard"]
         backend_type = "aggregate"
         allowed_roles = ["Admin"]
+        max_request_bytes = 64
 
         [[Server.ReverseRoutes."/api/dashboard".targets]]
         key = "profile"
@@ -1365,7 +1367,8 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
 
     // 2. Unprivileged caller (no Admin OID) must be rejected with 403 Forbidden
     let (unauth_status, _, _) =
-        send_with_oids(Vec::new(), Method::POST, "/api/dashboard", br#"{"id":"1"}"#).await;
+        send_with_oids(Vec::new(), Method::POST, "/api/dashboard", br#"{"stats":{"id":"1"}}"#)
+            .await;
     assert_eq!(unauth_status, StatusCode::FORBIDDEN);
 
     // 3. Authorized Admin caller (OID "1") gets aggregated JSON + hardened headers
@@ -1373,7 +1376,7 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
         vec!["1".to_string()],
         Method::POST,
         "/api/dashboard",
-        br#"{"id":"1"}"#,
+        br#"{"stats":{"id":"1"}}"#,
     )
     .await;
     assert_eq!(ok_status, StatusCode::OK);
@@ -1383,6 +1386,152 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
     let parsed: serde_json::Value = serde_json::from_slice(&ok_body).unwrap();
     assert_eq!(parsed["profile"]["name"], "Alice");
     assert_eq!(parsed["stats"]["logins"], 12);
+
+    // 4. Oversized request body (> max_request_bytes = 64) must return 413 Payload Too Large
+    // even without MaxPayloadLayer enabled (M1 protection)
+    let (too_large_status, _, _) = send_with_oids(
+        vec!["1".to_string()],
+        Method::POST,
+        "/api/dashboard",
+        br#"{"stats":{"padding":"012345678901234567890123456789012345678901234567890123456789"}}"#,
+    )
+    .await;
+    assert_eq!(too_large_status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 5. Negative /health check: marking a single `required = true` sub-target dead while
+    //    other targets remain alive must already cause GET /health to report 503 Service Unavailable.
+    let route = &server_config.parsed_routes[0];
+    for node in &route.aggregate_targets[0].target.upstreams {
+        node.mark_dead();
+    }
+    let (unhealthy_status, _, _) = send_with_oids(Vec::new(), Method::GET, "/health", b"").await;
+    assert_eq!(unhealthy_status, StatusCode::SERVICE_UNAVAILABLE);
+
+    cancel_token.cancel();
+}
+
+#[tokio::test]
+async fn test_build_service_stack_with_base_records_server_metrics_and_enforces_hardening() {
+    ensure_crypto_provider();
+    use std::sync::atomic::Ordering;
+
+    let server_name = "CustomEmbeddedBaseStackTest";
+    let mut cfg = ServerConfig {
+        name: server_name.into(),
+        ip: Some("127.0.0.1".into()),
+        port: Some(8080),
+        protocol: Protocol::Http,
+        layers: Layers {
+            enabled: vec!["TraceId".into(), "SecurityHeaders".into()],
+            security_headers_config: Some(SecurityHeadersConfig {
+                content_security_policy: "default-src 'self'".into(),
+                strict_transport_security: "max-age=63072000".into(),
+                x_content_type_options: "nosniff".into(),
+                x_frame_options: "DENY".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.finalize().expect("ServerConfig::finalize must succeed");
+    let server_config = Arc::new(cfg);
+
+    let custom_base = tower::service_fn(|_req: Request<SrvBody>| async move {
+        let body: ServiceRespBody = Full::new(Bytes::from_static(b"custom-ok"))
+            .map_err(|never| match never {})
+            .boxed();
+        Ok::<_, SrvError>(
+            hyper::Response::builder()
+                .status(StatusCode::OK)
+                .body(body)
+                .unwrap(),
+        )
+    })
+    .boxed_clone_sync();
+
+    let stack = build_service_stack_with_base(&server_config, custom_base)
+        .expect("build_service_stack_with_base must succeed");
+    let cancel_token = CancellationToken::new();
+    let peer_addr: SocketAddr = "198.51.100.42:50000".parse().unwrap();
+    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    let metrics = ServerMetrics::for_server(server_name);
+    let before_total = metrics.total_requests.load(Ordering::Relaxed);
+    let before_2xx = metrics.responses_2xx.load(Ordering::Relaxed);
+    let before_path_blocked = metrics.blocked_path_sanitizer.load(Ordering::Relaxed);
+
+    let send_req = |uri: &'static str| {
+        let stack = stack.clone();
+        let oid_mapping = oid_mapping.clone();
+        let srv_token = cancel_token.clone();
+        async move {
+            let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+            let server_task = tokio::spawn(async move {
+                let handler = ConnectionHandler::new(
+                    stack,
+                    peer_addr,
+                    Vec::new(),
+                    None,
+                    None,
+                    oid_mapping,
+                );
+                serve_http_connection(server_io, handler, srv_token).await;
+            });
+
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                    .await
+                    .expect("HTTP/1.1 handshake");
+            let conn_task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("host", "localhost:8080")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("send request");
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+
+            drop(sender);
+            let _ = conn_task.await;
+            server_task.abort();
+            (status, headers, body)
+        }
+    };
+
+    // 1. Valid request hits custom base service, receives SecurityHeaders, and updates ServerMetrics
+    let (status_ok, headers_ok, body_ok) = send_req("/v1/hello").await;
+    assert_eq!(status_ok, StatusCode::OK);
+    assert_eq!(body_ok, Bytes::from_static(b"custom-ok"));
+    assert_eq!(
+        headers_ok.get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(
+        metrics.total_requests.load(Ordering::Relaxed),
+        before_total + 1,
+        "build_service_stack_with_base must record ServerMetrics::total_requests"
+    );
+    assert_eq!(
+        metrics.responses_2xx.load(Ordering::Relaxed),
+        before_2xx + 1,
+        "build_service_stack_with_base must record ServerMetrics::responses_2xx"
+    );
+
+    // 2. Path traversal attempt is rejected by outer PathSanitizerLayer with 400 Bad Request
+    let (status_bad, _, _) = send_req("/../secret").await;
+    assert_eq!(status_bad, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        metrics.blocked_path_sanitizer.load(Ordering::Relaxed),
+        before_path_blocked + 1,
+        "PathSanitizerLayer must block traversal and increment blocked_path_sanitizer"
+    );
 
     cancel_token.cancel();
 }

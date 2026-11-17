@@ -59,9 +59,9 @@ pub use runner::{
     run_dual_stack, run_servers, run_tunnel, spawn_router_health_checks, start_single_server,
 };
 pub use stack::{
-    apply_layers, build_rustls_config, build_service_stack, build_tunnel_tls_connector,
-    resolve_tunnel_peer, run_tunnel_over_stream, serve_http_connection, serve_tls_connection,
-    wrap_serve_dir,
+    apply_layers, build_rustls_config, build_service_stack, build_service_stack_with_base,
+    build_tunnel_tls_connector, resolve_tunnel_peer, run_tunnel_over_stream, serve_http_connection,
+    serve_tls_connection, wrap_serve_dir, wrap_tonic_routes,
 };
 
 // ── Type Aliases ─────────────────────────────────────────────────────────────

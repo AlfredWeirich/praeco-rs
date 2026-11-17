@@ -163,28 +163,7 @@ impl RouterService {
             ));
         }
 
-        let mut any_alive = false;
-        for route in &config.parsed_routes {
-            if route.backend_type == RouteBackendType::Aggregate {
-                if route.aggregate_targets.iter().any(|sub| {
-                    sub.target
-                        .upstreams
-                        .iter()
-                        .any(|node| node.is_available(sub.target.cooldown_seconds))
-                }) {
-                    any_alive = true;
-                    break;
-                }
-            } else if route
-                .target
-                .upstreams
-                .iter()
-                .any(|node| node.is_available(route.target.cooldown_seconds))
-            {
-                any_alive = true;
-                break;
-            }
-        }
+        let any_alive = config.parsed_routes.iter().any(is_route_healthy);
 
         if any_alive {
             Ok(build_error_response(
@@ -197,6 +176,40 @@ impl RouterService {
                 StatusCode::SERVICE_UNAVAILABLE,
             ))
         }
+    }
+}
+
+/// Evaluates whether a single configured route has enough healthy upstream capacity to serve
+/// traffic: an `aggregate` route is healthy only when **every `required` sub-target** has at least
+/// one available upstream (or, if all targets are optional, when at least one sub-target does).
+fn is_route_healthy(route: &ParsedRoute) -> bool {
+    if route.backend_type == RouteBackendType::Aggregate {
+        let has_required = route.aggregate_targets.iter().any(|sub| sub.required);
+        if has_required {
+            route
+                .aggregate_targets
+                .iter()
+                .filter(|sub| sub.required)
+                .all(|sub| {
+                    sub.target
+                        .upstreams
+                        .iter()
+                        .any(|node| node.is_available(sub.target.cooldown_seconds))
+                })
+        } else {
+            route.aggregate_targets.iter().any(|sub| {
+                sub.target
+                    .upstreams
+                    .iter()
+                    .any(|node| node.is_available(sub.target.cooldown_seconds))
+            })
+        }
+    } else {
+        route
+            .target
+            .upstreams
+            .iter()
+            .any(|node| node.is_available(route.target.cooldown_seconds))
     }
 }
 
@@ -350,16 +363,29 @@ impl Service<Request<SrvBody>> for RouterService {
             let request_body = if can_stream {
                 RequestBody::Stream(body)
             } else if is_buffered_only {
-                match body.collect().await {
+                let limited = http_body_util::Limited::new(body, route_info.max_request_bytes);
+                match limited.collect().await {
                     Ok(c) => RequestBody::Buffered(c.to_bytes()),
                     Err(e) => {
                         let err_str = e.to_string();
-                        if matches!(e, SrvError::PayloadTooLarge { .. })
+                        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some()
+                            || err_str.contains("length limit exceeded")
                             || err_str.contains("Payload Limit Exceeded")
-                            || matches!(e, SrvError::DecompressionLimitExceeded { .. })
                             || err_str.contains("Decompressed payload")
+                            || e.downcast_ref::<SrvError>().is_some_and(|srv_err| {
+                                matches!(
+                                    srv_err,
+                                    SrvError::PayloadTooLarge { .. }
+                                        | SrvError::DecompressionLimitExceeded { .. }
+                                )
+                            })
                         {
-                            tracing::warn!("{}: Request body exceeded payload limit: {}", server_name, e);
+                            tracing::warn!(
+                                "{}: Request body exceeded buffered limit ({} bytes): {}",
+                                server_name,
+                                route_info.max_request_bytes,
+                                e
+                            );
                             return Ok(build_error_response(
                                 "Payload Too Large",
                                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -408,7 +434,7 @@ impl Service<Request<SrvBody>> for RouterService {
             match route_info.backend_type {
                 RouteBackendType::GrpcTranscoding => {
                     grpc_web::handle_grpc_web(
-                        route_info,
+                        &route_info.target,
                         request_body,
                         original_method,
                         prepared_headers,
@@ -417,12 +443,13 @@ impl Service<Request<SrvBody>> for RouterService {
                         server_name,
                         &grpc_client,
                         &self_clone.config,
+                        request_timeout,
                     )
                     .await
                 }
                 RouteBackendType::GrpcPassthrough => {
                     grpc_passthrough::handle_grpc_passthrough(
-                        route_info,
+                        &route_info.target,
                         request_body,
                         original_method,
                         prepared_headers,
@@ -437,7 +464,7 @@ impl Service<Request<SrvBody>> for RouterService {
                 }
                 RouteBackendType::Rest => {
                     http_proxy::handle_http_proxy(
-                        route_info,
+                        &route_info.target,
                         request_body,
                         original_method,
                         original_version,
@@ -479,5 +506,115 @@ impl Service<Request<SrvBody>> for RouterService {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configuration::ServerConfig;
+
+    #[test]
+    fn test_aggregate_route_health_requires_all_required_targets() {
+        let toml_cfg = r#"
+            name = "health_agg"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+
+            [Layers]
+            enabled = []
+
+            [ReverseRoutes."/agg"]
+            backend_type = "aggregate"
+
+            [[ReverseRoutes."/agg".targets]]
+            key = "req_a"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:9001"]
+            path = "/a"
+            required = true
+
+            [[ReverseRoutes."/agg".targets]]
+            key = "opt_b"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:9002"]
+            path = "/b"
+            required = false
+        "#;
+        let mut cfg: ServerConfig = toml::from_str(toml_cfg).unwrap();
+        cfg.finalize().unwrap();
+        let route = &cfg.parsed_routes[0];
+
+        assert!(is_route_healthy(route), "All targets alive => healthy");
+
+        // Optional target dead while required target alive => still healthy
+        route.aggregate_targets[1].target.upstreams[0].mark_dead();
+        assert!(
+            is_route_healthy(route),
+            "Aggregate route with dead optional target must stay healthy"
+        );
+
+        // Revive optional, kill required => must be UNHEALTHY even though optional is alive!
+        route.aggregate_targets[1].target.upstreams[0].mark_alive();
+        route.aggregate_targets[0].target.upstreams[0].mark_dead();
+        assert!(
+            !is_route_healthy(route),
+            "Aggregate route with dead required target must report unhealthy even when optional targets are alive"
+        );
+    }
+
+    #[test]
+    fn test_aggregate_route_health_all_optional_is_healthy_if_any_alive() {
+        let toml_cfg = r#"
+            name = "health_opt_only"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+
+            [Layers]
+            enabled = []
+
+            [ReverseRoutes."/agg"]
+            backend_type = "aggregate"
+
+            [[ReverseRoutes."/agg".targets]]
+            key = "opt_a"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:9001"]
+            path = "/a"
+            required = false
+
+            [[ReverseRoutes."/agg".targets]]
+            key = "opt_b"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:9002"]
+            path = "/b"
+            required = false
+        "#;
+        let mut cfg: ServerConfig = toml::from_str(toml_cfg).unwrap();
+        cfg.finalize().unwrap();
+        let route = &cfg.parsed_routes[0];
+
+        route.aggregate_targets[0].target.upstreams[0].mark_dead();
+        assert!(
+            is_route_healthy(route),
+            "Optional-only aggregate route remains healthy if another optional target is alive"
+        );
+        route.aggregate_targets[1].target.upstreams[0].mark_dead();
+        assert!(
+            !is_route_healthy(route),
+            "Optional-only aggregate route is unhealthy when every target is dead"
+        );
     }
 }

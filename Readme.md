@@ -22,7 +22,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 * **Zero-Allocation `IpFilterLayer` & RFC 3986 `PathSanitizerLayer`**: Pre-compiled IPv4/IPv6 CIDR allowlists/blocklists (`deny`-before-`allow`, `PROXY v2` aware) plus mandatory URI canonicalization and path-traversal rejection.
 * **Built-in Identity Provider (IdP), Claims Webhook & JWKS**: Issues signed Ed25519 JWTs from mTLS identities (with `OptionalClientCert` support, `iss`/`aud` enforcement, live role-fetching webhooks, `/.well-known/jwks.json`, and `revoke_on_paths` automatic JTI revocation).
 * **Outbound Zero-Trust Tunneling (SNI Relay) & Static File Server**: Multiplexed outbound mTLS (`yamux`) reverse tunnels with fail-closed `PROXY v2` client IP propagation, plus a native SPA-capable static file server (`StaticFiles`).
-* **Parallel Fan-Out / Aggregator Routes (`backend_type = "aggregate"`)**: Accepts a single `GET` or `POST` client request, fans out concurrently across mixed `grpc_transcoding` (via Reflection) and `rest` targets with independent circuit breakers, `required = false` graceful degradation (`null` + `_errors`), and zero-copy `BytesMut` JSON assembly.
+* **Parallel Fan-Out / Aggregator Routes (`backend_type = "aggregate"`, `v0.6.0`)**: Accepts a single `GET` or `POST` client request, fans out concurrently across mixed `grpc_transcoding` (via Reflection) and `rest` targets with zero-copy `keyed`/`broadcast` payload slicing (`RawValue` + `Bytes::slice_ref`), per-target query/header policies, independent circuit breakers, sanitized `required = false` graceful degradation (`null` + `_errors`), and zero-copy `ChunkedBytesBody` JSON frame assembly.
 
 ---
 
@@ -166,12 +166,12 @@ You can embed Praeco's gateway stack, Tower middlewares, or full dual-stack / tu
 
 ```toml
 [dependencies]
-praeco-rs = { version = "0.5.4", default-features = false }
+praeco-rs = { version = "0.6.0", default-features = false }
 ```
 
 Key library entry points re-exported at the crate root:
 - `praeco_rs::runner` (`run_servers`, `start_single_server`, `run_dual_stack`, `run_tunnel`, `spawn_router_health_checks`) – full TCP (HTTP/1.1, HTTP/2), UDP/QUIC (HTTP/3), active health-check loops, and outbound mTLS/Yamux tunnel orchestration.
-- `praeco_rs::stack` (`build_service_stack`, `apply_layers`, `build_rustls_config`, `serve_http_connection`, `serve_tls_connection`, `run_tunnel_over_stream`) – composable Tower pipelines and stream-level runners.
+- `praeco_rs::stack` (`build_service_stack`, `build_service_stack_with_base`, `wrap_tonic_routes`, `apply_layers`, `build_rustls_config`, `serve_http_connection`, `serve_tls_connection`, `run_tunnel_over_stream`) – composable Tower pipelines, custom/Tonic service wrappers, and stream-level runners.
 - `praeco_rs::middleware` & `praeco_rs::configuration` – standalone Tower layers (`IpFilterLayer`, `JwtAuthLayer`, `TokenBucketRateLimiterLayer`, `RouterService`, …) and TOML config parsing/finalization.
 
 ```rust,no_run
@@ -192,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
 #### Programmatic Embedding Without `Config.toml` (Binary gRPC Aggregator Example)
 For applications that configure `ServerConfig` purely in Rust (`..Default::default()`, no `Config.toml` on disk) and wrap a typed `tonic` gRPC service (e.g. binary Protobuf-to-Protobuf fan-out) with Praeco's middleware stack, see [`server/examples/embedded_grpc_aggregator.rs`](server/examples/embedded_grpc_aggregator.rs):
 
-- **What it does:** Spawns two typed `tonic` gRPC backend services (`user.UserService/GetUser` and `order.OrderService/CountOrders`), implements a typed Protobuf-to-Protobuf `aggregator.DashboardService/GetDashboard` service that fans out concurrently via `tokio::join!` while forwarding Praeco's `x-trace-id`, bridges `tonic::service::Routes` (`tonic::body::Body`) into `praeco_rs::BoxedCloneService` via a zero-cost `SyncBody` wrapper, applies `TraceId`, `IpFilter`, `MaxPayload`, and `PathSanitizerLayer` via `apply_layers`, starts the gateway with `start_single_server`, executes a real binary gRPC request against it, and shuts down cleanly via `CancellationToken`.
+- **What it does:** Spawns two typed `tonic` gRPC backend services (`user.UserService/GetUser` and `order.OrderService/CountOrders`), implements a typed Protobuf-to-Protobuf `aggregator.DashboardService/GetDashboard` service that fans out concurrently via `tokio::join!` while forwarding Praeco's `x-trace-id`, bridges `tonic::service::Routes` via `praeco_rs::wrap_tonic_routes`, wraps it with `praeco_rs::build_service_stack_with_base` (`TraceId`, `IpFilter`, `MaxPayload`, `TraceLayer`/`ServerMetrics`, and `PathSanitizerLayer`), starts the gateway with `start_single_server`, executes a real binary gRPC request against it, and shuts down cleanly via `CancellationToken`.
 - **How to run it (with `--no-default-features`):**
 
 ```bash

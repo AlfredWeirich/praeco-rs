@@ -7,22 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.5.5] - 2026-11-17
+## [0.6.0] - 2026-11-17
 
-Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), programmatic `ServerConfig::default()`, and embedded binary gRPC aggregator example.
+Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), SemVer-safe `#[non_exhaustive]` public types, programmatic `ServerConfig::default()`, and embedded binary gRPC aggregator example.
+
+### Breaking Changes
+* **Public Configuration & Routing Types (`src/configuration.rs`):**
+  * Extended `RouteBackendType` with `Aggregate`, added `targets` / `payload_mode` / `expose_upstream_errors` to `RouteConfig`, and added `aggregate_targets` / `aggregate_payload_mode` / `expose_upstream_errors` to `ParsedRoute`.
+  * Marked extensible public enums (`RouteBackendType`, `ServiceType`, `MiddlewareLayer`, `LbStrategy`, `AggregatePayloadMode`) and compiled route structs (`ParsedRoute`, `ParsedAggregateTarget`) as `#[non_exhaustive]` so future additions stay SemVer-compatible for library embedders.
 
 ### Added
 * **Parallel Fan-Out / Aggregator Route (`RouteBackendType::Aggregate`, `src/middleware/router/aggregator.rs`):**
   * Added `backend_type = "aggregate"` (alias `"fanout"`) with `[[Server.ReverseRoutes."/path".targets]]` (`AggregateTargetConfig` / `ParsedAggregateTarget`) supporting mixed `rest` and `grpc_transcoding` sub-targets within a single `RouterService` route.
   * Executes all configured sub-targets concurrently via `tokio::task::JoinSet` with OpenTelemetry `traceparent` / `x-trace-id` propagation, per-target load balancing, 3-state circuit breakers, and gRPC reflection schema caching.
-  * Supports `POST` (splitting incoming JSON objects by `target.key` or forwarding flat payloads unchanged with sanitized `Content-Length` / stripped `Accept-Encoding`) and `GET` (forwarding query strings to `rest` targets and automatically converting URL query parameters into JSON objects for `grpc_transcoding` targets).
-  * Supports `required = true` (fail-fast `abort_all()` returning `502`/`504`) and `required = false` graceful degradation (`"<key>": null` plus `"_errors": { "<key>": { "status", "message" } }`), using zero-copy `BytesMut` JSON assembly and `serde::de::IgnoredAny` validation.
+  * Enforces strict `payload_mode` (`"keyed"` default or `"broadcast"`): in `keyed` mode each target receives only a zero-copy `Bytes::slice_ref` view of `body[target.key]` parsed via `serde_json::value::RawValue` (absent keys receive `{}`, never sibling payloads; unknown top-level keys return `400 Bad Request`). `GET` query parameters are forwarded to `rest` targets and converted to JSON objects for `grpc_transcoding` targets.
+  * Enforces zero-trust query and header isolation per target: operator-pinned query parameters in `target.path` are pre-parsed at startup and always take precedence over client parameters (preventing parameter pollution), optional `forward_query` allowlists restrict forwarded parameters, conditional/range headers (`if-*`, `range`) are stripped once before fan-out, and client `Authorization`/`Cookie` headers are stripped by default unless opted in via `forward_headers`.
+  * Supports `required = true` (fail-fast `abort_all()` returning `502`/`504`) and `required = false` graceful degradation (`"<key>": null` plus `"_errors": { "<key>": { "status", "grpc_status", "message" } }`), using zero-copy `ChunkedBytesBody` frame assembly (with pre-encoded JSON key prefixes and `serde::de::IgnoredAny` validation) so upstream JSON payloads are never copied or parsed into a DOM. Raw upstream error bodies are logged internally and replaced with canonical HTTP reason phrases by default (`expose_upstream_errors = false`).
+  * Added per-target `timeout_ms`, route-wide `deadline_ms` (bounding tail latency of optional targets), buffered `max_request_bytes` (default 4 MiB, returning `413 Payload Too Large`), and cumulative `max_response_bytes` (default 16 MiB across all fan-out targets).
+  * Enhanced `grpc_web` JSON-to-gRPC transcoding to inspect both Trailers-Only initial headers and HTTP/2 trailing `grpc-status` headers (mapping `NOT_FOUND` $\rightarrow$ `404`, `UNAVAILABLE` $\rightarrow$ `503` + circuit-breaker failure, `DEADLINE_EXCEEDED` $\rightarrow$ `504`, `PERMISSION_DENIED` $\rightarrow$ `403`, `UNAUTHENTICATED` $\rightarrow$ `401`, etc., and rejecting trailing error frames after partial data).
   * Integrated `aggregate_targets` into `RouterService::handle_health_check`, active health checks / reflection pre-warming in `src/runner.rs`, and `/upstreams` / `mark_dead` / `mark_alive` telemetry in `src/middleware/admin.rs`.
-* **Programmatic Configuration & Embedded Binary gRPC Aggregator Example:**
-  * Implemented `Default` for `ServerConfig` (`enabled: true`, `ConnectionLimitsConfig::default()`, etc.) so library embedders can construct `ServerConfig` purely in Rust (`..Default::default()`) without a `Config.toml` file.
-  * Added runnable `server/examples/embedded_grpc_aggregator.rs` demonstrating `praeco-rs` with `default-features = false`, wrapping a typed binary Protobuf-to-Protobuf `tonic` aggregator service (`SyncBody` bridge) with `apply_layers`, `PathSanitizerLayer`, and `start_single_server`.
+* **Programmatic Configuration, Custom Stack Embedding & Binary gRPC Aggregator Example:**
+  * Implemented `Default` for `ServerConfig` (`enabled: true`, `ConnectionLimitsConfig::default()`, etc.) and `RouteConfig` so library embedders can construct configs purely in Rust (`..Default::default()`) without a `Config.toml` file, and rejected empty/whitespace `ServerConfig::name` in `ServerConfig::finalize()`.
+  * Added and re-exported `build_service_stack_with_base(server_config, base_service)` and `wrap_tonic_routes(routes)` in `praeco_rs::stack` so embedded applications can wrap any custom Tower service or `tonic::service::Routes` with Praeco's full hardening stack (configured middleware layers, `TraceLayer`/`ServerMetrics`, and outer `PathSanitizerLayer`) without duplicating boilerplate.
+  * Added runnable `server/examples/embedded_grpc_aggregator.rs` demonstrating `praeco-rs` with `default-features = false`, wrapping a typed binary Protobuf-to-Protobuf `tonic` aggregator service via `wrap_tonic_routes`, `build_service_stack_with_base`, and `start_single_server`.
 * **Tests & Documentation:**
-  * Added unit, mock, admin, and `RouterService` end-to-end integration tests covering config validation, mixed gRPC/REST fan-out, `GET` query conversion, invalid REST JSON, `504` optional timeouts, `405` method guards, REST header sanitization, RBAC enforcement, and `/health` checks.
+  * Added unit, mock, security regression, admin, and `RouterService` end-to-end integration tests covering config validation, keyed payload isolation, sanitized upstream error responses, query precedence/allowlists, credential/conditional header stripping, mixed gRPC/REST fan-out, `GET` query conversion, invalid REST JSON, `504` optional timeouts, `405` method guards, RBAC enforcement, and `/health` checks.
   * Documented `backend_type = "aggregate"` in `Config.md` and the embedded example in `Readme.md`.
 
 ---
