@@ -44,6 +44,7 @@ use std::sync::Arc;
 use anyhow::{Context, Error};
 use arc_swap::ArcSwap;
 use tokio::runtime::Builder;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
@@ -53,7 +54,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use praeco_rs::{
     BoxedCloneService,
     configuration::{Config, Protocol, ServerConfig},
-    runner::start_single_server,
+    runner::start_single_server_with_socket_signal,
     stack::{build_rustls_config, build_service_stack},
 };
 
@@ -100,19 +101,51 @@ fn main() -> Result<(), Error> {
     res
 }
 
-type ActiveServerEntry = (
-    CancellationToken,
-    Arc<ServerConfig>,
-    Arc<ArcSwap<BoxedCloneService>>,
-);
+/// A running server instance managed by the hot-reload loop.
+struct ActiveServer {
+    /// Cancels the server (stops accepting and drains connections).
+    cancel_token: CancellationToken,
+    /// Configuration the instance was started with.
+    config: Arc<ServerConfig>,
+    /// Hot-swappable service stack.
+    stack: Arc<ArcSwap<BoxedCloneService>>,
+    /// Resolves as soon as the server's listening sockets (or tunnel session)
+    /// are released, even while slow connections are still draining.
+    sockets_released: oneshot::Receiver<()>,
+}
+
+/// Spawns `start_single_server_with_socket_signal` into `join_set` and returns a
+/// receiver that resolves as soon as the server releases its listening sockets.
+///
+/// If `wait_for` is given (a predecessor that still holds the same socket address or
+/// tunnel), the new instance waits for that signal before binding, avoiding `EADDRINUSE`
+/// without stalling behind slow connection drains.
+fn spawn_server(
+    join_set: &mut tokio::task::JoinSet<()>,
+    config: Arc<ServerConfig>,
+    cancel_token: CancellationToken,
+    stack: Arc<ArcSwap<BoxedCloneService>>,
+    wait_for: Option<oneshot::Receiver<()>>,
+) -> oneshot::Receiver<()> {
+    let (released_tx, released_rx) = oneshot::channel();
+    join_set.spawn(async move {
+        if let Some(previous) = wait_for {
+            // An `Err` only means the predecessor task dropped the sender on exit.
+            let _ = previous.await;
+        }
+        start_single_server_with_socket_signal(config, cancel_token, stack, Some(released_tx))
+            .await;
+    });
+    released_rx
+}
 
 /// Asynchronous mission-control loop managing server tasks, `SIGHUP` hot-reloads,
 /// and `Ctrl-C` graceful shutdown.
 async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Error> {
     let mut server_join_set = tokio::task::JoinSet::new();
 
-    // Map: name -> (CancellationToken, Arc<ServerConfig>, Arc<ArcSwap<BoxedCloneService>>)
-    let mut active_servers: HashMap<String, ActiveServerEntry> = HashMap::new();
+    // Map: server name -> running instance
+    let mut active_servers: HashMap<String, ActiveServer> = HashMap::new();
 
     for server_config in &config.servers {
         if !server_config.enabled {
@@ -134,18 +167,22 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
         };
         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
+        let sockets_released = spawn_server(
+            &mut server_join_set,
+            server_config_arc.clone(),
+            cancel_token.clone(),
+            dynamic_stack.clone(),
+            None,
+        );
         active_servers.insert(
             server_config.name.clone(),
-            (
-                cancel_token.clone(),
-                server_config_arc.clone(),
-                dynamic_stack.clone(),
-            ),
+            ActiveServer {
+                cancel_token,
+                config: server_config_arc,
+                stack: dynamic_stack,
+                sockets_released,
+            },
         );
-
-        server_join_set.spawn(async move {
-            start_single_server(server_config_arc, cancel_token, dynamic_stack).await;
-        });
     }
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -220,40 +257,60 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                     let new_server = &server_config_arc;
                     let needs_restart = match active_servers.get(&name) {
                         None => true,
-                        Some((_, old_server, _)) => {
-                            old_server.ip != new_server.ip
-                                || old_server.port != new_server.port
-                                || old_server.protocol != new_server.protocol
-                                || old_server.tunnel != new_server.tunnel
+                        Some(old) => {
+                            old.config.ip != new_server.ip
+                                || old.config.port != new_server.port
+                                || old.config.protocol != new_server.protocol
+                                || old.config.tunnel != new_server.tunnel
                         }
                     };
 
                     if needs_restart {
+                        // Retire the previous instance first. If it holds the same socket
+                        // address (or tunnel SNI), the successor waits until it released it,
+                        // otherwise the new bind would fail with EADDRINUSE.
+                        let wait_for = active_servers.remove(&name).and_then(|old| {
+                            info!("Stopping previous instance of '{}' for restart", old.config.name);
+                            old.cancel_token.cancel();
+                            let same_bind = (old.config.ip == new_server.ip
+                                && old.config.port == new_server.port)
+                                || (old.config.tunnel.is_some() && new_server.tunnel.is_some());
+                            same_bind.then_some(old.sockets_released)
+                        });
+
                         info!("Starting server '{}'...", new_server.name);
                         let cancel_token = CancellationToken::new();
                         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
 
+                        let sockets_released = spawn_server(
+                            &mut server_join_set,
+                            server_config_arc.clone(),
+                            cancel_token.clone(),
+                            dynamic_stack.clone(),
+                            wait_for,
+                        );
                         next_active_servers.insert(
                             name,
-                            (cancel_token.clone(), server_config_arc.clone(), dynamic_stack.clone()),
+                            ActiveServer {
+                                cancel_token,
+                                config: server_config_arc.clone(),
+                                stack: dynamic_stack,
+                                sockets_released,
+                            },
                         );
-
-                        let cloned_config = server_config_arc.clone();
-                        server_join_set.spawn(async move {
-                            start_single_server(cloned_config, cancel_token, dynamic_stack).await;
-                        });
-                    } else if let Some((old_token, _, dynamic_stack)) = active_servers.remove(&name) {
-                        dynamic_stack.store(Arc::new(service_stack));
+                    } else if let Some(mut active) = active_servers.remove(&name) {
+                        active.stack.store(Arc::new(service_stack));
                         info!("Hot-swapped service stack for '{}'", new_server.name);
 
-                        next_active_servers.insert(name, (old_token, server_config_arc.clone(), dynamic_stack));
+                        active.config = server_config_arc.clone();
+                        next_active_servers.insert(name, active);
                     }
                 }
 
                 // 4. Stop drained/removed listeners.
-                for (_name, (token, old_server, _)) in active_servers.drain() {
-                    info!("Stopping server '{}'", old_server.name);
-                    token.cancel();
+                for (_name, active) in active_servers.drain() {
+                    info!("Stopping server '{}'", active.config.name);
+                    active.cancel_token.cancel();
                 }
 
                 active_servers = next_active_servers;
@@ -262,8 +319,8 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
         }
     }
 
-    for (_, (token, _, _)) in active_servers {
-        token.cancel();
+    for (_, active) in active_servers {
+        active.cancel_token.cancel();
     }
 
     while let Some(res) = server_join_set.join_next().await {

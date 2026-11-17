@@ -360,6 +360,7 @@ mod tests {
             compiled_rbac: None,
             metrics: Default::default(),
             pki_info: Default::default(),
+            ..Default::default()
         }
     }
 

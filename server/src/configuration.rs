@@ -228,6 +228,11 @@ pub struct ServerConfig {
     #[serde(default, alias = "ConnectionLimits")]
     pub connection_limits: ConnectionLimitsConfig,
 
+    /// Maximum time in seconds to drain in-flight connections on shutdown or
+    /// hot-reload restart before remaining tasks are aborted (default: `10`).
+    #[serde(default = "default_graceful_shutdown_timeout_seconds")]
+    pub graceful_shutdown_timeout_seconds: u64,
+
     /// Middleware layer configuration (names + per-layer settings).
     #[serde(rename = "Layers")]
     pub layers: Layers,
@@ -305,6 +310,7 @@ impl Default for ServerConfig {
             client_certs: None,
             client_cert_forwarding: None,
             connection_limits: ConnectionLimitsConfig::default(),
+            graceful_shutdown_timeout_seconds: default_graceful_shutdown_timeout_seconds(),
             layers: Layers::default(),
             allowed_pathes: None,
             rev_routes: None,
@@ -1714,6 +1720,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Default graceful connection drain timeout in seconds (`10`).
+fn default_graceful_shutdown_timeout_seconds() -> u64 {
+    10
+}
+
 // ============================================================================
 //  Implementations
 // ============================================================================
@@ -1856,6 +1867,11 @@ impl Config {
 }
 
 impl ServerConfig {
+    /// Returns the configured graceful connection drain timeout.
+    pub fn drain_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.graceful_shutdown_timeout_seconds)
+    }
+
     /// Finalizes the server configuration by preparing internal state.
     ///
     /// Performs the following steps:

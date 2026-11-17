@@ -28,11 +28,48 @@ use tls_parser::{TlsExtension, TlsMessageHandshake, parse_tls_plaintext};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinError, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::compat::{FuturesAsyncWriteCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use yamux::{Config as YamuxConfig, Connection, Mode, Stream as YamuxStream};
+
+/// Maximum time active control/data tasks get to finish on relay shutdown.
+const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Backoff after a transient `accept()` error (e.g. `EMFILE`) to avoid a busy loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+fn log_relay_task_result(what: &str, res: Result<(), JoinError>) {
+    if let Err(e) = res {
+        if e.is_panic() {
+            error!("Relay {} task panicked: {:?}", what, e);
+        } else if !e.is_cancelled() {
+            error!("Relay {} task failed: {:?}", what, e);
+        }
+    }
+}
+
+async fn drain_relay_tasks(tasks: &mut JoinSet<()>, what: &str, timeout: Duration) {
+    let drain = async {
+        while let Some(res) = tasks.join_next().await {
+            log_relay_task_result(what, res);
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "Relay {} drain timed out after {:?}; aborting {} remaining task(s)",
+            what,
+            timeout,
+            tasks.len()
+        );
+        tasks.abort_all();
+        while let Some(res) = tasks.join_next().await {
+            log_relay_task_result(what, res);
+        }
+    }
+}
 
 /// Domain-specific error type for the Praeco Relay Server library.
 #[derive(Debug, thiserror::Error)]
@@ -467,18 +504,7 @@ pub fn parse_register_command(line: &str, enable_proxy_protocol: bool) -> Option
 /// Performs the mTLS handshake, validates the client certificate's SANs against the
 /// requested SNI in the `REGISTER` command, enforces active-tunnel overwrite protection,
 /// registers the tunnel in `tunnels`, and drives the Yamux multiplexer until disconnection.
-#[tracing::instrument(
-    name = "control_connection",
-    skip(
-        stream,
-        acceptor,
-        tunnels,
-        handshake_timeout,
-        max_yamux_streams,
-        enable_proxy_protocol
-    ),
-    fields(client_ip = %client_addr)
-)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_control_connection<S>(
     stream: S,
     client_addr: SocketAddr,
@@ -487,6 +513,45 @@ pub async fn handle_control_connection<S>(
     handshake_timeout: Duration,
     max_yamux_streams: usize,
     enable_proxy_protocol: bool,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_control_connection_with_cancel(
+        stream,
+        client_addr,
+        acceptor,
+        tunnels,
+        handshake_timeout,
+        max_yamux_streams,
+        enable_proxy_protocol,
+        CancellationToken::new(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "control_connection",
+    skip(
+        stream,
+        acceptor,
+        tunnels,
+        handshake_timeout,
+        max_yamux_streams,
+        enable_proxy_protocol,
+        cancel_token
+    ),
+    fields(client_ip = %client_addr)
+)]
+async fn handle_control_connection_with_cancel<S>(
+    stream: S,
+    client_addr: SocketAddr,
+    acceptor: TlsAcceptor,
+    tunnels: SessionMap,
+    handshake_timeout: Duration,
+    max_yamux_streams: usize,
+    enable_proxy_protocol: bool,
+    cancel_token: CancellationToken,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -623,7 +688,7 @@ pub async fn handle_control_connection<S>(
         oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>,
     > = None;
 
-    std::future::poll_fn(|cx| {
+    let driver = std::future::poll_fn(|cx| {
         // 1. Check for new outbound requests (from Data Plane) if we don't have one pending
         if pending_outbound.is_none()
             && let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx)
@@ -658,8 +723,19 @@ pub async fn handle_control_connection<S>(
         }
 
         std::task::Poll::Pending
-    })
-    .await;
+    });
+
+    tokio::select! {
+        () = driver => {}
+        () = cancel_token.cancelled() => {
+            info!(target: "relay::control_plane", sni = %sni, "Closing control tunnel on shutdown");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                std::future::poll_fn(|cx| connection.poll_close(cx)),
+            )
+            .await;
+        }
+    }
 
     // Remove only if generation matches (P0.5)
     tunnels.remove_if(&sni, |_, route| route.generation == my_generation);
@@ -681,17 +757,27 @@ pub async fn run_control_plane(
         info!("Control plane listening on mTLS {}", local_addr);
     }
 
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
+
     loop {
         let (stream, client_addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
                 info!("Control plane shutting down gracefully");
                 break;
             }
+            Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                log_relay_task_result("control connection", res);
+                continue;
+            }
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok(s) => s,
                     Err(e) => {
                         warn!("Failed to accept control connection: {}", e);
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
                         continue;
                     }
                 }
@@ -708,8 +794,9 @@ pub async fn run_control_plane(
 
         let acceptor = tls_acceptor.clone();
         let tunnels = tunnels.clone();
+        let conn_cancel = cancel_token.child_token();
 
-        tokio::spawn(handle_control_connection(
+        conn_tasks.spawn(handle_control_connection_with_cancel(
             stream,
             client_addr,
             acceptor,
@@ -717,9 +804,12 @@ pub async fn run_control_plane(
             handshake_timeout,
             max_yamux_streams,
             enable_proxy_protocol,
+            conn_cancel,
         ));
     }
 
+    drop(listener);
+    drain_relay_tasks(&mut conn_tasks, "control connection", RELAY_DRAIN_TIMEOUT).await;
     Ok(())
 }
 
@@ -1001,7 +1091,7 @@ pub async fn run_data_plane(
     // Spawn a cleanup task to prevent DashMap from growing indefinitely
     let cleanup_limits = rate_limits.clone();
     let cleanup_token = cancel_token.clone();
-    tokio::spawn(async move {
+    let cleanup_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             tokio::select! {
@@ -1014,16 +1104,29 @@ pub async fn run_data_plane(
         }
     });
 
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
+
     loop {
         let (client_stream, client_addr) = tokio::select! {
             _ = cancel_token.cancelled() => {
                 info!("Data plane shutting down gracefully");
                 break;
             }
+            Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                log_relay_task_result("data connection", res);
+                continue;
+            }
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(e) => {
+                        warn!("Data plane accept error: {}", e);
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
+                        continue;
+                    }
                 }
             }
         };
@@ -1065,7 +1168,7 @@ pub async fn run_data_plane(
 
         let local_addr = client_stream.local_addr().unwrap_or(client_addr);
         let tunnels = tunnels.clone();
-        tokio::spawn(async move {
+        conn_tasks.spawn(async move {
             let _guard = connection_guard;
             handle_data_connection(
                 client_stream,
@@ -1079,6 +1182,9 @@ pub async fn run_data_plane(
         });
     }
 
+    drop(listener);
+    let _ = cleanup_handle.await;
+    drain_relay_tasks(&mut conn_tasks, "data connection", RELAY_DRAIN_TIMEOUT).await;
     Ok(())
 }
 

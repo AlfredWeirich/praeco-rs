@@ -19,21 +19,22 @@ use http_body_util::BodyExt;
 use hyper::{Request, Response, StatusCode};
 use rustls::ServerConfig as RustlsServerConfig;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
+use tokio::sync::oneshot;
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
 
 use crate::{
     BoxedCloneService, ConnectionHandler, H3Body, SrvError,
     configuration::{
-        AuthenticationMethod, CachedDescriptorPool, Config, Protocol, RouteBackendType,
-        ServerConfig, ServiceType, TunnelConfig, UserRole, RoleVec,
+        AuthenticationMethod, CachedDescriptorPool, Config, Protocol, RoleVec, RouteBackendType,
+        ServerConfig, ServiceType, TunnelConfig, UserRole,
     },
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::router::build_grpc_pool,
     stack::{
         build_rustls_config, build_service_stack, build_tunnel_tls_connector,
-        run_tunnel_over_stream, serve_http_connection, serve_tls_connection,
+        run_tunnel_over_stream_with_drain_timeout, serve_http_connection, serve_tls_connection,
     },
     tls_conf::extract_client_metadata,
 };
@@ -77,28 +78,187 @@ pub async fn run_servers(config: Arc<Config>, cancel_token: CancellationToken) {
     }
 }
 
+/// Default maximum time in-flight connections (and HTTP/3 streams) get to finish
+/// after a shutdown was requested. Can be overridden per server via
+/// `ServerConfig::graceful_shutdown_timeout_seconds`.
+pub const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum time the QUIC endpoint gets to flush `CONNECTION_CLOSE` frames after
+/// all HTTP/3 connections have been drained.
+const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum time background tasks (active health checks) get to stop after the
+/// server's cancellation token fired.
+const BACKGROUND_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Backoff after a transient `accept()` error (e.g. `EMFILE`) to avoid a busy loop.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Signals a `oneshot::Sender<()>` once `expected` socket-release events have occurred
+/// (or on `Drop` as a safety net if a task exits early).
+struct SocketReleaseBarrier {
+    remaining: std::sync::atomic::AtomicU8,
+    tx: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl SocketReleaseBarrier {
+    fn new(expected: u8, tx: Option<oneshot::Sender<()>>) -> Arc<Self> {
+        let barrier = Arc::new(Self {
+            remaining: std::sync::atomic::AtomicU8::new(expected),
+            tx: std::sync::Mutex::new(tx),
+        });
+        if expected == 0 {
+            barrier.fire();
+        }
+        barrier
+    }
+
+    fn release(&self) {
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.fire();
+        }
+    }
+
+    fn fire(&self) {
+        if let Ok(mut guard) = self.tx.lock()
+            && let Some(tx) = guard.take()
+        {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for SocketReleaseBarrier {
+    fn drop(&mut self) {
+        self.fire();
+    }
+}
+
+/// Logs panics and unexpected failures of a finished task; cancelled (aborted)
+/// tasks are silent because aborting is a deliberate action of the runner.
+fn log_task_result(server_name: &str, what: &str, res: Result<(), JoinError>) {
+    if let Err(e) = res {
+        if e.is_panic() {
+            error!("{}: {} task panicked: {:?}", server_name, what, e);
+        } else if !e.is_cancelled() {
+            error!("{}: {} task failed: {:?}", server_name, what, e);
+        }
+    }
+}
+
+/// Waits for all tasks in `tasks` to finish within `timeout`, then aborts the rest.
+///
+/// Panics of finished tasks are logged via [`log_task_result`].
+async fn drain_tasks(tasks: &mut JoinSet<()>, server_name: &str, what: &str, timeout: Duration) {
+    let drain = async {
+        while let Some(res) = tasks.join_next().await {
+            log_task_result(server_name, what, res);
+        }
+    };
+    if tokio::time::timeout(timeout, drain).await.is_err() {
+        warn!(
+            "{}: {} did not finish within {:?}; aborting {} remaining task(s)",
+            server_name,
+            what,
+            timeout,
+            tasks.len()
+        );
+        tasks.abort_all();
+        while let Some(res) = tasks.join_next().await {
+            log_task_result(server_name, what, res);
+        }
+    }
+}
+
+/// Reaps finished background tasks (logging panics) for as long as it is polled.
+///
+/// Never completes, so it can be used as a `select!` branch next to the actual
+/// server future.
+async fn watch_background_tasks(tasks: &mut JoinSet<()>, server_name: &str) {
+    while let Some(res) = tasks.join_next().await {
+        log_task_result(server_name, "background", res);
+    }
+    std::future::pending::<()>().await;
+}
+
 /// Starts a single server instance (HTTP, HTTPS/H3 dual-stack, or outbound Relay tunnel)
-/// based on the provided configuration.
+/// based on the provided configuration and returns once it has fully stopped.
 ///
 /// # Architecture & Lifecycle
 ///
 /// 1. **Active Health Checks**: For [`ServiceType::Router`], spawns background loops
-///    for every upstream with `active_health_check_interval > 0`.
+///    for every upstream with `active_health_check_interval > 0`. They are supervised:
+///    panics are logged and the loops are awaited on shutdown.
 /// 2. **Tunnel or Listener Dispatch**:
 ///    - If `server_config.tunnel` is set, connects outbound via mTLS + Yamux with
 ///      exponential backoff on disconnects.
 ///    - For [`Protocol::Https`], starts dual-stack TCP (HTTP/1.1 + HTTP/2) and UDP
-///      (HTTP/3 over QUIC) listeners via [`run_dual_stack`].
+///      (HTTP/3 over QUIC) listeners via [`spawn_dual_stack`]. If one listener dies
+///      unexpectedly, the whole server is shut down instead of running half-dead.
 ///    - For [`Protocol::Http`], starts a plaintext TCP listener.
+/// 3. **Graceful shutdown**: When `cancel_token` fires, listeners stop accepting,
+///    in-flight connections get up to `server_config.drain_timeout()` to finish and
+///    this function returns only after everything has been drained.
 pub async fn start_single_server(
     server_config: Arc<ServerConfig>,
     cancel_token: CancellationToken,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
 ) {
+    start_single_server_with_socket_signal(server_config, cancel_token, dynamic_stack, None).await;
+}
+
+/// Like [`start_single_server`], but notifies `sockets_released` as soon as the
+/// server's listening sockets are closed (before waiting for slow HTTP connection
+/// draining to finish), allowing hot-reload restarts on the same port to bind promptly.
+pub async fn start_single_server_with_socket_signal(
+    server_config: Arc<ServerConfig>,
+    cancel_token: CancellationToken,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    sockets_released: Option<oneshot::Sender<()>>,
+) {
+    // Per-server token: cancelled by the caller or if a listener dies unexpectedly.
+    let server_token = cancel_token.child_token();
+    let mut background_tasks: JoinSet<()> = JoinSet::new();
+
     if server_config.service == ServiceType::Router {
-        spawn_router_health_checks(&server_config, cancel_token.clone());
+        spawn_router_health_checks_in(&server_config, server_token.clone(), &mut background_tasks);
     }
 
+    tokio::select! {
+        () = serve_listeners(&server_config, &server_token, dynamic_stack, sockets_released) => {}
+        () = watch_background_tasks(&mut background_tasks, &server_config.name) => {}
+    }
+
+    if !cancel_token.is_cancelled() {
+        error!(
+            "{}: Server stopped before a shutdown was requested",
+            server_config.name
+        );
+    }
+
+    server_token.cancel();
+    drain_tasks(
+        &mut background_tasks,
+        &server_config.name,
+        "background",
+        BACKGROUND_STOP_TIMEOUT,
+    )
+    .await;
+}
+
+/// Runs the tunnel or listener part of a server until `server_token` is cancelled
+/// (or the listeners cannot be started) and drains all in-flight connections.
+async fn serve_listeners(
+    server_config: &Arc<ServerConfig>,
+    server_token: &CancellationToken,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    sockets_released: Option<oneshot::Sender<()>>,
+) {
+    let drain_timeout = server_config.drain_timeout();
     let Some(static_name) = server_config.static_name else {
         error!(
             "{}: Missing static_name (ensure ServerConfig::finalize was called)",
@@ -115,6 +275,7 @@ pub async fn start_single_server(
     ));
 
     if let Some(tunnel) = &server_config.tunnel {
+        let _release_guard = SocketReleaseBarrier::new(1, sockets_released);
         info!(
             "{}: Connecting to Zero-Trust Tunnel at {}",
             server_config.name, tunnel.target_url
@@ -131,19 +292,20 @@ pub async fn start_single_server(
         let initial_delay = Duration::from_secs(1);
 
         loop {
-            if cancel_token.is_cancelled() {
+            if server_token.is_cancelled() {
                 break;
             }
 
             let start_time = std::time::Instant::now();
-            if let Err(e) = run_tunnel(
+            if let Err(e) = run_tunnel_with_timeout(
                 tunnel.clone(),
                 tls_config.clone(),
                 dynamic_stack.clone(),
-                cancel_token.clone(),
+                server_token.clone(),
                 static_name,
                 oid_mapping.clone(),
                 connection_tracker.clone(),
+                drain_timeout,
             )
             .await
             {
@@ -164,7 +326,7 @@ pub async fn start_single_server(
 
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {},
-                _ = cancel_token.cancelled() => {
+                _ = server_token.cancelled() => {
                     break;
                 }
             }
@@ -195,21 +357,25 @@ pub async fn start_single_server(
             }
         };
 
-        if let Err(e) = run_dual_stack(
+        let barrier = SocketReleaseBarrier::new(2, sockets_released);
+        match spawn_dual_stack_inner(
             server_addr,
             tls_config,
             dynamic_stack,
-            cancel_token,
+            server_token.clone(),
             static_name,
             oid_mapping,
             connection_tracker.clone(),
+            drain_timeout,
+            Some(barrier),
         )
         .await
         {
-            error!(
+            Ok(handles) => supervise_dual_stack(handles, server_token, &server_config.name).await,
+            Err(e) => error!(
                 "{}: HTTPS/Dual Stack Server crashed: {:?}",
                 server_config.name, e
-            );
+            ),
         }
     } else {
         // === HTTP (PLAINTEXT) FALLBACK ===
@@ -221,9 +387,14 @@ pub async fn start_single_server(
             }
         };
 
+        let barrier = SocketReleaseBarrier::new(1, sockets_released);
+        let mut conn_tasks: JoinSet<()> = JoinSet::new();
         loop {
             tokio::select! {
-                _ = cancel_token.cancelled() => break,
+                _ = server_token.cancelled() => break,
+                Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                    log_task_result(static_name, "connection", res);
+                }
                 res = listener.accept() => {
                     match res {
                         Ok((stream, peer_addr)) => {
@@ -248,9 +419,9 @@ pub async fn start_single_server(
                                 }
                             };
                             let svc = (**dynamic_stack.load()).clone();
-                            let conn_token = cancel_token.clone();
+                            let conn_token = server_token.clone();
                             let oid_mapping = oid_mapping.clone();
-                            tokio::spawn(async move {
+                            conn_tasks.spawn(async move {
                                 let _guard = conn_guard;
                                 let handler = ConnectionHandler::new(
                                     svc,
@@ -263,12 +434,59 @@ pub async fn start_single_server(
                                 serve_http_connection(stream, handler, conn_token).await;
                             });
                         }
-                        Err(e) => error!("{}: HTTP Accept error: {}", server_config.name, e),
+                        Err(e) => {
+                            error!("{}: HTTP Accept error: {}", server_config.name, e);
+                            tokio::select! {
+                                _ = server_token.cancelled() => break,
+                                _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            }
+                        }
                     }
                 }
             }
         }
+
+        // Release the listening socket first so a successor can bind immediately.
+        drop(listener);
+        barrier.release();
+        drain_tasks(&mut conn_tasks, static_name, "connection", drain_timeout).await;
     }
+}
+
+/// Waits for both dual-stack listeners.
+///
+/// If one listener ends before a shutdown was requested (panic or unexpected exit),
+/// the server token is cancelled so the sibling listener and the health checks do
+/// not keep running half-dead, and both listeners are awaited.
+async fn supervise_dual_stack(
+    handles: DualStackHandles,
+    server_token: &CancellationToken,
+    server_name: &str,
+) {
+    let DualStackHandles {
+        mut tcp_task,
+        mut udp_task,
+    } = handles;
+
+    let (tcp_res, udp_res) = tokio::select! {
+        res = &mut tcp_task => {
+            if !server_token.is_cancelled() {
+                error!("{}: TCP listener exited unexpectedly; shutting down server", server_name);
+            }
+            server_token.cancel();
+            (res, udp_task.await)
+        }
+        res = &mut udp_task => {
+            if !server_token.is_cancelled() {
+                error!("{}: UDP/QUIC listener exited unexpectedly; shutting down server", server_name);
+            }
+            server_token.cancel();
+            (tcp_task.await, res)
+        }
+    };
+
+    log_task_result(server_name, "TCP listener", tcp_res);
+    log_task_result(server_name, "UDP/QUIC listener", udp_res);
 }
 
 /// Spawns background active health-checker loops for upstream router targets.
@@ -276,9 +494,33 @@ pub async fn start_single_server(
 /// Evaluates all `parsed_routes` in `server_config`. For any backend marked with a
 /// non-zero `active_health_check_interval`, this provisions keep-alive Hyper clients
 /// (HTTP/2-only for gRPC, standard for REST) and spawns periodic probes.
+///
+/// The probes run detached; a small reaper task logs panics. Use
+/// [`spawn_router_health_checks_in`] to supervise them in your own [`JoinSet`].
 pub fn spawn_router_health_checks(
     server_config: &Arc<ServerConfig>,
     cancel_token: CancellationToken,
+) {
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    spawn_router_health_checks_in(server_config, cancel_token, &mut tasks);
+    if tasks.is_empty() {
+        return;
+    }
+
+    let server_name = server_config.name.clone();
+    tokio::spawn(async move {
+        while let Some(res) = tasks.join_next().await {
+            log_task_result(&server_name, "health-check", res);
+        }
+    });
+}
+
+/// Like [`spawn_router_health_checks`], but spawns the probe loops into the caller's
+/// `tasks` set so they can be supervised, awaited and aborted together with the server.
+pub fn spawn_router_health_checks_in(
+    server_config: &Arc<ServerConfig>,
+    cancel_token: CancellationToken,
+    tasks: &mut JoinSet<()>,
 ) {
     let Some(router_params) = &server_config.router_params else {
         return;
@@ -404,7 +646,7 @@ pub fn spawn_router_health_checks(
             let auth_header = jwt_token.clone();
             let router_params = router_params.clone();
 
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 // Startup grace period (10 seconds): allow co-started or manually launched
                 // backend services (which may first fetch JWKS from Praeco's IdP) to bind
                 // their listening ports before running the first active health check.
@@ -653,8 +895,28 @@ fn record_health_check_failure(
     }
 }
 
+/// Join handles of the two accept loops started by [`spawn_dual_stack`].
+///
+/// Dropping the handles detaches the loops (they keep running until the
+/// cancellation token fires); awaiting them waits for the graceful drain.
+#[derive(Debug)]
+pub struct DualStackHandles {
+    /// TCP accept loop (HTTP/1.1 + HTTP/2 over TLS).
+    pub tcp_task: JoinHandle<()>,
+    /// UDP accept loop (HTTP/3 over QUIC).
+    pub udp_task: JoinHandle<()>,
+}
+
 /// Runs a dual-stack HTTPS server supporting both TCP (HTTP/1.1, HTTP/2) and UDP (HTTP/3 over QUIC)
 /// on the same socket address.
+///
+/// Returns as soon as both sockets are bound and the accept loops are running; the loops
+/// stay detached. Use [`spawn_dual_stack`] to obtain their [`JoinHandle`]s and supervise them.
+///
+/// # Errors
+///
+/// Returns [`SrvError`] if the TCP or UDP socket cannot be bound or the QUIC TLS
+/// configuration is invalid. In that case no task is left running.
 pub async fn run_dual_stack(
     server_addr: SocketAddr,
     tls_config: RustlsServerConfig,
@@ -664,58 +926,126 @@ pub async fn run_dual_stack(
     oid_mapping: Arc<HashMap<String, UserRole>>,
     connection_tracker: Arc<ConnectionTracker>,
 ) -> Result<(), SrvError> {
-    let arc_tls_config = Arc::new(tls_config);
-
-    let tcp_cancel_token = cancel_token.clone();
-    let udp_cancel_token = cancel_token;
-
-    let tcp_handle = run_tcp_listener(
+    spawn_dual_stack(
         server_addr,
-        arc_tls_config.clone(),
-        dynamic_stack.clone(),
-        tcp_cancel_token,
-        server_name,
-        oid_mapping.clone(),
-        connection_tracker.clone(),
-    );
-
-    let udp_handle = run_udp_listener(
-        server_addr,
-        arc_tls_config,
+        tls_config,
         dynamic_stack,
-        udp_cancel_token,
+        cancel_token,
         server_name,
         oid_mapping,
         connection_tracker,
-    );
-
-    let (tcp_res, udp_res) = tokio::join!(tcp_handle, udp_handle);
-    tcp_res?;
-    udp_res?;
-    Ok(())
+    )
+    .await
+    .map(|_| ())
 }
 
-/// Runs the TCP listener for HTTPS traffic (HTTP/1.1 and HTTP/2).
-async fn run_tcp_listener(
+/// Binds the TCP and UDP sockets and spawns the HTTPS (TCP) and HTTP/3 (QUIC) accept loops.
+///
+/// Both sockets are bound **before** any task is spawned, so a failing second bind never
+/// leaves the first accept loop running. When `cancel_token` fires, both loops stop
+/// accepting, release their sockets, drain in-flight connections for up to
+/// [`CONNECTION_DRAIN_TIMEOUT`] and then finish; awaiting the returned handles waits for that.
+///
+/// # Errors
+///
+/// Returns [`SrvError`] if the TCP/UDP bind fails or the QUIC TLS configuration is invalid.
+pub async fn spawn_dual_stack(
     server_addr: SocketAddr,
-    tls_config: Arc<RustlsServerConfig>,
+    tls_config: RustlsServerConfig,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
     oid_mapping: Arc<HashMap<String, UserRole>>,
     connection_tracker: Arc<ConnectionTracker>,
-) -> Result<(), SrvError> {
+) -> Result<DualStackHandles, SrvError> {
+    spawn_dual_stack_inner(
+        server_addr,
+        tls_config,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        CONNECTION_DRAIN_TIMEOUT,
+        None,
+    )
+    .await
+}
+
+/// Like [`spawn_dual_stack`], with explicit `drain_timeout` and optional `release_barrier`.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_dual_stack_inner(
+    server_addr: SocketAddr,
+    tls_config: RustlsServerConfig,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    release_barrier: Option<Arc<SocketReleaseBarrier>>,
+) -> Result<DualStackHandles, SrvError> {
+    let arc_tls_config = Arc::new(tls_config);
+
+    // Bind everything first: on failure the already-bound socket is simply dropped.
     let tcp_listener = TcpListener::bind(server_addr)
         .await
         .map_err(|e| SrvError::Other(format!("TCP bind failed on {server_addr}: {e}")))?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let quic_endpoint = build_quic_endpoint(server_addr, &arc_tls_config)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(arc_tls_config);
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => break,
-                res = tcp_listener.accept() => {
-                    if let Ok((stream, peer_addr)) = res {
+    let tcp_task = tokio::spawn(run_tcp_accept_loop(
+        tcp_listener,
+        acceptor,
+        dynamic_stack.clone(),
+        cancel_token.clone(),
+        server_name,
+        oid_mapping.clone(),
+        connection_tracker.clone(),
+        drain_timeout,
+        release_barrier.clone(),
+    ));
+    let udp_task = tokio::spawn(run_udp_accept_loop(
+        quic_endpoint,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        drain_timeout,
+        release_barrier,
+    ));
+
+    Ok(DualStackHandles { tcp_task, udp_task })
+}
+
+/// Accept loop for HTTPS traffic (HTTP/1.1 and HTTP/2) on an already bound listener.
+///
+/// Connection tasks are tracked in a [`JoinSet`]: finished ones are reaped while running
+/// (panics are logged) and the remaining ones are drained after `cancel_token` fired.
+#[allow(clippy::too_many_arguments)]
+async fn run_tcp_accept_loop(
+    tcp_listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    release_barrier: Option<Arc<SocketReleaseBarrier>>,
+) {
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                log_task_result(server_name, "connection", res);
+            }
+            res = tcp_listener.accept() => {
+                match res {
+                    Ok((stream, peer_addr)) => {
                         let peer_ip = peer_addr.ip();
                         let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
                             Ok(guard) => guard,
@@ -735,7 +1065,7 @@ async fn run_tcp_listener(
                         let dynamic_stack = dynamic_stack.clone();
                         let oid_mapping = oid_mapping.clone();
                         let conn_token = cancel_token.clone();
-                        tokio::spawn(async move {
+                        conn_tasks.spawn(async move {
                             let _guard = conn_guard;
                             trace!("{}: TCP Connection accepted", server_name);
                             let _ = serve_tls_connection(
@@ -750,25 +1080,32 @@ async fn run_tcp_listener(
                             .await;
                         });
                     }
+                    Err(e) => {
+                        error!("{}: TCP Accept error: {}", server_name, e);
+                        tokio::select! {
+                            _ = cancel_token.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                        }
+                    }
                 }
             }
         }
-    });
+    }
 
-    Ok(())
+    // Release the listening socket first so a successor can bind immediately.
+    drop(tcp_listener);
+    if let Some(barrier) = release_barrier {
+        barrier.release();
+    }
+    drain_tasks(&mut conn_tasks, server_name, "connection", drain_timeout).await;
 }
 
-/// Runs the UDP listener for HTTP/3 traffic using QUIC (`quinn` and `h3`).
-async fn run_udp_listener(
+/// Builds the QUIC server endpoint (and binds its UDP socket) for HTTP/3.
+fn build_quic_endpoint(
     server_addr: SocketAddr,
-    tls_config: Arc<RustlsServerConfig>,
-    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
-    cancel_token: CancellationToken,
-    server_name: &'static str,
-    oid_mapping: Arc<HashMap<String, UserRole>>,
-    connection_tracker: Arc<ConnectionTracker>,
-) -> Result<(), SrvError> {
-    let mut quic_tls_models = rustls::ServerConfig::clone(&tls_config);
+    tls_config: &Arc<RustlsServerConfig>,
+) -> Result<quinn::Endpoint, SrvError> {
+    let mut quic_tls_models = rustls::ServerConfig::clone(tls_config);
     quic_tls_models.alpn_protocols = vec![b"h3".to_vec()];
 
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(quic_tls_models)
@@ -788,64 +1125,118 @@ async fn run_udp_listener(
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     quinn_server_config.transport_config(Arc::new(transport));
 
-    let endpoint = quinn::Endpoint::server(quinn_server_config, server_addr)
-        .map_err(|e| SrvError::Other(format!("QUIC UDP bind failed on {server_addr}: {e}")))?;
+    quinn::Endpoint::server(quinn_server_config, server_addr)
+        .map_err(|e| SrvError::Other(format!("QUIC UDP bind failed on {server_addr}: {e}")))
+}
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_token.cancelled() => break,
-                res = endpoint.accept() => {
-                    if let Some(conn) = res {
-                        if !conn.remote_address_validated() && conn.may_retry() {
-                            if let Err(e) = conn.retry() {
-                                trace!("{}: Failed to send QUIC retry packet: {:?}", server_name, e);
-                            }
-                            continue;
-                        }
+/// Accept loop for HTTP/3 traffic using QUIC (`quinn` and `h3`) on an already bound endpoint.
+///
+/// On shutdown it stops accepting new connections, lets the per-connection tasks finish their
+/// in-flight streams (they send an HTTP/3 `GOAWAY`), and only then closes the endpoint.
+#[allow(clippy::too_many_arguments)]
+async fn run_udp_accept_loop(
+    endpoint: quinn::Endpoint,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    release_barrier: Option<Arc<SocketReleaseBarrier>>,
+) {
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
-                        let peer_ip = conn.remote_address().ip();
-                        let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
-                            Ok(guard) => guard,
-                            Err(AcquireError::GlobalLimitReached { current, max }) => {
-                                warn!("{}: Global connection limit reached ({} >= {}), dropping QUIC connection from {}", server_name, current, max, conn.remote_address());
-                                conn.refuse();
-                                continue;
-                            }
-                            Err(AcquireError::IpLimitReached { ip, current, max }) => {
-                                warn!("{}: Per-IP connection limit reached for {} ({} >= {}), dropping QUIC connection", server_name, ip, current, max);
-                                conn.refuse();
-                                continue;
-                            }
-                        };
-                        trace!("{}: UDP Connection accepted", server_name);
-                        let dynamic_stack = dynamic_stack.clone();
-                        let oid_mapping = oid_mapping.clone();
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                log_task_result(server_name, "H3 connection", res);
+            }
+            res = endpoint.accept() => {
+                let Some(conn) = res else { break };
 
-                        tokio::spawn(async move {
-                            let _guard = conn_guard;
-                            if let Err(e) = handle_h3_connection(conn, dynamic_stack, server_name, oid_mapping).await {
-                                error!("{}: H3 Connection Error: {:?}", server_name, e);
-                            }
-                        });
-                    } else {
-                        break;
+                if !conn.remote_address_validated() && conn.may_retry() {
+                    if let Err(e) = conn.retry() {
+                        trace!("{}: Failed to send QUIC retry packet: {:?}", server_name, e);
                     }
+                    continue;
                 }
+
+                let peer_ip = conn.remote_address().ip();
+                let conn_guard = match connection_tracker.acquire(Some(peer_ip)) {
+                    Ok(guard) => guard,
+                    Err(AcquireError::GlobalLimitReached { current, max }) => {
+                        warn!("{}: Global connection limit reached ({} >= {}), dropping QUIC connection from {}", server_name, current, max, conn.remote_address());
+                        conn.refuse();
+                        continue;
+                    }
+                    Err(AcquireError::IpLimitReached { ip, current, max }) => {
+                        warn!("{}: Per-IP connection limit reached for {} ({} >= {}), dropping QUIC connection", server_name, ip, current, max);
+                        conn.refuse();
+                        continue;
+                    }
+                };
+                trace!("{}: UDP Connection accepted", server_name);
+                let dynamic_stack = dynamic_stack.clone();
+                let oid_mapping = oid_mapping.clone();
+                let conn_token = cancel_token.clone();
+
+                conn_tasks.spawn(async move {
+                    let _guard = conn_guard;
+                    if let Err(e) = handle_h3_connection(
+                        conn,
+                        dynamic_stack,
+                        server_name,
+                        oid_mapping,
+                        conn_token,
+                        drain_timeout,
+                    )
+                    .await
+                    {
+                        error!("{}: H3 Connection Error: {:?}", server_name, e);
+                    }
+                });
             }
         }
-        endpoint.close(0u32.into(), b"shutdown");
-    });
+    }
 
-    Ok(())
+    // Refuse new handshakes while the existing connections finish their streams. The
+    // per-connection drain is bounded by `drain_timeout`, so this outer bound
+    // carries a small margin to avoid aborting a connection that is just about to finish.
+    endpoint.set_server_config(None);
+    drain_tasks(
+        &mut conn_tasks,
+        server_name,
+        "H3 connection",
+        drain_timeout + Duration::from_secs(1),
+    )
+    .await;
+
+    endpoint.close(0u32.into(), b"shutdown");
+    if tokio::time::timeout(QUIC_IDLE_TIMEOUT, endpoint.wait_idle())
+        .await
+        .is_err()
+    {
+        trace!("{}: QUIC endpoint did not become idle in time", server_name);
+    }
+    drop(endpoint);
+    if let Some(barrier) = release_barrier {
+        barrier.release();
+    }
 }
 
 /// Handles a single HTTP/3 (QUIC) connection and dispatches its request streams through [`ConnectionHandler`].
+///
+/// When `cancel_token` fires, an HTTP/3 `GOAWAY` is sent, no new requests are accepted and the
+/// in-flight request streams get up to `drain_timeout` to finish. The `h3`
+/// connection object is kept alive until then because dropping it closes the QUIC connection.
 async fn handle_h3_connection(
     connecting: quinn::Incoming,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
-    #[allow(unused_variables)] server_name: &str,
+    server_name: &str,
     oid_mapping: Arc<HashMap<String, UserRole>>,
+    cancel_token: CancellationToken,
+    drain_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connection = connecting.await?;
     let peer_addr = connection.remote_address();
@@ -887,96 +1278,111 @@ async fn handle_h3_connection(
 
     let base_svc = (**dynamic_stack.load()).clone();
     let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(128));
+    let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
     loop {
-        match h3_server.accept().await {
-            Ok(Some(resolver)) => {
-                let permit = match stream_semaphore.clone().try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        warn!("{}: Max concurrent H3 streams reached (128), shedding request", server_name);
-                        continue;
-                    }
-                };
-                let svc = base_svc.clone();
-                let roles_for_req = shared_roles.clone();
-                let shared_oids_for_req = shared_oids.clone();
-                let req_cert_pem = client_cert_pem.clone();
-                let req_cert_san = client_cert_san.clone();
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                // Tell the client to stop opening requests; in-flight ones are drained below.
+                if let Err(e) = h3_server.shutdown(0).await {
+                    trace!("{}: H3 GOAWAY failed: {:?}", server_name, e);
+                }
+                break;
+            }
+            Some(res) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                log_task_result(server_name, "H3 stream", res);
+            }
+            accepted = h3_server.accept() => match accepted {
+                Ok(Some(resolver)) => {
+                    let permit = match stream_semaphore.clone().try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            warn!("{}: Max concurrent H3 streams reached (128), shedding request", server_name);
+                            continue;
+                        }
+                    };
+                    let svc = base_svc.clone();
+                    let roles_for_req = shared_roles.clone();
+                    let shared_oids_for_req = shared_oids.clone();
+                    let req_cert_pem = client_cert_pem.clone();
+                    let req_cert_san = client_cert_san.clone();
 
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    match resolver.resolve_request().await {
-                        Ok((req, stream)) => {
-                            let (mut sender, receiver) = stream.split();
+                    stream_tasks.spawn(async move {
+                        let _permit = permit;
+                        match resolver.resolve_request().await {
+                            Ok((req, stream)) => {
+                                let (mut sender, receiver) = stream.split();
 
-                            let handler = ConnectionHandler::new_shared(
-                                svc,
-                                peer_addr,
-                                roles_for_req,
-                                req_cert_pem,
-                                req_cert_san,
-                                shared_oids_for_req,
-                            );
+                                let handler = ConnectionHandler::new_shared(
+                                    svc,
+                                    peer_addr,
+                                    roles_for_req,
+                                    req_cert_pem,
+                                    req_cert_san,
+                                    shared_oids_for_req,
+                                );
 
-                            let (parts, _) = req.into_parts();
-                            let body = H3Body::new(receiver);
-                            let hyper_req = Request::from_parts(parts, body.boxed());
+                                let (parts, _) = req.into_parts();
+                                let body = H3Body::new(receiver);
+                                let hyper_req = Request::from_parts(parts, body.boxed());
 
-                            if let Ok(res) = handler.handle(hyper_req).await {
-                                let (res_parts, mut res_body) = res.into_parts();
+                                if let Ok(res) = handler.handle(hyper_req).await {
+                                    let (res_parts, mut res_body) = res.into_parts();
 
-                                if sender
-                                    .send_response(Response::from_parts(res_parts, ()))
-                                    .await
-                                    .is_ok()
-                                {
-                                    while let Some(frame_res) = res_body.frame().await {
-                                        match frame_res {
-                                            Ok(frame) => {
-                                                let frame = match frame.into_data() {
-                                                    Ok(data) => {
-                                                        if sender.send_data(data).await.is_err() {
-                                                            break;
+                                    if sender
+                                        .send_response(Response::from_parts(res_parts, ()))
+                                        .await
+                                        .is_ok()
+                                    {
+                                        while let Some(frame_res) = res_body.frame().await {
+                                            match frame_res {
+                                                Ok(frame) => {
+                                                    let frame = match frame.into_data() {
+                                                        Ok(data) => {
+                                                            if sender.send_data(data).await.is_err() {
+                                                                break;
+                                                            }
+                                                            continue;
                                                         }
-                                                        continue;
+                                                        Err(f) => f,
+                                                    };
+                                                    if let Ok(trailers) = frame.into_trailers()
+                                                        && sender.send_trailers(trailers).await.is_err()
+                                                    {
+                                                        break;
                                                     }
-                                                    Err(f) => f,
-                                                };
-
-                                                if let Ok(trailers) = frame.into_trailers()
-                                                    && sender.send_trailers(trailers).await.is_err()
-                                                {
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "H3 Response body stream error: {:?}",
+                                                        e
+                                                    );
                                                     break;
                                                 }
                                             }
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    "H3 Response body stream error: {:?}",
-                                                    e
-                                                );
-                                                break;
-                                            }
                                         }
+                                        let _ = sender.finish().await;
                                     }
-                                    let _ = sender.finish().await;
                                 }
                             }
+                            Err(e) => error!("H3 Request Error: {e}"),
                         }
-                        Err(e) => error!("H3 Request Error: {e}"),
-                    }
-                });
+                    });
+                }
+                Ok(None) | Err(_) => break,
             }
-            Ok(None) => break,
-            Err(_e) => break,
         }
     }
+
+    // Let in-flight request streams finish; `h3_server` stays alive until they are done
+    // because dropping it closes the QUIC connection.
+    drain_tasks(&mut stream_tasks, server_name, "H3 stream", drain_timeout).await;
+    drop(h3_server);
     Ok(())
 }
 
 /// Connects outbound to the configured Relay Server via TCP + mTLS and drives
 /// [`run_tunnel_over_stream`] until the control plane closes or `cancel_token` fires.
-#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
 pub async fn run_tunnel(
     tunnel: TunnelConfig,
     tls_config: Arc<RustlsServerConfig>,
@@ -985,6 +1391,32 @@ pub async fn run_tunnel(
     server_name: &'static str,
     oid_mapping: Arc<HashMap<String, UserRole>>,
     connection_tracker: Arc<ConnectionTracker>,
+) -> Result<(), SrvError> {
+    run_tunnel_with_timeout(
+        tunnel,
+        tls_config,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        CONNECTION_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`run_tunnel`], with an explicit `drain_timeout` for in-flight tunneled streams.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+pub async fn run_tunnel_with_timeout(
+    tunnel: TunnelConfig,
+    tls_config: Arc<RustlsServerConfig>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
 ) -> Result<(), SrvError> {
     let connector = build_tunnel_tls_connector(&tunnel)?;
 
@@ -1037,7 +1469,7 @@ pub async fn run_tunnel(
         }
     };
 
-    run_tunnel_over_stream(
+    run_tunnel_over_stream_with_drain_timeout(
         tls_stream,
         &tunnel,
         tls_config,
@@ -1046,6 +1478,7 @@ pub async fn run_tunnel(
         server_name,
         oid_mapping,
         connection_tracker,
+        drain_timeout,
     )
     .await?;
 
@@ -1296,5 +1729,284 @@ mod tests {
         let token = CancellationToken::new();
         spawn_router_health_checks(&srv, token.clone());
         token.cancel();
+    }
+
+    /// Picks a loopback address whose port is currently free on TCP and UDP.
+    async fn reserve_dual_stack_addr() -> SocketAddr {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let udp = std::net::UdpSocket::bind(addr).unwrap();
+        drop(udp);
+        drop(tcp);
+        addr
+    }
+
+    /// Builds a finalized HTTPS Echo server config bound to `127.0.0.1:{port}`.
+    fn echo_https_server(name: &str, port: u16) -> Arc<ServerConfig> {
+        let mut cfg: Config = toml::from_str(&format!(
+            r#"
+            [[Server]]
+            name = "{name}"
+            ip = "127.0.0.1"
+            port = {port}
+            protocol = "https"
+            service = "Echo"
+            enabled = true
+
+            [Server.server_certs]
+            ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
+            ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+
+            [Server.Layers]
+            enabled = []
+        "#
+        ))
+        .expect("valid TOML");
+        cfg.servers[0].finalize().unwrap();
+        Arc::new(cfg.servers.pop().unwrap())
+    }
+
+    /// Waits (briefly) until the UDP socket of a closed QUIC endpoint is released.
+    ///
+    /// The endpoint driver task releases the socket asynchronously after the endpoint
+    /// was dropped, so a short poll avoids a flaky immediate re-bind.
+    async fn assert_udp_released(addr: SocketAddr) {
+        for _ in 0..40 {
+            if std::net::UdpSocket::bind(addr).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("UDP port {addr} was not released");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_dual_stack_partial_bind_failure_leaks_no_listener() {
+        ensure_crypto_provider();
+        let addr = reserve_dual_stack_addr().await;
+        // Occupy only the UDP side: the TCP bind succeeds first, the QUIC bind then fails.
+        let _udp_blocker = std::net::UdpSocket::bind(addr).unwrap();
+
+        let srv = echo_https_server("dual_partial", addr.port());
+        let tls_cfg = build_rustls_config(&srv).unwrap();
+        let stack = Arc::new(ArcSwap::from_pointee(
+            EchoService::new("dual_partial").boxed_clone_sync(),
+        ));
+        let token = CancellationToken::new();
+
+        let res = spawn_dual_stack(
+            addr,
+            tls_cfg,
+            stack,
+            token.clone(),
+            "dual_partial",
+            Arc::new(HashMap::new()),
+            Arc::new(ConnectionTracker::new(16, 16)),
+        )
+        .await;
+        assert!(res.is_err(), "occupied UDP port must surface a bind error");
+
+        // The TCP listener must not be left behind in a detached accept loop.
+        TcpListener::bind(addr)
+            .await
+            .expect("TCP port must be released after a failed dual-stack start");
+        token.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_start_single_server_https_returns_only_after_sockets_released() {
+        ensure_crypto_provider();
+        let addr = reserve_dual_stack_addr().await;
+        let srv = echo_https_server("graceful_https", addr.port());
+        let stack = Arc::new(ArcSwap::from_pointee(
+            EchoService::new("graceful_https").boxed_clone_sync(),
+        ));
+        let token = CancellationToken::new();
+
+        let server = tokio::spawn(start_single_server(srv, token.clone(), stack));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("start_single_server must return after cancellation")
+            .expect("server task must not panic");
+
+        // Returning means the listeners are gone: the addresses can be re-bound right away.
+        TcpListener::bind(addr)
+            .await
+            .expect("TCP port must be free once start_single_server returned");
+        assert_udp_released(addr).await;
+    }
+
+    #[test]
+    fn test_graceful_shutdown_timeout_configuration_parses_and_defaults() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+            [[Server]]
+            name = "default_drain"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            service = "Echo"
+
+            [Server.Layers]
+            enabled = []
+
+            [[Server]]
+            name = "custom_drain"
+            ip = "127.0.0.1"
+            port = 8081
+            protocol = "http"
+            service = "Echo"
+            graceful_shutdown_timeout_seconds = 3
+
+            [Server.Layers]
+            enabled = []
+        "#,
+        )
+        .expect("valid TOML");
+        for srv in &mut cfg.servers {
+            srv.finalize().unwrap();
+        }
+        assert_eq!(cfg.servers[0].graceful_shutdown_timeout_seconds, 10);
+        assert_eq!(cfg.servers[0].drain_timeout(), Duration::from_secs(10));
+        assert_eq!(cfg.servers[1].graceful_shutdown_timeout_seconds, 3);
+        assert_eq!(cfg.servers[1].drain_timeout(), Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn test_http_server_drains_inflight_request_while_releasing_socket_early() {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Empty, Full};
+        use hyper_util::rt::TokioIo;
+        use tower::Service;
+
+        #[derive(Clone)]
+        struct SlowEchoService;
+
+        impl Service<Request<crate::SrvBody>> for SlowEchoService {
+            type Response = Response<crate::ServiceRespBody>;
+            type Error = SrvError;
+            type Future = std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+            >;
+
+            fn poll_ready(
+                &mut self,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<crate::SrvBody>) -> Self::Future {
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(
+                            Full::new(Bytes::from_static(b"slow-ok"))
+                                .map_err(SrvError::from)
+                                .boxed(),
+                        )
+                        .unwrap())
+                })
+            }
+        }
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let mut cfg: Config = toml::from_str(&format!(
+            r#"
+            [[Server]]
+            name = "slow_drain"
+            ip = "127.0.0.1"
+            port = {}
+            protocol = "http"
+            service = "Echo"
+            graceful_shutdown_timeout_seconds = 3
+
+            [Server.Layers]
+            enabled = []
+        "#,
+            addr.port()
+        ))
+        .expect("valid TOML");
+        cfg.servers[0].finalize().unwrap();
+        let srv = Arc::new(cfg.servers.pop().unwrap());
+        let stack = Arc::new(ArcSwap::from_pointee(SlowEchoService.boxed_clone_sync()));
+        let token = CancellationToken::new();
+        let (released_tx, released_rx) = oneshot::channel();
+
+        let server_handle = tokio::spawn(start_single_server_with_socket_signal(
+            srv,
+            token.clone(),
+            stack,
+            Some(released_tx),
+        ));
+
+        let stream = {
+            let mut attempts = 0u32;
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(s) => break s,
+                    Err(e) if attempts < 50 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let _ = e;
+                    }
+                    Err(e) => panic!("failed to connect to test HTTP server at {addr}: {e}"),
+                }
+            }
+        };
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .method(hyper::Method::GET)
+            .uri("/slow")
+            .header("host", addr.to_string())
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp_fut = tokio::spawn(async move { sender.send_request(req).await });
+
+        // Give the server a moment to accept and enter the 300ms handler.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        token.cancel();
+
+        // 1. Listening socket is released immediately (before the 300ms request finishes).
+        tokio::time::timeout(Duration::from_millis(150), released_rx)
+            .await
+            .expect("listening socket should be released before slow request finishes")
+            .expect("socket release signal must fire");
+        let rebound = TcpListener::bind(addr)
+            .await
+            .expect("port must be re-bindable while old HTTP connections drain");
+        drop(rebound);
+
+        // 2. Server task must NOT have returned yet because the in-flight request is still draining.
+        assert!(
+            !server_handle.is_finished(),
+            "server must wait for in-flight request drain before returning"
+        );
+
+        // 3. In-flight request completes with 200 OK and body.
+        let resp = resp_fut.await.unwrap().expect("in-flight request must succeed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"slow-ok");
+
+        // 4. Server exits cleanly once drain completes.
+        tokio::time::timeout(Duration::from_secs(2), server_handle)
+            .await
+            .expect("server must exit right after in-flight request completes")
+            .expect("server task must not panic");
     }
 }

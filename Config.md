@@ -93,6 +93,7 @@ kill -HUP <PID_OF_PRAECO>
 5. **Atomic Swap:** Only if **all** validation checks pass, Praeco swaps the running configuration in memory via an `arc-swap` atomic pointer swap (`Config::update_global`).
    - Existing in-flight connections continue processing against their existing middleware stacks.
    - All newly accepted connections immediately run on the newly loaded configuration.
+   - **Ordered Socket Restarts & Draining:** If a server's `ip`, `port`, `protocol`, or `tunnel` changed, the previous instance is retired first and its replacement waits until the listening sockets (or tunnel session) are released before binding, preventing `EADDRINUSE` races while in-flight connections drain for up to `graceful_shutdown_timeout_seconds`.
    - **Rollback Guarantee:** If any step fails (syntax error, missing certificate, invalid regex), an error log is emitted and the running gateway continues operating on the previous valid configuration **with zero downtime and zero dropped sockets**.
 
 ---
@@ -288,6 +289,7 @@ Multiple `[[Server]]` blocks can be declared to run distinct listeners (or tunne
 | :--- | :--- | :--- | :--- | :--- |
 | `name` | String | **Mandatory** | *None* | Unique name identifier. Leaked into `'static str` during initialization to allow zero-copy reference passing in middleware logs and metrics. Matches against TLS certificate resolvers. |
 | `enabled` | Boolean | Optional | `true` | When `false`, the server instance is completely ignored. No listener socket is bound, no tunnel is opened, and no memory structures are allocated. |
+| `graceful_shutdown_timeout_seconds` | Integer (`u64`) | Optional | `10` | Maximum time in seconds to drain in-flight HTTP/1.1, HTTP/2, HTTP/3 (`GOAWAY`), and Yamux tunnel connections on shutdown (`Ctrl-C`) or `SIGHUP` restart before remaining tasks are aborted. For plaintext HTTP listeners, the listening socket is released immediately so a restarted instance on the same port can bind without waiting for slow connection drains. |
 
 ---
 

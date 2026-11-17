@@ -23,6 +23,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use rustls::ServerConfig as RustlsServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::task::JoinSet;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 use tower::Layer;
@@ -799,7 +800,9 @@ where
 }
 
 /// Runs the Praeco side of a Relay Server tunnel over an already-established
-/// control-plane stream (e.g., an outbound mTLS stream to the Relay Control Plane).
+/// control-plane stream (e.g., an outbound mTLS stream to the Relay Control Plane),
+/// using [`CONNECTION_DRAIN_TIMEOUT`](crate::runner::CONNECTION_DRAIN_TIMEOUT) for
+/// graceful connection draining.
 ///
 /// Performs:
 /// 1. SNI registration (`REGISTER <sni_domain> [PROXY_V2]\n`).
@@ -812,8 +815,38 @@ where
 ///
 /// Returns [`SrvError::Other`] if writing the registration command fails.
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
 pub async fn run_tunnel_over_stream<S>(
+    control_stream: S,
+    tunnel: &TunnelConfig,
+    tls_config: Arc<RustlsServerConfig>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+) -> Result<(), SrvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    run_tunnel_over_stream_with_drain_timeout(
+        control_stream,
+        tunnel,
+        tls_config,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        crate::runner::CONNECTION_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+/// Like [`run_tunnel_over_stream`], but uses a caller-supplied `drain_timeout` when
+/// waiting for in-flight tunneled connections to finish on shutdown.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+pub async fn run_tunnel_over_stream_with_drain_timeout<S>(
     mut control_stream: S,
     tunnel: &TunnelConfig,
     tls_config: Arc<RustlsServerConfig>,
@@ -822,6 +855,7 @@ pub async fn run_tunnel_over_stream<S>(
     server_name: &'static str,
     oid_mapping: Arc<HashMap<String, UserRole>>,
     connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
 ) -> Result<(), SrvError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -858,11 +892,22 @@ where
 
     let use_proxy_protocol = tunnel.proxy_protocol;
     let sni_domain = tunnel.sni_domain.clone();
+    let stream_token = cancel_token.child_token();
+    let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
     // 3. Accept Streams loop
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => break,
+            Some(res) = conn_tasks.join_next(), if !conn_tasks.is_empty() => {
+                if let Err(e) = res {
+                    if e.is_panic() {
+                        error!("{}: Tunneled connection task panicked: {:?}", server_name, e);
+                    } else if !e.is_cancelled() {
+                        error!("{}: Tunneled connection task failed: {:?}", server_name, e);
+                    }
+                }
+            }
             inbound = std::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => {
                 match inbound {
                     Some(Ok(yamux_stream)) => {
@@ -881,10 +926,10 @@ where
                         let acceptor = acceptor.clone();
                         let dynamic_stack = dynamic_stack.clone();
                         let oid_mapping = oid_mapping.clone();
-                        let conn_token = cancel_token.child_token();
+                        let conn_token = stream_token.clone();
                         let span_sni = sni_domain.clone();
 
-                        tokio::spawn(async move {
+                        conn_tasks.spawn(async move {
                             let mut connection_guard = connection_guard;
                             let compat_stream = yamux_stream.compat();
 
@@ -929,6 +974,71 @@ where
                         info!("{}: Tunnel closed by Relay", server_name);
                         break;
                     }
+                }
+            }
+        }
+    }
+
+    if cancel_token.is_cancelled() {
+        // Keep polling `connection` during drain because active Yamux streams need the
+        // multiplexer driver to exchange frames and complete HTTP/2 GOAWAY shutdowns.
+        if !conn_tasks.is_empty() {
+            let drain = async {
+                while !conn_tasks.is_empty() {
+                    tokio::select! {
+                        Some(res) = conn_tasks.join_next() => {
+                            if let Err(e) = res {
+                                if e.is_panic() {
+                                    error!("{}: Tunneled connection task panicked during drain: {:?}", server_name, e);
+                                } else if !e.is_cancelled() {
+                                    error!("{}: Tunneled connection task failed during drain: {:?}", server_name, e);
+                                }
+                            }
+                        }
+                        inbound = std::future::poll_fn(|cx| connection.poll_next_inbound(cx)) => {
+                            match inbound {
+                                Some(Ok(extra_stream)) => drop(extra_stream),
+                                Some(Err(_)) | None => break,
+                            }
+                        }
+                    }
+                }
+            };
+            if tokio::time::timeout(drain_timeout, drain).await.is_err() {
+                warn!(
+                    "{}: Tunnel connection drain timed out after {:?}; aborting {} remaining task(s)",
+                    server_name,
+                    drain_timeout,
+                    conn_tasks.len()
+                );
+                conn_tasks.abort_all();
+                while let Some(res) = conn_tasks.join_next().await {
+                    if let Err(e) = res && e.is_panic() {
+                        error!("{}: Tunneled connection task panicked during abort: {:?}", server_name, e);
+                    }
+                }
+            }
+        }
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            std::future::poll_fn(|cx| connection.poll_close(cx)),
+        )
+        .await;
+    } else {
+        // Underlying Yamux connection closed or errored: cancel active stream handlers and reap.
+        stream_token.cancel();
+        let drain = async {
+            while let Some(res) = conn_tasks.join_next().await {
+                if let Err(e) = res && e.is_panic() {
+                    error!("{}: Tunneled connection task panicked: {:?}", server_name, e);
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(2), drain).await.is_err() {
+            conn_tasks.abort_all();
+            while let Some(res) = conn_tasks.join_next().await {
+                if let Err(e) = res && e.is_panic() {
+                    error!("{}: Tunneled connection task panicked during abort: {:?}", server_name, e);
                 }
             }
         }

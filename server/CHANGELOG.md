@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.6.0] - 2026-11-17
 
-Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), SemVer-safe `#[non_exhaustive]` public types, programmatic `ServerConfig::default()`, and embedded binary gRPC aggregator example.
+Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), SemVer-safe `#[non_exhaustive]` public types, programmatic `ServerConfig::default()`, embedded binary gRPC aggregator example, and supervised listener/tunnel lifecycle with graceful connection draining.
 
 ### Breaking Changes
 * **Public Configuration & Routing Types (`src/configuration.rs`):**
@@ -30,9 +30,24 @@ Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), SemVer-
   * Implemented `Default` for `ServerConfig` (`enabled: true`, `ConnectionLimitsConfig::default()`, etc.) and `RouteConfig` so library embedders can construct configs purely in Rust (`..Default::default()`) without a `Config.toml` file, and rejected empty/whitespace `ServerConfig::name` in `ServerConfig::finalize()`.
   * Added and re-exported `build_service_stack_with_base(server_config, base_service)` and `wrap_tonic_routes(routes)` in `praeco_rs::stack` so embedded applications can wrap any custom Tower service or `tonic::service::Routes` with Praeco's full hardening stack (configured middleware layers, `TraceLayer`/`ServerMetrics`, and outer `PathSanitizerLayer`) without duplicating boilerplate.
   * Added runnable `server/examples/embedded_grpc_aggregator.rs` demonstrating `praeco-rs` with `default-features = false`, wrapping a typed binary Protobuf-to-Protobuf `tonic` aggregator service via `wrap_tonic_routes`, `build_service_stack_with_base`, and `start_single_server`.
+* **Supervised Listeners, Tunnel Draining & Configurable Shutdown Timeout (`src/configuration.rs`, `src/runner.rs`, `src/stack.rs`, `src/lib.rs`):**
+  * Added `ServerConfig::graceful_shutdown_timeout_seconds` (default `10` s) and `ServerConfig::drain_timeout()`, plus `CONNECTION_DRAIN_TIMEOUT` re-exported at the crate root.
+  * Added and re-exported `spawn_dual_stack` returning `DualStackHandles` (`tcp_task`, `udp_task`) and `start_single_server_with_socket_signal`: TCP and UDP sockets are both bound before any task spawns so partial bind failures never leave an orphaned listener running (`run_dual_stack` stays non-blocking for backward compatibility).
+  * Added `spawn_router_health_checks_in`, `run_tunnel_with_timeout`, and `run_tunnel_over_stream_with_drain_timeout` to track active connections, HTTP/3 streams, Yamux tunneled streams, and router health checks in `JoinSet`s with panic logging.
+
+### Changed & Fixed
+* **Graceful Shutdown & Accept-Loop Hardening (`src/runner.rs`, `src/stack.rs`, `src/server.rs`):**
+  * `start_single_server` now supervises TCP, UDP/QUIC, HTTP, tunnel, and active health-check tasks until full shutdown, cancels sibling tasks if one dual-stack listener dies unexpectedly, and logs unexpected early exits.
+  * HTTP/3 (`handle_h3_connection`) now observes cancellation, sends `GOAWAY`, drains in-flight request streams while keeping the `h3` connection alive, and closes the `quinn::Endpoint` (`set_server_config(None)`, `close`, `wait_idle`) only after draining.
+  * Outbound Yamux tunnels (`run_tunnel_over_stream_with_drain_timeout`) keep driving the Yamux multiplexer during graceful drain so active HTTP/2 streams complete `GOAWAY` cleanly before `poll_close`.
+  * Added `50 ms` cancellable backoff (`ACCEPT_ERROR_BACKOFF`) on transient `accept()` errors (e.g. `EMFILE`) in HTTP and HTTPS/TCP accept loops to prevent CPU busy-loops.
+  * `SIGHUP` hot-reload restarts in `src/server.rs` now retire the old `ActiveServer` and wait for its `sockets_released` signal (`SocketReleaseBarrier`) before binding a replacement on the same address/tunnel, eliminating `EADDRINUSE` races without stalling behind slow HTTP connection drains.
+* **Relay Server Lifecycle Hardening (`relay-server`):**
+  * `praeco-relay-server` Control Plane and Data Plane accept loops now track tasks in `JoinSet`s, back off `50 ms` on transient `accept()` errors, close active Yamux control connections via `poll_close` on shutdown, and cross-cancel if either plane exits unexpectedly.
 * **Tests & Documentation:**
   * Added unit, mock, security regression, admin, and `RouterService` end-to-end integration tests covering config validation, keyed payload isolation, sanitized upstream error responses, query precedence/allowlists, credential/conditional header stripping, mixed gRPC/REST fan-out, `GET` query conversion, invalid REST JSON, `504` optional timeouts, `405` method guards, RBAC enforcement, and `/health` checks.
-  * Documented `backend_type = "aggregate"` in `Config.md` and the embedded example in `Readme.md`.
+  * Added runner lifecycle tests covering partial dual-stack bind failure cleanup, HTTPS socket release on shutdown, `graceful_shutdown_timeout_seconds` parsing/defaults, and immediate socket release with full in-flight HTTP request draining (`test_http_server_drains_inflight_request_while_releasing_socket_early`).
+  * Documented `backend_type = "aggregate"` and `graceful_shutdown_timeout_seconds` / ordered hot-reload restarts in `Config.md`, and the embedded example + runner/stack APIs in `Readme.md`.
 
 ---
 

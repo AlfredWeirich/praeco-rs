@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
     let enable_proxy_protocol = config.enable_proxy_protocol.unwrap_or(true);
     let control_cancel = cancel_token.clone();
 
-    let control_handle = tokio::spawn(async move {
+    let mut control_handle = tokio::spawn(async move {
         if let Err(e) = run_control_plane(
             control_listener,
             tls_acceptor,
@@ -234,7 +234,7 @@ async fn main() -> Result<()> {
     let client_hello_timeout = Duration::from_secs(config.client_hello_timeout_secs.unwrap_or(10));
     let data_cancel = cancel_token.clone();
 
-    let data_handle = tokio::spawn(async move {
+    let mut data_handle = tokio::spawn(async move {
         if let Err(e) = run_data_plane(
             data_listener,
             active_tunnels,
@@ -252,11 +252,28 @@ async fn main() -> Result<()> {
         }
     });
 
-    wait_for_shutdown().await?;
-    info!("Shutdown signal received. Shutting down Relay Server...");
-    cancel_token.cancel();
-
-    let _ = tokio::join!(control_handle, data_handle);
+    tokio::select! {
+        res = wait_for_shutdown() => {
+            res?;
+            info!("Shutdown signal received. Shutting down Relay Server...");
+            cancel_token.cancel();
+            let _ = tokio::join!(control_handle, data_handle);
+        }
+        res = &mut control_handle => {
+            error!("Control plane exited unexpectedly ({:?}); shutting down Relay Server", res);
+            cancel_token.cancel();
+            if let Err(e) = data_handle.await {
+                error!("Data plane task panicked during shutdown: {:?}", e);
+            }
+        }
+        res = &mut data_handle => {
+            error!("Data plane exited unexpectedly ({:?}); shutting down Relay Server", res);
+            cancel_token.cancel();
+            if let Err(e) = control_handle.await {
+                error!("Control plane task panicked during shutdown: {:?}", e);
+            }
+        }
+    }
 
     if let Some(provider) = tracer_provider {
         let _ = provider.shutdown();

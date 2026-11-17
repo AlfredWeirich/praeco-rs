@@ -56,12 +56,15 @@ pub mod stack;
 pub mod tls_conf;
 pub use error::SrvError;
 pub use runner::{
-    run_dual_stack, run_servers, run_tunnel, spawn_router_health_checks, start_single_server,
+    CONNECTION_DRAIN_TIMEOUT, DualStackHandles, run_dual_stack, run_servers, run_tunnel,
+    run_tunnel_with_timeout, spawn_dual_stack, spawn_router_health_checks,
+    spawn_router_health_checks_in, start_single_server, start_single_server_with_socket_signal,
 };
 pub use stack::{
     apply_layers, build_rustls_config, build_service_stack, build_service_stack_with_base,
-    build_tunnel_tls_connector, resolve_tunnel_peer, run_tunnel_over_stream, serve_http_connection,
-    serve_tls_connection, wrap_serve_dir, wrap_tonic_routes,
+    build_tunnel_tls_connector, resolve_tunnel_peer, run_tunnel_over_stream,
+    run_tunnel_over_stream_with_drain_timeout, serve_http_connection, serve_tls_connection,
+    wrap_serve_dir, wrap_tonic_routes,
 };
 
 // ── Type Aliases ─────────────────────────────────────────────────────────────
