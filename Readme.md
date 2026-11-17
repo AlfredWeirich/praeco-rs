@@ -205,6 +205,16 @@ Aggregator received request with x-trace-id="00-..."
 Aggregated gRPC Response -> user_name='Alice (42)', order_count=7, cache-control=no-store
 ```
 
+#### Programmatic Embedding Without `Config.toml` (HTTPS + HTTP/3 Web Server Crate)
+For a standalone binary crate embedding `praeco-rs` (`default-features = false`) as an HTTPS + HTTP/3 (QUIC) web server with composable endpoint handlers defined outside `main()`, see [`examples/https_web_server`](https://github.com/AlfredWeirich/praeco-rs/tree/main/examples/https_web_server):
+
+- **What it does:** Configures `ServerConfig` programmatically (`Protocol::Https`, `ServerCertConfig`, `ConnectionLimitsConfig`), registers standalone `async fn` endpoints (`/`, `/healthz`, `/users/{id}`, `POST /api/echo`) via a `matchit`-backed `WebRouter`, applies Praeco's security stack (`TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter`, `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression`, and `Inspection` with `AllowedPathes`), and starts dual-stack TCP (HTTP/1.1 + HTTP/2) and UDP/QUIC (HTTP/3) listeners via `start_single_server`.
+- **How to run it from the workspace:**
+
+```bash
+cargo run -p https_web_server
+```
+
 
 ### Attachment:
 Here is a **FULL example** of a `Config.toml` from a production system:
