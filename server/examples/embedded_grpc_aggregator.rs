@@ -398,7 +398,7 @@ async fn main() -> anyhow::Result<()> {
         .connect()
         .await?;
 
-    // 2. Build Praeco ServerConfig programmatically (Weg 3 — NO Config.toml!)
+    // 2. Build Praeco ServerConfig programmatically (NO Config.toml!)
     let gateway_port = reserve_free_port().await?;
     let mut cfg = ServerConfig {
         name: "embedded_grpc_aggregator".into(),
