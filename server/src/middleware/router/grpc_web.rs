@@ -154,11 +154,10 @@ pub async fn handle_grpc_web(
         let _conn_guard =
             super::upstreams::ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
-        if let Some(auth) = backend_base_uri.authority() {
-            if let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
+        if let Some(auth) = backend_base_uri.authority()
+            && let Ok(host_val) = header::HeaderValue::from_str(auth.as_str()) {
                 current_headers.insert(header::HOST, host_val);
             }
-        }
 
         let reflection_ttl = config
             .router_params

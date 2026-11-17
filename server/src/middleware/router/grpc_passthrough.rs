@@ -231,7 +231,7 @@ mod tests {
                         io,
                         hyper::service::service_fn(|mut req: hyper::Request<hyper::body::Incoming>| async move {
                             use http_body_util::BodyExt;
-                            while let Some(_) = req.frame().await {}
+                            while req.frame().await.is_some() {}
                             Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Empty::<bytes::Bytes>::new()))
                         }),
                     )

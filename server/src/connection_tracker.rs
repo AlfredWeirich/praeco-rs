@@ -80,8 +80,8 @@ impl ConnectionTracker {
         }
 
         // 2. Check and increment per-IP counter (skipping unspecified addresses such as 0.0.0.0 from tunnels)
-        if let Some(ip_addr) = ip {
-            if !ip_addr.is_unspecified() {
+        if let Some(ip_addr) = ip
+            && !ip_addr.is_unspecified() {
                 let mut entry = self.ip_counts.entry(ip_addr).or_insert(0);
                 if *entry as usize >= self.max_connections_per_ip {
                     let cur_ip = *entry;
@@ -98,7 +98,6 @@ impl ConnectionTracker {
                 }
                 *entry += 1;
             }
-        }
 
         if let Some(m) = &self.metrics {
             m.active_connections.fetch_add(1, Ordering::Relaxed);
@@ -116,9 +115,9 @@ impl ConnectionTracker {
         if let Some(m) = &self.metrics {
             m.active_connections.fetch_sub(1, Ordering::Relaxed);
         }
-        if let Some(ip_addr) = ip.map(common::canonical_client_ip) {
-            if !ip_addr.is_unspecified() {
-                if let dashmap::mapref::entry::Entry::Occupied(mut occ) = self.ip_counts.entry(ip_addr) {
+        if let Some(ip_addr) = ip.map(common::canonical_client_ip)
+            && !ip_addr.is_unspecified()
+                && let dashmap::mapref::entry::Entry::Occupied(mut occ) = self.ip_counts.entry(ip_addr) {
                     let count = occ.get_mut();
                     if *count <= 1 {
                         occ.remove();
@@ -126,8 +125,6 @@ impl ConnectionTracker {
                         *count -= 1;
                     }
                 }
-            }
-        }
     }
 
     /// Returns the current number of active connections tracked across the server.

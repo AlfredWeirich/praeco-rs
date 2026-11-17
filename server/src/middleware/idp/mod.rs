@@ -49,7 +49,7 @@ impl IdpService {
         let encoding_key = common::load_encoding_key(&params.jwt_private_key)?;
 
         let decoding_keys = if let Some(pub_key_path) = &params.jwt_public_key {
-            match common::load_decoding_keys(&[pub_key_path.clone()]) {
+            match common::load_decoding_keys(std::slice::from_ref(pub_key_path)) {
                 Ok(keys) => Arc::new(keys),
                 Err(e) => {
                     tracing::warn!("{}: Failed to load public key for JWT validation/revocation: {}", server_name, e);
@@ -257,6 +257,15 @@ impl IdpService {
     }
 }
 
+/// Deferred state for an IdP request awaiting an external claims webhook.
+pub struct IdpWebhookState {
+    claims: Claims,
+    sid: Option<String>,
+    code: Option<String>,
+    idp: IdpService,
+    is_token_endpoint: bool,
+}
+
 #[pin_project(project = IdpFutureProj)]
 pub enum IdpFuture {
     Ready {
@@ -265,11 +274,7 @@ pub enum IdpFuture {
     Webhook {
         #[pin]
         fetch_fut: webhook::WebhookFetchFuture,
-        claims: Claims,
-        sid: Option<String>,
-        code: Option<String>,
-        idp: IdpService,
-        is_token_endpoint: bool,
+        state: Box<IdpWebhookState>,
     },
 }
 
@@ -282,15 +287,20 @@ impl Future for IdpFuture {
             IdpFutureProj::Ready { response } => {
                 Poll::Ready(Ok(response.take().unwrap()))
             }
-            IdpFutureProj::Webhook { fetch_fut, claims, sid, code, idp, is_token_endpoint } => {
+            IdpFutureProj::Webhook { fetch_fut, state } => {
                 let dynamic_oids_res = std::task::ready!(fetch_fut.poll(cx));
-                
-                let claims_owned = claims.clone();
-                let resp = if *is_token_endpoint {
-                    idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
+
+                let claims_owned = state.claims.clone();
+                let resp = if state.is_token_endpoint {
+                    state.idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
                 } else {
-                    let sid_str = sid.as_ref().unwrap();
-                    idp.handle_auth_confirm(sid_str, code.as_deref(), claims_owned, Some(dynamic_oids_res))
+                    let sid_str = state.sid.as_ref().unwrap();
+                    state.idp.handle_auth_confirm(
+                        sid_str,
+                        state.code.as_deref(),
+                        claims_owned,
+                        Some(dynamic_oids_res),
+                    )
                 };
                 Poll::Ready(Ok(resp))
             }
@@ -426,8 +436,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 1. Start a new DeviceAuth login session (Frontend calls this)
             (Method::POST, "/auth/login") => {
-                if let Some(ref a) = requested_aud {
-                    if !self.params.allowed_audiences.is_empty() && !self.params.allowed_audiences.contains(a) {
+                if let Some(ref a) = requested_aud
+                    && !self.params.allowed_audiences.is_empty() && !self.params.allowed_audiences.contains(a) {
                         return IdpFuture::Ready {
                             response: Some(Self::response_err(
                                 StatusCode::BAD_REQUEST,
@@ -435,7 +445,6 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             )),
                         };
                     }
-                }
                 let target_aud = requested_aud.or_else(|| self.params.allowed_audiences.first().cloned());
 
                 match self.session_store.create_session(client_ip, target_aud) {
@@ -567,11 +576,13 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         Ok(fetch_fut) => {
                             return IdpFuture::Webhook {
                                 fetch_fut,
-                                claims,
-                                sid: Some(sid),
-                                code: user_code,
-                                idp: self.clone(),
-                                is_token_endpoint: false,
+                                state: Box::new(IdpWebhookState {
+                                    claims,
+                                    sid: Some(sid),
+                                    code: user_code,
+                                    idp: self.clone(),
+                                    is_token_endpoint: false,
+                                }),
                             };
                         }
                         Err(e) => {
@@ -600,11 +611,13 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         Ok(fetch_fut) => {
                             return IdpFuture::Webhook {
                                 fetch_fut,
-                                claims,
-                                sid: None,
-                                code: None,
-                                idp: self.clone(),
-                                is_token_endpoint: true,
+                                state: Box::new(IdpWebhookState {
+                                    claims,
+                                    sid: None,
+                                    code: None,
+                                    idp: self.clone(),
+                                    is_token_endpoint: true,
+                                }),
                             };
                         }
                         Err(e) => {
@@ -651,8 +664,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
                         validation.validate_exp = false;
                         validation.validate_aud = false;
-                        if let Ok(data) = jsonwebtoken::decode::<Claims>(&token_str, key, &validation) {
-                            if let Some(jti) = data.claims.jti {
+                        if let Ok(data) = jsonwebtoken::decode::<Claims>(&token_str, key, &validation)
+                            && let Some(jti) = data.claims.jti {
                                 let exp = if data.claims.exp > 0 { data.claims.exp as u64 } else {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
@@ -665,7 +678,6 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                 revoked_any = true;
                                 break;
                             }
-                        }
                     }
                 }
 
@@ -703,11 +715,10 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                     "{}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; SameSite=Lax",
                     self.params.cookie_name
                 );
-                if let Some(domain) = &self.params.cookie_domain {
-                    if !self.params.cookie_name.starts_with("__Host-") {
+                if let Some(domain) = &self.params.cookie_domain
+                    && !self.params.cookie_name.starts_with("__Host-") {
                         cookie_clear.push_str(&format!("; Domain={}", domain));
                     }
-                }
 
                 let body = if revoked_any {
                     r#"{"status":"revoked"}"#

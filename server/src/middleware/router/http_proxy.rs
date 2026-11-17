@@ -537,14 +537,13 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
             }
         }
 
-        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>() {
-            if hyper_err.is_user() || hyper_err.is_body_write_aborted() {
+        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>()
+            && (hyper_err.is_user() || hyper_err.is_body_write_aborted()) {
                 is_user_body = true;
             }
-        }
 
-        if is_user_body {
-            if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+        if is_user_body
+            && let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                 match io_err.kind() {
                     std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::ConnectionReset
@@ -555,7 +554,6 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
                     _ => {}
                 }
             }
-        }
 
         let msg = e.to_string();
         if msg.contains("Payload Limit Exceeded") {

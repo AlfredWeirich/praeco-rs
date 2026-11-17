@@ -77,10 +77,9 @@ impl JwtRevocationStore {
             .as_secs();
 
         let last = self.last_cleanup.load(std::sync::atomic::Ordering::Relaxed);
-        if self.revoked.len() >= MAX_REVOKED_ENTRIES
-            || now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS
-        {
-            if self
+        if (self.revoked.len() >= MAX_REVOKED_ENTRIES
+            || now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS)
+            && self
                 .last_cleanup
                 .compare_exchange(
                     last,
@@ -92,7 +91,6 @@ impl JwtRevocationStore {
             {
                 self.cleanup_expired();
             }
-        }
 
         if self.revoked.len() < MAX_REVOKED_ENTRIES || self.revoked.contains_key(&jti_str) {
             self.revoked.insert(jti_str, expires_at);
@@ -325,15 +323,14 @@ where
                     match claims_res {
                         Ok(claims) => {
                             // --- Revocation Check (jti Denylist) ---
-                            if let Some(ref jti) = claims.jti {
-                                if get_jwt_revocation_store().is_revoked(jti) {
+                            if let Some(ref jti) = claims.jti
+                                && get_jwt_revocation_store().is_revoked(jti) {
                                     crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
                                     tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
                                     let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
                                     self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
                                     continue;
                                 }
-                            }
 
                             // --- Role Mapping Logic ---
                             let mut roles: crate::configuration::RoleVec<6> = claims
@@ -360,8 +357,7 @@ where
                             // --- Auto-Revoke JTI on Configured Logout Paths ([F-11]) ---
                             if !revoke_on_paths.is_empty()
                                 && revoke_on_paths.iter().any(|p| p == request.uri().path())
-                            {
-                                if let Some(ref jti) = claims.jti {
+                                && let Some(ref jti) = claims.jti {
                                     let exp = if claims.exp > 0 {
                                         claims.exp as u64
                                     } else {
@@ -379,7 +375,6 @@ where
                                         request.uri().path()
                                     );
                                 }
-                            }
 
                             request.extensions_mut().insert::<Claims>(claims);
                             request
@@ -457,8 +452,8 @@ where
             .map(|s| s.trim().to_string());
 
         // If not found in header, check the cookie fallback (if configured).
-        if token.is_none() {
-            if let Some(cookie_name) = &self.cookie_fallback {
+        if token.is_none()
+            && let Some(cookie_name) = &self.cookie_fallback {
                 let cookie_prefix = format!("{}=", cookie_name);
                 for cookie_header in req.headers().get_all("Cookie").iter() {
                     if let Ok(v) = cookie_header.to_str() {
@@ -475,7 +470,6 @@ where
                     }
                 }
             }
-        }
 
         let inner = self.inner.clone();
         let redirect = self.redirect_on_failure.clone();
@@ -516,8 +510,8 @@ where
 /// Generic over the error type `T` so it can be used in any `Result<Response, T>`
 /// context — the `Ok` variant is always returned, making the error type irrelevant.
 fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRespBody>, T> {
-    if let Some(url) = redirect {
-        if let Ok(loc_val) = hyper::header::HeaderValue::from_str(url) {
+    if let Some(url) = redirect
+        && let Ok(loc_val) = hyper::header::HeaderValue::from_str(url) {
             let body: ServiceRespBody = Full::new(Bytes::new())
                 .map_err(SrvError::from)
                 .boxed();
@@ -526,7 +520,6 @@ fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRe
             resp.headers_mut().insert(hyper::header::LOCATION, loc_val);
             return Ok(resp);
         }
-    }
 
     let body: ServiceRespBody = Full::new(Bytes::from("Unauthorized"))
         .map_err(SrvError::from)

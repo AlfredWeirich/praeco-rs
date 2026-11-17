@@ -736,12 +736,11 @@ fn urlencoding_decode(input: &str) -> String {
             let lo = chars.next();
             if let (Some(h), Some(l)) = (hi, lo) {
                 let hex = [h, l];
-                if let Ok(s) = std::str::from_utf8(&hex) {
-                    if let Ok(val) = u8::from_str_radix(s, 16) {
+                if let Ok(s) = std::str::from_utf8(&hex)
+                    && let Ok(val) = u8::from_str_radix(s, 16) {
                         bytes.push(val);
                         continue;
                     }
-                }
             }
             bytes.push(b'%');
         } else if b == b'+' {

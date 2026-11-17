@@ -178,11 +178,10 @@ impl Body for PrefixedStreamBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
-        if let Some(bytes) = this.prefix.take() {
-            if !bytes.is_empty() {
+        if let Some(bytes) = this.prefix.take()
+            && !bytes.is_empty() {
                 return Poll::Ready(Some(Ok(Frame::data(bytes))));
             }
-        }
         this.remaining.poll_frame(cx)
     }
 }

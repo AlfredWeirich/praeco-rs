@@ -282,7 +282,7 @@ impl Service<Request<SrvBody>> for RouterService {
                 self_clone.config.compiled_rbac.as_deref(),
                 server_name,
             ) {
-                return Ok(forbidden_response);
+                return Ok(*forbidden_response);
             }
 
             // Internal Admin / Telemetry route (`backend_type = "admin"`) is answered directly in-memory
@@ -302,13 +302,11 @@ impl Service<Request<SrvBody>> for RouterService {
             let mut prepared_headers = parts.headers;
 
             // For HTTP/2 and HTTP/3, populate Host from :authority if not explicitly present
-            if !prepared_headers.contains_key(header::HOST) {
-                if let Some(auth) = parts.uri.authority() {
-                    if let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
+            if !prepared_headers.contains_key(header::HOST)
+                && let Some(auth) = parts.uri.authority()
+                    && let Ok(hv) = header::HeaderValue::from_str(auth.as_str()) {
                         prepared_headers.insert(header::HOST, hv);
                     }
-                }
-            }
 
             if let Err(err_resp) = headers::prepare_proxy_headers(
                 &mut prepared_headers,
@@ -317,7 +315,7 @@ impl Service<Request<SrvBody>> for RouterService {
                 &parts.extensions,
                 &self_clone.config,
             ) {
-                return Ok(err_resp);
+                return Ok(*err_resp);
             }
 
             let original_version = if parts.version == hyper::Version::HTTP_3 {

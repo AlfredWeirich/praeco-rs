@@ -94,17 +94,15 @@ pub fn extract_rate_limit_key<ReqBody>(
         RateLimitKeyStrategy::Ip => extract_ip_key(req, trust_forwarded_headers),
         RateLimitKeyStrategy::Identity => {
             // 1. Try JWT Claims `sub`
-            if let Some(claims) = req.extensions().get::<common::Claims>() {
-                if !claims.sub.is_empty() {
+            if let Some(claims) = req.extensions().get::<common::Claims>()
+                && !claims.sub.is_empty() {
                     return RateLimitKey::User(claims.sub.clone());
                 }
-            }
             // 2. Try mTLS client certificate SAN
-            if let Some(san) = req.extensions().get::<crate::SanCertExtension>() {
-                if !san.0.is_empty() {
+            if let Some(san) = req.extensions().get::<crate::SanCertExtension>()
+                && !san.0.is_empty() {
                     return RateLimitKey::ClientCert(san.0.clone());
                 }
-            }
             // 3. Fallback to client IP
             extract_ip_key(req, trust_forwarded_headers)
         }
@@ -123,24 +121,19 @@ fn extract_ip_key<ReqBody>(req: &Request<ReqBody>, trust_forwarded_headers: bool
     // Only inspect X-Forwarded-For / X-Real-IP when explicitly configured as behind a trusted HTTP proxy
     if trust_forwarded_headers {
         // 2. Check X-Forwarded-For if socket address was unspecified
-        if let Some(xff) = req.headers().get("x-forwarded-for") {
-            if let Ok(s) = xff.to_str() {
-                if let Some(first_ip) = s.split(',').next() {
-                    if let Ok(ip) = first_ip.trim().parse::<std::net::IpAddr>() {
+        if let Some(xff) = req.headers().get("x-forwarded-for")
+            && let Ok(s) = xff.to_str()
+                && let Some(first_ip) = s.split(',').next()
+                    && let Ok(ip) = first_ip.trim().parse::<std::net::IpAddr>() {
                         return RateLimitKey::Ip(common::canonical_client_ip(ip));
                     }
-                }
-            }
-        }
 
         // 3. Check X-Real-IP
-        if let Some(xrip) = req.headers().get("x-real-ip") {
-            if let Ok(s) = xrip.to_str() {
-                if let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
+        if let Some(xrip) = req.headers().get("x-real-ip")
+            && let Ok(s) = xrip.to_str()
+                && let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
                     return RateLimitKey::Ip(common::canonical_client_ip(ip));
                 }
-            }
-        }
     }
 
     RateLimitKey::Global
@@ -218,21 +211,19 @@ impl KeyedSimpleRateLimitStore {
     }
 
     fn maybe_cleanup(&self, now: Instant) {
-        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
+            && now.duration_since(*last_cleanup) > Duration::from_secs(10) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
-        }
     }
 
     fn maybe_cleanup_when_full(&self, now: Instant) {
-        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
+            && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -520,21 +511,19 @@ impl KeyedTokenBucketStore {
     }
 
     fn maybe_cleanup(&self, now: Instant) {
-        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if now.duration_since(*last_cleanup) > Duration::from_secs(10) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
+            && now.duration_since(*last_cleanup) > Duration::from_secs(10) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
-        }
     }
 
     fn maybe_cleanup_when_full(&self, now: Instant) {
-        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock() {
-            if now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
+        if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
+            && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
                 self.cleanup(now);
             }
-        }
     }
 
     pub fn len(&self) -> usize {
@@ -657,6 +646,7 @@ impl<S> TokenBucketRateLimiterService<S> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         inner: S,
         capacity: usize,
@@ -909,7 +899,7 @@ mod tests {
 
         let retry_header = resp2.headers().get(hyper::header::RETRY_AFTER).unwrap().to_str().unwrap();
         let wait_secs: u64 = retry_header.parse().unwrap();
-        assert!(wait_secs >= 1 && wait_secs <= 5);
+        assert!((1..=5).contains(&wait_secs));
     }
 
     #[test]

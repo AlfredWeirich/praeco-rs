@@ -13,7 +13,7 @@ use crate::{
 /// Supports stack-allocated [`RoleVec<6>`] (fast-path), [`Arc<RoleVec<6>>`],
 /// and legacy [`Arc<Vec<UserRole>>`].
 #[inline]
-pub fn extract_user_roles<'a>(parts: &'a hyper::http::request::Parts) -> Option<&'a [UserRole]> {
+pub fn extract_user_roles(parts: &hyper::http::request::Parts) -> Option<&[UserRole]> {
     parts
         .extensions
         .get::<Arc<RoleVec<6>>>()
@@ -48,13 +48,13 @@ pub fn enforce_rbac(
     route_info: &ParsedRoute,
     compiled_rbac: Option<&CompiledRbac>,
     server_name: &str,
-) -> Result<(), Response<ServiceRespBody>> {
+) -> Result<(), Box<Response<ServiceRespBody>>> {
     let path = parts.uri.path();
     let user_roles = extract_user_roles(parts);
 
     // 1. Path-specific granular RBAC (Option B)
-    if let Some(rbac) = compiled_rbac {
-        if let Some(required_roles) = rbac.match_path(path) {
+    if let Some(rbac) = compiled_rbac
+        && let Some(required_roles) = rbac.match_path(path) {
             // Fail-closed: empty role list acts as explicit Deny-All
             if required_roles.is_empty() {
                 crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
@@ -62,7 +62,7 @@ pub fn enforce_rbac(
                     "{}: Forbidden: explicit empty RBAC rule for '{}' denies all requests",
                     server_name, path
                 );
-                return Err(build_error_response("Forbidden", StatusCode::FORBIDDEN));
+                return Err(Box::new(build_error_response("Forbidden", StatusCode::FORBIDDEN)));
             }
 
             let is_authorized = if required_roles.iter().any(|r| r.0 == "*") {
@@ -80,12 +80,11 @@ pub fn enforce_rbac(
                     "{}: Forbidden: RBAC required one of {:?} for path '{}', but client has {:?}",
                     server_name, required_roles, path, user_roles
                 );
-                return Err(build_error_response("Forbidden", StatusCode::FORBIDDEN));
+                return Err(Box::new(build_error_response("Forbidden", StatusCode::FORBIDDEN)));
             }
 
             return Ok(());
         }
-    }
 
     // 2. Fallback: Route-level RBAC
     if !route_info.allowed_roles.is_empty() {
@@ -103,7 +102,7 @@ pub fn enforce_rbac(
                 path,
                 route_info.allowed_roles
             );
-            return Err(build_error_response("Forbidden", StatusCode::FORBIDDEN));
+            return Err(Box::new(build_error_response("Forbidden", StatusCode::FORBIDDEN)));
         }
     }
 

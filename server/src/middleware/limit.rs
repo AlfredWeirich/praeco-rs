@@ -148,9 +148,9 @@ where
         let server_name = self.server_name;
 
         // Stage 1: Content-Length header fast path
-        if let Some(content_length_str) = req.headers().get(CONTENT_LENGTH) {
-            if let Ok(content_length) = content_length_str.to_str().unwrap_or("").parse::<usize>() {
-                if content_length > max_bytes {
+        if let Some(content_length_str) = req.headers().get(CONTENT_LENGTH)
+            && let Ok(content_length) = content_length_str.to_str().unwrap_or("").parse::<usize>()
+                && content_length > max_bytes {
                     crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
                     let msg = "Payload too large (Header check)";
                     tracing::warn!("{}: {}", server_name, msg);
@@ -158,8 +158,6 @@ where
                         response: Some(build_413_response(msg)),
                     };
                 }
-            }
-        }
 
         // Stage 2: Streaming byte counter
         let is_grpc = req

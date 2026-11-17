@@ -88,24 +88,22 @@ pub fn prepare_proxy_headers(
     jwt_token: Option<&hyper::header::HeaderValue>,
     extensions: &hyper::http::Extensions,
     config: &ServerConfig,
-) -> Result<(), Response<ServiceRespBody>> {
+) -> Result<(), Box<Response<ServiceRespBody>>> {
     // 1. Loop Detection
     let mut max_forwards = 10;
-    if let Some(mf_val) = original_headers.get(header::MAX_FORWARDS) {
-        if let Ok(mf_str) = mf_val.to_str() {
-            if let Ok(mut mf) = mf_str.parse::<u8>() {
+    if let Some(mf_val) = original_headers.get(header::MAX_FORWARDS)
+        && let Ok(mf_str) = mf_val.to_str()
+            && let Ok(mut mf) = mf_str.parse::<u8>() {
                 if mf == 0 {
                     warn!("{}: Max-Forwards reached 0, Loop Detected!", server_name);
-                    return Err(build_error_response(
+                    return Err(Box::new(build_error_response(
                         "Loop Detected",
                         StatusCode::LOOP_DETECTED,
-                    ));
+                    )));
                 }
                 mf -= 1;
                 max_forwards = mf;
             }
-        }
-    }
     original_headers.insert(
         header::MAX_FORWARDS,
         header::HeaderValue::from(max_forwards as u16),
@@ -140,46 +138,41 @@ pub fn prepare_proxy_headers(
 
     // Also strip any custom header names configured for this server
     if let Some(forward_config) = &config.client_cert_forwarding {
-        if let Some(h) = &forward_config.header_cert {
-            if let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
+        if let Some(h) = &forward_config.header_cert
+            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
                 original_headers.remove(&hdr);
             }
-        }
-        if let Some(h) = &forward_config.header_san {
-            if let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
+        if let Some(h) = &forward_config.header_san
+            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
                 original_headers.remove(&hdr);
             }
-        }
-        if let Some(h) = &forward_config.header_roles {
-            if let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
+        if let Some(h) = &forward_config.header_roles
+            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
                 original_headers.remove(&hdr);
             }
-        }
-        if let Some(h) = &forward_config.header_client_ip {
-            if let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
+        if let Some(h) = &forward_config.header_client_ip
+            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
                 original_headers.remove(&hdr);
             }
-        }
     }
 
     // 4. Sanitize and manage Forwarded / X-Forwarded-* headers
     // Unconditionally strip client-supplied forwarding headers at the edge proxy to prevent spoofing
-    original_headers.remove(&header::HeaderName::from_static("forwarded"));
-    original_headers.remove(&header::HeaderName::from_static("x-forwarded-for"));
-    original_headers.remove(&header::HeaderName::from_static("x-real-ip"));
-    original_headers.remove(&header::HeaderName::from_static("x-forwarded-host"));
-    original_headers.remove(&header::HeaderName::from_static("x-forwarded-proto"));
+    original_headers.remove(header::HeaderName::from_static("forwarded"));
+    original_headers.remove(header::HeaderName::from_static("x-forwarded-for"));
+    original_headers.remove(header::HeaderName::from_static("x-real-ip"));
+    original_headers.remove(header::HeaderName::from_static("x-forwarded-host"));
+    original_headers.remove(header::HeaderName::from_static("x-forwarded-proto"));
 
     // Authoritatively set Client IP headers from verified socket / PROXY-v2 address
-    if let Some(addr) = extensions.get::<std::net::SocketAddr>() {
-        if !addr.ip().is_unspecified() {
+    if let Some(addr) = extensions.get::<std::net::SocketAddr>()
+        && !addr.ip().is_unspecified() {
             let ip_str = addr.ip().to_string();
             if let Ok(ip_val) = header::HeaderValue::from_str(&ip_str) {
                 original_headers.insert("x-real-ip", ip_val.clone());
                 original_headers.insert("x-forwarded-for", ip_val);
             }
         }
-    }
 
     // Manage X-Forwarded-Proto (always authoritative from gateway configuration)
     let proto_val = match config.protocol {
@@ -191,11 +184,10 @@ pub fn prepare_proxy_headers(
     // Manage X-Forwarded-Host (from Host header if present, or tunnel sni_domain fallback)
     if let Some(host_val) = original_headers.get(header::HOST).cloned() {
         original_headers.insert("x-forwarded-host", host_val);
-    } else if let Some(tunnel) = &config.tunnel {
-        if let Ok(sni_val) = header::HeaderValue::from_str(&tunnel.sni_domain) {
+    } else if let Some(tunnel) = &config.tunnel
+        && let Ok(sni_val) = header::HeaderValue::from_str(&tunnel.sni_domain) {
             original_headers.insert("x-forwarded-host", sni_val);
         }
-    }
 
     // 5. Inject JWT Bearer Token if configured
     if let Some(hv) = jwt_token {
@@ -205,8 +197,8 @@ pub fn prepare_proxy_headers(
     // 6. Inject verified client-cert identity headers IF AND ONLY IF client_cert_forwarding is configured
     if let Some(forward_config) = &config.client_cert_forwarding {
         tracing::trace!("Client cert forwarding is ENABLED in config!");
-        if let Some(header_cert) = &forward_config.header_cert {
-            if let Some(pem) = extensions.get::<crate::PemCertExtension>() {
+        if let Some(header_cert) = &forward_config.header_cert
+            && let Some(pem) = extensions.get::<crate::PemCertExtension>() {
                 let pem_escaped = urlencoding::encode(&pem.0).into_owned();
                 if let Ok(hdr_val) = header::HeaderValue::from_str(&pem_escaped) {
                     if let Ok(hdr_name) = header::HeaderName::from_bytes(header_cert.as_bytes()) {
@@ -217,7 +209,6 @@ pub fn prepare_proxy_headers(
                     tracing::warn!("FAILED to convert escaped PEM to HeaderValue");
                 }
             }
-        }
         if let Some(header_san) = &forward_config.header_san {
             tracing::trace!("Config expects SAN header name: '{}'", header_san);
             if let Some(san) = extensions.get::<crate::SanCertExtension>() {
@@ -258,33 +249,29 @@ pub fn prepare_proxy_headers(
                         .get::<std::sync::Arc<Vec<UserRole>>>()
                         .map(|r| r.as_slice())
                 });
-            if let Some(roles) = roles_slice {
-                if !roles.is_empty() {
+            if let Some(roles) = roles_slice
+                && !roles.is_empty() {
                     let roles_str = roles
                         .iter()
                         .map(|r| r.0.as_str())
                         .collect::<SmallVec<[&str; 6]>>()
                         .join(", ");
-                    if let Ok(hdr_val) = header::HeaderValue::from_str(&roles_str) {
-                        if let Ok(hdr_name) = header::HeaderName::from_bytes(header_roles.as_bytes()) {
+                    if let Ok(hdr_val) = header::HeaderValue::from_str(&roles_str)
+                        && let Ok(hdr_name) = header::HeaderName::from_bytes(header_roles.as_bytes()) {
                             tracing::trace!("Injecting User Roles into header: {}", hdr_name);
                             original_headers.insert(hdr_name, hdr_val);
                         }
-                    }
                 }
-            }
         }
-        if let Some(header_ip) = &forward_config.header_client_ip {
-            if let Some(addr) = extensions.get::<std::net::SocketAddr>() {
+        if let Some(header_ip) = &forward_config.header_client_ip
+            && let Some(addr) = extensions.get::<std::net::SocketAddr>() {
                 let ip_str = addr.ip().to_string();
-                if let Ok(hdr_val) = header::HeaderValue::from_str(&ip_str) {
-                    if let Ok(hdr_name) = header::HeaderName::from_bytes(header_ip.as_bytes()) {
+                if let Ok(hdr_val) = header::HeaderValue::from_str(&ip_str)
+                    && let Ok(hdr_name) = header::HeaderName::from_bytes(header_ip.as_bytes()) {
                         tracing::trace!("Injecting Client IP into header: {}", hdr_name);
                         original_headers.insert(hdr_name, hdr_val);
                     }
-                }
             }
-        }
     } else {
         tracing::trace!("Client cert forwarding is NOT enabled in config!");
     }

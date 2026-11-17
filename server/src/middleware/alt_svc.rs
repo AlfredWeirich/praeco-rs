@@ -39,7 +39,7 @@ impl AltSvcLayer {
     /// This constructs a header value like `h3=":443"; ma=86400`.
     /// - `h3`: Indicates HTTP/3 support.
     /// - `ma`: Max-age in seconds (86400 seconds = 24 hours), telling the client
-    ///         how long to cache this alternative service association.
+    ///   how long to cache this alternative service association.
     pub fn new(port: u16) -> Self {
         tracing::trace!("AltSvcLayer::new(port: {})", port);
         // Construct the Alt-Svc header value.

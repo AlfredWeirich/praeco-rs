@@ -375,13 +375,12 @@ impl SessionStore {
 
     /// Throttled cleanup of expired sessions and stale IP rate-limiting records.
     fn maybe_cleanup_expired(&self) {
-        if let Ok(mut last) = self.last_cleanup.try_lock() {
-            if last.elapsed() >= CLEANUP_THROTTLE_INTERVAL {
+        if let Ok(mut last) = self.last_cleanup.try_lock()
+            && last.elapsed() >= CLEANUP_THROTTLE_INTERVAL {
                 *last = Instant::now();
                 drop(last);
                 self.cleanup_expired_force();
             }
-        }
     }
 
     /// Forcefully purges all expired sessions and rate limits.

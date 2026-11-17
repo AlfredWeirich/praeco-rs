@@ -1684,11 +1684,10 @@ impl MethodRules {
         }
         // 2. Prefix matches (longest first)
         for (pfx, rules) in &self.prefix {
-            if path.starts_with(pfx) {
-                if rules.iter().any(|re| re.is_match(full_path)) {
+            if path.starts_with(pfx)
+                && rules.iter().any(|re| re.is_match(full_path)) {
                     return true;
                 }
-            }
         }
         false
     }
@@ -1903,14 +1902,13 @@ impl ServerConfig {
             if let Some(cert_config) = &self.server_certs {
                 let static_name = self.static_name.expect("static_name initialized");
                 let loaded_key = crate::tls_conf::load_certified_key(static_name, cert_config)?;
-                if let Some(leaf_der) = loaded_key.cert.first() {
-                    if let Ok((_, parsed_cert)) =
+                if let Some(leaf_der) = loaded_key.cert.first()
+                    && let Ok((_, parsed_cert)) =
                         x509_parser::parse_x509_certificate(leaf_der.as_ref())
                     {
                         pki_info.server_cert_valid_until_unix =
                             Some(parsed_cert.validity().not_after.timestamp());
                     }
-                }
                 self.certified_key = Some(loaded_key);
             } else {
                 return Err(Error::msg(format!(
@@ -1924,9 +1922,9 @@ impl ServerConfig {
         if let Some(ref client_certs) = self.client_certs {
             use rustls_pki_types::{CertificateRevocationListDer, pem::PemObject};
             for cc in client_certs {
-                if let Some(ref crl_path) = cc.ssl_client_crl {
-                    if let Ok(crl_der) = CertificateRevocationListDer::from_pem_file(crl_path) {
-                        if let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
+                if let Some(ref crl_path) = cc.ssl_client_crl
+                    && let Ok(crl_der) = CertificateRevocationListDer::from_pem_file(crl_path)
+                        && let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
                             pki_info.crl_revoked_certs_count +=
                                 parsed_crl.iter_revoked_certificates().count();
                             if let Some(next_up) = parsed_crl.next_update() {
@@ -1937,8 +1935,6 @@ impl ServerConfig {
                                 };
                             }
                         }
-                    }
-                }
             }
         }
         self.pki_info = pki_info;
@@ -2430,7 +2426,7 @@ impl ServerConfig {
             }
         }
         // Sort by descending prefix length for longest-prefix-first matching.
-        rules.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        rules.sort_by_key(|a| std::cmp::Reverse(a.prefix.len()));
         self.parsed_routes = rules;
         Ok(())
     }
@@ -2472,11 +2468,8 @@ impl CompiledAllowedPathes {
                             .map_err(|e| Error::msg(format!("Regex error for '{pattern}': {e}")))?;
 
                         if pattern.ends_with('*') {
-                            let pfx = if pattern.ends_with("/*") {
-                                &pattern[..pattern.len() - 1] // Keep trailing slash: "/api/"
-                            } else {
-                                &pattern[..pattern.len() - 1] // e.g. "/api"
-                            };
+                            // Strip trailing `*`: keeps trailing `/` for `"/api/*"`, or prefix `"/api"` for `"/api*"`
+                            let pfx = &pattern[..pattern.len() - 1];
                             prefix.push((pfx.to_string(), regexes));
                         } else {
                             exact.insert(pattern.clone(), regexes);
@@ -2485,7 +2478,7 @@ impl CompiledAllowedPathes {
                 }
 
                 // Deterministic longest-prefix match: sort descending by prefix length
-                prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+                prefix.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
                 Ok(MethodRules { exact, prefix })
             };
@@ -2567,7 +2560,7 @@ impl CompiledRbac {
         }
 
         // Sort descending by prefix length: most specific prefix wins
-        prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        prefix.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         Self { exact, prefix }
     }
@@ -2593,18 +2586,17 @@ impl Layers {
     /// Validates the order of middleware layers in `enabled`.
     fn validate_middleware_order(&self) -> Result<(), Error> {
         // Rule 1: TraceId (if present) must be first
-        if let Some(idx) = self.enabled.iter().position(|l| l == "TraceId") {
-            if idx != 0 {
+        if let Some(idx) = self.enabled.iter().position(|l| l == "TraceId")
+            && idx != 0 {
                 return Err(Error::msg(
                     "TraceId layer must be FIRST (outermost) in [Server.Layers].enabled to capture all requests."
                 ));
             }
-        }
 
         // Rule 2: Inspection must come AFTER Decompression
-        if let Some(insp_idx) = self.enabled.iter().position(|l| l == "Inspection") {
-            if let Some(decomp_idx) = self.enabled.iter().position(|l| l == "Decompression") {
-                if insp_idx < decomp_idx {
+        if let Some(insp_idx) = self.enabled.iter().position(|l| l == "Inspection")
+            && let Some(decomp_idx) = self.enabled.iter().position(|l| l == "Decompression")
+                && insp_idx < decomp_idx {
                     return Err(Error::msg(
                         format!(
                             "Inspection (at index {}) must come AFTER Decompression (at index {}). Otherwise the WAF inspects compressed bytes!",
@@ -2612,8 +2604,6 @@ impl Layers {
                         )
                     ));
                 }
-            }
-        }
 
         Ok(())
     }

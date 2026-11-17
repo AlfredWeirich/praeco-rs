@@ -133,7 +133,7 @@ impl IpCidr {
                             })?;
                             if pfx <= 32 {
                                 IpAddr::V4(mapped_v4)
-                            } else if pfx >= 96 && pfx <= 128 {
+                            } else if (96..=128).contains(&pfx) {
                                 // Convert /96..=/128 on ::ffff:a.b.c.d to the equivalent IPv4 /0..=/32 prefix
                                 let v4_pfx = pfx - 96;
                                 let mask = if v4_pfx == 0 {
@@ -328,27 +328,20 @@ pub fn extract_client_ip<ReqBody>(
     }
 
     if trust_forwarded_headers {
-        if let Some(xff) = req.headers().get("x-forwarded-for") {
-            if let Ok(s) = xff.to_str() {
-                if let Some(first_ip) = s.split(',').next() {
-                    if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
-                        if !ip.is_unspecified() {
+        if let Some(xff) = req.headers().get("x-forwarded-for")
+            && let Ok(s) = xff.to_str()
+                && let Some(first_ip) = s.split(',').next()
+                    && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
+                        && !ip.is_unspecified() {
                             return Some(unwrap_ipv4_mapped(ip));
                         }
-                    }
-                }
-            }
-        }
 
-        if let Some(xrip) = req.headers().get("x-real-ip") {
-            if let Ok(s) = xrip.to_str() {
-                if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                    if !ip.is_unspecified() {
+        if let Some(xrip) = req.headers().get("x-real-ip")
+            && let Ok(s) = xrip.to_str()
+                && let Ok(ip) = s.trim().parse::<IpAddr>()
+                    && !ip.is_unspecified() {
                         return Some(unwrap_ipv4_mapped(ip));
                     }
-                }
-            }
-        }
     }
 
     None

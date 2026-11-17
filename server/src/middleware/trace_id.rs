@@ -136,16 +136,14 @@ where
 
         // 3. Inject `traceparent` and `x-trace-id` into request headers if not already present
         //    so that both the OpenTelemetry HeaderExtractor below and non-OTel handlers see them.
-        if !req.headers().contains_key("traceparent") {
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&trace_id) {
+        if !req.headers().contains_key("traceparent")
+            && let Ok(value) = hyper::header::HeaderValue::from_str(&trace_id) {
                 req.headers_mut().insert("traceparent", value);
             }
-        }
-        if !req.headers().contains_key("x-trace-id") {
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&trace_id) {
+        if !req.headers().contains_key("x-trace-id")
+            && let Ok(value) = hyper::header::HeaderValue::from_str(&trace_id) {
                 req.headers_mut().insert("x-trace-id", value);
             }
-        }
 
         // 4. Attach the W3C OpenTelemetry context to the active span hierarchy:
         //    - In production (`stack.rs`), `TraceLayer::make_span_with` has ALREADY extracted
