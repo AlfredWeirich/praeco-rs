@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.5] - 2026-11-17
+
+Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), programmatic `ServerConfig::default()`, and embedded binary gRPC aggregator example.
+
+### Added
+* **Parallel Fan-Out / Aggregator Route (`RouteBackendType::Aggregate`, `src/middleware/router/aggregator.rs`):**
+  * Added `backend_type = "aggregate"` (alias `"fanout"`) with `[[Server.ReverseRoutes."/path".targets]]` (`AggregateTargetConfig` / `ParsedAggregateTarget`) supporting mixed `rest` and `grpc_transcoding` sub-targets within a single `RouterService` route.
+  * Executes all configured sub-targets concurrently via `tokio::task::JoinSet` with OpenTelemetry `traceparent` / `x-trace-id` propagation, per-target load balancing, 3-state circuit breakers, and gRPC reflection schema caching.
+  * Supports `POST` (splitting incoming JSON objects by `target.key` or forwarding flat payloads unchanged with sanitized `Content-Length` / stripped `Accept-Encoding`) and `GET` (forwarding query strings to `rest` targets and automatically converting URL query parameters into JSON objects for `grpc_transcoding` targets).
+  * Supports `required = true` (fail-fast `abort_all()` returning `502`/`504`) and `required = false` graceful degradation (`"<key>": null` plus `"_errors": { "<key>": { "status", "message" } }`), using zero-copy `BytesMut` JSON assembly and `serde::de::IgnoredAny` validation.
+  * Integrated `aggregate_targets` into `RouterService::handle_health_check`, active health checks / reflection pre-warming in `src/runner.rs`, and `/upstreams` / `mark_dead` / `mark_alive` telemetry in `src/middleware/admin.rs`.
+* **Programmatic Configuration & Embedded Binary gRPC Aggregator Example:**
+  * Implemented `Default` for `ServerConfig` (`enabled: true`, `ConnectionLimitsConfig::default()`, etc.) so library embedders can construct `ServerConfig` purely in Rust (`..Default::default()`) without a `Config.toml` file.
+  * Added runnable `server/examples/embedded_grpc_aggregator.rs` demonstrating `praeco-rs` with `default-features = false`, wrapping a typed binary Protobuf-to-Protobuf `tonic` aggregator service (`SyncBody` bridge) with `apply_layers`, `PathSanitizerLayer`, and `start_single_server`.
+* **Tests & Documentation:**
+  * Added unit, mock, admin, and `RouterService` end-to-end integration tests covering config validation, mixed gRPC/REST fan-out, `GET` query conversion, invalid REST JSON, `504` optional timeouts, `405` method guards, REST header sanitization, RBAC enforcement, and `/health` checks.
+  * Documented `backend_type = "aggregate"` in `Config.md` and the embedded example in `Readme.md`.
+
+---
+
 ## [0.5.4] - 2026-11-16
 
 Library/CLI decoupling (Stage 1) and dual-stack / HTTP/3 test coverage.

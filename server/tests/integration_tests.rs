@@ -1219,3 +1219,170 @@ async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
         .await
         .expect("QUIC client endpoint must close cleanly");
 }
+
+/// End-to-End Integration Test for `RouteBackendType::Aggregate` through `build_service_stack`
+/// and `RouterService`:
+/// - `GET /health` reports `200 OK` when aggregate sub-target upstreams are available.
+/// - Route-level RBAC (`allowed_roles = ["Admin"]`) rejects unprivileged callers (`403 Forbidden`)
+///   before fanning out.
+/// - Authorized callers trigger parallel fan-out across mixed REST targets and receive the merged
+///   JSON response with Praeco's hardened response headers.
+#[tokio::test]
+async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
+    let spawn_json_backend = |body: &'static str| async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = TokioIo::new(socket);
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            hyper::service::service_fn(move |_req: hyper::Request<hyper::body::Incoming>| async move {
+                                Ok::<_, std::convert::Infallible>(
+                                    hyper::Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from_static(body.as_bytes())))
+                                        .unwrap(),
+                                )
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        port
+    };
+
+    let profile_port = spawn_json_backend(r#"{"name":"Alice","tier":"pro"}"#).await;
+    let stats_port = spawn_json_backend(r#"{"logins":12}"#).await;
+
+    let toml_cfg = format!(
+        r#"
+        [[Server]]
+        name = "IntegrationAggregateServer"
+        ip = "127.0.0.1"
+        port = 8080
+        protocol = "http"
+        service = "Router"
+        authentication = "None"
+        oid_mapping = {{ "1" = "Admin" }}
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+
+        [Server.ReverseRoutes."/api/dashboard"]
+        backend_type = "aggregate"
+        allowed_roles = ["Admin"]
+
+        [[Server.ReverseRoutes."/api/dashboard".targets]]
+        key = "profile"
+        backend_type = "rest"
+        upstreams = ["http://127.0.0.1:{profile_port}"]
+        path = "/v1/profile"
+        method = "GET"
+        required = true
+
+        [[Server.ReverseRoutes."/api/dashboard".targets]]
+        key = "stats"
+        backend_type = "rest"
+        upstreams = ["http://127.0.0.1:{stats_port}"]
+        path = "/v1/stats"
+        method = "POST"
+        required = true
+
+        [Server.Layers]
+        enabled = ["TraceId", "SecurityHeaders"]
+
+        [Server.Layers.SecurityHeaders]
+        content_security_policy = "default-src 'self'"
+        strict_transport_security = "max-age=63072000; includeSubDomains"
+        x_content_type_options = "nosniff"
+        x_frame_options = "DENY"
+    "#
+    );
+
+    let server_config = parse_server_config(&toml_cfg);
+    let stack = build_service_stack(&server_config).expect("build_service_stack must succeed");
+    let cancel_token = CancellationToken::new();
+    let peer_addr: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    // Helper to send a single request with given OIDs over an in-memory duplex connection
+    let send_with_oids = |oids: Vec<String>, method: Method, uri: &'static str, body: &'static [u8]| {
+        let stack = stack.clone();
+        let oid_mapping = oid_mapping.clone();
+        let srv_token = cancel_token.clone();
+        async move {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let handler = ConnectionHandler::new(
+                    stack,
+                    peer_addr,
+                    oids,
+                    None,
+                    None,
+                    oid_mapping,
+                );
+                serve_http_connection(server_io, handler, srv_token).await;
+            });
+
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                    .await
+                    .expect("HTTP/1.1 handshake");
+            let conn_task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("host", "localhost:8080")
+                .body(Full::new(Bytes::from_static(body)))
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("send request");
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let resp_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+
+            drop(sender);
+            let _ = conn_task.await;
+            server_task.abort();
+            (status, headers, resp_bytes)
+        }
+    };
+
+    // 1. /health must report 200 OK via aggregate_targets availability check
+    let (health_status, _, _) = send_with_oids(Vec::new(), Method::GET, "/health", b"").await;
+    assert_eq!(health_status, StatusCode::OK);
+
+    // 2. Unprivileged caller (no Admin OID) must be rejected with 403 Forbidden
+    let (unauth_status, _, _) =
+        send_with_oids(Vec::new(), Method::POST, "/api/dashboard", br#"{"id":"1"}"#).await;
+    assert_eq!(unauth_status, StatusCode::FORBIDDEN);
+
+    // 3. Authorized Admin caller (OID "1") gets aggregated JSON + hardened headers
+    let (ok_status, ok_headers, ok_body) = send_with_oids(
+        vec!["1".to_string()],
+        Method::POST,
+        "/api/dashboard",
+        br#"{"id":"1"}"#,
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_headers.get("x-content-type-options").unwrap(), "nosniff");
+    assert_eq!(ok_headers.get("cache-control").unwrap(), "no-store");
+
+    let parsed: serde_json::Value = serde_json::from_slice(&ok_body).unwrap();
+    assert_eq!(parsed["profile"]["name"], "Alice");
+    assert_eq!(parsed["stats"]["logins"], 12);
+
+    cancel_token.cancel();
+}

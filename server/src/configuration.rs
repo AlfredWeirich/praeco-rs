@@ -286,6 +286,40 @@ pub struct ServerConfig {
     pub pki_info: ServerPkiInfo,
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            static_name: None,
+            ip: None,
+            port: None,
+            tunnel: None,
+            enabled: true,
+            service: ServiceType::default(),
+            protocol: Protocol::default(),
+            authentication: AuthenticationMethod::default(),
+            oid_mapping: HashMap::new(),
+            server_certs: None,
+            client_certs: None,
+            client_cert_forwarding: None,
+            connection_limits: ConnectionLimitsConfig::default(),
+            layers: Layers::default(),
+            allowed_pathes: None,
+            rev_routes: None,
+            rbac: None,
+            router_params: None,
+            idp_params: None,
+            static_files_params: None,
+            parsed_routes: Vec::new(),
+            compiled_allowed_pathes: None,
+            compiled_rbac: None,
+            certified_key: None,
+            metrics: Arc::new(ServerMetrics::default()),
+            pki_info: ServerPkiInfo::default(),
+        }
+    }
+}
+
 static SERVER_METRICS_REGISTRY: OnceLock<dashmap::DashMap<String, Arc<ServerMetrics>>> =
     OnceLock::new();
 
@@ -3309,6 +3343,19 @@ mod tests {
                 "Case '{label}' failed: expected '{expected_err}' in '{err_msg}'"
             );
         }
+    }
+
+    #[test]
+    fn test_server_config_default_and_programmatic_finalize() {
+        let mut cfg = ServerConfig {
+            name: "programmatic_test".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8080),
+            ..Default::default()
+        };
+        assert!(cfg.enabled);
+        assert!(cfg.finalize().is_ok());
+        assert_eq!(cfg.static_name, Some("programmatic_test"));
     }
 }
 

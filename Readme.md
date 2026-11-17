@@ -189,6 +189,21 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+#### Programmatic Embedding Without `Config.toml` (Binary gRPC Aggregator Example)
+For applications that configure `ServerConfig` purely in Rust (`..Default::default()`, no `Config.toml` on disk) and wrap a typed `tonic` gRPC service (e.g. binary Protobuf-to-Protobuf fan-out) with Praeco's middleware stack, see [`server/examples/embedded_grpc_aggregator.rs`](server/examples/embedded_grpc_aggregator.rs):
+
+- **What it does:** Spawns two typed `tonic` gRPC backend services (`user.UserService/GetUser` and `order.OrderService/CountOrders`), implements a typed Protobuf-to-Protobuf `aggregator.DashboardService/GetDashboard` service that fans out concurrently via `tokio::join!` while forwarding Praeco's `x-trace-id`, bridges `tonic::service::Routes` (`tonic::body::Body`) into `praeco_rs::BoxedCloneService` via a zero-cost `SyncBody` wrapper, applies `TraceId`, `IpFilter`, `MaxPayload`, and `PathSanitizerLayer` via `apply_layers`, starts the gateway with `start_single_server`, executes a real binary gRPC request against it, and shuts down cleanly via `CancellationToken`.
+- **How to run it (with `--no-default-features`):**
+
+```bash
+cargo run -p praeco-rs --example embedded_grpc_aggregator --no-default-features
+```
+
+```text
+Aggregator received request with x-trace-id="00-..."
+Aggregated gRPC Response -> user_name='Alice (42)', order_count=7, cache-control=no-store
+```
+
 
 ### Attachment:
 Here is a **FULL example** of a `Config.toml` from a production system:

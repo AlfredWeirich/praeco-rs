@@ -1219,4 +1219,293 @@ mod tests {
         assert_eq!(grpc_trace.lock().await.as_deref(), Some(traceparent));
         assert_eq!(rest_trace.lock().await.as_deref(), Some(traceparent));
     }
+
+    #[tokio::test]
+    async fn test_aggregate_invalid_json_from_rest_upstream_required_and_optional() {
+        let bad_json_port = spawn_rest_mock(
+            StatusCode::OK,
+            "<html>not json</html>",
+            Duration::ZERO,
+            None,
+            None,
+        )
+        .await;
+        let ok_port = spawn_rest_mock(
+            StatusCode::OK,
+            r#"{"ok":true}"#,
+            Duration::ZERO,
+            None,
+            None,
+        )
+        .await;
+
+        let (http_client, grpc_client) = build_clients();
+        let cfg = test_server_config(5);
+
+        // Case A: required = true -> 502 Bad Gateway
+        let route_req = make_aggregate_route(vec![make_sub_target(
+            "bad",
+            RouteBackendType::Rest,
+            bad_json_port,
+            "/v1/bad",
+            Some(Method::GET),
+            true,
+            None,
+        )]);
+        let resp_req = handle_aggregate(
+            &route_req,
+            RequestBody::Buffered(Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &"/api/dashboard".parse().unwrap(),
+            None,
+            "agg_test",
+            &http_client,
+            &grpc_client,
+            &cfg,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp_req.status(), StatusCode::BAD_GATEWAY);
+
+        // Case B: required = false -> 200 OK with null + _errors (502)
+        let route_opt = make_aggregate_route(vec![
+            make_sub_target(
+                "good",
+                RouteBackendType::Rest,
+                ok_port,
+                "/v1/ok",
+                Some(Method::GET),
+                true,
+                None,
+            ),
+            make_sub_target(
+                "bad",
+                RouteBackendType::Rest,
+                bad_json_port,
+                "/v1/bad",
+                Some(Method::GET),
+                false,
+                None,
+            ),
+        ]);
+        let resp_opt = handle_aggregate(
+            &route_opt,
+            RequestBody::Buffered(Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &"/api/dashboard".parse().unwrap(),
+            None,
+            "agg_test",
+            &http_client,
+            &grpc_client,
+            &cfg,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp_opt.status(), StatusCode::OK);
+        let json_bytes = resp_opt.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed["good"]["ok"], true);
+        assert!(parsed["bad"].is_null());
+        assert_eq!(parsed["_errors"]["bad"]["status"], 502);
+        assert!(
+            parsed["_errors"]["bad"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid JSON")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_optional_timeout_returns_null_and_504_in_errors() {
+        let ok_port = spawn_rest_mock(
+            StatusCode::OK,
+            r#"{"fast":1}"#,
+            Duration::ZERO,
+            None,
+            None,
+        )
+        .await;
+        let slow_port = spawn_rest_mock(
+            StatusCode::OK,
+            r#"{"slow":2}"#,
+            Duration::from_millis(300),
+            None,
+            None,
+        )
+        .await;
+
+        let route = make_aggregate_route(vec![
+            make_sub_target(
+                "fast",
+                RouteBackendType::Rest,
+                ok_port,
+                "/v1/fast",
+                Some(Method::GET),
+                true,
+                None,
+            ),
+            make_sub_target(
+                "slow",
+                RouteBackendType::Rest,
+                slow_port,
+                "/v1/slow",
+                Some(Method::GET),
+                false,
+                None,
+            ),
+        ]);
+
+        let (http_client, grpc_client) = build_clients();
+        let cfg = test_server_config(5);
+
+        let resp = handle_aggregate(
+            &route,
+            RequestBody::Buffered(Bytes::new()),
+            Method::GET,
+            Version::HTTP_11,
+            hyper::HeaderMap::new(),
+            &"/api/dashboard".parse().unwrap(),
+            None,
+            "agg_test",
+            &http_client,
+            &grpc_client,
+            &cfg,
+            Some(Duration::from_millis(60)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed["fast"]["fast"], 1);
+        assert!(parsed["slow"].is_null());
+        assert_eq!(parsed["_errors"]["slow"]["status"], 504);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_method_not_allowed_returns_405() {
+        let route = make_aggregate_route(vec![]);
+        let (http_client, grpc_client) = build_clients();
+        let cfg = test_server_config(5);
+
+        for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+            let resp = handle_aggregate(
+                &route,
+                RequestBody::Buffered(Bytes::new()),
+                method,
+                Version::HTTP_11,
+                hyper::HeaderMap::new(),
+                &"/api/dashboard".parse().unwrap(),
+                None,
+                "agg_test",
+                &http_client,
+                &grpc_client,
+                &cfg,
+                Some(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_rest_post_flat_payload_forwarding_and_header_sanitizing() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<(
+            Option<String>,
+            Option<String>,
+            Bytes,
+        )>));
+        let captured_srv = captured.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                let io = hyper_util::rt::TokioIo::new(socket);
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let captured_srv = captured_srv.clone();
+                            async move {
+                                let cl = req
+                                    .headers()
+                                    .get(header::CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                let ae = req
+                                    .headers()
+                                    .get(header::ACCEPT_ENCODING)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.to_string());
+                                let body = req.into_body().collect().await.unwrap().to_bytes();
+                                *captured_srv.lock().await = Some((cl, ae, body));
+                                Ok::<_, std::convert::Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("content-type", "application/json")
+                                        .body(Full::new(Bytes::from_static(br#"{"saved":true}"#)))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await;
+            }
+        });
+
+        let route = make_aggregate_route(vec![make_sub_target(
+            "audit",
+            RouteBackendType::Rest,
+            port,
+            "/v1/audit",
+            Some(Method::POST),
+            true,
+            None,
+        )]);
+
+        let (http_client, grpc_client) = build_clients();
+        let cfg = test_server_config(5);
+
+        let flat_body = Bytes::from_static(br#"{"user_id":"42","action":"login"}"#);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(header::ACCEPT_ENCODING, header::HeaderValue::from_static("gzip, br"));
+        // Deliberately mismatched Content-Length to verify sanitizer recomputes it
+        headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from_static("9999"));
+
+        let resp = handle_aggregate(
+            &route,
+            RequestBody::Buffered(flat_body.clone()),
+            Method::POST,
+            Version::HTTP_11,
+            headers,
+            &"/api/dashboard".parse().unwrap(),
+            None,
+            "agg_test",
+            &http_client,
+            &grpc_client,
+            &cfg,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed["audit"]["saved"], true);
+
+        let (got_cl, got_ae, got_body) = captured.lock().await.clone().unwrap();
+        assert_eq!(got_cl.as_deref(), Some(flat_body.len().to_string().as_str()));
+        assert_eq!(got_ae, None, "Accept-Encoding must be stripped for REST aggregate sub-calls");
+        assert_eq!(got_body, flat_body);
+    }
 }
