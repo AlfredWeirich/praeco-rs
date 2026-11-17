@@ -1543,4 +1543,257 @@ mod tests {
             .set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
         yamux_cfg.set_max_num_streams(max_streams);
     }
+
+    #[test]
+    fn test_token_bucket_burst_refill_and_cap() {
+        let mut bucket = TokenBucket::new(2.0);
+        // Initial burst of 2 tokens should succeed
+        assert!(bucket.consume(100.0, 2.0));
+        assert!(bucket.consume(100.0, 2.0));
+        // Immediately consuming a 3rd token should fail
+        assert!(!bucket.consume(100.0, 2.0));
+
+        // Wait enough time to refill >= 2 tokens at 100/sec, verify capped at burst=2.0
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(bucket.consume(100.0, 2.0));
+        assert!(bucket.consume(100.0, 2.0));
+        assert!(!bucket.consume(100.0, 2.0));
+        let _ = bucket.last_update();
+    }
+
+    #[test]
+    fn test_is_valid_sni() {
+        assert!(is_valid_sni("example.com"));
+        assert!(is_valid_sni("api-1.sub.example.eu"));
+        assert!(is_valid_sni("localhost"));
+
+        assert!(!is_valid_sni(""));
+        assert!(!is_valid_sni(&"a".repeat(254)));
+        assert!(!is_valid_sni(&format!("{}.com", "a".repeat(64))));
+        assert!(!is_valid_sni("-bad.com"));
+        assert!(!is_valid_sni("bad-.com"));
+        assert!(!is_valid_sni("bad..com"));
+        assert!(!is_valid_sni(".bad.com"));
+        assert!(!is_valid_sni("bad.com."));
+        assert!(!is_valid_sni("bad/path.com"));
+        assert!(!is_valid_sni("bad_host.com"));
+        assert!(!is_valid_sni("bad host.com"));
+    }
+
+    #[test]
+    fn test_parse_register_command_invalid_and_case_normalization() {
+        assert_eq!(
+            parse_register_command("  REGISTER API.Example.COM PROXY_V2 \n", true),
+            Some(("api.example.com".to_string(), true))
+        );
+        assert_eq!(parse_register_command("", true), None);
+        assert_eq!(parse_register_command("   \n", true), None);
+        assert_eq!(parse_register_command("REGISTER\n", true), None);
+        assert_eq!(parse_register_command("HELLO api.example.com\n", true), None);
+    }
+
+    #[test]
+    fn test_extract_allowed_snis_edge_cases() {
+        // Garbage bytes return empty list
+        assert!(extract_allowed_snis(b"not-a-der-cert").is_empty());
+
+        // CA cert without DNS SAN extensions returns empty list
+        let ca_certs: Vec<CertificateDer> =
+            CertificateDer::pem_file_iter("../server_certs/self_signed/relay_ca.pem")
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+        assert!(extract_allowed_snis(ca_certs.first().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn test_setup_mtls_acceptor_errors_and_crl_loading() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Missing CA file
+        assert!(matches!(
+            setup_mtls_acceptor(
+                "nonexistent_ca.pem",
+                "../server_certs/self_signed/relay_server.pem",
+                "../server_certs/self_signed/relay_server.key",
+                None,
+            ),
+            Err(RelayError::Pem(_) | RelayError::Io(_))
+        ));
+
+        // Missing CRL file
+        let missing_crl = "nonexistent_crl.pem".to_string();
+        assert!(matches!(
+            setup_mtls_acceptor(
+                "../server_certs/self_signed/relay_ca.pem",
+                "../server_certs/self_signed/relay_server.pem",
+                "../server_certs/self_signed/relay_server.key",
+                Some(&missing_crl),
+            ),
+            Err(RelayError::Pem(_) | RelayError::Io(_))
+        ));
+
+        // Valid certs + CRL file (exercises CRL parsing & expiration warning check)
+        let crl_path = "../client_certs/crl_experiments/test1_crl/ca.crl.pem".to_string();
+        assert!(
+            setup_mtls_acceptor(
+                "../server_certs/self_signed/relay_ca.pem",
+                "../server_certs/self_signed/relay_server.pem",
+                "../server_certs/self_signed/relay_server.key",
+                Some(&crl_path),
+            )
+            .is_ok()
+        );
+    }
+
+    fn build_client_hello_bytes(server_name: rustls::pki_types::ServerName<'static>) -> Vec<u8> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth(),
+        );
+        let mut conn = rustls::ClientConnection::new(cfg, server_name).unwrap();
+        let mut out = Vec::new();
+        conn.write_tls(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn test_extract_sni_valid_and_error_cases() {
+        // 1. Valid TLS ClientHello with DNS SNI
+        let hello_dns = build_client_hello_bytes(
+            rustls::pki_types::ServerName::try_from("service.example.eu".to_string()).unwrap(),
+        );
+        assert_eq!(extract_sni(&hello_dns), Ok("service.example.eu".to_string()));
+
+        // 2. Valid TLS ClientHello with IP literal (no SNI extension per RFC 6066)
+        let ip_name = rustls::pki_types::ServerName::IpAddress(
+            "127.0.0.1".parse::<IpAddr>().unwrap().into(),
+        );
+        let hello_ip = build_client_hello_bytes(ip_name);
+        assert_eq!(extract_sni(&hello_ip), Err("ClientHello has no SNI extension"));
+
+        // 3. Invalid TLS plaintext
+        assert_eq!(
+            extract_sni(b"GET / HTTP/1.1\r\n\r\n"),
+            Err("Not a valid TLS plaintext message")
+        );
+
+        // 4. Valid TLS ChangeCipherSpec record (0x14) -> no handshake
+        let ccs = [0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+        assert_eq!(extract_sni(&ccs), Err("No TLS Handshake found"));
+    }
+
+    #[tokio::test]
+    async fn test_read_client_hello_record_error_cases() {
+        // 1. Empty EOF
+        let (client_write, mut server_read) = tokio::io::duplex(64);
+        drop(client_write);
+        assert_eq!(
+            read_client_hello_record(&mut server_read, Duration::from_secs(1)).await,
+            Err("Connection closed before any data received")
+        );
+
+        // 2. Truncated 3-byte header EOF
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+        client_write.write_all(&[0x16, 0x03, 0x01]).await.unwrap();
+        drop(client_write);
+        assert_eq!(
+            read_client_hello_record(&mut server_read, Duration::from_secs(1)).await,
+            Err("Unexpected EOF while reading TLS record header")
+        );
+
+        // 3. Truncated payload EOF (claims 10 bytes, sends 4)
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+        client_write
+            .write_all(&[0x16, 0x03, 0x01, 0x00, 0x0A, 1, 2, 3, 4])
+            .await
+            .unwrap();
+        drop(client_write);
+        assert_eq!(
+            read_client_hello_record(&mut server_read, Duration::from_secs(1)).await,
+            Err("Unexpected EOF while reading TLS record payload")
+        );
+
+        // 4. Oversized TLS record (> 16384 bytes)
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+        client_write
+            .write_all(&[0x16, 0x03, 0x01, 0x40, 0x01])
+            .await
+            .unwrap();
+        assert_eq!(
+            read_client_hello_record(&mut server_read, Duration::from_secs(1)).await,
+            Err("TLS record payload exceeds maximum allowable length of 16384 bytes")
+        );
+
+        // 5. Slowloris timeout (partial header, stream stays open)
+        let (mut client_write, mut server_read) = tokio::io::duplex(64);
+        client_write.write_all(&[0x16, 0x03]).await.unwrap();
+        let res = read_client_hello_record(&mut server_read, Duration::from_millis(40)).await;
+        drop(client_write);
+        assert_eq!(res, Err("Timed out while reading TLS ClientHello"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_copy_bidirectional_clean_idle_timeout_and_activity_reset() {
+        // 1. Clean bidirectional copy without idle timeout
+        let (mut a_peer, a_relay) = tokio::io::duplex(1024);
+        let (mut b_peer, b_relay) = tokio::io::duplex(1024);
+        let copy_task = tokio::spawn(copy_bidirectional_with_idle_timeout(a_relay, b_relay, None));
+
+        a_peer.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        b_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        b_peer.write_all(b"world!").await.unwrap();
+        let mut buf2 = [0u8; 6];
+        a_peer.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"world!");
+
+        a_peer.shutdown().await.unwrap();
+        b_peer.shutdown().await.unwrap();
+        match copy_task.await.unwrap() {
+            CopyResult::Clean(up, down) => {
+                assert_eq!(up, 5);
+                assert_eq!(down, 6);
+            }
+            other => panic!("Expected Clean copy result, got {:?}", other),
+        }
+
+        // 2. Idle timeout triggers when no data flows (virtual time auto-advances)
+        let (_a_peer2, a_relay2) = tokio::io::duplex(1024);
+        let (_b_peer2, b_relay2) = tokio::io::duplex(1024);
+        let idle_res = copy_bidirectional_with_idle_timeout(
+            a_relay2,
+            b_relay2,
+            Some(Duration::from_secs(20)),
+        )
+        .await;
+        assert!(matches!(idle_res, CopyResult::IdleTimeout));
+
+        // 3. Continuous periodic activity prevents idle timeout past the timeout window
+        let (mut a_peer3, a_relay3) = tokio::io::duplex(1024);
+        let (mut b_peer3, b_relay3) = tokio::io::duplex(1024);
+        let active_task = tokio::spawn(copy_bidirectional_with_idle_timeout(
+            a_relay3,
+            b_relay3,
+            Some(Duration::from_secs(10)),
+        ));
+
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            a_peer3.write_all(b"ping").await.unwrap();
+            let mut r = [0u8; 4];
+            b_peer3.read_exact(&mut r).await.unwrap();
+            assert_eq!(&r, b"ping");
+        }
+        a_peer3.shutdown().await.unwrap();
+        b_peer3.shutdown().await.unwrap();
+        assert!(matches!(
+            active_task.await.unwrap(),
+            CopyResult::Clean(20, 0)
+        ));
+    }
 }

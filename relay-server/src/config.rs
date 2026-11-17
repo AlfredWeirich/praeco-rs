@@ -145,4 +145,64 @@ mod tests {
         let config: RelayConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.log_dir, None);
     }
+
+    #[test]
+    fn test_relay_config_default_values() {
+        let cfg = RelayConfig::default();
+        assert_eq!(cfg.control_plane_addr, "0.0.0.0:7001");
+        assert_eq!(cfg.data_plane_addr, "0.0.0.0:443");
+        assert_eq!(cfg.crl_path, None);
+        assert_eq!(cfg.enable_opentelemetry, Some(false));
+        assert_eq!(cfg.rate_limit_connections_per_sec, Some(50));
+        assert_eq!(cfg.rate_limit_burst, Some(100));
+        assert_eq!(cfg.data_plane_idle_timeout_secs, Some(1800));
+        assert_eq!(cfg.tcp_keepalive_secs, Some(60));
+        assert_eq!(cfg.max_concurrent_connections, Some(10000));
+        assert_eq!(cfg.max_concurrent_connections_per_ip, Some(100));
+        assert_eq!(cfg.client_hello_timeout_secs, Some(10));
+        assert_eq!(cfg.control_plane_handshake_timeout_secs, Some(10));
+        assert_eq!(cfg.max_yamux_streams, Some(4096));
+        assert_eq!(cfg.enable_proxy_protocol, Some(true));
+    }
+
+    #[test]
+    fn test_relay_config_load_success_and_errors() {
+        // 1. Missing file returns ConfigNotFound
+        let missing = std::env::temp_dir().join("praeco_relay_nonexistent_config_12345.toml");
+        let missing_str = missing.to_string_lossy().to_string();
+        assert!(matches!(
+            RelayConfig::load(&missing_str),
+            Err(RelayError::ConfigNotFound(_))
+        ));
+
+        // 2. Invalid TOML returns ConfigParse
+        let bad_path = std::env::temp_dir().join(format!(
+            "praeco_relay_bad_config_{}.toml",
+            std::process::id()
+        ));
+        fs::write(&bad_path, "this is = [not valid toml").unwrap();
+        let bad_res = RelayConfig::load(&bad_path.to_string_lossy());
+        let _ = fs::remove_file(&bad_path);
+        assert!(matches!(bad_res, Err(RelayError::ConfigParse(_))));
+
+        // 3. Valid TOML file loads cleanly
+        let ok_path = std::env::temp_dir().join(format!(
+            "praeco_relay_ok_config_{}.toml",
+            std::process::id()
+        ));
+        let valid_toml = r#"
+            control_plane_addr = "127.0.0.1:7101"
+            data_plane_addr = "127.0.0.1:8443"
+            ca_cert_path = "ca.pem"
+            server_cert_path = "cert.pem"
+            server_key_path = "key.pem"
+            enable_proxy_protocol = false
+        "#;
+        fs::write(&ok_path, valid_toml).unwrap();
+        let loaded = RelayConfig::load(&ok_path.to_string_lossy()).expect("valid config should load");
+        let _ = fs::remove_file(&ok_path);
+        assert_eq!(loaded.control_plane_addr, "127.0.0.1:7101");
+        assert_eq!(loaded.data_plane_addr, "127.0.0.1:8443");
+        assert_eq!(loaded.enable_proxy_protocol, Some(false));
+    }
 }
