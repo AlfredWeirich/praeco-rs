@@ -460,6 +460,15 @@ impl ConnectionHandler {
             req.extensions_mut().insert(OidCertExtension((*self.client_oids).clone()));
         }
 
+        // === gRPC Client Protocol Negotiation Check ===
+        // Native gRPC requests (`content-type: application/grpc*`) cannot parse HTTP plain-text
+        // short-circuit bodies from Tower middlewares (e.g. `403 Forbidden`, `429`, `401`, `413`).
+        let is_grpc_request = req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_grpc_content_type);
+
         // Tower service contract: poll_ready() MUST be called before call().
         // This is critical for layers like ConcurrencyLimit that acquire a
         // semaphore permit during poll_ready() and assert it exists in call().
@@ -468,12 +477,112 @@ impl ConnectionHandler {
 
         let mut resp = self.inner_service.call(req).await?;
 
+        if is_grpc_request && !resp.status().is_success() {
+            let already_grpc = resp.headers().contains_key("grpc-status")
+                || resp
+                    .headers()
+                    .get(hyper::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(is_grpc_content_type);
+            if !already_grpc {
+                resp = translate_http_error_to_grpc(resp).await;
+            }
+        }
+
         // === Universal Response Headers (pre-computed, zero-parse overhead) ===
         let headers = resp.headers_mut();
         headers.insert(hyper::header::CACHE_CONTROL, CACHE_CTL_VALUE);
 
         Ok(resp)
     }
+}
+
+/// Returns `true` if `content_type` designates a native gRPC-over-HTTP/2 stream
+/// (`application/grpc` or `application/grpc+<subtype>`, ignoring optional `; params`).
+#[inline]
+fn is_grpc_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    const PREFIX_PLUS: &str = "application/grpc+";
+    media_type.eq_ignore_ascii_case("application/grpc")
+        || (media_type.len() > PREFIX_PLUS.len()
+            && media_type[..PREFIX_PLUS.len()].eq_ignore_ascii_case(PREFIX_PLUS))
+}
+
+/// Maps HTTP error status codes from Tower middleware short-circuits to canonical gRPC status codes.
+#[inline]
+fn map_http_status_to_grpc_code(status: hyper::StatusCode) -> &'static str {
+    match status {
+        hyper::StatusCode::BAD_REQUEST => "3",            // INVALID_ARGUMENT
+        hyper::StatusCode::UNAUTHORIZED => "16",          // UNAUTHENTICATED
+        hyper::StatusCode::FORBIDDEN => "7",              // PERMISSION_DENIED
+        hyper::StatusCode::NOT_FOUND
+        | hyper::StatusCode::METHOD_NOT_ALLOWED
+        | hyper::StatusCode::NOT_IMPLEMENTED => "12",     // UNIMPLEMENTED
+        hyper::StatusCode::REQUEST_TIMEOUT
+        | hyper::StatusCode::GATEWAY_TIMEOUT => "4",      // DEADLINE_EXCEEDED
+        hyper::StatusCode::PAYLOAD_TOO_LARGE
+        | hyper::StatusCode::TOO_MANY_REQUESTS => "8",    // RESOURCE_EXHAUSTED
+        hyper::StatusCode::BAD_GATEWAY
+        | hyper::StatusCode::SERVICE_UNAVAILABLE => "14", // UNAVAILABLE
+        _ => "13",                                        // INTERNAL
+    }
+}
+
+/// Converts a non-gRPC HTTP error response (e.g. `403 Forbidden` plain-text body from `IpFilterLayer`)
+/// into a gRPC Trailers-Only error response (`content-type: application/grpc`, `grpc-status`,
+/// `grpc-message`, and empty body) while preserving existing security/tracing headers.
+async fn translate_http_error_to_grpc(resp: Response<ServiceRespBody>) -> Response<ServiceRespBody> {
+    let (mut parts, mut body) = resp.into_parts();
+    let status = parts.status;
+    let grpc_code = map_http_status_to_grpc_code(status);
+
+    // Read at most 512 bytes for a clean `grpc-message` instead of letting gRPC clients
+    // try to frame the plain-text body as Protobuf.
+    const MAX_MSG_BYTES: usize = 512;
+    let mut msg_buf = Vec::with_capacity(64);
+    while msg_buf.len() < MAX_MSG_BYTES {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Some(data) = frame.data_ref() {
+                    let take = (MAX_MSG_BYTES - msg_buf.len()).min(data.len());
+                    msg_buf.extend_from_slice(&data[..take]);
+                }
+            }
+            Some(Err(_)) | None => break,
+        }
+    }
+
+    let raw_msg = String::from_utf8_lossy(&msg_buf);
+    let trimmed = raw_msg.trim();
+    let msg_text = if trimmed.is_empty() {
+        status.canonical_reason().unwrap_or("gRPC Error")
+    } else {
+        trimmed
+    };
+
+    parts.headers.remove(hyper::header::CONTENT_LENGTH);
+    parts.headers.remove(hyper::header::CONTENT_ENCODING);
+    parts.headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/grpc"),
+    );
+    parts.headers.insert(
+        "grpc-status",
+        hyper::header::HeaderValue::from_static(grpc_code),
+    );
+    let encoded_msg = urlencoding::encode(msg_text);
+    if let Ok(msg_val) = hyper::header::HeaderValue::from_str(encoded_msg.as_ref()) {
+        parts.headers.insert("grpc-message", msg_val);
+    }
+
+    let empty_body: ServiceRespBody = http_body_util::Empty::<Bytes>::new()
+        .map_err(SrvError::from)
+        .boxed();
+    Response::from_parts(parts, empty_body)
 }
 
 // ── Hyper Service Implementation ─────────────────────────────────────────────

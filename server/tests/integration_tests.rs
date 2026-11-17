@@ -1535,3 +1535,184 @@ async fn test_build_service_stack_with_base_records_server_metrics_and_enforces_
 
     cancel_token.cancel();
 }
+
+#[tokio::test]
+async fn test_grpc_request_blocked_by_ip_filter_returns_grpc_trailers_only_status() {
+    ensure_crypto_provider();
+    use praeco_rs::configuration::IpFilterConfig;
+
+    let mut cfg = ServerConfig {
+        name: "GrpcIpFilterTranslationTest".into(),
+        ip: Some("127.0.0.1".into()),
+        port: Some(8080),
+        protocol: Protocol::Http,
+        layers: Layers {
+            // SecurityHeaders is auto-inserted outermost before IpFilter
+            enabled: vec!["IpFilter".into()],
+            ip_filter_config: Some(IpFilterConfig {
+                // Deliberately excludes the test peer IP 198.51.100.10
+                allow_cidrs: vec!["128.0.0.1/32".into()],
+                deny_cidrs: vec![],
+                trust_forwarded_headers: false,
+            }),
+            security_headers_config: Some(SecurityHeadersConfig::default()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cfg.finalize().expect("ServerConfig::finalize must succeed");
+    let server_config = Arc::new(cfg);
+
+    let custom_base = tower::service_fn(|_req: Request<SrvBody>| async move {
+        let body: ServiceRespBody = Full::new(Bytes::from_static(b"unreachable"))
+            .map_err(|never| match never {})
+            .boxed();
+        Ok::<_, SrvError>(hyper::Response::new(body))
+    })
+    .boxed_clone_sync();
+
+    let stack = build_service_stack_with_base(&server_config, custom_base)
+        .expect("build_service_stack_with_base must succeed");
+    let cancel_token = CancellationToken::new();
+    let peer_addr: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    let (client_io, server_io) = tokio::io::duplex(32 * 1024);
+    let srv_token = cancel_token.clone();
+    let stack_first = stack.clone();
+    let server_task = tokio::spawn(async move {
+        let handler = ConnectionHandler::new(
+            stack_first,
+            peer_addr,
+            Vec::new(),
+            None,
+            None,
+            oid_mapping,
+        );
+        serve_http_connection(server_io, handler, srv_token).await;
+    });
+
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+            .await
+            .expect("HTTP/2 handshake");
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Send an empty 5-byte gRPC frame with content-type: application/grpc
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/aggregator.DashboardService/GetDashboard")
+        .header("host", "localhost:8080")
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::from_static(&[0, 0, 0, 0, 0])))
+        .unwrap();
+
+    let resp = sender.send_request(req).await.expect("send request");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+        Some("application/grpc"),
+        "Blocked gRPC request must receive application/grpc response content-type"
+    );
+    assert_eq!(
+        resp.headers().get("grpc-status").and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "403 Forbidden must map to gRPC PERMISSION_DENIED (7)"
+    );
+    assert!(
+        resp.headers()
+            .get("grpc-message")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m.contains("Forbidden")),
+        "grpc-message must carry Forbidden detail"
+    );
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff",
+        "Hardened SecurityHeaders must still be preserved"
+    );
+    // Verify Tonic's own Status parser recognizes the response as PermissionDenied
+    let tonic_status = tonic::Status::from_header_map(resp.headers())
+        .expect("Tonic must parse a gRPC Status directly from the headers");
+    assert_eq!(tonic_status.code(), tonic::Code::PermissionDenied);
+    assert!(tonic_status.message().contains("Forbidden"));
+
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        body_bytes.is_empty(),
+        "gRPC Trailers-Only error response must have an empty body (got {:?})",
+        body_bytes
+    );
+
+    drop(sender);
+    let _ = conn_task.await;
+    server_task.abort();
+
+    // Also verify end-to-end with a real `tonic::client::Grpc::unary` client over HTTP/2 duplex!
+    let (client_io2, server_io2) = tokio::io::duplex(32 * 1024);
+    let srv_token2 = cancel_token.clone();
+    let oid_mapping2 = Arc::new(server_config.oid_mapping.clone());
+    let server_task2 = tokio::spawn(async move {
+        let handler = ConnectionHandler::new(
+            stack,
+            peer_addr,
+            Vec::new(),
+            None,
+            None,
+            oid_mapping2,
+        );
+        serve_http_connection(server_io2, handler, srv_token2).await;
+    });
+    let (mut sender2, conn2) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io2))
+            .await
+            .expect("HTTP/2 handshake 2");
+    let conn_task2 = tokio::spawn(async move {
+        let _ = conn2.await;
+    });
+
+    let grpc_svc = tower::service_fn(move |mut req: Request<tonic::body::Body>| {
+        let pq = req
+            .uri()
+            .path_and_query()
+            .cloned()
+            .unwrap_or_else(|| hyper::http::uri::PathAndQuery::from_static("/"));
+        *req.uri_mut() = hyper::Uri::builder()
+            .scheme("http")
+            .authority("127.0.0.1:8080")
+            .path_and_query(pq)
+            .build()
+            .unwrap();
+        let mapped = req.map(|b| {
+            b.map_err(|e| std::io::Error::other(e.to_string())).boxed_unsync()
+        });
+        sender2.send_request(mapped)
+    });
+    let mut grpc_client = tonic::client::Grpc::new(grpc_svc);
+    grpc_client.ready().await.expect("grpc_client ready");
+    let err = grpc_client
+        .unary(
+            tonic::Request::new(()),
+            hyper::http::uri::PathAndQuery::from_static(
+                "/aggregator.DashboardService/GetDashboard",
+            ),
+            tonic_prost::ProstCodec::<(), ()>::default(),
+        )
+        .await
+        .expect_err("IpFilter-blocked gRPC unary call must return Err(tonic::Status)");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "Tonic client must receive PermissionDenied instead of compression-flag protocol error (got {:?})",
+        err
+    );
+    assert!(err.message().contains("Forbidden"), "got: {:?}", err);
+
+    drop(grpc_client);
+    let _ = conn_task2.await;
+    server_task2.abort();
+    cancel_token.cancel();
+}
