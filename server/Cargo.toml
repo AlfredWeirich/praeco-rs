@@ -21,6 +21,7 @@ cli = [
     "dep:tracing-appender",
     "dep:tracing-subscriber",
 ]
+web = ["dep:serde_urlencoded"]
 
 [dependencies]
 # --- Core ---
@@ -90,6 +91,7 @@ prost-reflect = { workspace = true, features = ["serde"] }
 # --- Serialization & Utilities ---
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+serde_urlencoded = { workspace = true, optional = true }
 toml = { workspace = true }
 regex = { workspace = true }
 glob = { workspace = true }

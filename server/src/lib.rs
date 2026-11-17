@@ -22,6 +22,7 @@
 //! - [`runner`] – Transport listeners (HTTP/1.1, H2, H3/QUIC), health checks, and tunnel client.
 //! - [`stack`] – Service stack assembly, TLS configuration builders, and stream runners.
 //! - [`tls_conf`] – TLS acceptor construction for `rustls`.
+//! - [`web`] *(feature `web`)* – Composable HTTP router, typed extractors, and WAF rule sync.
 
 use bytes::Buf;
 use core::net::SocketAddr;
@@ -54,6 +55,9 @@ pub mod runner;
 pub mod stack;
 /// TLS acceptor and `rustls` configuration helpers.
 pub mod tls_conf;
+/// Composable HTTP endpoint router and typed extractors (enabled via the `web` feature).
+#[cfg(feature = "web")]
+pub mod web;
 pub use error::SrvError;
 pub use runner::{
     CONNECTION_DRAIN_TIMEOUT, DualStackHandles, run_dual_stack, run_servers, run_tunnel,

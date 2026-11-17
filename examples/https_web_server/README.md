@@ -1,9 +1,10 @@
 # HTTPS & HTTP/3 Embedded Web Server Example
 
-Eigenständiges Beispiel-Crate, das `praeco-rs` mit `default-features = false` und **ohne `Config.toml`** einbindet:
+Eigenständiges Beispiel-Crate, das `praeco-rs` mit `default-features = false, features = ["web"]` und **ohne `Config.toml`** einbindet:
 
 - **Dual-Stack HTTPS:** HTTP/1.1 + HTTP/2 (TCP) und HTTP/3 (QUIC/UDP) auf Port `8443` (konfigurierbar via `PORT`).
-- **Modulares Endpoint-Routing:** Endpunkte sind als normale `async fn` außerhalb von `main()` definiert und werden über `WebRouter` registriert.
+- **Universeller Router & Extractors (`praeco_rs::web`):** Endpunkte sind schlanke `async fn`s mit typisierten Extractors (`Query<T>`, `Path<T>`, `Json<T>`, `TraceId`), `IntoResponse` und automatischer `AllowedPathes`-Ableitung für die WAF.
+- **Saubere Trennung:** `src/main.rs` enthält nur noch die Endpunkte & Routen; Server-Konfiguration und Shutdown liegen in `src/bootstrap.rs`.
 - **Sicherheitslayer:** `TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter` (`127.0.0.1/32`, `::1/128`), `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression` und `Inspection` (`AllowedPathes`).
 
 ## Starten
@@ -22,6 +23,10 @@ curl -v --http2 --cacert server_certs/self_signed/public_ca.pem https://127.0.0.
 
 # HTTP/2 GET /users/42
 curl -v --http2 --cacert server_certs/self_signed/public_ca.pem https://127.0.0.1:8443/users/42
+
+# HTTP/2 GET /greet?user_name=alice (Query<GreetQuery>-Extractor, optionales age: Option<u8>)
+curl -v --http2 --cacert server_certs/self_signed/public_ca.pem "https://127.0.0.1:8443/greet?user_name=alice"
+curl -v --http2 --cacert server_certs/self_signed/public_ca.pem "https://127.0.0.1:8443/greet?user_name=alice&age=17"
 
 # POST /api/echo
 curl -v --http2 --cacert server_certs/self_signed/public_ca.pem \
