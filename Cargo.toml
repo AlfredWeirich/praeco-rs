@@ -8,6 +8,7 @@ members = [
     "grpc_reflection", 
     "relay-server",
     "relay-server/test_multiplex",
+    "examples/https_web_server",
 ]
 resolver = "3"
 
