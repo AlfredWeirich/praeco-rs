@@ -1,6 +1,6 @@
 [package]
 name = "praeco-rs"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 description = "Zero-Trust API Gateway and Reverse Proxy with mTLS OID RBAC, JWT IdP, HTTP/3, and gRPC JSON-transcoding"
 readme = "../Readme.md"

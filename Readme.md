@@ -24,6 +24,7 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 * **Outbound Zero-Trust Tunneling (SNI Relay) & Static File Server**: Multiplexed outbound mTLS (`yamux`) reverse tunnels with fail-closed `PROXY v2` client IP propagation, plus a native SPA-capable static file server (`StaticFiles`).
 * **Parallel Fan-Out / Aggregator Routes (`backend_type = "aggregate"`, `v0.6.0`)**: Accepts a single `GET` or `POST` client request, fans out concurrently across mixed `grpc_transcoding` (via Reflection) and `rest` targets with zero-copy `keyed`/`broadcast` payload slicing (`RawValue` + `Bytes::slice_ref`), per-target query/header policies, independent circuit breakers, sanitized `required = false` graceful degradation (`null` + `_errors`), and zero-copy `ChunkedBytesBody` JSON frame assembly.
 * **Supervised Listeners, Graceful Draining & Ordered Hot-Reload Restarts (`v0.6.0`)**: `start_single_server` and `spawn_dual_stack` supervise TCP, UDP/QUIC (`h3` `GOAWAY`), Yamux tunnel streams, and active health-check tasks end-to-end with configurable `graceful_shutdown_timeout_seconds` (default `10` s), transient `accept()` error backoff, and `SocketReleaseBarrier`-coordinated `SIGHUP` restarts that release old sockets before re-binding without `EADDRINUSE`.
+* **Embedded Web Router, Typed Extractors & WAF Sync (`web` feature, `v0.6.1`)**: Optional `praeco_rs::web` module (`features = ["web"]`) providing a `matchit`-backed `WebRouter`, Axum-style typed extractors (`Query<T>`, `Path<T>`, `PathParams`, `Json<T>`, `TraceId`, `Request<SrvBody>`), `IntoResponse`, and single-source-of-truth `WebRouter::allowed_pathes()` generation for Praeco's `Inspection` WAF layer.
 
 ---
 
@@ -167,12 +168,15 @@ You can embed Praeco's gateway stack, Tower middlewares, or full dual-stack / tu
 
 ```toml
 [dependencies]
-praeco-rs = { version = "0.6.0", default-features = false }
+praeco-rs = { version = "0.6.1", default-features = false }
+# Enable the embedded WebRouter & typed extractors (Query, Path, Json, TraceId):
+# praeco-rs = { version = "0.6.1", default-features = false, features = ["web"] }
 ```
 
 Key library entry points re-exported at the crate root:
 - `praeco_rs::runner` (`run_servers`, `start_single_server`, `start_single_server_with_socket_signal`, `run_dual_stack`, `spawn_dual_stack`, `DualStackHandles`, `run_tunnel`, `run_tunnel_with_timeout`, `spawn_router_health_checks`, `spawn_router_health_checks_in`, `CONNECTION_DRAIN_TIMEOUT`) – supervised TCP (HTTP/1.1, HTTP/2), UDP/QUIC (HTTP/3), active health-check loops, graceful connection draining, and outbound mTLS/Yamux tunnel orchestration.
 - `praeco_rs::stack` (`build_service_stack`, `build_service_stack_with_base`, `wrap_tonic_routes`, `apply_layers`, `build_rustls_config`, `serve_http_connection`, `serve_tls_connection`, `run_tunnel_over_stream`, `run_tunnel_over_stream_with_drain_timeout`) – composable Tower pipelines, custom/Tonic service wrappers, and stream-level runners.
+- `praeco_rs::web` *(feature `web`)* – composable `WebRouter` (`.get()`, `.post()`, `*_with_waf()`, `.allowed_pathes()`), Axum-style typed extractors (`Query<T>`, `Path<T>`, `PathParams`, `Json<T>`, `TraceId`), and `IntoResponse` for building embedded HTTPS/HTTP3 APIs directly behind Praeco's security stack.
 - `praeco_rs::middleware` & `praeco_rs::configuration` – standalone Tower layers (`IpFilterLayer`, `JwtAuthLayer`, `TokenBucketRateLimiterLayer`, `RouterService`, …) and TOML config parsing/finalization.
 
 ```rust,no_run
@@ -206,13 +210,39 @@ Aggregated gRPC Response -> user_name='Alice (42)', order_count=7, cache-control
 ```
 
 #### Programmatic Embedding Without `Config.toml` (HTTPS + HTTP/3 Web Server Crate)
-For a standalone binary crate embedding `praeco-rs` (`default-features = false`) as an HTTPS + HTTP/3 (QUIC) web server with composable endpoint handlers defined outside `main()`, see [`examples/https_web_server`](https://github.com/AlfredWeirich/praeco-rs/tree/main/examples/https_web_server):
+For a standalone binary crate embedding `praeco-rs` (`default-features = false, features = ["web"]`) as a hardened HTTPS + HTTP/3 (QUIC) web server with composable endpoint handlers, see [`examples/https_web_server`](https://github.com/AlfredWeirich/praeco-rs/tree/main/examples/https_web_server):
 
-- **What it does:** Configures `ServerConfig` programmatically (`Protocol::Https`, `ServerCertConfig`, `ConnectionLimitsConfig`), registers standalone `async fn` endpoints (`/`, `/healthz`, `/users/{id}`, `POST /api/echo`) via a `matchit`-backed `WebRouter`, applies Praeco's security stack (`TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter`, `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression`, and `Inspection` with `AllowedPathes`), and starts dual-stack TCP (HTTP/1.1 + HTTP/2) and UDP/QUIC (HTTP/3) listeners via `start_single_server`.
-- **How to run it from the workspace:**
+- **What it does:** Keeps `src/main.rs` focused purely on domain endpoints (`/`, `/healthz`, `/users/{id}`, `/greet?user_name=alice[&age=17]`, `POST /api/echo`) using `praeco_rs::web::{WebRouter, Path, Query, Json, TraceId}` and `IntoResponse`, while `src/bootstrap.rs` encapsulates programmatic `ServerConfig` defaults, TLS 1.3 certs, and graceful `Ctrl+C` shutdown.
+- **Full Praeco security stack:** Every endpoint is automatically protected by Praeco's full hardened middleware pipeline (`TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter`, `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression`, and `Inspection` WAF whose `AllowedPathes` rules are derived directly from `router.allowed_pathes()`) plus TCP/UDP dual-stack HTTP/1.1, HTTP/2, and HTTP/3 (QUIC) via `start_single_server`.
+
+```rust,no_run
+use praeco_rs::web::{Json, Path, Query, TraceId, WebRouter};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct GreetQuery { user_name: String, age: Option<u8> }
+
+#[derive(Serialize)]
+struct GreetPayload { user_name: String, age: Option<u8>, greeting: String }
+
+async fn greet(Query(GreetQuery { user_name, age }): Query<GreetQuery>) -> Json<GreetPayload> {
+    let greeting = match age {
+        Some(years) => format!("Hallo {user_name} ({years} Jahre)!"),
+        None => format!("Hallo {user_name}!"),
+    };
+    Json(GreetPayload { user_name, age, greeting })
+}
+
+async fn get_user(Path(id): Path<String>, TraceId(trace_id): TraceId) -> String {
+    format!("user={id}, trace_id={trace_id:?}\n")
+}
+```
+
+- **How to run and test it from the workspace:**
 
 ```bash
 cargo run -p https_web_server
+cargo test -p https_web_server
 ```
 
 

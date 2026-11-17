@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.1] - 2026-11-17
+
+Optional `web` feature introducing `praeco_rs::web` (composable HTTP router, Axum-style typed extractors, `IntoResponse`, and automatic `Inspection` WAF allowlist synchronization), plus the standalone `examples/https_web_server` embedded HTTPS + HTTP/3 example crate.
+
+### Added
+* **Embedded Web Router & Typed Extractors (`web` Feature, `src/web.rs`):**
+  * Added optional Cargo feature `web` (`dep:serde_urlencoded`) exposing `praeco_rs::web` so embedded applications can build typed HTTP/JSON APIs directly on top of Praeco's hardened Tower middleware stack without adding dependencies to the default reverse-proxy build.
+  * Added `WebRouter` backed by `matchit` with method shorthands (`.get()`, `.post()`, `.put()`, `.delete()`, `.patch()`, `.route()`) and explicit WAF overrides (`*_with_waf()`), returning `405 Method Not Allowed` (with `Allow` header) and `404 Not Found` automatically.
+  * Added single-source-of-truth WAF synchronization via `WebRouter::allowed_pathes()`, automatically deriving exact/prefix `Inspection` allowlist rules from registered routes for `ServerConfig::allowed_pathes`.
+  * Added `FromRequestParts` / `FromRequest` extractors (`Query<T>` via `serde_urlencoded`, `Path<T>`, `PathParams`, `Json<T>`, `TraceId`, `Request<SrvBody>`) combinable for 0–4 handler arguments (`Handler<T>`), `IntoResponse` (`Json<T>`, `String`, `&'static str`, `StatusCode`, `(StatusCode, T)`, `Response<ServiceRespBody>`, `Result<T, E>`), structured `Rejection` / `ExtractError` preserving `SrvError` propagation (e.g. `413 Payload Too Large`), and `thiserror`-backed `WebRouterError`.
+* **Embedded HTTPS + HTTP/3 Web Server Example (`examples/https_web_server`):**
+  * Added standalone example workspace crate embedding `praeco-rs` with `default-features = false, features = ["web"]` and programmatic `ServerConfig` (no `Config.toml`), demonstrating dual-stack HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC), `src/bootstrap.rs` lifecycle separation, and concise endpoints (`/`, `/healthz`, `/users/{id}`, `/greet?user_name=...[&age=...]`, `POST /api/echo`) protected by Praeco's full hardened security middleware stack.
+* **Tests & Documentation:**
+  * Added unit tests in `praeco_rs::web` (`test_extractors_and_into_response`) and hardened stack integration tests in `examples/https_web_server` (`test_hardened_https_stack_and_endpoints`).
+  * Documented the `web` feature, `praeco_rs::web` APIs, and the embedded HTTPS/HTTP3 example in `Readme.md` and `examples/https_web_server/README.md`.
+
+---
+
 ## [0.6.0] - 2026-11-17
 
 Parallel REST & gRPC fan-out aggregation (`backend_type = "aggregate"`), SemVer-safe `#[non_exhaustive]` public types, programmatic `ServerConfig::default()`, embedded binary gRPC aggregator example, and supervised listener/tunnel lifecycle with graceful connection draining.
