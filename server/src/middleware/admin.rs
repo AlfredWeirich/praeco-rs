@@ -599,8 +599,26 @@ fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerCon
                         || node_uri_str.trim_end_matches('/') == up_str.trim_end_matches('/')
                     {
                         match act {
-                            "mark_dead" | "open" => node.mark_dead(),
-                            "mark_alive" | "close" | "reset" => node.mark_alive(),
+                            "mark_dead" | "open" => {
+                                node.mark_dead();
+                                tracing::warn!(
+                                    target: "admin::audit",
+                                    server = %srv.name,
+                                    action = %act,
+                                    upstream = %node_uri_str,
+                                    "Admin circuit-breaker control action executed"
+                                );
+                            }
+                            "mark_alive" | "close" | "reset" => {
+                                node.mark_alive();
+                                tracing::warn!(
+                                    target: "admin::audit",
+                                    server = %srv.name,
+                                    action = %act,
+                                    upstream = %node_uri_str,
+                                    "Admin circuit-breaker control action executed"
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -849,6 +867,47 @@ pub fn handle_admin_request_with_prefix(
 
     // Optional circuit-breaker control action on POST requests (e.g. ?action=mark_dead&upstream=...)
     if *method == Method::POST && !query.is_empty() {
+        let is_unauthenticated_standalone = mount_prefix.is_none()
+            && fallback_server.is_some_and(|srv| {
+                srv.service == crate::configuration::ServiceType::Admin
+                    && srv.authentication == crate::configuration::AuthenticationMethod::None
+                    && !srv.layers.enabled.iter().any(|l| {
+                        l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+                    })
+            });
+
+        if is_unauthenticated_standalone {
+            tracing::warn!(
+                target: "admin::audit",
+                path = %path,
+                "Rejected POST admin control action on unauthenticated Admin listener"
+            );
+            return build_admin_response(
+                StatusCode::FORBIDDEN,
+                "application/json",
+                Bytes::from_static(br#"{"error":"Admin control actions require authentication"}"#),
+            );
+        }
+
+        if let Some(sec_fetch_site) = headers
+            .get("sec-fetch-site")
+            .and_then(|v| v.to_str().ok())
+            && !sec_fetch_site.eq_ignore_ascii_case("same-origin")
+            && !sec_fetch_site.eq_ignore_ascii_case("none")
+        {
+            tracing::warn!(
+                target: "admin::audit",
+                sec_fetch_site = %sec_fetch_site,
+                path = %path,
+                "Blocked cross-site POST admin control action"
+            );
+            return build_admin_response(
+                StatusCode::FORBIDDEN,
+                "application/json",
+                Bytes::from_static(br#"{"error":"Cross-site admin control action blocked"}"#),
+            );
+        }
+
         apply_optional_control_action(query, fallback_server);
     }
 
@@ -1238,5 +1297,59 @@ mod tests {
                 .is_alive
                 .load(std::sync::atomic::Ordering::Acquire)
         );
+    }
+
+    #[tokio::test]
+    async fn test_unauthenticated_standalone_admin_is_read_only_and_csrf_protected() {
+        let toml_str = r#"
+            name = "readonly_admin_test"
+            enabled = true
+            protocol = "http"
+            service = "Admin"
+            authentication = "None"
+            ip = "127.0.0.1"
+            port = 9090
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut srv: ServerConfig = toml::from_str(toml_str).unwrap();
+        srv.finalize().unwrap();
+
+        let headers = HeaderMap::new();
+        let status_uri: Uri = "http://127.0.0.1:9090/status".parse().unwrap();
+        let get_resp = handle_admin_request(&status_uri, &Method::GET, &headers, Some(&srv));
+        assert_eq!(get_resp.status(), StatusCode::OK);
+
+        // POST control action on unauthenticated standalone AdminService must be forbidden
+        let mark_dead_uri: Uri =
+            "http://127.0.0.1:9090/status?action=mark_dead&upstream=http://127.0.0.1:50051/"
+                .parse()
+                .unwrap();
+        let post_resp = handle_admin_request(&mark_dead_uri, &Method::POST, &headers, Some(&srv));
+        assert_eq!(post_resp.status(), StatusCode::FORBIDDEN);
+
+        // Cross-site Sec-Fetch-Site on mounted/authenticated admin POST must also be blocked
+        let mut router_srv = ServerConfig {
+            name: "mounted_admin".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8080),
+            service: crate::configuration::ServiceType::Router,
+            ..Default::default()
+        };
+        router_srv.finalize().unwrap();
+
+        let mut csrf_headers = HeaderMap::new();
+        csrf_headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let csrf_resp = handle_admin_request_with_prefix(
+            &"http://127.0.0.1:8080/api/GetPraecoStatus?action=mark_dead&upstream=http://127.0.0.1:50051/"
+                .parse()
+                .unwrap(),
+            &Method::POST,
+            &csrf_headers,
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(csrf_resp.status(), StatusCode::FORBIDDEN);
     }
 }

@@ -8,4 +8,14 @@ authentication = "None"
 service = "Admin"
 
 [Server.Layers]
-    enabled = []
+    enabled = ["IpFilter", "RateLimiter:TokenBucket"]
+
+[Server.Layers.IpFilter]
+    allow_cidrs = ["127.0.0.1/32", "::1/128"]
+    deny_cidrs = []
+    trust_forwarded_headers = false
+
+[Server.Layers.TokenBucketRateLimiter]
+    max_capacity = 60
+    refill = 10
+    duration_micros = 1000000

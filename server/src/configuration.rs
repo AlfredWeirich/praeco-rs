@@ -2161,6 +2161,49 @@ impl ServerConfig {
                     self.name, params.root
                 );
             }
+        } else if self.service == ServiceType::Admin
+            && self.authentication == AuthenticationMethod::None
+        {
+            let has_jwt_layer = self.layers.enabled.iter().any(|l| {
+                l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+            });
+            if !has_jwt_layer {
+                if self.tunnel.is_some() {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Service 'Admin' without authentication cannot be exposed over a tunnel.",
+                        self.name
+                    )));
+                }
+                let is_loopback = self.ip.as_deref().is_some_and(|ip| {
+                    ip.eq_ignore_ascii_case("localhost")
+                        || ip.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback())
+                });
+                if !is_loopback {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Service 'Admin' without authentication must bind to a loopback address (127.0.0.1 or ::1).",
+                        self.name
+                    )));
+                }
+            }
+        }
+
+        if self.service == ServiceType::Router {
+            let has_jwt_layer = self.layers.enabled.iter().any(|l| {
+                l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+            });
+            for route in &self.parsed_routes {
+                if route.backend_type == RouteBackendType::Admin
+                    && self.authentication == AuthenticationMethod::None
+                    && !has_jwt_layer
+                    && route.allowed_roles.is_empty()
+                    && self.rbac.is_none()
+                {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Route '{}' with backend_type 'admin' requires authentication, non-empty 'allowed_roles', or [Server.Rbac].",
+                        self.name, route.prefix
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -3831,6 +3874,52 @@ enabled = []
         let dbg = format!("{rp:?}");
         assert!(!dbg.contains("super-secret-jwt-token"));
         assert!(dbg.contains("<redacted>"));
+    }
+
+    #[test]
+    fn test_unauthenticated_admin_must_be_loopback_and_admin_route_requires_protection() {
+        let mut non_loopback_admin = ServerConfig {
+            name: "exposed_admin".into(),
+            ip: Some("0.0.0.0".into()),
+            port: Some(9090),
+            service: ServiceType::Admin,
+            authentication: AuthenticationMethod::None,
+            ..Default::default()
+        };
+        assert!(
+            non_loopback_admin.finalize().is_err(),
+            "Unauthenticated Admin service on 0.0.0.0 must be rejected"
+        );
+
+        let mut loopback_admin = ServerConfig {
+            name: "local_admin".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(9090),
+            service: ServiceType::Admin,
+            authentication: AuthenticationMethod::None,
+            ..Default::default()
+        };
+        assert!(
+            loopback_admin.finalize().is_ok(),
+            "Unauthenticated Admin service on 127.0.0.1 must be accepted (read-only monitoring)"
+        );
+
+        let unprotected_admin_route_toml = r#"
+            name = "unprotected_admin_route"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Router"
+            authentication = "None"
+            [Layers]
+            enabled = []
+            [ReverseRoutes."/admin"]
+            backend_type = "admin"
+        "#;
+        let mut bad_router: ServerConfig = toml::from_str(unprotected_admin_route_toml).unwrap();
+        assert!(
+            bad_router.finalize().is_err(),
+            "Route backend_type='admin' without auth/roles/rbac must be rejected"
+        );
     }
 }
 
