@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+* **Per-Server `pki_base_oid` (`src/configuration.rs`, `src/tls_conf.rs`, `src/runner.rs`, `src/stack.rs`):**
+  * Added optional `pki_base_oid` on `[[Server]]` blocks with fallback to global `Config::pki_base_oid`, plus SemVer-safe `*_with_base` / `*_with_base_oid` variants so multi-server setups can use separate client PKIs without changing existing public signatures.
+
+### Security & Hardening
+* **Strict Config, CORS & JWT Validation (`src/configuration.rs`, `src/stack.rs`, `src/middleware/jwt.rs`):**
+  * Added `#[serde(deny_unknown_fields)]` across `Config`, `ServerConfig`, `Layers`, routes, and middleware structs so unknown/misspelled fields fail fast at startup and `SIGHUP` reload.
+  * Rejected CORS `allow_credentials = true` paired with `"*"` in `allowed_methods` or `allowed_headers`.
+  * Enforced non-empty `expected_issuer`, `expected_audience`, and `jwt_public_keys` in JWT validation and redacted sensitive `RouterParams::jwt` paths in `Debug` as well as query strings / full config dumps from logs.
+* **Admin Endpoint Guardrails (`src/middleware/admin.rs`, `src/configuration.rs`):**
+  * Enforced loopback-only binding, disallowed `[Server.tunnel]`, and enforced read-only mode (`403 Forbidden` on `POST ?action=...`) for unauthenticated standalone `ServiceType::Admin` listeners.
+  * Required authentication or explicit non-wildcard RBAC on `backend_type = "admin"` router routes, added `Sec-Fetch-Site` anti-CSRF verification and `admin::audit` warning logs for `mark_dead` / `mark_alive`, and eliminated deep `ServerConfig` vector cloning per admin/metrics request.
+* **RBAC & gRPC Passthrough Fixes (`src/middleware/path_sanitizer.rs`, `src/middleware/router/rbac.rs`, `src/middleware/router/http_proxy.rs`):**
+  * Rejected semicolon matrix parameters (`;` / `%3b`) in `PathSanitizerLayer` (`400`) and `enforce_rbac` (`403`), and normalized trailing slashes on exact RBAC rules in `CompiledRbac`.
+  * Added `buffer_grpc_first_frame_or_stream` (preserving initial frames via `PrefixedStreamBody` with a `408` read timeout) so bidirectional/client-streaming gRPC passthrough streams immediately without hanging while unary/server-streaming calls stay retryable strictly on `RetryReason::ConnectError`.
+
+### Changed & Fixed
+* **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**
+  * Handled `SIGTERM` (`SignalKind::terminate`) alongside `Ctrl-C` for graceful connection draining and OTLP flush.
+  * Migrated all unit, integration, and relay E2E tests (plus `examples/https_web_server`) from gitignored `server_certs/` / `client_certs/` files to ephemeral `common::test_pki::TestPki` (`praeco-common` `test-pki` feature).
+
+---
+
 ## [0.6.1] - 2026-11-17
 
 Optional `web` feature introducing `praeco_rs::web` (composable HTTP router, Axum-style typed extractors, `IntoResponse`, and automatic `Inspection` WAF allowlist synchronization), plus the standalone `examples/https_web_server` embedded HTTPS + HTTP/3 example crate.

@@ -10,6 +10,7 @@
 
 - **mTLS Support**: Easily perform mutual TLS authentication by providing client certificates and private keys.
 - **Next-Generation Protocols**: Full support for HTTP/2 and HTTP/3 (QUIC) connections.
+- **Validated Concurrency**: Rejects `--num-parallel 0` fail-fast via `clap` validation and guards empty connection pools in sliding-window benchmarks against busy-loops.
 - **Diagnostics**: Built-in integration with OpenTelemetry and `tracing` to log connection metrics and request flows.
 
 ## Usage

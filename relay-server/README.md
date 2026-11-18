@@ -56,7 +56,7 @@ Das fertige Binary liegt danach in `target/release/praeco-relay-server`.
 
 ## Konfiguration (`RelayConfig.toml`)
 
-Der Relay Server wird über eine TOML-Datei (standardmäßig `RelayConfig.toml` im Arbeitsverzeichnis oder als erstes CLI-Argument übergeben) gesteuert. Fehlt die Datei, bricht der Start fail-closed mit `RelayError::ConfigNotFound` ab.
+Der Relay Server wird über eine TOML-Datei (standardmäßig `RelayConfig.toml` im Arbeitsverzeichnis oder als erstes CLI-Argument übergeben) gesteuert. Fehlt die Datei oder enthält sie unbekannte Felder (`#[serde(deny_unknown_fields)]`), bricht der Start fail-closed ab.
 Hier ist eine Beispielkonfiguration:
 
 ```toml
@@ -110,13 +110,13 @@ cargo run -p praeco-relay-server -- RelayConfig.toml
 
 ## Tests
 
-Die Unit- und Integration-Tests für `praeco-relay-server` (aktuell 21 Unit-Tests und 17 Integration-Tests, inkl. TCP-Accept-Loop-, Rate-Limit-, Concurrency-, CRL-Widerrufs-, Slowloris- und Graceful-Shutdown-Tests) werden ausgeführt mit:
+Die Unit- und Integration-Tests für `praeco-relay-server` (aktuell 24 Unit-Tests und 17 Integration-Tests, inkl. TCP-Accept-Loop-, Rate-Limit-, Concurrency-, CRL-Widerrufs-, Slowloris-, Stream-Open-Timeout- und Graceful-Shutdown-Tests) werden ausgeführt mit:
 
 ```bash
 cargo test -p praeco-relay-server
 ```
 
-> **Hinweis:** Für die CRL- und SAN-Integration-Tests wird das `openssl`-CLI im `PATH` benötigt; die TCP-Accept-Loop-Tests binden lokale Ephemeral-Ports (`127.0.0.1:0`).
+> **Hinweis:** Alle Test-Zertifikate und CRLs werden zur Laufzeit über `common::test_pki::TestPki` (`rcgen`) im Speicher/Temp-Verzeichnis erzeugt — lokale `server_certs/`-Dateien oder das `openssl`-CLI werden für die Tests nicht benötigt. Die TCP-Accept-Loop-Tests binden lokale Ephemeral-Ports (`127.0.0.1:0`).
 
 ## Praeco-Client-Konfiguration (`[Server.tunnel]`)
 

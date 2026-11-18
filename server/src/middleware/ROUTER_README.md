@@ -33,9 +33,9 @@ Incoming HTTP requests are matched against prefix-based routes and forwarded to 
 | Feature | Description |
 |---------|-------------|
 | **Prefix Routing** | Uses [`matchit`](https://docs.rs/matchit) radix-tree router for efficient O(1)-ish path matching with wildcard support (`{*rest}`). |
-| **Path Canonicalization** | Enforces RFC 3986 path canonicalization, rejecting traversal (`..`, `%2e%2e`), encoded slashes (`%2f`), and null bytes with `400 Bad Request`. |
-| **Specialized Handlers** | Dynamically dispatches requests to standard HTTP proxies, transparent gRPC passthroughs, or JSON-to-gRPC transcoding backends. |
-| **RBAC** | Dual-tier RBAC: Granular path-level rules (`[Server.rbac]`) with exact and prefix matching, plus route-level `allowed_roles`. Supports fail-closed empty deny lists (`[]`) and wildcard public access (`*`). |
+| **Path Canonicalization** | Enforces RFC 3986 path canonicalization, rejecting traversal (`..`, `%2e%2e`), encoded slashes (`%2f`), semicolon matrix parameters (`;` / `%3b`), and null bytes with `400 Bad Request`. |
+| **Specialized Handlers** | Dynamically dispatches requests to standard HTTP proxies, transparent gRPC passthroughs, JSON-to-gRPC transcoding backends, fan-out aggregators, or RBAC-protected internal `admin` endpoints. |
+| **RBAC** | Dual-tier RBAC: Granular path-level rules (`[Server.rbac]`) with exact (trailing-slash normalized) and prefix matching, plus route-level `allowed_roles`. Rejects semicolon matrix parameters fail-closed (`403 Forbidden`), and supports empty deny lists (`[]`) and wildcard public access (`*`). |
 | **Hop-by-Hop & Forwarding Header Sanitization** | Removes connection-level headers (`Connection`, `Transfer-Encoding`, `Upgrade`, etc.) per RFC 7230 §6.1, unconditionally strips client-supplied `Forwarded`, `X-Forwarded-*`, `X-Real-IP`, and `x-client-*` headers across HTTP/1.1, HTTP/2, and HTTP/3, and authoritatively sets `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host` (including `:authority`). |
 | **Upstream Authentication** | Supports **mTLS** (client certificate with strict custom CA isolation) or **JWT bearer token** injection toward backends. |
 | **Dual Connection Pooling** | Maintains separate optimized connection pools for standard REST (`client`) and HTTP/2-only gRPC traffic (`grpc_client`). |
@@ -51,8 +51,8 @@ Each incoming request passes through the `call()` method:
 4. **Route Lookup** — Matches the canonical request path against the radix-tree router. Returns `404 Not Found` on miss.
 5. **RBAC Enforcement** — Delegates to `rbac::enforce_rbac()`, evaluating fine-grained `[Server.rbac]` path rules (exact first, then longest-prefix) before falling back to route-level `allowed_roles`. Returns `403 Forbidden` on denial.
 6. **Header Management** — Delegates to `headers::prepare_proxy_headers()` to strip hop-by-hop headers, unconditionally strip untrusted client identity headers (`x-client-cert`, `x-client-roles`, etc.), sanitize `X-Forwarded-*` / `Forwarded`, and inject verified identity tokens.
-7. **Buffering Decision** — Determines if the request body should be streamed or buffered in memory (required for retries or transcoding).
-8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, `grpc_web`, `aggregator` (fan-out), or the built-in admin handler based on the configured `RouteBackendType`.
+7. **Buffering Decision** — Determines whether the request body can be buffered (`max_retry_buffer_bytes`) or should stream immediately. For `grpc_passthrough`, `buffer_grpc_first_frame_or_stream` peeks up to one gRPC frame (bounded by a read timeout returning `408`) so unary/server-streaming calls stay retryable on connect errors while open bidirectional/client streams flow without blocking.
+8. **Dispatch** — Routes the request to `http_proxy`, `grpc_passthrough`, `grpc_web`, `aggregator` (fan-out), or the built-in `admin` handler (protected by route/server auth or RBAC, anti-CSRF `Sec-Fetch-Site`, and `admin::audit` logs) based on the configured `RouteBackendType`.
 
 ## Struct & API Reference
 
@@ -82,7 +82,7 @@ pub struct RouterService {
 | Module | Purpose |
 |--------|---------|
 | `http_proxy` | Handles standard REST/HTTP forwarding, URI rewrites, and retries. Hosts the shared failover engine `forward_with_failover` (retry loop, `ProbeGuard`/`ConnectionGuard`, outlier detection, OTel injection, client-fault isolation) parameterized by `ProxyMode::{Http, GrpcPassthrough}`. |
-| `grpc_passthrough` | Thin wrapper around `forward_with_failover(ProxyMode::GrpcPassthrough, …)`: enforces HTTP/2, strips hop-by-hop headers, sets `te: trailers`, retries any buffered request, applies gRPC outlier detection, and returns gRPC Trailers-Only error responses (`grpc-status`). |
+| `grpc_passthrough` | Thin wrapper around `forward_with_failover(ProxyMode::GrpcPassthrough, …)`: enforces HTTP/2, strips hop-by-hop headers, sets `te: trailers`, buffers only up to the first gRPC frame (`buffer_grpc_first_frame_or_stream`) so bidi streams do not stall, retries strictly on `ConnectError`, applies gRPC outlier detection, and returns gRPC Trailers-Only error responses (`grpc-status`). |
 | `aggregator` | Fan-out route (`backend_type = "aggregate"`): splits a `GET`/`POST` request into concurrent `rest` / `grpc_transcoding` sub-requests (zero-copy keyed payload slicing, per-target query/header policies, `required` vs. optional targets, cumulative response cap) and assembles the JSON result (`null` + `_errors` for failed optional targets) via a zero-copy chunked body. Delegates the actual upstream calls to `http_proxy` and `grpc_web`. |
 | `grpc_web` | Handles dynamic JSON-to-Protobuf transcoding using non-blocking async reflection (`tokio::fs::read`), preserving `content-type: application/grpc` and `te: trailers`, propagating W3C `traceparent` (`HeaderInjector`) and `x-trace-id` headers end-to-end, enforcing `request_timeout_seconds`, and bounding upstream responses to `16 MiB` (`http_body_util::Limited`). |
 | `rbac` | Enforces Role-Based Access Control logic based on configured OIDs. |

@@ -12,6 +12,14 @@
 - Inject custom claims, roles, and expiration times for testing various authorization edge cases.
 - Seamlessly integrates with the `JwtAuth` middleware layer of the `praeco-rs` gateway.
 
+## Key Generation (`create_keys.sh`)
+
+To generate a fresh Ed25519 key pair (`jwt_private.pem` / `jwt_public.pem`) safely with `umask 077` (mode `0600` on private keys, refusing to overwrite existing keys unless `-f` / `--force` is passed):
+
+```bash
+./jwt_creator/create_keys.sh
+```
+
 ## Usage
 
 Run the utility from the workspace root to generate a new token:

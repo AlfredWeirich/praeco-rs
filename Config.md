@@ -77,7 +77,9 @@ Praeco can be started with a default or custom configuration file:
 cargo run --bin server -- /path/to/custom_config.toml
 ```
 
-### Atomic Hot-Reloading via `SIGHUP`
+### Atomic Hot-Reloading via `SIGHUP` & Graceful Shutdown (`SIGINT` / `SIGTERM`)
+
+Praeco handles both `SIGINT` (`Ctrl-C`) and `SIGTERM` (`kill <PID>`) by draining in-flight connections up to `graceful_shutdown_timeout_seconds`, releasing listeners cleanly, and flushing OpenTelemetry traces before exit.
 
 To trigger a live configuration reload without dropping client connections:
 
@@ -86,7 +88,7 @@ kill -HUP <PID_OF_PRAECO>
 ```
 
 #### Under the Hood: The Crash-Safe Dry-Run Process
-1. **File Reading & Deserialization:** The configuration file specified at launch (and all globbed `includes`) is read and parsed into memory.
+1. **File Reading & Strict Schema Validation:** The configuration file specified at launch (and all globbed `includes`) is read and parsed into memory with `#[serde(deny_unknown_fields)]` enabled on `Config`, `ServerConfig`, `RelayConfig`, layers, and routes—so typos or unknown configuration keys fail fast instead of silently falling back to defaults.
 2. **Regex Pre-Compilation:** All regular expressions in `[Server.AllowedPathes]` and path patterns in `[Server.rbac]` are compiled.
 3. **Eager Cryptographic Validation:** Server TLS certificate chains, private keys, client CA roots, CRLs, and JWT public/private keys are read and validated from disk. If a certificate file is missing or contains invalid PEM data, the process stops here.
 4. **Middleware Ordering & Constraint Checks:** The middleware stack of every server is validated (e.g. verifying that `TraceId` is first and CORS credentials rules are satisfied).
@@ -446,7 +448,9 @@ Exposes real-time, lock-free gateway telemetry (server list, connection limits, 
 
 Can be mounted in two ways:
 1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) strictly serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), `/healthz`, and `/health`. Any unrecognized path returns `404 Not Found` (`{"error":"Not Found"}`).
+   - **Security Guardrail (Unauthenticated Standalone Admin):** When `authentication = "None"`, `ServerConfig::finalize()` requires `ip` to be a loopback address (`127.0.0.1` or `::1`), disallows `[Server.tunnel]`, and enforces **strict read-only mode** (`POST ?action=...` returns `403 Forbidden`).
 2. **Internal Router Route (`backend_type = "admin"`):** Mounted under any custom path inside an existing `service = "Router"` server (e.g. `[Server.ReverseRoutes."/api/GetPraecoStatus"]`, `upstreams` may be omitted or `[]`), inheriting that server's SNI tunnel, TLS, JWT/mTLS authentication, and RBAC rules. Accepts the mounted prefix itself (`/`), `/status`, `/upstreams`, `/metrics`, `/healthz`, and `/health` relative to the route prefix (`404 Not Found` for unknown sub-paths). Supports optional `POST` circuit control queries (`?action=mark_dead&upstream=<uri>` or `?action=mark_alive&upstream=<uri>`).
+   - **Security Guardrail (Auth & Anti-CSRF / Audit):** Mounted `backend_type = "admin"` routes **require** authentication (`ClientCert`, `OptionalClientCert`, or active `"JWT"` layer) or explicit non-wildcard RBAC (`allowed_roles` / `[Server.rbac]`). `POST` control actions reject cross-site browser requests (`Sec-Fetch-Site` other than `same-origin`/`none`) and emit `admin::audit` warning logs.
 
 #### Exposed Prometheus Metrics (`/metrics`)
 - **Process & Auth:** `praeco_uptime_seconds`, `praeco_revoked_jwt_tokens`
@@ -598,8 +602,8 @@ Configured when you want Praeco to act as an edge reverse proxy and load balance
   This guarantees that backend gRPC servers transmit status codes and metadata in trailing HTTP/2 HEADERS frames instead of dropping them.
 
 #### 2. Streaming Integrity & Retry Semantics
-- **Non-Streaming Calls:** If an upstream node fails or times out before transmitting headers, Praeco automatically retries alternate healthy nodes up to `max_retries`.
-- **Streaming Calls (Client / Server / Bidi):** Streaming bodies (`RequestBody::Stream`) cannot be rewound once frames have been dispatched across the wire. If a stream fails midway, Praeco detects the consumed stream state and **aborts immediately** rather than attempting retries on a second node (which would send corrupted, partial payloads to the backend).
+- **Unary / Server-Streaming Calls (First-Frame Peek):** Praeco peeks up to the first length-prefixed gRPC frame (bounded by `max_retry_buffer_bytes` and a read timeout returning `408 Request Timeout`). Unary/server-streaming calls whose request body fits into that buffer remain retryable strictly on **`RetryReason::ConnectError`** up to `max_retries` (timed-out or post-send upstream errors are never replayed to another node).
+- **Client-Streaming / Bidirectional Calls:** If a client keeps the request stream open without an immediate end-of-stream (`buffer_grpc_first_frame_or_stream`), Praeco preserves the already-read prefix (`PrefixedStreamBody`) and switches to zero-copy passthrough streaming immediately without blocking on EOF. Once streaming starts, the body cannot be rewound and retries are bypassed.
 
 #### 3. Client Fault Isolation (Zero Upstream Penalization)
 When proxying gRPC streams, failures can originate either from the backend or the client. Praeco isolates client errors:
@@ -862,10 +866,11 @@ Enforces method- and path-level privilege separation within the same route prefi
 ```
 
 ### Precedence:
-1. **Exact Path Match:** If request path matches an exact key, enforced immediately.
-2. **Longest Prefix Wildcard Match:** Evaluates keys ending with `*` in descending order of prefix length.
-3. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
-4. **Fallback to Route `allowed_roles`:** If no rule in `[Server.rbac]` matches, falls back to the enclosing route's `allowed_roles`.
+1. **Matrix Parameter Rejection:** Request paths containing semicolon matrix parameters (`;` / `%3b`) are rejected fail-closed (`400 Bad Request` by `PathSanitizerLayer`, `403 Forbidden` inside `enforce_rbac`).
+2. **Exact Path Match (Trailing-Slash Normalized):** Exact non-root keys normalize trailing slashes (so an exact rule for `"/api/Admin"` also matches `"/api/Admin/"`) and are enforced first.
+3. **Longest Prefix Wildcard Match:** Evaluates keys ending with `*` in descending order of prefix length.
+4. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
+5. **Fallback to Route `allowed_roles`:** If no rule in `[Server.rbac]` matches, falls back to the enclosing route's `allowed_roles`.
 
 ---
 
@@ -933,8 +938,8 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `allowed_origins` | Array of Strings | Optional | `[]` | Allowed origins (e.g. `["https://app.example.com"]`) or `["*"]`. **Security Constraint:** Cannot combine wildcard `["*"]` with `allow_credentials = true`. |
-| `allowed_methods` | Array of Strings | Optional | `[]` | Allowed HTTP methods (e.g. `["GET", "POST", "OPTIONS"]`). |
-| `allowed_headers` | Array of Strings | Optional | `[]` | Allowed request headers. |
+| `allowed_methods` | Array of Strings | Optional | `[]` | Allowed HTTP methods (e.g. `["GET", "POST", "OPTIONS"]`). Cannot contain `"*"` when `allow_credentials = true`. |
+| `allowed_headers` | Array of Strings | Optional | `[]` | Allowed request headers. Cannot contain `"*"` when `allow_credentials = true`. |
 | `allow_credentials` | Boolean | Optional | `false` | Whether credentials (cookies, auth headers) are exposed to cross-origin callers. |
 
 #### `[Server.Layers.SecurityHeaders]`
@@ -949,9 +954,9 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 #### `[Server.Layers.JWT]`
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `jwt_public_keys` | Array of Strings | **Mandatory** | *None* | File paths to PEM-encoded Ed25519 or RSA public keys used to verify token signatures. |
-| `expected_issuer` | String | **Mandatory** | *None* | Expected `iss` claim. |
-| `expected_audience` | String | **Mandatory** | *None* | Expected `aud` claim. |
+| `jwt_public_keys` | Array of Strings | **Mandatory** | *None* | Non-empty list of file paths to PEM-encoded Ed25519 or RSA public keys used to verify token signatures. |
+| `expected_issuer` | String | **Mandatory** | *None* | Expected `iss` claim (must be non-empty / non-whitespace; fails closed otherwise). |
+| `expected_audience` | String | **Mandatory** | *None* | Expected `aud` claim (must be non-empty / non-whitespace; fails closed otherwise). |
 | `cookie_fallback` | String | Optional | `None` | Cookie name to extract JWT if `Authorization` header is missing. |
 | `redirect_on_failure` | String | Optional | `None` | Target URL (HTTP 302/307) to redirect unauthenticated browser requests. |
 | `revoke_on_paths` | Array of Strings | Optional | `[]` | Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` is automatically added to the global `JwtRevocationStore`. |
@@ -1022,8 +1027,11 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `max_concurrent_connections_per_ip` | Integer | Optional | `100` | Maximum simultaneous public connections allowed from a single IP or IPv6 `/64` subnet. |
 | `client_hello_timeout_secs` | Integer | Optional | `10` | Timeout in seconds to read the complete TLS `ClientHello` record (handles TCP fragmentation up to 16 KB). Protects against slowloris SNI probing. |
 | `control_plane_handshake_timeout_secs`| Integer | Optional | `10` | Timeout in seconds for mTLS handshake and `REGISTER` command on the control plane. |
+| `tunnel_stream_open_timeout_secs` | Integer | Optional | `5` | Timeout in seconds for opening a Yamux tunnel stream (`control.open_stream()`) and writing initial PROXY-v2 / `ClientHello` bytes. |
 | `max_yamux_streams` | Integer | Optional | `4096` | Maximum concurrent multiplexed Yamux streams per tunnel connection. |
 | `enable_proxy_protocol` | Boolean | Optional | `true` | When `true`, injects HAProxy PROXY-Protocol v2 headers into tunnel streams, propagating real client IPs to Praeco backend instances. |
+
+> **Strict Schema Validation:** `RelayConfig` uses `#[serde(deny_unknown_fields)]`, so unrecognized keys in `RelayConfig.toml` cause startup to fail fast.
 
 ---
 
@@ -1031,11 +1039,11 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 
 | Key / Certificate Type | Usage & Purpose | Configuration Parameter | Generation Tool / Source |
 | :--- | :--- | :--- | :--- |
-| **Server TLS Certificate (Public)** | Authenticates the server to incoming HTTPS clients. Must be fullchain PEM. | `[Server.server_certs.ssl_certificate]` | Production: Let's Encrypt (Certbot).<br>Testing: OpenSSL or `rcgen`. |
+| **Server TLS Certificate (Public)** | Authenticates the server to incoming HTTPS clients. Must be fullchain PEM. | `[Server.server_certs.ssl_certificate]` | Production: Let's Encrypt (Certbot).<br>Automated Tests: `common::test_pki::TestPki` (`rcgen`). |
 | **Server TLS Key (Private)** | Private key for the server certificate. Must be unencrypted PEM. | `[Server.server_certs.ssl_certificate_key]` | Generated with server CSR. |
-| **Client CA Certificate (Public)** | Trust anchor used by Praeco to authenticate client mTLS certificates. | `[[Server.client_certs.ssl_client_ca]]`<br>`[Server.RouterParams.ssl_root_certificate]` | Script: `./client_certs/generate_mtls_oid_certs.sh` |
-| **Client mTLS Certificate & Key** | Issued to clients (apps, microservices) to authenticate against Praeco. Contains OIDs for RBAC. | Used by client.<br>For Proxy-to-Upstream:<br>`ssl_client_certificate` / `key` | Script:<br>`./client_certs/generate_mtls_oid_certs.sh -c <cn> -o <roles>` |
-| **JWT Private Key** | Used by IdP (`service = "Idp"`) to sign issued JWTs. | `[Server.IdpParams.jwt_private_key]` | OpenSSL (Ed25519):<br>`openssl genpkey -algorithm ed25519 -out idp_private.pem` |
+| **Client CA Certificate (Public)** | Trust anchor used by Praeco to authenticate client mTLS certificates. | `[[Server.client_certs.ssl_client_ca]]`<br>`[Server.RouterParams.ssl_root_certificate]` | Script: `./client_certs/generate_mtls_oid_certs.sh -s <server> -d <outdir>` |
+| **Client mTLS Certificate & Key** | Issued to clients (apps, microservices) to authenticate against Praeco. Contains OIDs for RBAC. | Used by client.<br>For Proxy-to-Upstream:<br>`ssl_client_certificate` / `key` | Script:<br>`./client_certs/generate_mtls_oid_certs.sh -s <server> -c <cn> -o <roles> -d <outdir>` |
+| **JWT Private Key** | Used by IdP (`service = "Idp"`) to sign issued JWTs. | `[Server.IdpParams.jwt_private_key]` | Script: `./jwt_creator/create_keys.sh`<br>or OpenSSL (`ed25519`) |
 | **JWT Public Key** | Used by resource servers (`JwtAuth` layer) to verify token signatures. | `[Server.IdpParams.jwt_public_key]`<br>`[Server.Layers.JWT.jwt_public_keys]` | OpenSSL:<br>`openssl pkey -in idp_private.pem -pubout -out idp_public.pem` |
 
 ---

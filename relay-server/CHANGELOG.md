@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Added
+* **Configurable Stream-Open Timeout (`src/config.rs`, `src/lib.rs`, `RelayConfig.toml`):**
+  * Added `tunnel_stream_open_timeout_secs` (default: `5` s) plus SemVer-compatible `handle_data_connection_with_stream_timeout` and `run_data_plane_with_stream_timeout` to bound `control.open_stream()` and initial `PROXY v2` / `ClientHello` writes.
+
+### Fixed & Hardened
+* **Concurrency & Config Hardening (`src/config.rs`, `src/lib.rs`):**
+  * Added `#[serde(deny_unknown_fields)]` to `RelayConfig` so unknown configuration keys fail fast.
+  * Fixed `RelayConnectionGuard::drop` race using atomic `DashMap::remove_if` cleanup and made `try_register_tunnel` atomic via `DashMap::entry()` to eliminate concurrent `REGISTER` races.
+* **Self-Contained Test PKI (`Cargo.toml`, `src/lib.rs`, `tests/integration_tests.rs`):**
+  * Replaced all `server_certs/` / `client_certs/` references and external `openssl` CLI calls in unit and integration tests with ephemeral `common::test_pki::TestPki` (`praeco-common/test-pki`).
+
+---
+
 ## [0.3.3] - 2026-11-17
 
 Lifecycle & accept-loop hardening, supervised cross-plane shutdown, and a comprehensive expansion of the unit and integration test suites to 38 tests.

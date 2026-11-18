@@ -7,9 +7,15 @@ Eigenständiges Beispiel-Crate, das `praeco-rs` mit `default-features = false, f
 - **Saubere Trennung:** `src/main.rs` verdrahtet nur noch die Routen und startet den Server; Endpunkte & DTOs liegen in `src/endpoints.rs`, Server-Konfiguration und Shutdown in `src/bootstrap.rs`.
 - **Sicherheitslayer:** `TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter` (`127.0.0.1/32`, `::1/128`), `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression` und `Inspection` (`AllowedPathes`).
 
-## Starten
+## Starten & Testen
 
-Vom Workspace-Root aus:
+Vom Workspace-Root aus (der Stack-Test nutzt automatisch eine ephemere `TestPki` ohne lokale `server_certs/`):
+
+```bash
+cargo test -p https_web_server
+```
+
+Für `cargo run` werden Zertifikate über `PRAECO_TLS_CERT` / `PRAECO_TLS_KEY` oder unter `server_certs/self_signed/praeco_public.{pem,key}` erwartet:
 
 ```bash
 cargo run -p https_web_server

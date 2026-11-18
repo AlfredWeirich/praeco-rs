@@ -13,7 +13,7 @@ Verbindet die iOS-App, das Praeco Gateway und das ChatApp Backend über striktes
 - **Root of Trust:** `ca.pem` (ChatApp) — strikt isolierter Root-Store ohne Vermischung mit öffentlichen Mozilla-WebPKI-Wurzeln (`build_root_store`).
 - **Abhängigkeiten:**
   - **ChatApp (`Config.toml`):** Nutzt `ca.key`, um Zertifikate für iOS-Geräte auszustellen (Onboarding).
-  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren, sowie optional `ssl_client_crl` (mit automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start und Hot-Reload).
+  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren, sowie optional `ssl_client_crl` (mit automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start und Hot-Reload). Die Custom-OID-Auswertung (`pki_base_oid`) wird dabei pro `[[Server]]`-Block konfiguriert (mit optionalem globalen Fallback in `Config.toml`).
   - **Praeco Intern:** Praeco leitet Traffic an die ChatApp weiter und authentifiziert sich dabei selbst per mTLS mit `proxy-client.pem`.
   - **ChatApp Server:** Der gRPC-Server der ChatApp vertraut eingehenden Praeco-Verbindungen, da auch `proxy-client.pem` von `ca.pem` signiert wurde.
 
@@ -41,7 +41,7 @@ Sichert den Tunnel zwischen dem lokalen Praeco-Netzwerk und dem Cloud-Relay.
 Die Erstellung unterscheidet sich je nach Zertifikatstyp:
 
 1. **Interne mTLS & Relay Zertifikate (`ca.pem`, `relay_ca.pem`):**
-   Diese werden einmalig lokal vom Administrator (z. B. per OpenSSL oder einem Praeco-Script) generiert. Da sie das absolute Fundament der Zero-Trust Architektur bilden, sollten sie langläufig (z.B. 10 Jahre) und extrem sicher aufbewahrt werden.
+   Diese werden einmalig lokal vom Administrator generiert (z. B. via `./client_certs/generate_mtls_oid_certs.sh -s <ServerName> -o <OID-Suffixe> -d client_certs/<ServerName>`, gehärtet mit `umask 077`, `chmod 600` und Mehrdeutigkeitsprüfung bei unterschiedlichen `pki_base_oid`s; automatisierte Rust-Tests erzeugen ihre eigenen PKIs zur Laufzeit über `common::test_pki::TestPki` / `rcgen`). Da produktive Root-CAs das absolute Fundament der Zero-Trust Architektur bilden, sollten sie langläufig (z. B. 10 Jahre) und extrem sicher aufbewahrt werden.
 2. **iOS Client-Zertifikate:**
    Diese werden **automatisch und dynamisch (on-the-fly)** vom ChatApp-Backend generiert. Die iOS-App erzeugt lokal einen privaten Schlüssel, schickt einen CSR (Certificate Signing Request) an die ChatApp, und diese signiert den CSR mit der `ca.key`.
 3. **Öffentliche TLS Zertifikate (Data Plane):**

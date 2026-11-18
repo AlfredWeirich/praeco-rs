@@ -12,7 +12,7 @@ This crate enables the unique **JSON Transcoding** feature of the gateway. It al
 
 1. **Schema Discovery**: Connects to upstream gRPC servers and uses gRPC Server Reflection to download the protobuf schemas on-the-fly.
 2. **Dynamic Translation**: Parses incoming JSON HTTP requests and translates them into binary Protobuf payloads (`prost`).
-3. **Transparent Proxying**: Forwards the binary payload to the gRPC server, awaits the response, and translates the Protobuf response back into JSON before sending it to the client.
+3. **Transparent Proxying**: Forwards the binary payload to the gRPC server, validates returned length-prefixed framing with overflow checks (rejecting compressed frames and surfacing non-zero `grpc-status` trailers as `502 Bad Gateway`, while logging only payload byte lengths at `debug`), and translates the Protobuf response back into JSON before sending it to the client.
 
 By using this crate, `praeco-rs` can proxy gRPC services without requiring any pre-compiled `.proto` files at runtime.
 
