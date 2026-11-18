@@ -23,3 +23,16 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
 tracing = { workspace = true }
 webpki-roots = { workspace = true }
+
+# Optional runtime test PKI utilities (enabled via `test-pki` feature in dev-dependencies)
+rcgen = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
+
+[features]
+test-pki = ["dep:rcgen", "dep:tempfile", "dep:time"]
+
+[dev-dependencies]
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+time = { workspace = true }

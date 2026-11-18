@@ -28,6 +28,9 @@ use serde::{Deserialize, Serialize};
 
 // Note: tracing 'info' was unused, so it was removed.
 
+#[cfg(any(test, feature = "test-pki"))]
+pub mod test_pki;
+
 /// Loads a list of DER-encoded certificates from a PEM file.
 ///
 /// Reads the file at `path`, parses every `-----BEGIN CERTIFICATE-----` block,
@@ -434,13 +437,8 @@ mod tests {
 
     #[test]
     fn test_build_root_store_custom_ca_isolates_and_excludes_webpki() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let ca_path = manifest_dir
-            .parent()
-            .unwrap()
-            .join("client_certs/ca.cert.pem")
-            .to_string_lossy()
-            .to_string();
+        let pki = crate::test_pki::TestPki::new();
+        let ca_path = pki.relay_ca_pem.to_string_lossy().to_string();
 
         let store = build_root_store(&Some(ca_path.clone()))
             .expect("build_root_store should succeed with custom CA");
