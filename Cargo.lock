@@ -976,6 +976,7 @@ dependencies = [
  "bytes",
  "http-body-util",
  "hyper",
+ "praeco-common",
  "praeco-rs",
  "rustls",
  "serde",

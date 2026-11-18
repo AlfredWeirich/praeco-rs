@@ -22,5 +22,6 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+common = { workspace = true, features = ["test-pki"] }
 http-body-util = { workspace = true }
 tower = { workspace = true }

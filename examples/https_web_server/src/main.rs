@@ -43,10 +43,15 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use common::test_pki::TestPki;
     use http_body_util::{BodyExt, Empty, Full};
     use hyper::{Method, Request, StatusCode};
-    use praeco_rs::{SrvBody, SrvError, build_rustls_config, build_service_stack_with_base};
+    use praeco_rs::{
+        SrvBody, SrvError, build_rustls_config, build_service_stack_with_base,
+        configuration::ServerCertConfig,
+    };
     use std::net::SocketAddr;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn make_req(method: Method, uri: &str, body: Option<&'static [u8]>) -> Request<SrvBody> {
@@ -69,10 +74,15 @@ mod tests {
     #[tokio::test]
     async fn test_hardened_https_stack_and_endpoints() -> anyhow::Result<()> {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = TestPki::new();
         let router = build_app_router()?;
-        let cfg = bootstrap::build_server_config(8443, router.allowed_pathes())?;
+        let mut cfg = bootstrap::build_server_config(8443, router.allowed_pathes())?;
+        Arc::make_mut(&mut cfg).server_certs = Some(ServerCertConfig {
+            ssl_certificate: TestPki::s(&pki.praeco_public_pem).to_owned(),
+            ssl_certificate_key: TestPki::s(&pki.praeco_public_key).to_owned(),
+        });
 
-        // Verify TLS/QUIC rustls ServerConfig builds cleanly from the self-signed certs.
+        // Verify TLS/QUIC rustls ServerConfig builds cleanly from the ephemeral TestPki certs.
         let _tls = build_rustls_config(&cfg)?;
 
         let stack = build_service_stack_with_base(&cfg, router.into_service())?;
