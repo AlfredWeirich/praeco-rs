@@ -5,6 +5,7 @@
 //! Yamux stream multiplexing, and HAProxy PROXY Protocol v2 propagation.
 
 use common::proxy_protocol::read_proxy_v2;
+use common::test_pki::TestPki;
 use praeco_relay_server::{
     Control, RelayConnectionTracker, SessionMap, TunnelRoute, handle_control_connection,
     handle_data_connection, new_session_map, run_control_plane, run_data_plane,
@@ -26,11 +27,23 @@ fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Builds the Relay Control Plane `TlsAcceptor` using the ephemeral `TestPki`.
+fn build_control_mtls_acceptor(pki: &TestPki, crl_path: Option<&std::path::Path>) -> TlsAcceptor {
+    let crl = crl_path.map(|p| p.to_string_lossy().into_owned());
+    setup_mtls_acceptor(
+        TestPki::s(&pki.relay_ca_pem),
+        TestPki::s(&pki.relay_server_pem),
+        TestPki::s(&pki.relay_server_key),
+        crl.as_ref(),
+    )
+    .expect("Failed to setup Relay mTLS acceptor")
+}
+
 /// Builds a `TlsConnector` for the simulated Praeco Gateway to authenticate
 /// against the Relay Server's Control Plane via mTLS.
-fn build_control_plane_client_connector() -> TlsConnector {
+fn build_control_plane_client_connector(pki: &TestPki) -> TlsConnector {
     let mut root_store = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/relay_ca.pem")
+    for cert in CertificateDer::pem_file_iter(&pki.relay_ca_pem)
         .expect("Failed to open relay_ca.pem")
     {
         root_store
@@ -38,13 +51,12 @@ fn build_control_plane_client_connector() -> TlsConnector {
             .expect("Failed to add CA cert");
     }
 
-    let certs: Vec<CertificateDer> =
-        CertificateDer::pem_file_iter("../server_certs/self_signed/praeco_client.pem")
-            .expect("Failed to open praeco_client.pem")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to parse client certs");
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.praeco_client_pem)
+        .expect("Failed to open praeco_client.pem")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to parse client certs");
 
-    let key = PrivateKeyDer::from_pem_file("../server_certs/self_signed/praeco_client.key")
+    let key = PrivateKeyDer::from_pem_file(&pki.praeco_client_key)
         .expect("Failed to read praeco_client.key");
 
     let client_config = rustls::ClientConfig::builder()
@@ -57,14 +69,13 @@ fn build_control_plane_client_connector() -> TlsConnector {
 
 /// Builds an end-to-end `TlsAcceptor` representing the backend Praeco Gateway
 /// that terminates the end-user's HTTPS connection.
-fn build_backend_e2e_acceptor() -> TlsAcceptor {
-    let certs: Vec<CertificateDer> =
-        CertificateDer::pem_file_iter("../server_certs/self_signed/praeco_public.pem")
-            .expect("Failed to open praeco_public.pem")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Failed to parse backend certs");
+fn build_backend_e2e_acceptor(pki: &TestPki) -> TlsAcceptor {
+    let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.praeco_public_pem)
+        .expect("Failed to open praeco_public.pem")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("Failed to parse backend certs");
 
-    let key = PrivateKeyDer::from_pem_file("../server_certs/self_signed/praeco_public.key")
+    let key = PrivateKeyDer::from_pem_file(&pki.praeco_public_key)
         .expect("Failed to read praeco_public.key");
 
     let server_config = rustls::ServerConfig::builder()
@@ -77,9 +88,9 @@ fn build_backend_e2e_acceptor() -> TlsAcceptor {
 
 /// Builds an end-to-end `TlsConnector` representing an external client (browser/API client)
 /// connecting to the Relay Data Plane and verifying the backend's `praeco_public.pem` against `public_ca.pem`.
-fn build_external_client_connector() -> TlsConnector {
+fn build_external_client_connector(pki: &TestPki) -> TlsConnector {
     let mut root_store = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem")
+    for cert in CertificateDer::pem_file_iter(&pki.public_ca_pem)
         .expect("Failed to open public_ca.pem")
     {
         root_store
@@ -111,15 +122,10 @@ async fn wait_for_tunnel_registration(tunnels: &SessionMap, sni: &str) {
 #[tokio::test]
 async fn test_e2e_relay_tunnel_routing_with_tls_termination() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .expect("Failed to setup Relay mTLS acceptor");
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.api.aweirich.eu";
 
@@ -140,8 +146,9 @@ async fn test_e2e_relay_tunnel_routing_with_tls_termination() {
     });
 
     // Spawn Praeco side of the tunnel (mTLS + REGISTER + Yamux Client + E2E TLS Termination)
+    let connector = build_control_plane_client_connector(&pki);
+    let e2e_acceptor = build_backend_e2e_acceptor(&pki);
     let praeco_task = tokio::spawn(async move {
-        let connector = build_control_plane_client_connector();
         let domain = ServerName::try_from("localhost".to_string()).unwrap();
         let mut tls_stream = connector
             .connect(domain, praeco_ctrl_io)
@@ -169,12 +176,10 @@ async fn test_e2e_relay_tunnel_routing_with_tls_termination() {
             {}
         });
 
-        let e2e_acceptor = build_backend_e2e_acceptor();
         let mut e2e_tls = e2e_acceptor
             .accept(inbound_stream.compat())
             .await
             .expect("End-to-end TLS handshake at Praeco failed");
-
         let mut reader = TokioBufReader::new(&mut e2e_tls);
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
@@ -212,7 +217,7 @@ async fn test_e2e_relay_tunnel_routing_with_tls_termination() {
         .await;
     });
 
-    let client_connector = build_external_client_connector();
+    let client_connector = build_external_client_connector(&pki);
     let target_sni = ServerName::try_from(sni_domain.to_string()).unwrap();
     let mut client_tls = client_connector
         .connect(target_sni, client_data_io)
@@ -239,15 +244,10 @@ async fn test_e2e_relay_tunnel_routing_with_tls_termination() {
 #[tokio::test]
 async fn test_e2e_relay_tunnel_with_proxy_protocol_v2_propagation() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .expect("Failed to setup Relay mTLS acceptor");
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.onboarding.aweirich.eu";
     let expected_client_addr: SocketAddr = "203.0.113.42:54321".parse().unwrap();
@@ -269,8 +269,9 @@ async fn test_e2e_relay_tunnel_with_proxy_protocol_v2_propagation() {
         .await;
     });
 
+    let connector = build_control_plane_client_connector(&pki);
+    let e2e_acceptor = build_backend_e2e_acceptor(&pki);
     let praeco_task = tokio::spawn(async move {
-        let connector = build_control_plane_client_connector();
         let domain = ServerName::try_from("localhost".to_string()).unwrap();
         let mut tls_stream = connector
             .connect(domain, praeco_ctrl_io)
@@ -304,7 +305,6 @@ async fn test_e2e_relay_tunnel_with_proxy_protocol_v2_propagation() {
 
         assert_eq!(resolved_client_ip, expected_client_addr);
 
-        let e2e_acceptor = build_backend_e2e_acceptor();
         let mut e2e_tls = e2e_acceptor
             .accept(compat_stream)
             .await
@@ -352,7 +352,7 @@ async fn test_e2e_relay_tunnel_with_proxy_protocol_v2_propagation() {
         .await;
     });
 
-    let client_connector = build_external_client_connector();
+    let client_connector = build_external_client_connector(&pki);
     let target_sni = ServerName::try_from(sni_domain.to_string()).unwrap();
     let mut client_tls = client_connector
         .connect(target_sni, client_data_io)
@@ -376,15 +376,10 @@ async fn test_e2e_relay_tunnel_with_proxy_protocol_v2_propagation() {
 #[tokio::test]
 async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.admin.aweirich.eu";
     let num_concurrent_clients = 5usize;
@@ -405,8 +400,9 @@ async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
     });
 
     // Spawn Praeco backend handling multiple concurrent Yamux streams
+    let connector = build_control_plane_client_connector(&pki);
+    let e2e_acceptor = build_backend_e2e_acceptor(&pki);
     let praeco_task = tokio::spawn(async move {
-        let connector = build_control_plane_client_connector();
         let domain = ServerName::try_from("localhost".to_string()).unwrap();
         let mut tls_stream = connector.connect(domain, praeco_ctrl_io).await.unwrap();
 
@@ -416,7 +412,6 @@ async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
 
         let mut yamux_conn =
             Connection::new(tls_stream.compat(), YamuxConfig::default(), Mode::Client);
-        let e2e_acceptor = build_backend_e2e_acceptor();
 
         let mut stream_tasks = Vec::new();
         let mut accepted = 0;
@@ -465,9 +460,11 @@ async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
     wait_for_tunnel_registration(&tunnels, sni_domain).await;
 
     // Launch 5 concurrent external clients
+    let ext_connector = build_external_client_connector(&pki);
     let mut client_handles = Vec::new();
     for i in 0..num_concurrent_clients {
         let tunnels_data = tunnels.clone();
+        let connector = ext_connector.clone();
         client_handles.push(tokio::spawn(async move {
             let (client_io, relay_io) = tokio::io::duplex(65536);
             tokio::spawn(async move {
@@ -482,7 +479,6 @@ async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
                 .await;
             });
 
-            let connector = build_external_client_connector();
             let target_sni = ServerName::try_from(sni_domain.to_string()).unwrap();
             let mut tls = connector.connect(target_sni, client_io).await.unwrap();
 
@@ -507,15 +503,10 @@ async fn test_e2e_relay_multiplexes_concurrent_streams_over_single_tunnel() {
 #[tokio::test]
 async fn test_e2e_unauthorized_sni_registration_rejected() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let unauthorized_sni = "unauthorized.other-domain.eu";
 
@@ -534,7 +525,7 @@ async fn test_e2e_unauthorized_sni_registration_rejected() {
         .await;
     });
 
-    let connector = build_control_plane_client_connector();
+    let connector = build_control_plane_client_connector(&pki);
     let domain = ServerName::try_from("localhost".to_string()).unwrap();
     let mut tls_stream = connector.connect(domain, praeco_ctrl_io).await.unwrap();
 
@@ -553,15 +544,10 @@ async fn test_e2e_unauthorized_sni_registration_rejected() {
 #[tokio::test]
 async fn test_e2e_active_tunnel_overwrite_rejected_and_reconnect_succeeds() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.idp.aweirich.eu";
 
@@ -582,7 +568,7 @@ async fn test_e2e_active_tunnel_overwrite_rejected_and_reconnect_succeeds() {
         .await;
     });
 
-    let connector = build_control_plane_client_connector();
+    let connector = build_control_plane_client_connector(&pki);
     let domain = ServerName::try_from("localhost".to_string()).unwrap();
     let mut tls1 = connector.connect(domain.clone(), praeco1_io).await.unwrap();
     tls1.write_all(format!("REGISTER {}\n", sni_domain).as_bytes())
@@ -671,6 +657,7 @@ async fn test_e2e_active_tunnel_overwrite_rejected_and_reconnect_succeeds() {
 #[tokio::test]
 async fn test_e2e_unregistered_sni_on_data_plane_dropped_cleanly() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     // Empty routing table: no tunnels registered
     let tunnels = new_session_map();
@@ -688,7 +675,7 @@ async fn test_e2e_unregistered_sni_on_data_plane_dropped_cleanly() {
         .await;
     });
 
-    let client_connector = build_external_client_connector();
+    let client_connector = build_external_client_connector(&pki);
     let target_sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
 
     // Handshake must fail cleanly because Relay closes the stream when no route exists
@@ -704,15 +691,10 @@ async fn test_e2e_unregistered_sni_on_data_plane_dropped_cleanly() {
 #[tokio::test]
 async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let ctrl_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ctrl_addr = ctrl_listener.local_addr().unwrap();
@@ -749,7 +731,7 @@ async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
 
     // Connect simulated Praeco Gateway over real TCP
     let praeco_tcp = TcpStream::connect(ctrl_addr).await.unwrap();
-    let connector = build_control_plane_client_connector();
+    let connector = build_control_plane_client_connector(&pki);
     let domain = ServerName::try_from("localhost".to_string()).unwrap();
     let mut ctrl_tls = connector.connect(domain, praeco_tcp).await.unwrap();
     ctrl_tls
@@ -760,6 +742,7 @@ async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
 
     let mut yamux_conn = Connection::new(ctrl_tls.compat(), YamuxConfig::default(), Mode::Client);
     let (stream_done_tx, stream_done_rx) = tokio::sync::oneshot::channel::<()>();
+    let e2e_acceptor = build_backend_e2e_acceptor(&pki);
     let backend_task = tokio::spawn(async move {
         let inbound = std::future::poll_fn(|cx| yamux_conn.poll_next_inbound(cx))
             .await
@@ -779,7 +762,6 @@ async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
             .expect("Expected PROXY v2 header over TCP");
         assert_eq!(client_ip.ip(), "127.0.0.1".parse::<std::net::IpAddr>().unwrap());
 
-        let e2e_acceptor = build_backend_e2e_acceptor();
         let mut e2e_tls = e2e_acceptor.accept(compat).await.unwrap();
         let mut reader = TokioBufReader::new(&mut e2e_tls);
         let mut line = String::new();
@@ -800,7 +782,7 @@ async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
 
     // External client connects over real TCP to Data Plane
     let ext_tcp = TcpStream::connect(data_addr).await.unwrap();
-    let ext_connector = build_external_client_connector();
+    let ext_connector = build_external_client_connector(&pki);
     let mut ext_tls = ext_connector
         .connect(ServerName::try_from(sni_domain.to_string()).unwrap(), ext_tcp)
         .await
@@ -837,6 +819,7 @@ async fn test_e2e_tcp_control_and_data_plane_with_graceful_shutdown() {
 #[tokio::test]
 async fn test_run_data_plane_rate_limit_drops_excess_connections() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -867,7 +850,7 @@ async fn test_run_data_plane_rate_limit_drops_excess_connections() {
         cancel_token.clone(),
     ));
 
-    let client_connector = build_external_client_connector();
+    let client_connector = build_external_client_connector(&pki);
     let target_sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
 
     // First 2 connections consume the burst and reach `control.open_stream()`
@@ -908,6 +891,7 @@ async fn test_run_data_plane_rate_limit_drops_excess_connections() {
 #[tokio::test]
 async fn test_run_data_plane_concurrency_limit_enforced_over_tcp() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -972,7 +956,7 @@ async fn test_run_data_plane_concurrency_limit_enforced_over_tcp() {
 
     // 3rd connection now succeeds and reaches tunnel open_stream()
     let third_tcp = TcpStream::connect(data_addr).await.unwrap();
-    let conn = build_external_client_connector();
+    let conn = build_external_client_connector(&pki);
     let sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
     tokio::spawn(async move {
         let _ = conn.connect(sni, third_tcp).await;
@@ -989,15 +973,10 @@ async fn test_run_data_plane_concurrency_limit_enforced_over_tcp() {
 #[tokio::test]
 async fn test_control_plane_mtls_handshake_timeout_and_untrusted_client_rejected() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     // 1. Handshake timeout when client sends nothing
     let (client_io, server_io) = tokio::io::duplex(4096);
@@ -1023,7 +1002,7 @@ async fn test_control_plane_mtls_handshake_timeout_and_untrusted_client_rejected
 
     // 2. Client without client certificate is rejected by mTLS WebPkiClientVerifier
     let mut root_store = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/relay_ca.pem").unwrap() {
+    for cert in CertificateDer::pem_file_iter(&pki.relay_ca_pem).unwrap() {
         root_store.add(cert.unwrap()).unwrap();
     }
     let no_auth_connector = TlsConnector::from(Arc::new(
@@ -1060,88 +1039,12 @@ async fn test_control_plane_mtls_handshake_timeout_and_untrusted_client_rejected
     assert!(tunnels.is_empty());
 }
 
-struct TempDirGuard(std::path::PathBuf);
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[tokio::test]
 async fn test_control_plane_crl_revocation_rejects_revoked_client_cert() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "praeco_relay_crl_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _cleanup = TempDirGuard(tmp_dir.clone());
-    std::fs::create_dir_all(tmp_dir.join("newcerts")).unwrap();
-    std::fs::write(tmp_dir.join("index.txt"), "").unwrap();
-    std::fs::write(tmp_dir.join("crlnumber"), "1000\n").unwrap();
-
-    let ca_cert_abs = std::fs::canonicalize("../server_certs/self_signed/relay_ca.pem").unwrap();
-    let ca_key_abs = std::fs::canonicalize("../server_certs/self_signed/relay_ca.key").unwrap();
-    let client_cert_abs =
-        std::fs::canonicalize("../server_certs/self_signed/praeco_client.pem").unwrap();
-
-    let cnf_path = tmp_dir.join("ca.cnf");
-    let cnf_content = format!(
-        "[ ca ]\ndefault_ca = CA_default\n[ CA_default ]\ndir = {}\ndatabase = $dir/index.txt\nnew_certs_dir = $dir/newcerts\ncertificate = {}\nserial = $dir/serial\ncrlnumber = $dir/crlnumber\nprivate_key = {}\ndefault_crl_days = 30\ndefault_md = sha256\n",
-        tmp_dir.display(),
-        ca_cert_abs.display(),
-        ca_key_abs.display()
-    );
-    std::fs::write(&cnf_path, cnf_content).unwrap();
-
-    // Revoke praeco_client.pem and generate a fresh valid CRL
-    let revoke_status = std::process::Command::new("openssl")
-        .args([
-            "ca",
-            "-batch",
-            "-config",
-            &cnf_path.to_string_lossy(),
-            "-revoke",
-            &client_cert_abs.to_string_lossy(),
-        ])
-        .output()
-        .expect("openssl must be available for CRL test");
-    assert!(
-        revoke_status.status.success(),
-        "openssl revoke failed: {}",
-        String::from_utf8_lossy(&revoke_status.stderr)
-    );
-
-    let crl_path = tmp_dir.join("fresh.crl.pem");
-    let gencrl_status = std::process::Command::new("openssl")
-        .args([
-            "ca",
-            "-config",
-            &cnf_path.to_string_lossy(),
-            "-gencrl",
-            "-out",
-            &crl_path.to_string_lossy(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        gencrl_status.status.success(),
-        "openssl gencrl failed: {}",
-        String::from_utf8_lossy(&gencrl_status.stderr)
-    );
-
-    let crl_path_str = crl_path.to_string_lossy().to_string();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        Some(&crl_path_str),
-    )
-    .expect("setup_mtls_acceptor with fresh CRL must succeed");
+    let control_acceptor = build_control_mtls_acceptor(&pki, Some(&pki.relay_crl_revoking_client_pem));
 
     let tunnels = new_session_map();
     let (client_io, server_io) = tokio::io::duplex(65536);
@@ -1159,7 +1062,7 @@ async fn test_control_plane_crl_revocation_rejects_revoked_client_cert() {
         .await;
     });
 
-    let connector = build_control_plane_client_connector();
+    let connector = build_control_plane_client_connector(&pki);
     let domain = ServerName::try_from("localhost".to_string()).unwrap();
     if let Ok(mut tls_stream) = connector.connect(domain, client_io).await {
         let _ = tls_stream
@@ -1180,15 +1083,10 @@ async fn test_control_plane_crl_revocation_rejects_revoked_client_cert() {
 #[tokio::test]
 async fn test_control_plane_malformed_and_oversized_register_commands_rejected() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
-    let connector = build_control_plane_client_connector();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
+    let connector = build_control_plane_client_connector(&pki);
     let domain = ServerName::try_from("localhost".to_string()).unwrap();
 
     let oversized_payload = vec![b'a'; 1030];
@@ -1232,6 +1130,7 @@ async fn test_control_plane_malformed_and_oversized_register_commands_rejected()
 #[tokio::test]
 async fn test_data_plane_scanner_slowloris_and_dead_tunnel_handled_cleanly() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
 
@@ -1303,7 +1202,7 @@ async fn test_data_plane_scanner_slowloris_and_dead_tunnel_handled_cleanly() {
         )
         .await;
     });
-    let connector = build_external_client_connector();
+    let connector = build_external_client_connector(&pki);
     let res = connector
         .connect(
             ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap(),
@@ -1320,15 +1219,10 @@ async fn test_data_plane_scanner_slowloris_and_dead_tunnel_handled_cleanly() {
 #[tokio::test]
 async fn test_control_plane_generation_guard_preserves_newer_route_on_stale_cleanup() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.idp.aweirich.eu";
     let (praeco_io, relay_io) = tokio::io::duplex(65536);
@@ -1346,7 +1240,7 @@ async fn test_control_plane_generation_guard_preserves_newer_route_on_stale_clea
         .await;
     });
 
-    let connector = build_control_plane_client_connector();
+    let connector = build_control_plane_client_connector(&pki);
     let mut tls = connector
         .connect(ServerName::try_from("localhost".to_string()).unwrap(), praeco_io)
         .await
@@ -1386,75 +1280,17 @@ async fn test_control_plane_generation_guard_preserves_newer_route_on_stale_clea
 #[tokio::test]
 async fn test_control_plane_client_cert_without_dns_sans_rejected() {
     ensure_crypto_provider();
-
-    let tmp_dir = std::env::temp_dir().join(format!(
-        "praeco_relay_nosan_test_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let _cleanup = TempDirGuard(tmp_dir.clone());
-    std::fs::create_dir_all(&tmp_dir).unwrap();
-
-    let ca_cert = std::fs::canonicalize("../server_certs/self_signed/relay_ca.pem").unwrap();
-    let ca_key = std::fs::canonicalize("../server_certs/self_signed/relay_ca.key").unwrap();
-    let key_path = tmp_dir.join("nosan.key");
-    let csr_path = tmp_dir.join("nosan.csr");
-    let cert_path = tmp_dir.join("nosan.pem");
-
-    let genkey = std::process::Command::new("openssl")
-        .args(["genrsa", "-out", &key_path.to_string_lossy(), "2048"])
-        .output()
-        .expect("openssl must be available");
-    assert!(genkey.status.success());
-
-    let req = std::process::Command::new("openssl")
-        .args([
-            "req",
-            "-new",
-            "-key",
-            &key_path.to_string_lossy(),
-            "-subj",
-            "/CN=NoSanClient",
-            "-out",
-            &csr_path.to_string_lossy(),
-        ])
-        .output()
-        .unwrap();
-    assert!(req.status.success());
-
-    let sign = std::process::Command::new("openssl")
-        .args([
-            "x509",
-            "-req",
-            "-in",
-            &csr_path.to_string_lossy(),
-            "-CA",
-            &ca_cert.to_string_lossy(),
-            "-CAkey",
-            &ca_key.to_string_lossy(),
-            "-CAcreateserial",
-            "-out",
-            &cert_path.to_string_lossy(),
-            "-days",
-            "1",
-            "-sha256",
-        ])
-        .output()
-        .unwrap();
-    assert!(sign.status.success());
+    let pki = TestPki::new();
 
     let mut root_store = RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter(&ca_cert).unwrap() {
+    for cert in CertificateDer::pem_file_iter(&pki.relay_ca_pem).unwrap() {
         root_store.add(cert.unwrap()).unwrap();
     }
-    let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&cert_path)
+    let client_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.nosan_client_pem)
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let client_key = PrivateKeyDer::from_pem_file(&key_path).unwrap();
+    let client_key = PrivateKeyDer::from_pem_file(&pki.nosan_client_key).unwrap();
     let no_san_connector = TlsConnector::from(Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -1462,13 +1298,7 @@ async fn test_control_plane_client_cert_without_dns_sans_rejected() {
             .unwrap(),
     ));
 
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let tunnels = new_session_map();
     let (client_io, server_io) = tokio::io::duplex(65536);
@@ -1505,15 +1335,10 @@ async fn test_control_plane_client_cert_without_dns_sans_rejected() {
 #[tokio::test]
 async fn test_data_plane_case_insensitive_sni_routing() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let lower_sni = "wurzelwerk.api.aweirich.eu";
     let upper_sni = "WURZELWERK.API.AWEIRICH.EU";
@@ -1534,8 +1359,8 @@ async fn test_data_plane_case_insensitive_sni_routing() {
         .await;
     });
 
+    let connector = build_control_plane_client_connector(&pki);
     let praeco_task = tokio::spawn(async move {
-        let connector = build_control_plane_client_connector();
         let mut tls = connector
             .connect(
                 ServerName::try_from("localhost".to_string()).unwrap(),
@@ -1630,15 +1455,10 @@ async fn test_data_plane_case_insensitive_sni_routing() {
 #[tokio::test]
 async fn test_control_plane_unexpected_inbound_yamux_stream_keeps_tunnel_healthy() {
     ensure_crypto_provider();
+    let pki = TestPki::new();
 
     let tunnels = new_session_map();
-    let control_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
-        None,
-    )
-    .unwrap();
+    let control_acceptor = build_control_mtls_acceptor(&pki, None);
 
     let sni_domain = "wurzelwerk.api.aweirich.eu";
     let (praeco_ctrl_io, relay_ctrl_io) = tokio::io::duplex(65536);
@@ -1657,8 +1477,9 @@ async fn test_control_plane_unexpected_inbound_yamux_stream_keeps_tunnel_healthy
     });
 
     let (unexpected_sent_tx, unexpected_sent_rx) = tokio::sync::oneshot::channel::<()>();
+    let connector = build_control_plane_client_connector(&pki);
+    let e2e_acceptor = build_backend_e2e_acceptor(&pki);
     let praeco_task = tokio::spawn(async move {
-        let connector = build_control_plane_client_connector();
         let mut tls = connector
             .connect(
                 ServerName::try_from("localhost".to_string()).unwrap(),
@@ -1692,7 +1513,6 @@ async fn test_control_plane_unexpected_inbound_yamux_stream_keeps_tunnel_healthy
             {}
         });
 
-        let e2e_acceptor = build_backend_e2e_acceptor();
         let mut e2e_tls = e2e_acceptor.accept(inbound.compat()).await.unwrap();
         let mut reader = TokioBufReader::new(&mut e2e_tls);
         let mut line = String::new();
@@ -1730,7 +1550,7 @@ async fn test_control_plane_unexpected_inbound_yamux_stream_keeps_tunnel_healthy
         .await;
     });
 
-    let ext_connector = build_external_client_connector();
+    let ext_connector = build_external_client_connector(&pki);
     let mut ext_tls = ext_connector
         .connect(
             ServerName::try_from(sni_domain.to_string()).unwrap(),

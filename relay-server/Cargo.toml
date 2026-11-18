@@ -37,4 +37,5 @@ socket2 = { workspace = true }
 mimalloc = { workspace = true }
 
 [dev-dependencies]
+common = { workspace = true, features = ["test-pki"] }
 tokio = { workspace = true, features = ["test-util"] }

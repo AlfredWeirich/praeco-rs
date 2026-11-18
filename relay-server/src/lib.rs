@@ -1356,11 +1356,11 @@ mod tests {
 
     #[test]
     fn test_praeco_client_cert_snis() {
-        let certs: Vec<CertificateDer> =
-            CertificateDer::pem_file_iter("../server_certs/self_signed/praeco_client.pem")
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+        let pki = common::test_pki::TestPki::new();
+        let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.praeco_client_pem)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let cert_der = certs.first().unwrap();
         let allowed_snis = extract_allowed_snis(cert_der);
         assert!(allowed_snis.contains(&"wurzelwerk.api.aweirich.eu".to_string()));
@@ -1372,11 +1372,12 @@ mod tests {
     #[tokio::test]
     async fn test_full_control_plane_registration() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
         // 1. Setup Acceptor
         let acceptor = setup_mtls_acceptor(
-            "../server_certs/self_signed/relay_ca.pem",
-            "../server_certs/self_signed/relay_server.pem",
-            "../server_certs/self_signed/relay_server.key",
+            common::test_pki::TestPki::s(&pki.relay_ca_pem),
+            common::test_pki::TestPki::s(&pki.relay_server_pem),
+            common::test_pki::TestPki::s(&pki.relay_server_key),
             None,
         )
         .unwrap();
@@ -1413,18 +1414,14 @@ mod tests {
 
         // 2. Client side (Praeco run_tunnel)
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in
-            CertificateDer::pem_file_iter("../server_certs/self_signed/relay_ca.pem").unwrap()
-        {
+        for cert in CertificateDer::pem_file_iter(&pki.relay_ca_pem).unwrap() {
             root_store.add(cert.unwrap()).unwrap();
         }
-        let certs: Vec<CertificateDer> =
-            CertificateDer::pem_file_iter("../server_certs/self_signed/praeco_client.pem")
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-        let key =
-            PrivateKeyDer::from_pem_file("../server_certs/self_signed/praeco_client.key").unwrap();
+        let certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.praeco_client_pem)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(&pki.praeco_client_key).unwrap();
 
         let client_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -1690,56 +1687,42 @@ mod tests {
 
     #[test]
     fn test_extract_allowed_snis_edge_cases() {
+        let pki = common::test_pki::TestPki::new();
         // Garbage bytes return empty list
         assert!(extract_allowed_snis(b"not-a-der-cert").is_empty());
 
         // CA cert without DNS SAN extensions returns empty list
-        let ca_certs: Vec<CertificateDer> =
-            CertificateDer::pem_file_iter("../server_certs/self_signed/relay_ca.pem")
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
+        let ca_certs: Vec<CertificateDer> = CertificateDer::pem_file_iter(&pki.relay_ca_pem)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(extract_allowed_snis(ca_certs.first().unwrap()).is_empty());
     }
 
     #[test]
     fn test_setup_mtls_acceptor_errors_and_crl_loading() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let ca = common::test_pki::TestPki::s(&pki.relay_ca_pem);
+        let srv_cert = common::test_pki::TestPki::s(&pki.relay_server_pem);
+        let srv_key = common::test_pki::TestPki::s(&pki.relay_server_key);
 
         // Missing CA file
         assert!(matches!(
-            setup_mtls_acceptor(
-                "nonexistent_ca.pem",
-                "../server_certs/self_signed/relay_server.pem",
-                "../server_certs/self_signed/relay_server.key",
-                None,
-            ),
+            setup_mtls_acceptor("nonexistent_ca.pem", srv_cert, srv_key, None),
             Err(RelayError::Pem(_) | RelayError::Io(_))
         ));
 
         // Missing CRL file
         let missing_crl = "nonexistent_crl.pem".to_string();
         assert!(matches!(
-            setup_mtls_acceptor(
-                "../server_certs/self_signed/relay_ca.pem",
-                "../server_certs/self_signed/relay_server.pem",
-                "../server_certs/self_signed/relay_server.key",
-                Some(&missing_crl),
-            ),
+            setup_mtls_acceptor(ca, srv_cert, srv_key, Some(&missing_crl)),
             Err(RelayError::Pem(_) | RelayError::Io(_))
         ));
 
         // Valid certs + CRL file (exercises CRL parsing & expiration warning check)
-        let crl_path = "../client_certs/crl_experiments/test1_crl/ca.crl.pem".to_string();
-        assert!(
-            setup_mtls_acceptor(
-                "../server_certs/self_signed/relay_ca.pem",
-                "../server_certs/self_signed/relay_server.pem",
-                "../server_certs/self_signed/relay_server.key",
-                Some(&crl_path),
-            )
-            .is_ok()
-        );
+        let crl_path = pki.relay_crl_pem.to_string_lossy().to_string();
+        assert!(setup_mtls_acceptor(ca, srv_cert, srv_key, Some(&crl_path)).is_ok());
     }
 
     fn build_client_hello_bytes(server_name: rustls::pki_types::ServerName<'static>) -> Vec<u8> {
