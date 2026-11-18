@@ -564,11 +564,11 @@ where
                 crate::configuration::ServerMetrics::inc_blocked_ip_filter(self.server_name);
                 tracing::warn!(
                     target: "security",
-                    "{}: Blocked request with 403 Forbidden due to IP filter: {} (method: {}, uri: '{}')",
+                    "{}: Blocked request with 403 Forbidden due to IP filter: {} (method: {}, path: '{}')",
                     self.server_name,
                     rejection,
                     req.method(),
-                    req.uri()
+                    req.uri().path()
                 );
                 IpFilterFuture::Blocked {
                     response: Some(Self::build_forbidden_response()),

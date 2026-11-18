@@ -502,9 +502,9 @@ pub fn apply_layers(
                 let is_any_method = cfg.allowed_methods.iter().any(|m| m == "*");
                 let is_any_header = cfg.allowed_headers.iter().any(|h| h == "*");
 
-                if cfg.allow_credentials && is_any_origin {
+                if cfg.allow_credentials && (is_any_origin || is_any_method || is_any_header) {
                     return Err(SrvError::Other(format!(
-                        "{server_name}: CORS allow_credentials cannot be true when allowed_origins contains '*'"
+                        "{server_name}: CORS allow_credentials cannot be true when allowed_origins, allowed_methods, or allowed_headers contains '*'"
                     )));
                 }
 

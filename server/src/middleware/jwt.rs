@@ -185,6 +185,12 @@ impl JwtAuthLayer {
         expected_issuer: String,
         expected_audience: String,
     ) -> Result<Self, anyhow::Error> {
+        if expected_issuer.split(',').all(|s| s.trim().is_empty()) {
+            anyhow::bail!("{server_name}: JwtAuthLayer expected_issuer must not be empty");
+        }
+        if expected_audience.split(',').all(|s| s.trim().is_empty()) {
+            anyhow::bail!("{server_name}: JwtAuthLayer expected_audience must not be empty");
+        }
         let decoding_keys = load_decoding_keys(&key_files)?;
 
         // Convert HashMap to Vec for faster linear search (avoids SipHash overhead on small sets)

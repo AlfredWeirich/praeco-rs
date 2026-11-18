@@ -46,7 +46,7 @@ use arc_swap::ArcSwap;
 use tokio::runtime::Builder;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace};
+use tracing::{error, info};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
@@ -91,8 +91,7 @@ fn main() -> Result<(), Error> {
 
     let (_tracing_guard, _tracer_provider) = setup_tracing(&config)?;
 
-    info!("Configuration loaded from: {}", arg);
-    trace!("Full Config: {:#?}", config);
+    info!("Configuration loaded from: {} ({} servers)", arg, config.servers.len());
 
     let res = runtime.block_on(main_async(config, arg));
     if let Some(provider) = _tracer_provider {

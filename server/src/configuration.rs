@@ -119,6 +119,7 @@ pub enum AuthenticationMethod {
 /// (OID mappings, Tokio threads, log directory) and a list of
 /// [`ServerConfig`] instances.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// List of file globs to include (e.g., ["conf.d/*.toml"]).
     #[serde(default)]
@@ -156,6 +157,7 @@ pub struct Config {
 // ============================================================================
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TunnelConfig {
     pub target_url: String,
     pub sni_domain: String,
@@ -178,6 +180,7 @@ pub struct TunnelConfig {
 /// listener for HTTP/3). The middleware stack and base service are built from
 /// the fields defined here.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Human-readable name used in all log/trace output.
     pub name: String,
@@ -540,6 +543,7 @@ pub struct ServerPkiInfo {
 
 /// Parameters for the StaticFiles service.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct StaticFilesParams {
     /// The root directory to serve files from.
     pub root: String,
@@ -550,6 +554,7 @@ pub struct StaticFilesParams {
 
 /// A single reverse-proxy route definition from the TOML config.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// The upstream backend addresses (e.g. `["127.0.0.1:8080", "127.0.0.1:8081"]`).
     /// Can be omitted or empty (`[]`) when `backend_type = "admin"` or `"aggregate"`.
@@ -620,6 +625,7 @@ pub enum AggregatePayloadMode {
 
 /// Configuration for a single fan-out target within an `aggregate` route.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AggregateTargetConfig {
     /// JSON key under which this target's response is placed in the aggregated object.
     pub key: String,
@@ -1243,6 +1249,7 @@ pub enum RateLimiter {
 /// Container for the ordered list of enabled layers and their per-layer
 /// configuration sections.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Layers {
     /// Ordered list of layer names. The order defines the middleware
     /// wrapping order (first entry = outermost layer).
@@ -1283,6 +1290,7 @@ pub struct Layers {
 
 /// Configuration for the maximum payload size enforcement layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MaxPayloadConfig {
     /// Maximum allowed request body size in bytes.
     pub max_bytes: usize,
@@ -1290,6 +1298,7 @@ pub struct MaxPayloadConfig {
 
 /// Configuration for the decompression layer's bomb protection.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DecompressionConfig {
     /// Maximum allowed size of the decompressed request body in bytes.
     pub max_decompressed_bytes: usize,
@@ -1319,7 +1328,8 @@ fn default_grpc_reflection_ttl_seconds() -> u64 {
 ///
 /// Controls how the router communicates with backend services (protocol,
 /// TLS settings, authentication).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RouterParams {
     /// Protocol for upstream connections (HTTP or HTTPS).
     #[serde(default)]
@@ -1329,7 +1339,7 @@ pub struct RouterParams {
     pub authentication: AuthenticationMethod,
     /// Path to the root CA certificate for verifying upstream TLS.
     pub ssl_root_certificate: Option<String>,
-    /// Path to a JWT token file for upstream authentication.
+    /// Path to a JWT token file or bearer token for upstream authentication.
     pub jwt: Option<String>,
     /// Path to the client certificate for upstream mTLS.
     pub ssl_client_certificate: Option<String>,
@@ -1352,10 +1362,35 @@ pub struct RouterParams {
     pub grpc_reflection_ttl_seconds: u64,
 }
 
+impl std::fmt::Debug for RouterParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouterParams")
+            .field("protocol", &self.protocol)
+            .field("authentication", &self.authentication)
+            .field("ssl_root_certificate", &self.ssl_root_certificate)
+            .field("jwt", &self.jwt.as_ref().map(|_| "<redacted>"))
+            .field("ssl_client_certificate", &self.ssl_client_certificate)
+            .field("ssl_client_key", &self.ssl_client_key)
+            .field("connect_timeout_seconds", &self.connect_timeout_seconds)
+            .field("request_timeout_seconds", &self.request_timeout_seconds)
+            .field("idle_timeout_seconds", &self.idle_timeout_seconds)
+            .field(
+                "grpc_reflection_timeout_seconds",
+                &self.grpc_reflection_timeout_seconds,
+            )
+            .field(
+                "grpc_reflection_ttl_seconds",
+                &self.grpc_reflection_ttl_seconds,
+            )
+            .finish()
+    }
+}
+
 /// Parameters for the Identity Provider (IdP) service.
 ///
 /// Controls how the IdP issues tokens and manages sessions.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct IdpParams {
     /// Path to the Ed25519 private key used to sign issued JWTs.
     pub jwt_private_key: String,
@@ -1414,6 +1449,7 @@ fn default_on_webhook_failure() -> String { "reject".to_string() }
 
 /// Server TLS certificate and key paths.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ServerCertConfig {
     /// Path to the PEM-encoded server certificate chain.
     pub ssl_certificate: String,
@@ -1423,6 +1459,7 @@ pub struct ServerCertConfig {
 
 /// Client CA certificate configuration for mTLS.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientCertConfig {
     /// Path to the PEM-encoded client CA certificate.
     pub ssl_client_ca: String,
@@ -1432,6 +1469,7 @@ pub struct ClientCertConfig {
 
 /// Configuration for client certificate forwarding.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClientCertForwardingConfig {
     /// The HTTP header name used to forward the full URL-encoded client certificate.
     pub header_cert: Option<String>,
@@ -1470,6 +1508,7 @@ fn default_load_shed() -> bool {
 
 /// Configuration for the simple fixed-window rate limiter.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SimpleRateLimiterConfig {
     /// Maximum number of requests per second.
     pub requests_per_second: u64,
@@ -1489,6 +1528,7 @@ pub struct SimpleRateLimiterConfig {
 
 /// Configuration for the token-bucket rate limiter.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TokenBucketRateLimiterConfig {
     /// Maximum number of tokens the bucket can hold.
     pub max_capacity: usize,
@@ -1512,6 +1552,7 @@ pub struct TokenBucketRateLimiterConfig {
 
 /// Configuration for the artificial delay layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DelayConfig {
     /// Delay duration in microseconds.
     pub delay_micros: u64,
@@ -1519,6 +1560,7 @@ pub struct DelayConfig {
 
 /// Configuration for the JWT authentication layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct JwtAuthConfig {
     /// List of file paths to PEM-encoded Ed25519 public keys.
     pub jwt_public_keys: Vec<String>,
@@ -1547,6 +1589,7 @@ fn default_max_connections_per_ip() -> usize {
 
 /// Configuration for server connection limits (global and per-IP).
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionLimitsConfig {
     /// Maximum number of concurrent connections across the entire server instance (default: 10,000).
     #[serde(default = "default_max_connections")]
@@ -1568,6 +1611,7 @@ impl Default for ConnectionLimitsConfig {
 
 /// Configuration for the concurrency limit layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ConcurrencyLimitConfig {
     /// Maximum number of in-flight requests.
     pub max_concurrent_requests: usize,
@@ -1580,6 +1624,7 @@ pub struct ConcurrencyLimitConfig {
 
 /// Configuration for the CORS layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct CorsConfig {
     /// List of allowed origins. Use `["*"]` to allow all.
     #[serde(default)]
@@ -1597,6 +1642,7 @@ pub struct CorsConfig {
 
 /// Configuration for the SecurityHeaders layer.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityHeadersConfig {
     pub content_security_policy: String,
     pub strict_transport_security: String,
@@ -1611,6 +1657,7 @@ pub struct SecurityHeadersConfig {
 /// Evaluates `deny_cidrs` first (explicit blocklist) and `allow_cidrs` second
 /// (when non-empty, only IPs matching at least one allowed CIDR are permitted).
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct IpFilterConfig {
     /// Optional list of allowed IPv4/IPv6 CIDR blocks or single IPs
     /// (e.g. `["10.0.0.0/8", "192.168.1.0/24", "127.0.0.1/32", "::1/128"]`).
@@ -1650,6 +1697,7 @@ impl Default for SecurityHeadersConfig {
 /// strings. These are compiled into [`CompiledAllowedPathes`] during
 /// [`ServerConfig::finalize`].
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedPathes {
     /// Allowed GET path patterns.
     #[serde(rename = "GET")]
@@ -2694,6 +2742,24 @@ impl Layers {
                                 server_name
                             ))
                         })?;
+                    if c.jwt_public_keys.is_empty() {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'JwtAuth': jwt_public_keys must not be empty",
+                            server_name
+                        )));
+                    }
+                    if c.expected_issuer.split(',').all(|s| s.trim().is_empty()) {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'JwtAuth': expected_issuer must not be empty",
+                            server_name
+                        )));
+                    }
+                    if c.expected_audience.split(',').all(|s| s.trim().is_empty()) {
+                        return Err(Error::msg(format!(
+                            "{}: Layer 'JwtAuth': expected_audience must not be empty",
+                            server_name
+                        )));
+                    }
                     // Validate decoding keys can actually be loaded
                     common::load_decoding_keys(&c.jwt_public_keys)?;
                     Ok(MiddlewareLayer::JwtAuth(c.clone()))
@@ -2716,9 +2782,12 @@ impl Layers {
                         .cors_config
                         .as_ref()
                         .context("Missing [Layers.Cors]")?;
-                    if c.allow_credentials && c.allowed_origins.iter().any(|o| o == "*") {
+                    let has_wildcard = c.allowed_origins.iter().any(|o| o == "*")
+                        || c.allowed_methods.iter().any(|m| m == "*")
+                        || c.allowed_headers.iter().any(|h| h == "*");
+                    if c.allow_credentials && has_wildcard {
                         return Err(Error::msg(format!(
-                            "{}: Layer 'Cors': allow_credentials cannot be true when allowed_origins contains wildcard '*' (violates CORS specification and causes panic in tower-http)",
+                            "{}: Layer 'Cors': allow_credentials cannot be true when allowed_origins, allowed_methods, or allowed_headers contains wildcard '*' (violates CORS specification and causes panic in tower-http)",
                             server_name
                         )));
                     }
@@ -3636,6 +3705,117 @@ enabled = []
             ..Default::default()
         };
         assert!(invalid.finalize().is_err());
+    }
+
+    #[test]
+    fn test_cors_credentials_rejects_wildcard_methods_and_headers() {
+        let cases = [
+            (
+                "wildcard origin",
+                vec!["*".into()],
+                vec!["GET".into()],
+                vec!["Content-Type".into()],
+            ),
+            (
+                "wildcard method",
+                vec!["https://example.com".into()],
+                vec!["*".into()],
+                vec!["Content-Type".into()],
+            ),
+            (
+                "wildcard header",
+                vec!["https://example.com".into()],
+                vec!["GET".into()],
+                vec!["*".into()],
+            ),
+        ];
+
+        for (label, origins, methods, headers) in cases {
+            let layers = Layers {
+                enabled: vec!["Cors".into()],
+                cors_config: Some(CorsConfig {
+                    allowed_origins: origins,
+                    allowed_methods: methods,
+                    allowed_headers: headers,
+                    allow_credentials: true,
+                }),
+                ..Default::default()
+            };
+            let err = layers
+                .build_middleware_layers("cors_test")
+                .expect_err(&format!("{label} with allow_credentials=true must fail"));
+            assert!(
+                err.to_string().contains("allow_credentials"),
+                "Unexpected error for {label}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_jwt_layer_rejects_empty_issuer_and_audience() {
+        let layers_empty_iss = Layers {
+            enabled: vec!["JwtAuth".into()],
+            jwt_config: Some(JwtAuthConfig {
+                jwt_public_keys: vec!["dummy.pem".into()],
+                cookie_fallback: None,
+                redirect_on_failure: None,
+                expected_issuer: "   ".into(),
+                expected_audience: "api".into(),
+                revoke_on_paths: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(layers_empty_iss
+            .build_middleware_layers("jwt_iss_test")
+            .is_err());
+
+        let layers_empty_aud = Layers {
+            enabled: vec!["JwtAuth".into()],
+            jwt_config: Some(JwtAuthConfig {
+                jwt_public_keys: vec!["dummy.pem".into()],
+                cookie_fallback: None,
+                redirect_on_failure: None,
+                expected_issuer: "idp".into(),
+                expected_audience: "".into(),
+                revoke_on_paths: vec![],
+            }),
+            ..Default::default()
+        };
+        assert!(layers_empty_aud
+            .build_middleware_layers("jwt_aud_test")
+            .is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_fields_and_redacts_router_jwt_debug() {
+        let bad_toml = r#"
+[[Server]]
+name = "typo_srv"
+ip = "127.0.0.1"
+port = 8080
+protcol = "https"
+[Server.Layers]
+enabled = []
+"#;
+        let res: Result<Config, _> = toml::from_str(bad_toml);
+        assert!(res.is_err(), "Unknown field 'protcol' must be rejected");
+
+        let rp = RouterParams {
+            protocol: Protocol::Https,
+            authentication: AuthenticationMethod::Jwt,
+            ssl_root_certificate: None,
+            jwt: Some("super-secret-jwt-token".into()),
+            ssl_client_certificate: None,
+            ssl_client_key: None,
+            connect_timeout_seconds: 5,
+            request_timeout_seconds: 30,
+            idle_timeout_seconds: 90,
+            grpc_reflection_timeout_seconds: 10,
+            grpc_reflection_ttl_seconds: 600,
+        };
+        let dbg = format!("{rp:?}");
+        assert!(!dbg.contains("super-secret-jwt-token"));
+        assert!(dbg.contains("<redacted>"));
     }
 }
 

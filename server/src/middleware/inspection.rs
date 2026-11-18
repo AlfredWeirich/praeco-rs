@@ -168,12 +168,11 @@ where
             // Log the failure
             let method_owned = method.to_string(); // Only allocate if we actually block
             let path_owned = path.to_string();
-            let query_owned = query.to_string();
 
             tracing::warn!(
                 target: "inspection",
-                "{}: Blocked request: {} {}?{}",
-                server_name, method_owned, path_owned, query_owned
+                "{}: Blocked request: {} {}",
+                server_name, method_owned, path_owned
             );
 
             // Return the 'Blocked' variant containing the immediate response.

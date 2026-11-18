@@ -10,6 +10,7 @@ use std::fs;
 
 /// Configuration for the Praeco Relay Server.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RelayConfig {
     /// The address (IP:Port) where the control plane (mTLS from Praeco) listens.
     pub control_plane_addr: String,
@@ -204,5 +205,23 @@ mod tests {
         assert_eq!(loaded.control_plane_addr, "127.0.0.1:7101");
         assert_eq!(loaded.data_plane_addr, "127.0.0.1:8443");
         assert_eq!(loaded.enable_proxy_protocol, Some(false));
+
+        // 4. Unknown fields (e.g. typo in crl_path) must be rejected
+        let typo_path = std::env::temp_dir().join(format!(
+            "praeco_relay_typo_config_{}.toml",
+            std::process::id()
+        ));
+        let typo_toml = r#"
+            control_plane_addr = "127.0.0.1:7101"
+            data_plane_addr = "127.0.0.1:8443"
+            ca_cert_path = "ca.pem"
+            server_cert_path = "cert.pem"
+            server_key_path = "key.pem"
+            crl_pth = "revoked.crl.pem"
+        "#;
+        fs::write(&typo_path, typo_toml).unwrap();
+        let typo_res = RelayConfig::load(&typo_path.to_string_lossy());
+        let _ = fs::remove_file(&typo_path);
+        assert!(matches!(typo_res, Err(RelayError::ConfigParse(_))));
     }
 }

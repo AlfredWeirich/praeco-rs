@@ -328,8 +328,8 @@ where
                 crate::configuration::ServerMetrics::inc_blocked_path_sanitizer(self.server_name);
                 tracing::warn!(
                     target: "security",
-                    "{}: Blocked request with 400 Bad Request due to path sanitization: {} (URI: '{}')",
-                    self.server_name, e, req.uri()
+                    "{}: Blocked request with 400 Bad Request due to path sanitization: {} (path: '{}')",
+                    self.server_name, e, req.uri().path()
                 );
                 let resp = self.build_bad_request_response(&e.to_string());
                 PathSanitizerFuture::Blocked {

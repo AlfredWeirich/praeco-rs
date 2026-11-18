@@ -169,22 +169,21 @@ pub fn load_encoding_key(path: &str) -> Result<EncodingKey, Error> {
 ///
 /// # Errors
 ///
-/// Returns an error if **none** of the provided keys can verify the token.
+/// Returns an error if `expected_issuer` or `expected_audience` is empty,
+/// or if **none** of the provided keys can verify the token.
 pub fn verify_jwt(
     token: &str,
     decoding_keys: &[DecodingKey],
     expected_issuer: &str,
     expected_audience: &str,
 ) -> Result<Claims, Error> {
-    let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
-    
     let iss_list: Vec<&str> = expected_issuer
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if !iss_list.is_empty() {
-        validation.set_issuer(&iss_list);
+    if iss_list.is_empty() {
+        return Err(Error::msg("JWT verification failed: expected_issuer must not be empty"));
     }
 
     let aud_list: Vec<&str> = expected_audience
@@ -192,11 +191,13 @@ pub fn verify_jwt(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if !aud_list.is_empty() {
-        validation.set_audience(&aud_list);
-    } else {
-        validation.validate_aud = false;
+    if aud_list.is_empty() {
+        return Err(Error::msg("JWT verification failed: expected_audience must not be empty"));
     }
+
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
+    validation.set_issuer(&iss_list);
+    validation.set_audience(&aud_list);
 
     // Try verifying the JWT with each decoding key
     for key in decoding_keys {
@@ -397,6 +398,31 @@ mod tests {
 
         // 3. Mismatched audience fails
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", "wrong-aud").is_err());
+    }
+
+    #[test]
+    fn test_verify_jwt_rejects_empty_issuer_or_audience() {
+        let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+        let pub_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+
+        let enc_key = EncodingKey::from_ed_pem(priv_pem.as_bytes()).unwrap();
+        let dec_key = DecodingKey::from_ed_pem(pub_pem.as_bytes()).unwrap();
+
+        let claims = Claims {
+            sub: "test-user".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("admin-dashboard".to_string()),
+            exp: 9999999999,
+            oids: vec!["1".to_string()],
+            jti: None,
+        };
+
+        let token = sign_jwt(&claims, &enc_key).unwrap();
+
+        assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), "", "admin-dashboard").is_err());
+        assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), " , ", "admin-dashboard").is_err());
+        assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), "praeco-idp", "").is_err());
+        assert!(verify_jwt(&token, &[dec_key], "praeco-idp", " , ").is_err());
     }
 
     #[test]

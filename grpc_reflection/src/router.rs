@@ -223,7 +223,7 @@ async fn handle_json_to_grpc(
     };
 
     let incoming_body = req.collect().await?.to_bytes();
-    println!("Router intercepted JSON payload: {:?}", incoming_body);
+    tracing::debug!(body_len = incoming_body.len(), "Router received JSON payload");
 
     // ------------------------------------
     // STEP 2: TRANSLATE JSON -> PROTOBUF
@@ -314,7 +314,7 @@ async fn handle_json_to_grpc(
     // Finally, transform it into standard JSON to send back to the REST client
     // DynamicMessage implements the Trait Serialize
     let response_json = serde_json::to_string(&dynamic_res_msg)?;
-    println!("Router sending back JSON: {}", response_json);
+    tracing::debug!(response_len = response_json.len(), "Router sending JSON response");
 
     Ok(Response::builder()
         .status(StatusCode::OK)
