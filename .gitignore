@@ -36,6 +36,7 @@ $RECYCLE.BIN/
 
 # Linux
 *.lock
+!Cargo.lock
 *~
 
 # Logs
@@ -43,9 +44,6 @@ $RECYCLE.BIN/
 
 # Byebug (Rust-specific debugging)
 .bk
-
-# Optional: ignore Cargo.lock in libraries (not binaries)
-/Cargo.lock
 
 .tokensave/*
 jwt_creator/*.jwt

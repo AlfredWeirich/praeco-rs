@@ -101,6 +101,9 @@ async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
 mimalloc = { version = "0.1", features = ["v3"] }
 socket2 = "0.5"
 smallvec = { version = "1.14", features = ["const_generics"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+tempfile = "3.27"
+time = "0.3"
 
 [profile.release]
 opt-level = 3
