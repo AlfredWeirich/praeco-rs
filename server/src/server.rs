@@ -185,11 +185,16 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
     }
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Shutdown signal received (Ctrl+C). Starting graceful shutdown...");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("Shutdown signal received (SIGTERM). Starting graceful shutdown...");
                 break;
             }
             _ = sighup.recv() => {

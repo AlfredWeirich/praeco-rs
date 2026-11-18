@@ -178,7 +178,7 @@ struct Cli {
 
     /// Maximum number of requests in flight at the same time.
     /// Higher values increase throughput but also resource usage.
-    #[clap(long, default_value_t = 128)]
+    #[clap(long, default_value_t = 128, value_parser = clap::value_parser!(u16).range(1..))]
     num_parallel: u16,
 
     /// Authentication / security mode (determines TLS and auth setup).
@@ -717,6 +717,10 @@ async fn run_sliding_window<F, Fut>(
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
+    if concurrency == 0 || total_requests == 0 {
+        return;
+    }
+
     let mut futs = FuturesUnordered::new();
     let start = Instant::now();
     let mut completed = 0;
@@ -731,17 +735,18 @@ async fn run_sliding_window<F, Fut>(
 
     // Poll completions and refill until all are done
     while completed < total_requests {
-        if let Some(res) = futs.next().await {
-            completed += 1;
-            match res {
-                Ok(_) => {}
-                Err(e) => error!("{err_prefix}: {e}"),
-            }
+        let Some(res) = futs.next().await else {
+            break;
+        };
+        completed += 1;
+        match res {
+            Ok(_) => {}
+            Err(e) => error!("{err_prefix}: {e}"),
+        }
 
-            if launched < total_requests {
-                futs.push(make_future());
-                launched += 1;
-            }
+        if launched < total_requests {
+            futs.push(make_future());
+            launched += 1;
         }
     }
 
@@ -764,4 +769,26 @@ fn print_stats(start: Instant, total_requests: usize, concurrency: usize) {
         concurrency,
         1000000. / mean
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_rejects_zero_num_parallel() {
+        assert!(Cli::try_parse_from(["client", "--num-parallel", "0"]).is_err());
+        let ok = Cli::try_parse_from(["client", "--num-parallel", "1"]).expect("1 is valid");
+        assert_eq!(ok.num_parallel, 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_sliding_window_zero_concurrency_returns_immediately() {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            run_sliding_window(10, 0, "err", || async { Ok(String::new()) }),
+        )
+        .await
+        .expect("run_sliding_window with concurrency=0 must not spin");
+    }
 }

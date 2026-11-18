@@ -284,18 +284,27 @@ async fn handle_json_to_grpc(
     // ------------------------------------
     // STEP 5: RECEIVE gRPC BINARY
     // ------------------------------------
-    let res_body_bytes = grpc_res.body_mut().collect().await?.to_bytes();
-
-    // Verify it actually contains the 5-byte header
-    if res_body_bytes.len() < 5 {
+    let collected = grpc_res.body_mut().collect().await?;
+    let grpc_status_ok = collected
+        .trailers()
+        .and_then(|t| t.get("grpc-status"))
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|s| s == "0");
+    if !grpc_status_ok {
         return Ok(Response::builder()
-            .status(502)
-            .body(Full::new(Bytes::from("Invalid gRPC Response\n")))?);
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Full::new(Bytes::from("Backend gRPC Error\n")))?);
     }
 
-    // Parse the 4 bytes indicating length to extract only the payload
-    let payload_len = u32::from_be_bytes(res_body_bytes[1..5].try_into().unwrap()) as usize;
-    let raw_protobuf_res = &res_body_bytes[5..5 + payload_len];
+    let res_body_bytes = collected.to_bytes();
+    let raw_protobuf_res = match extract_grpc_frame(&res_body_bytes) {
+        Ok(payload) => payload,
+        Err(msg) => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Full::new(Bytes::from(format!("{msg}\n"))))?);
+        }
+    };
 
     // ------------------------------------
     // STEP 6: TRANSLATE PROTOBUF -> JSON
@@ -320,4 +329,52 @@ async fn handle_json_to_grpc(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(response_json)))?)
+}
+
+/// Validates a 5-byte gRPC Length-Prefixed-Message header and returns the
+/// uncompressed payload slice without panicking on malformed frames.
+fn extract_grpc_frame(buf: &[u8]) -> Result<&[u8], &'static str> {
+    if buf.len() < 5 {
+        return Err("Invalid gRPC Response");
+    }
+    if buf[0] != 0 {
+        return Err("Compressed gRPC responses are not supported");
+    }
+    let payload_len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    let end = 5usize
+        .checked_add(payload_len)
+        .filter(|&end| end <= buf.len())
+        .ok_or("Truncated or malformed gRPC frame")?;
+    Ok(&buf[5..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_grpc_frame_valid_and_malformed() {
+        // Valid 3-byte payload
+        let valid = [0u8, 0, 0, 0, 3, 0x0A, 0x0B, 0x0C];
+        assert_eq!(extract_grpc_frame(&valid), Ok(&[0x0A, 0x0B, 0x0C][..]));
+
+        // Valid empty payload
+        let empty_payload = [0u8, 0, 0, 0, 0];
+        assert_eq!(extract_grpc_frame(&empty_payload), Ok(&[][..]));
+
+        // Too short (< 5 bytes)
+        assert!(extract_grpc_frame(&[0u8, 0, 0, 1]).is_err());
+
+        // Compressed flag set (byte 0 != 0)
+        let compressed = [1u8, 0, 0, 0, 1, 0xAA];
+        assert!(extract_grpc_frame(&compressed).is_err());
+
+        // Length exceeds buffer (previously panicked on slice indexing)
+        let truncated = [0u8, 0, 0, 0, 10, 0x01, 0x02];
+        assert!(extract_grpc_frame(&truncated).is_err());
+
+        // Extreme length u32::MAX (overflow guard)
+        let max_len = [0u8, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert!(extract_grpc_frame(&max_len).is_err());
+    }
 }
