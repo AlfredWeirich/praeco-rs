@@ -194,10 +194,11 @@ log_dir = "/var/log/praeco"
 - **Default Value:** `None`
 
 #### Detailed Mechanics & System Impact:
-- **Under the Hood:** During `Config::init`, Praeco parses each numeric component into an optimized vector of 64-bit integers (`Vec<u64>`). If the string contains non-numeric segments or invalid characters, startup fails immediately.
-- **OID Extraction from Certificates:** When an incoming client certificate is verified during an mTLS handshake, Praeco's ASN.1 parser (`extract_oids_from_cert`) scans all X.509 extensions.
+- **Under the Hood:** During `Config::load` and `ServerConfig::finalize`, Praeco parses each numeric component into an optimized vector of 64-bit integers (`Vec<u64>`). If the string contains non-numeric segments or invalid characters, startup fails immediately.
+- **Global Fallback & Per-Server Override:** `pki_base_oid` can be configured globally in `Config.toml` as a default fallback and optionally overridden per `[[Server]]` block (useful when different servers use different client CAs / PKIs).
+- **OID Extraction from Certificates:** When an incoming client certificate is verified during an mTLS handshake, Praeco's ASN.1 parser (`extract_oids_from_cert_with_base`) scans all X.509 extensions against the listener's effective `pki_base_oid`.
 - **Prefix Matching:** An extension is recognized as an authorization OID only if its integer sequence starts with `pki_base_oid`. The final component is extracted as the role suffix (e.g. OID `1.3.6.1.4.1.65111.1` yields suffix `"1"`).
-- **What happens if omitted?** If `pki_base_oid` is omitted from `Config.toml`, Praeco cannot extract role suffixes from client certificates. Any client authenticating via mTLS will receive the fallback role **`Guest`**, regardless of what extensions are in the certificate.
+- **What happens if omitted?** If `pki_base_oid` is omitted from both the `[[Server]]` block and `Config.toml`, Praeco cannot extract role suffixes from client certificates. Any client authenticating via mTLS will receive the fallback role **`Guest`**, regardless of what extensions are in the certificate.
 
 ```toml
 # Private Enterprise Number (PEN) assigned by IANA: 65111
@@ -379,6 +380,8 @@ Defines layer-4 and layer-7 connection boundaries to prevent connection starvati
 ---
 
 ### Role-Based Access Control & OID Mapping (`[Server.oid_mapping]`)
+
+Optionally set `pki_base_oid = "..."` directly on `[[Server]]` to override the global `pki_base_oid` from `Config.toml` for this server's PKI.
 
 Maps OID suffix numbers extracted from certificates or JWT claims to internal `UserRole` values:
 

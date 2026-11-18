@@ -275,43 +275,53 @@ pub fn warn_if_crl_expired(server_name: &str, crl_path: &str, crl_der: &[u8]) ->
     }
 }
 
-/// Extracts custom PKI OIDs from a DER-encoded X.509 certificate.
+/// Extracts custom PKI OIDs from a DER-encoded X.509 certificate using the
+/// globally configured `pki_base_oid` in [`Config::try_global`].
+///
+/// Prefer [`extract_oids_from_cert_with_base`] when a per-server
+/// [`ServerConfig::parsed_pki_base_oid`](crate::configuration::ServerConfig::parsed_pki_base_oid)
+/// is available.
+pub fn extract_oids_from_cert(cert_der: &[u8]) -> Vec<String> {
+    let config = match crate::configuration::Config::try_global() {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    extract_oids_from_cert_with_base(cert_der, config.parsed_pki_base_oid.as_deref())
+}
+
+/// Extracts custom PKI OIDs from a DER-encoded X.509 certificate using an
+/// explicit `base_oid` prefix.
 ///
 /// Iterates over every extension in the certificate, checks if its OID starts
-/// with the globally configured `pki_base_oid` prefix, and if so, returns the
-/// trailing suffix components as dot-separated strings.
+/// with `base_oid`, and if so, returns the trailing suffix components as
+/// dot-separated strings.
 ///
 /// # Performance Optimized
 ///
 /// This function avoids allocating strings for every OID in the certificate.
-/// It compares the raw integer components of the OID against the pre-computed
-/// base OID configuration stored in [`Config::parsed_pki_base_oid`](crate::configuration::Config::parsed_pki_base_oid).
-///
+/// It compares the raw integer components of the OID against `base_oid`.
 /// Allocations only occur if a valid match is found and we need to return the suffix.
 ///
 /// # Example
 ///
-/// If the base OID is `2.25` and the certificate contains an extension with
+/// If `base_oid` is `Some(&[2, 25])` and the certificate contains an extension with
 /// OID `2.25.42.7`, this function returns `vec!["42.7"]`.
 ///
 /// # Arguments
 ///
 /// * `cert_der` – Raw DER-encoded bytes of the X.509 certificate.
+/// * `base_oid` – Pre-computed integer components of the base OID, or `None` if unconfigured.
 ///
 /// # Returns
 ///
 /// A `Vec<String>` of OID suffixes (e.g. `["1", "2.3"]`). Empty if no
-/// matching extensions are found or if `pki_base_oid` is not configured.
-pub fn extract_oids_from_cert(cert_der: &[u8]) -> Vec<String> {
+/// matching extensions are found or if `base_oid` is `None`/empty.
+pub fn extract_oids_from_cert_with_base(cert_der: &[u8], base_oid: Option<&[u64]>) -> Vec<String> {
     let mut oids = Vec::new();
-    let config = match crate::configuration::Config::try_global() {
-        Some(c) => c,
-        None => return oids,
-    };
 
-    // 1. Get the pre-computed base OID (Vec<u64>).
+    // 1. Get the pre-computed base OID.
     //    If not configured or empty, there's nothing to match against.
-    let base_components = match config.parsed_pki_base_oid.as_deref() {
+    let base_components = match base_oid {
         Some(v) if !v.is_empty() => v,
         _ => return oids,
     };
@@ -411,16 +421,31 @@ pub struct ClientIdentityMetadata {
 }
 
 /// Extracts identity metadata strictly from the client's **leaf** certificate
-/// (the first certificate in the provided chain).
+/// (the first certificate in the provided chain), using the globally configured
+/// `pki_base_oid`.
 ///
-/// Any subsequent intermediate or extra certificates in the chain are intentionally
-/// ignored to prevent privilege escalation via injected certificates.
+/// Prefer [`extract_client_metadata_with_base`] when a per-server `pki_base_oid`
+/// is available.
 pub fn extract_client_metadata(
     certs: Option<&[CertificateDer<'_>]>,
 ) -> ClientIdentityMetadata {
+    let global_base = crate::configuration::Config::try_global()
+        .and_then(|c| c.parsed_pki_base_oid.clone());
+    extract_client_metadata_with_base(certs, global_base.as_deref())
+}
+
+/// Extracts identity metadata strictly from the client's **leaf** certificate
+/// (the first certificate in the provided chain) using an explicit `base_oid`.
+///
+/// Any subsequent intermediate or extra certificates in the chain are intentionally
+/// ignored to prevent privilege escalation via injected certificates.
+pub fn extract_client_metadata_with_base(
+    certs: Option<&[CertificateDer<'_>]>,
+    base_oid: Option<&[u64]>,
+) -> ClientIdentityMetadata {
     if let Some(leaf) = certs.and_then(|c| c.first()) {
         let (pem, san) = extract_cert_san_and_pem(leaf.as_ref());
-        let oids = extract_oids_from_cert(leaf.as_ref());
+        let oids = extract_oids_from_cert_with_base(leaf.as_ref(), base_oid);
         ClientIdentityMetadata { oids, pem, san }
     } else {
         ClientIdentityMetadata::default()

@@ -34,9 +34,10 @@ use crate::{
     middleware::router::build_grpc_pool,
     stack::{
         build_rustls_config, build_service_stack, build_tunnel_tls_connector,
-        run_tunnel_over_stream_with_drain_timeout, serve_http_connection, serve_tls_connection,
+        run_tunnel_over_stream_with_drain_timeout_and_base_oid, serve_http_connection,
+        serve_tls_connection_with_base_oid,
     },
-    tls_conf::extract_client_metadata,
+    tls_conf::extract_client_metadata_with_base,
 };
 
 /// Spawns and drives all enabled [`ServerConfig`] instances in `config` until
@@ -268,6 +269,8 @@ async fn serve_listeners(
     };
 
     let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+    let pki_base_oid: Option<Arc<[u64]>> =
+        server_config.parsed_pki_base_oid.as_deref().map(Arc::from);
     let connection_tracker = Arc::new(ConnectionTracker::with_server_name(
         server_config.connection_limits.max_connections,
         server_config.connection_limits.max_connections_per_ip,
@@ -297,7 +300,7 @@ async fn serve_listeners(
             }
 
             let start_time = std::time::Instant::now();
-            if let Err(e) = run_tunnel_with_timeout(
+            if let Err(e) = run_tunnel_with_timeout_and_base_oid(
                 tunnel.clone(),
                 tls_config.clone(),
                 dynamic_stack.clone(),
@@ -306,6 +309,7 @@ async fn serve_listeners(
                 oid_mapping.clone(),
                 connection_tracker.clone(),
                 drain_timeout,
+                pki_base_oid.clone(),
             )
             .await
             {
@@ -368,6 +372,7 @@ async fn serve_listeners(
             connection_tracker.clone(),
             drain_timeout,
             Some(barrier),
+            pki_base_oid,
         )
         .await
         {
@@ -968,11 +973,13 @@ pub async fn spawn_dual_stack(
         connection_tracker,
         CONNECTION_DRAIN_TIMEOUT,
         None,
+        Config::try_global().and_then(|c| c.parsed_pki_base_oid.as_deref().map(Arc::from)),
     )
     .await
 }
 
-/// Like [`spawn_dual_stack`], with explicit `drain_timeout` and optional `release_barrier`.
+/// Like [`spawn_dual_stack`], with explicit `drain_timeout`, optional `release_barrier`,
+/// and optional per-server `pki_base_oid`.
 #[allow(clippy::too_many_arguments)]
 async fn spawn_dual_stack_inner(
     server_addr: SocketAddr,
@@ -984,6 +991,7 @@ async fn spawn_dual_stack_inner(
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
+    pki_base_oid: Option<Arc<[u64]>>,
 ) -> Result<DualStackHandles, SrvError> {
     let arc_tls_config = Arc::new(tls_config);
 
@@ -1004,6 +1012,7 @@ async fn spawn_dual_stack_inner(
         connection_tracker.clone(),
         drain_timeout,
         release_barrier.clone(),
+        pki_base_oid.clone(),
     ));
     let udp_task = tokio::spawn(run_udp_accept_loop(
         quic_endpoint,
@@ -1014,6 +1023,7 @@ async fn spawn_dual_stack_inner(
         connection_tracker,
         drain_timeout,
         release_barrier,
+        pki_base_oid,
     ));
 
     Ok(DualStackHandles { tcp_task, udp_task })
@@ -1034,6 +1044,7 @@ async fn run_tcp_accept_loop(
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
+    pki_base_oid: Option<Arc<[u64]>>,
 ) {
     let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1065,10 +1076,11 @@ async fn run_tcp_accept_loop(
                         let dynamic_stack = dynamic_stack.clone();
                         let oid_mapping = oid_mapping.clone();
                         let conn_token = cancel_token.clone();
+                        let pki_base_oid = pki_base_oid.clone();
                         conn_tasks.spawn(async move {
                             let _guard = conn_guard;
                             trace!("{}: TCP Connection accepted", server_name);
-                            let _ = serve_tls_connection(
+                            let _ = serve_tls_connection_with_base_oid(
                                 stream,
                                 peer_addr,
                                 &acceptor,
@@ -1076,6 +1088,7 @@ async fn run_tcp_accept_loop(
                                 &oid_mapping,
                                 conn_token,
                                 server_name,
+                                pki_base_oid.as_deref(),
                             )
                             .await;
                         });
@@ -1143,6 +1156,7 @@ async fn run_udp_accept_loop(
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
+    pki_base_oid: Option<Arc<[u64]>>,
 ) {
     let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1180,6 +1194,7 @@ async fn run_udp_accept_loop(
                 let dynamic_stack = dynamic_stack.clone();
                 let oid_mapping = oid_mapping.clone();
                 let conn_token = cancel_token.clone();
+                let pki_base_oid = pki_base_oid.clone();
 
                 conn_tasks.spawn(async move {
                     let _guard = conn_guard;
@@ -1190,6 +1205,7 @@ async fn run_udp_accept_loop(
                         oid_mapping,
                         conn_token,
                         drain_timeout,
+                        pki_base_oid,
                     )
                     .await
                     {
@@ -1237,6 +1253,7 @@ async fn handle_h3_connection(
     oid_mapping: Arc<HashMap<String, UserRole>>,
     cancel_token: CancellationToken,
     drain_timeout: Duration,
+    pki_base_oid: Option<Arc<[u64]>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let connection = connecting.await?;
     let peer_addr = connection.remote_address();
@@ -1248,7 +1265,7 @@ async fn handle_h3_connection(
                 .downcast_ref::<Vec<rustls_pki_types::CertificateDer<'static>>>()
                 .map(|v| v.as_slice())
         });
-        extract_client_metadata(client_certs)
+        extract_client_metadata_with_base(client_certs, pki_base_oid.as_deref())
     };
     let oids = client_meta.oids;
     let client_cert_pem = client_meta.pem;
@@ -1418,6 +1435,37 @@ pub async fn run_tunnel_with_timeout(
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
 ) -> Result<(), SrvError> {
+    let global_base: Option<Arc<[u64]>> = Config::try_global()
+        .and_then(|c| c.parsed_pki_base_oid.as_deref().map(Arc::from));
+    run_tunnel_with_timeout_and_base_oid(
+        tunnel,
+        tls_config,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        drain_timeout,
+        global_base,
+    )
+    .await
+}
+
+/// Like [`run_tunnel_with_timeout`], but accepts an explicit `pki_base_oid`
+/// instead of reading [`Config::try_global`].
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+pub async fn run_tunnel_with_timeout_and_base_oid(
+    tunnel: TunnelConfig,
+    tls_config: Arc<RustlsServerConfig>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    pki_base_oid: Option<Arc<[u64]>>,
+) -> Result<(), SrvError> {
     let connector = build_tunnel_tls_connector(&tunnel)?;
 
     let parsed_url = url::Url::parse(&tunnel.target_url)
@@ -1469,7 +1517,7 @@ pub async fn run_tunnel_with_timeout(
         }
     };
 
-    run_tunnel_over_stream_with_drain_timeout(
+    run_tunnel_over_stream_with_drain_timeout_and_base_oid(
         tls_stream,
         &tunnel,
         tls_config,
@@ -1479,6 +1527,7 @@ pub async fn run_tunnel_with_timeout(
         oid_mapping,
         connection_tracker,
         drain_timeout,
+        pki_base_oid,
     )
     .await?;
 

@@ -267,7 +267,8 @@ jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
 # otel_sample_ratio = 1.0  # Trace sampling ratio (0.0 to 1.0, default: 1.0)
 
-# The Base Object Identifier (OID) used for security validation.
+# The Base Object Identifier (OID) used for security validation (global fallback;
+# can also be overridden per [[Server]] block).
 # This acts as the root for interpreting client certificate extensions and JWT claims.
 # Private Enterprise Number (PEN)
 pki_base_oid = "1.3.6.1.4.1.65111"

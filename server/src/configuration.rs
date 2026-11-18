@@ -216,6 +216,13 @@ pub struct ServerConfig {
     #[serde(default)]
     pub oid_mapping: HashMap<String, UserRole>,
 
+    /// Optional per-server PKI Base Object Identifier (OID) overriding the global
+    /// `pki_base_oid` in `Config.toml` (e.g. `"1.3.6.1.4.1.65111"`).
+    ///
+    /// When omitted, the global [`Config::pki_base_oid`] is used as fallback.
+    #[serde(default)]
+    pub pki_base_oid: Option<String>,
+
     /// Server TLS certificate and key paths (required for HTTPS).
     pub server_certs: Option<ServerCertConfig>,
     /// Client CA certificates for mTLS verification.
@@ -291,6 +298,11 @@ pub struct ServerConfig {
     /// Cached X.509 certificate and CRL expiration metadata extracted in [`ServerConfig::finalize`].
     #[serde(skip)]
     pub pki_info: ServerPkiInfo,
+
+    /// Pre-parsed base OID components for this server (`server.pki_base_oid` or
+    /// fallback to [`Config::parsed_pki_base_oid`]).
+    #[serde(skip)]
+    pub parsed_pki_base_oid: Option<Vec<u64>>,
 }
 
 impl Default for ServerConfig {
@@ -324,6 +336,8 @@ impl Default for ServerConfig {
             certified_key: None,
             metrics: Arc::new(ServerMetrics::default()),
             pki_info: ServerPkiInfo::default(),
+            pki_base_oid: None,
+            parsed_pki_base_oid: None,
         }
     }
 }
@@ -1805,21 +1819,15 @@ impl Config {
         // We parse the dot-notation string (e.g. "1.2.840.113549") into u64 integers.
         // We use u64 to support UUID-based OIDs (arc 2.25).
         if let Some(ref oid_str) = config.pki_base_oid {
-            let parsed: Vec<u64> = oid_str
-                .split('.')
-                .map(|s| {
-                    s.parse::<u64>()
-                        .with_context(|| format!("Invalid OID component in config: '{}'", s))
-                })
-                .collect::<Result<Vec<u64>, Error>>()?;
-
-            // Store the optimized vector
-            config.parsed_pki_base_oid = Some(parsed);
+            config.parsed_pki_base_oid = Some(parse_pki_base_oid(oid_str)?);
         }
 
         // 4. Finalize individual server settings (e.g. compile regexes, load certs, validate layers)
         for server in config.servers.iter_mut() {
             server.finalize()?;
+            if server.parsed_pki_base_oid.is_none() {
+                server.parsed_pki_base_oid = config.parsed_pki_base_oid.clone();
+            }
         }
 
         Ok(Arc::new(config))
@@ -1865,6 +1873,27 @@ impl Config {
     }
 }
 
+/// Parses a dot-separated OID string (e.g. `"1.3.6.1.4.1.65111"`) into `u64` components.
+///
+/// Supports 64-bit arcs such as UUID-based OIDs (`2.25.<uuid-int>`).
+///
+/// # Errors
+///
+/// Returns an error if the string is empty or any dot-separated component is not a valid `u64`.
+pub fn parse_pki_base_oid(oid_str: &str) -> Result<Vec<u64>, Error> {
+    let trimmed = oid_str.trim();
+    if trimmed.is_empty() {
+        return Err(Error::msg("Invalid OID in config: must not be empty"));
+    }
+    trimmed
+        .split('.')
+        .map(|s| {
+            s.parse::<u64>()
+                .with_context(|| format!("Invalid OID component in config: '{}'", s))
+        })
+        .collect()
+}
+
 impl ServerConfig {
     /// Returns the configured graceful connection drain timeout.
     pub fn drain_timeout(&self) -> std::time::Duration {
@@ -1894,6 +1923,13 @@ impl ServerConfig {
         self.static_name = Some(Box::leak(self.name.clone().into_boxed_str()));
         let server_name = self.name.clone();
         self.metrics = ServerMetrics::for_server(&server_name);
+
+        if let Some(ref oid_str) = self.pki_base_oid {
+            self.parsed_pki_base_oid = Some(
+                parse_pki_base_oid(oid_str)
+                    .with_context(|| format!("{server_name}: invalid pki_base_oid"))?,
+            );
+        }
 
         let mut pki_info = ServerPkiInfo::default();
 
@@ -3547,6 +3583,59 @@ mod tests {
         assert!(cfg.enabled);
         assert!(cfg.finalize().is_ok());
         assert_eq!(cfg.static_name, Some("programmatic_test"));
+    }
+
+    #[test]
+    fn test_per_server_pki_base_oid_override_and_global_fallback() {
+        let dir = std::env::temp_dir().join(format!("praeco_oid_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cfg_path = dir.join("Config.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+pki_base_oid = "1.3.6.1.4.1.65111"
+
+[[Server]]
+name = "uses_global_fallback"
+ip = "127.0.0.1"
+port = 8080
+[Server.Layers]
+enabled = []
+
+[[Server]]
+name = "uses_server_override"
+ip = "127.0.0.1"
+port = 8081
+pki_base_oid = "2.25.42"
+[Server.Layers]
+enabled = []
+"#,
+        )
+        .expect("write Config.toml");
+
+        let loaded = Config::load(cfg_path.to_str().unwrap()).expect("load config");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            loaded.parsed_pki_base_oid.as_deref(),
+            Some(&[1, 3, 6, 1, 4, 1, 65111][..])
+        );
+        assert_eq!(
+            loaded.servers[0].parsed_pki_base_oid.as_deref(),
+            Some(&[1, 3, 6, 1, 4, 1, 65111][..])
+        );
+        assert_eq!(
+            loaded.servers[1].parsed_pki_base_oid.as_deref(),
+            Some(&[2, 25, 42][..])
+        );
+
+        let mut invalid = ServerConfig {
+            name: "invalid_oid".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8082),
+            pki_base_oid: Some("1.3.invalid.1".into()),
+            ..Default::default()
+        };
+        assert!(invalid.finalize().is_err());
     }
 }
 

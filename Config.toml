@@ -14,10 +14,6 @@ jaeger_endpoint = "http://localhost:4317"
 otel_log_level = "info"
 #otel_sample_ratio = 0.9
 
-# The Base Object Identifier (OID) used for security validation.
-# This acts as the root for interpreting client certificate extensions and JWT claims.
-# Private Enterprise Number (PEN)
-pki_base_oid = "1.3.6.1.4.1.65111"
 
 # Directory path for persistent log files.
 # If commented out or omitted, the application will only log to Standard Output (stdout).

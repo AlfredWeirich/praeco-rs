@@ -46,7 +46,7 @@ use crate::{
         compression::{SrvCompressionLayer, SrvDecompressionLayer},
         idp::IdpService,
     },
-    tls_conf::{extract_client_metadata, tls_config},
+    tls_conf::{extract_client_metadata_with_base, tls_config},
 };
 
 /// Wraps a `tower_http::services::ServeDir` (with or without fallback) into
@@ -768,12 +768,48 @@ pub async fn serve_tls_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let global_base = crate::configuration::Config::try_global()
+        .and_then(|c| c.parsed_pki_base_oid.clone());
+    serve_tls_connection_with_base_oid(
+        stream,
+        peer_addr,
+        acceptor,
+        dynamic_stack,
+        oid_mapping,
+        cancel_token,
+        server_name,
+        global_base.as_deref(),
+    )
+    .await
+}
+
+/// Like [`serve_tls_connection`], but uses an explicit `pki_base_oid` slice
+/// instead of reading [`Config::try_global`](crate::configuration::Config::try_global).
+///
+/// # Errors
+///
+/// Returns [`SrvError::Other`] if the TLS handshake fails or times out after 10 seconds.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls_connection_with_base_oid<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    acceptor: &tokio_rustls::TlsAcceptor,
+    dynamic_stack: &Arc<ArcSwap<BoxedCloneService>>,
+    oid_mapping: &Arc<HashMap<String, UserRole>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    pki_base_oid: Option<&[u64]>,
+) -> Result<(), SrvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let tls_result = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await;
 
     match tls_result {
         Ok(Ok(tls_stream)) => {
             let (_, session) = tls_stream.get_ref();
-            let client_meta = extract_client_metadata(session.peer_certificates());
+            let client_meta =
+                extract_client_metadata_with_base(session.peer_certificates(), pki_base_oid);
 
             let svc = (**dynamic_stack.load()).clone();
             let handler = ConnectionHandler::new(
@@ -847,6 +883,41 @@ where
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
 pub async fn run_tunnel_over_stream_with_drain_timeout<S>(
+    control_stream: S,
+    tunnel: &TunnelConfig,
+    tls_config: Arc<RustlsServerConfig>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+) -> Result<(), SrvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let global_base: Option<Arc<[u64]>> = crate::configuration::Config::try_global()
+        .and_then(|c| c.parsed_pki_base_oid.as_deref().map(Arc::from));
+    run_tunnel_over_stream_with_drain_timeout_and_base_oid(
+        control_stream,
+        tunnel,
+        tls_config,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        oid_mapping,
+        connection_tracker,
+        drain_timeout,
+        global_base,
+    )
+    .await
+}
+
+/// Like [`run_tunnel_over_stream_with_drain_timeout`], but accepts an explicit
+/// `pki_base_oid` instead of reading [`Config::try_global`](crate::configuration::Config::try_global).
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+pub async fn run_tunnel_over_stream_with_drain_timeout_and_base_oid<S>(
     mut control_stream: S,
     tunnel: &TunnelConfig,
     tls_config: Arc<RustlsServerConfig>,
@@ -856,6 +927,7 @@ pub async fn run_tunnel_over_stream_with_drain_timeout<S>(
     oid_mapping: Arc<HashMap<String, UserRole>>,
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
+    pki_base_oid: Option<Arc<[u64]>>,
 ) -> Result<(), SrvError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -928,6 +1000,7 @@ where
                         let oid_mapping = oid_mapping.clone();
                         let conn_token = stream_token.clone();
                         let span_sni = sni_domain.clone();
+                        let pki_base_oid = pki_base_oid.clone();
 
                         conn_tasks.spawn(async move {
                             let mut connection_guard = connection_guard;
@@ -954,7 +1027,7 @@ where
                                 return;
                             }
 
-                            let _ = serve_tls_connection(
+                            let _ = serve_tls_connection_with_base_oid(
                                 stream,
                                 peer_addr,
                                 &acceptor,
@@ -962,6 +1035,7 @@ where
                                 &oid_mapping,
                                 conn_token,
                                 server_name,
+                                pki_base_oid.as_deref(),
                             )
                             .await;
                         }.instrument(tracing::info_span!("tunneled_connection", server = %server_name, sni = %span_sni)));
