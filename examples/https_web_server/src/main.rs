@@ -3,127 +3,35 @@
 //! Demonstrates how an external Rust binary can embed `praeco-rs` with
 //! `default-features = false, features = ["web"]` and **without any `Config.toml`**:
 //!
-//! - Reusable routing, typed extractors ([`Query`], [`Path`], [`Json`], [`TraceId`]),
+//! - Reusable routing, typed extractors (`Query`, `Path`, `Json`, `TraceId`),
 //!   and automatic `Inspection` WAF allowlist generation come from `praeco_rs::web`.
 //! - App-specific server defaults and graceful shutdown live in [`bootstrap`].
-//! - This file only defines the application's endpoints and wires them together.
+//! - Endpoint handlers and DTOs live in [`endpoints`].
+//! - This file only wires routes together and starts the server.
 
 mod bootstrap;
+mod endpoints;
 
-use hyper::Request;
-use praeco_rs::{
-    SrvBody,
-    web::{Json, Path, Query, TraceId, WebRouter},
-};
-use serde::{Deserialize, Serialize};
-
-// ============================================================================
-//  Request / Response DTOs
-// ============================================================================
-
-#[derive(Serialize)]
-struct HealthPayload {
-    status: &'static str,
-    protocol_hint: &'static str,
-}
-
-#[derive(Serialize)]
-struct UserPayload {
-    id: String,
-    name: String,
-    trace_id: Option<String>,
-}
-
-/// Query parameters for `GET /greet?user_name=alice` (with optional `&age=17`).
-#[derive(Deserialize)]
-struct GreetQuery {
-    user_name: String,
-    age: Option<u8>,
-}
-
-#[derive(Serialize)]
-struct GreetPayload {
-    user_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    age: Option<u8>,
-    greeting: String,
-}
-
-#[derive(Serialize)]
-struct EchoPayload {
-    body: serde_json::Value,
-    trace_id: Option<String>,
-}
-
-// ============================================================================
-//  Endpoint Handlers
-// ============================================================================
-
-/// `GET /` — Welcome response showing HTTP version and Trace ID.
-async fn index(TraceId(trace_id): TraceId, req: Request<SrvBody>) -> String {
-    let version = req.version();
-    let trace = trace_id.as_deref().unwrap_or("<none>");
-    format!("Hallo von praeco-rs ({version:?}, x-trace-id={trace})!\n")
-}
-
-/// `GET /healthz` — Liveness probe returning JSON.
-async fn healthz() -> Json<HealthPayload> {
-    Json(HealthPayload {
-        status: "ok",
-        protocol_hint: "HTTP/1.1 + HTTP/2 + HTTP/3 (QUIC)",
-    })
-}
-
-/// `GET /users/{id}` — Demonstrates typed [`Path`] + [`TraceId`] extractors.
-async fn get_user(Path(id): Path<String>, TraceId(trace_id): TraceId) -> Json<UserPayload> {
-    Json(UserPayload {
-        name: format!("User {id}"),
-        id,
-        trace_id,
-    })
-}
-
-/// `GET /greet?user_name=alice[&age=17]` — Demonstrates [`Query`] extraction with
-/// struct destructuring so `user_name` and `age` are injected as typed variables.
-async fn greet(
-    Query(GreetQuery { user_name, age }): Query<GreetQuery>,
-) -> Json<GreetPayload> {
-    let greeting = match age {
-        Some(years) => format!("Hallo {user_name} ({years} Jahre)!"),
-        None => format!("Hallo {user_name}!"),
-    };
-    Json(GreetPayload {
-        user_name,
-        age,
-        greeting,
-    })
-}
-
-/// `POST /api/echo` — Demonstrates async [`Json`] body extraction + [`TraceId`].
-async fn echo_json(
-    TraceId(trace_id): TraceId,
-    Json(body): Json<serde_json::Value>,
-) -> Json<EchoPayload> {
-    Json(EchoPayload { body, trace_id })
-}
-
-// ============================================================================
-//  Router Wiring & Entrypoint
-// ============================================================================
+use praeco_rs::web::WebRouter;
 
 /// Builds the endpoint router (including single-source-of-truth WAF rules).
 fn build_app_router() -> anyhow::Result<WebRouter> {
     Ok(WebRouter::new()
-        .get("/", index)?
-        .get("/healthz", healthz)?
-        .get_with_waf("/users/{id}", "/users/*", "^/users/[A-Za-z0-9_-]+$", get_user)?
+        .get("/", endpoints::index)?
+        .get("/healthz", endpoints::healthz)?
+        .get_with_waf(
+            "/users/{id}",
+            "/users/*",
+            "^/users/[A-Za-z0-9_-]+$",
+            endpoints::get_user,
+        )?
         .get_with_waf(
             "/greet",
             "/greet",
             r"^/greet\?(?:user_name=[A-Za-z0-9_-]+(?:&age=[0-9]{1,3})?|age=[0-9]{1,3}&user_name=[A-Za-z0-9_-]+)$",
-            greet,
+            endpoints::greet,
         )?
-        .post("/api/echo", echo_json)?)
+        .post("/api/echo", endpoints::echo_json)?)
 }
 
 #[tokio::main]
@@ -136,8 +44,8 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use http_body_util::{BodyExt, Empty, Full};
-    use hyper::{Method, StatusCode};
-    use praeco_rs::{SrvError, build_rustls_config, build_service_stack_with_base};
+    use hyper::{Method, Request, StatusCode};
+    use praeco_rs::{SrvBody, SrvError, build_rustls_config, build_service_stack_with_base};
     use std::net::SocketAddr;
     use tower::ServiceExt;
 

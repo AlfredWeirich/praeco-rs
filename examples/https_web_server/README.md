@@ -4,7 +4,7 @@ Eigenständiges Beispiel-Crate, das `praeco-rs` mit `default-features = false, f
 
 - **Dual-Stack HTTPS:** HTTP/1.1 + HTTP/2 (TCP) und HTTP/3 (QUIC/UDP) auf Port `8443` (konfigurierbar via `PORT`).
 - **Universeller Router & Extractors (`praeco_rs::web`):** Endpunkte sind schlanke `async fn`s mit typisierten Extractors (`Query<T>`, `Path<T>`, `Json<T>`, `TraceId`), `IntoResponse` und automatischer `AllowedPathes`-Ableitung für die WAF.
-- **Saubere Trennung:** `src/main.rs` enthält nur noch die Endpunkte & Routen; Server-Konfiguration und Shutdown liegen in `src/bootstrap.rs`.
+- **Saubere Trennung:** `src/main.rs` verdrahtet nur noch die Routen und startet den Server; Endpunkte & DTOs liegen in `src/endpoints.rs`, Server-Konfiguration und Shutdown in `src/bootstrap.rs`.
 - **Sicherheitslayer:** `TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter` (`127.0.0.1/32`, `::1/128`), `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression` und `Inspection` (`AllowedPathes`).
 
 ## Starten
