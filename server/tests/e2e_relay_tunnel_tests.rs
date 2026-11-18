@@ -56,12 +56,13 @@ fn parse_server_config(toml_str: &str) -> Arc<ServerConfig> {
     Arc::new(config.servers.into_iter().next().expect("at least one [[Server]]"))
 }
 
-fn build_external_client_tls_connector(alpn: Vec<Vec<u8>>) -> tokio_rustls::TlsConnector {
+fn build_external_client_tls_connector(
+    pki: &common::test_pki::TestPki,
+    alpn: Vec<Vec<u8>>,
+) -> tokio_rustls::TlsConnector {
     ensure_crypto_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem")
-        .expect("read public_ca.pem")
-    {
+    for cert in CertificateDer::pem_file_iter(&pki.public_ca_pem).expect("read public_ca.pem") {
         root_store
             .add(cert.expect("parse public_ca.pem"))
             .expect("add public_ca.pem");
@@ -88,9 +89,11 @@ fn build_external_client_tls_connector(alpn: Vec<Vec<u8>>) -> tokio_rustls::TlsC
 #[tokio::test]
 async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
     ensure_crypto_provider();
+    let pki = common::test_pki::TestPki::new();
 
     // ── 1. Configure & Prepare Praeco Gateway (`praeco-rs`) ──────────────────
-    let praeco_toml = r#"
+    let praeco_toml = format!(
+        r#"
         [[Server]]
         name = "E2ETunneledPraecoGateway"
         protocol = "https"
@@ -100,15 +103,15 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
         [Server.tunnel]
         target_url = "tls://localhost:7001"
         sni_domain = "wurzelwerk.api.aweirich.eu"
-        ca_cert_path = "../server_certs/self_signed/relay_ca.pem"
-        client_cert_path = "../server_certs/self_signed/praeco_client.pem"
-        client_key_path = "../server_certs/self_signed/praeco_client.key"
+        ca_cert_path = "{relay_ca}"
+        client_cert_path = "{client_cert}"
+        client_key_path = "{client_key}"
         proxy_protocol = true
         max_yamux_streams = 256
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{pub_cert}"
+        ssl_certificate_key = "{pub_key}"
 
         [Server.AllowedPathes.GET]
         "/name" = ["^/name(\\?.*)?$"]
@@ -133,9 +136,15 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
         allow_cidrs = ["198.51.100.0/24"]
         deny_cidrs = ["198.51.100.99/32"]
         trust_forwarded_headers = false
-    "#;
+    "#,
+        relay_ca = pki.relay_ca_pem.display(),
+        client_cert = pki.praeco_client_pem.display(),
+        client_key = pki.praeco_client_key.display(),
+        pub_cert = pki.praeco_public_pem.display(),
+        pub_key = pki.praeco_public_key.display(),
+    );
 
-    let server_config = parse_server_config(praeco_toml);
+    let server_config = parse_server_config(&praeco_toml);
     let tunnel_cfg: TunnelConfig = server_config
         .tunnel
         .clone()
@@ -151,9 +160,9 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
     // ── 2. Configure & Prepare Relay Server (`praeco-relay-server`) ──────────
     let session_map = new_session_map();
     let relay_mtls_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
+        common::test_pki::TestPki::s(&pki.relay_ca_pem),
+        common::test_pki::TestPki::s(&pki.relay_server_pem),
+        common::test_pki::TestPki::s(&pki.relay_server_key),
         None,
     )
     .expect("setup Relay Control Plane mTLS acceptor");
@@ -240,7 +249,7 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
         });
 
         // External client performs end-to-end TLS 1.3 handshake with ALPN `h2`
-        let ext_connector = build_external_client_tls_connector(vec![b"h2".to_vec()]);
+        let ext_connector = build_external_client_tls_connector(&pki, vec![b"h2".to_vec()]);
         let target_sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
         let ext_tls = ext_connector
             .connect(target_sni, ext_client_io)
@@ -308,7 +317,7 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
             .await;
         });
 
-        let ext_connector = build_external_client_tls_connector(vec![b"http/1.1".to_vec()]);
+        let ext_connector = build_external_client_tls_connector(&pki, vec![b"http/1.1".to_vec()]);
         let target_sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
         let ext_tls = ext_connector
             .connect(target_sni, ext_client_io)
@@ -358,7 +367,7 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
             .await;
         });
 
-        let ext_connector = build_external_client_tls_connector(vec![b"http/1.1".to_vec()]);
+        let ext_connector = build_external_client_tls_connector(&pki, vec![b"http/1.1".to_vec()]);
         let unregistered_sni =
             ServerName::try_from("wurzelwerk.admin.aweirich.eu".to_string()).unwrap();
         let res = ext_connector.connect(unregistered_sni, ext_client_io).await;
@@ -391,7 +400,9 @@ async fn test_e2e_praeco_gateway_and_relay_server_full_tunnel_pipeline() {
 async fn test_e2e_per_ip_connection_limit_via_proxy_v2_and_session_failover() {
     ensure_crypto_provider();
 
-    let praeco_toml = r#"
+    let pki = common::test_pki::TestPki::new();
+    let praeco_toml = format!(
+        r#"
         [[Server]]
         name = "E2EAuthTunnelGateway"
         protocol = "https"
@@ -401,24 +412,30 @@ async fn test_e2e_per_ip_connection_limit_via_proxy_v2_and_session_failover() {
         [Server.tunnel]
         target_url = "tls://localhost:7001"
         sni_domain = "wurzelwerk.api.aweirich.eu"
-        ca_cert_path = "../server_certs/self_signed/relay_ca.pem"
-        client_cert_path = "../server_certs/self_signed/praeco_client.pem"
-        client_key_path = "../server_certs/self_signed/praeco_client.key"
+        ca_cert_path = "{relay_ca}"
+        client_cert_path = "{client_cert}"
+        client_key_path = "{client_key}"
         proxy_protocol = true
         max_yamux_streams = 128
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{pub_cert}"
+        ssl_certificate_key = "{pub_key}"
 
         [Server.AllowedPathes.GET]
         "/health" = ["^/health$"]
 
         [Server.Layers]
         enabled = ["TraceId"]
-    "#;
+    "#,
+        relay_ca = pki.relay_ca_pem.display(),
+        client_cert = pki.praeco_client_pem.display(),
+        client_key = pki.praeco_client_key.display(),
+        pub_cert = pki.praeco_public_pem.display(),
+        pub_key = pki.praeco_public_key.display(),
+    );
 
-    let server_config = parse_server_config(praeco_toml);
+    let server_config = parse_server_config(&praeco_toml);
     let tunnel_cfg: TunnelConfig = server_config.tunnel.clone().unwrap();
     let praeco_public_tls = Arc::new(build_rustls_config(&server_config).unwrap());
     let stack = build_service_stack(&server_config).unwrap();
@@ -431,9 +448,9 @@ async fn test_e2e_per_ip_connection_limit_via_proxy_v2_and_session_failover() {
 
     let session_map = new_session_map();
     let relay_mtls_acceptor = setup_mtls_acceptor(
-        "../server_certs/self_signed/relay_ca.pem",
-        "../server_certs/self_signed/relay_server.pem",
-        "../server_certs/self_signed/relay_server.key",
+        common::test_pki::TestPki::s(&pki.relay_ca_pem),
+        common::test_pki::TestPki::s(&pki.relay_server_pem),
+        common::test_pki::TestPki::s(&pki.relay_server_key),
         None,
     )
     .unwrap();
@@ -514,7 +531,7 @@ async fn test_e2e_per_ip_connection_limit_via_proxy_v2_and_session_failover() {
         .await;
     });
 
-    let ext_connector = build_external_client_tls_connector(vec![b"h2".to_vec()]);
+    let ext_connector = build_external_client_tls_connector(&pki, vec![b"h2".to_vec()]);
     let c1_tls = ext_connector
         .connect(
             ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap(),

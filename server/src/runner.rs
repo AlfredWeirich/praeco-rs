@@ -1639,7 +1639,11 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = occupied.local_addr().unwrap();
 
-        let mut cfg: Config = toml::from_str(
+        let pki = common::test_pki::TestPki::new();
+        let cert_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+        let cert_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
+
+        let mut cfg: Config = toml::from_str(&format!(
             r#"
             [[Server]]
             name = "dual_conflict"
@@ -1650,13 +1654,13 @@ mod tests {
             enabled = true
 
             [Server.server_certs]
-            ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-            ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+            ssl_certificate = "{cert_pem}"
+            ssl_certificate_key = "{cert_key}"
 
             [Server.Layers]
             enabled = []
         "#,
-        )
+        ))
         .expect("valid TOML");
         cfg.servers[0].finalize().unwrap();
 
@@ -1684,7 +1688,13 @@ mod tests {
     #[tokio::test]
     async fn test_run_tunnel_invalid_url_and_unreachable_relay_return_srv_error() {
         ensure_crypto_provider();
-        let mut cfg: Config = toml::from_str(
+        let pki = common::test_pki::TestPki::new();
+        let pub_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+        let pub_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
+        let cli_pem = common::test_pki::TestPki::s(&pki.praeco_client_pem);
+        let cli_key = common::test_pki::TestPki::s(&pki.praeco_client_key);
+        let ca_pem = common::test_pki::TestPki::s(&pki.public_ca_pem);
+        let mut cfg: Config = toml::from_str(&format!(
             r#"
             [[Server]]
             name = "tunnel_err"
@@ -1693,20 +1703,20 @@ mod tests {
             enabled = true
 
             [Server.server_certs]
-            ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-            ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+            ssl_certificate = "{pub_pem}"
+            ssl_certificate_key = "{pub_key}"
 
             [Server.tunnel]
             target_url = "not a valid url"
             sni_domain = "wurzelwerk.api.aweirich.eu"
-            client_cert_path = "../server_certs/self_signed/praeco_client.pem"
-            client_key_path = "../server_certs/self_signed/praeco_client.key"
-            ca_cert_path = "../server_certs/self_signed/public_ca.pem"
+            client_cert_path = "{cli_pem}"
+            client_key_path = "{cli_key}"
+            ca_cert_path = "{ca_pem}"
 
             [Server.Layers]
             enabled = []
         "#,
-        )
+        ))
         .expect("valid TOML");
         cfg.servers[0].finalize().unwrap();
 
@@ -1791,7 +1801,13 @@ mod tests {
     }
 
     /// Builds a finalized HTTPS Echo server config bound to `127.0.0.1:{port}`.
-    fn echo_https_server(name: &str, port: u16) -> Arc<ServerConfig> {
+    fn echo_https_server(
+        pki: &common::test_pki::TestPki,
+        name: &str,
+        port: u16,
+    ) -> Arc<ServerConfig> {
+        let cert_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+        let cert_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
         let mut cfg: Config = toml::from_str(&format!(
             r#"
             [[Server]]
@@ -1803,8 +1819,8 @@ mod tests {
             enabled = true
 
             [Server.server_certs]
-            ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-            ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+            ssl_certificate = "{cert_pem}"
+            ssl_certificate_key = "{cert_key}"
 
             [Server.Layers]
             enabled = []
@@ -1832,11 +1848,12 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_dual_stack_partial_bind_failure_leaks_no_listener() {
         ensure_crypto_provider();
+        let pki = common::test_pki::TestPki::new();
         let addr = reserve_dual_stack_addr().await;
         // Occupy only the UDP side: the TCP bind succeeds first, the QUIC bind then fails.
         let _udp_blocker = std::net::UdpSocket::bind(addr).unwrap();
 
-        let srv = echo_https_server("dual_partial", addr.port());
+        let srv = echo_https_server(&pki, "dual_partial", addr.port());
         let tls_cfg = build_rustls_config(&srv).unwrap();
         let stack = Arc::new(ArcSwap::from_pointee(
             EchoService::new("dual_partial").boxed_clone_sync(),
@@ -1865,8 +1882,9 @@ mod tests {
     #[tokio::test]
     async fn test_start_single_server_https_returns_only_after_sockets_released() {
         ensure_crypto_provider();
+        let pki = common::test_pki::TestPki::new();
         let addr = reserve_dual_stack_addr().await;
-        let srv = echo_https_server("graceful_https", addr.port());
+        let srv = echo_https_server(&pki, "graceful_https", addr.port());
         let stack = Arc::new(ArcSwap::from_pointee(
             EchoService::new("graceful_https").boxed_clone_sync(),
         ));

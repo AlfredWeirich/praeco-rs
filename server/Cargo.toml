@@ -104,6 +104,7 @@ uuid = { workspace = true }
 smallvec = { workspace = true }
 
 [dev-dependencies]
+common = { workspace = true, features = ["test-pki"] }
 opentelemetry_sdk = { workspace = true }
 praeco-relay-server = { path = "../relay-server" }
 tracing-subscriber = { workspace = true }

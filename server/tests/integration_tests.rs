@@ -45,13 +45,14 @@ fn parse_server_config(toml_str: &str) -> Arc<ServerConfig> {
     Arc::new(config.servers.into_iter().next().expect("at least one [[Server]]"))
 }
 
-/// Helper to build a TLS client connector trusting `../server_certs/self_signed/public_ca.pem`.
-fn build_public_tls_connector(alpn_protocols: Vec<Vec<u8>>) -> tokio_rustls::TlsConnector {
+/// Helper to build a TLS client connector trusting the ephemeral `TestPki`'s `public_ca.pem`.
+fn build_public_tls_connector(
+    pki: &common::test_pki::TestPki,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> tokio_rustls::TlsConnector {
     ensure_crypto_provider();
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem")
-        .expect("read public_ca.pem")
-    {
+    for cert in CertificateDer::pem_file_iter(&pki.public_ca_pem).expect("read public_ca.pem") {
         root_store
             .add(cert.expect("parse public_ca.pem"))
             .expect("add public_ca.pem");
@@ -509,7 +510,9 @@ async fn test_rate_limiter_and_ip_filter_integration() {
 /// - Zero-downtime hot-reload via `ArcSwap<BoxedCloneService>`.
 #[tokio::test]
 async fn test_tls_http2_multiplexing_and_arcswap_hot_reload() {
-    let echo_toml = r#"
+    let pki = common::test_pki::TestPki::new();
+    let echo_toml = format!(
+        r#"
         [[Server]]
         name = "IntegrationTlsH2Server"
         ip = "127.0.0.1"
@@ -519,17 +522,20 @@ async fn test_tls_http2_multiplexing_and_arcswap_hot_reload() {
         authentication = "None"
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{pub_cert}"
+        ssl_certificate_key = "{pub_key}"
 
         [Server.AllowedPathes.GET]
         "/*" = ["^/.*$"]
 
         [Server.Layers]
         enabled = ["TraceId", "Inspection"]
-    "#;
+    "#,
+        pub_cert = pki.praeco_public_pem.display(),
+        pub_key = pki.praeco_public_key.display(),
+    );
 
-    let echo_config = parse_server_config(echo_toml);
+    let echo_config = parse_server_config(&echo_toml);
     let rustls_cfg = Arc::new(build_rustls_config(&echo_config).expect("build_rustls_config"));
     let acceptor = tokio_rustls::TlsAcceptor::from(rustls_cfg);
 
@@ -561,7 +567,7 @@ async fn test_tls_http2_multiplexing_and_arcswap_hot_reload() {
         .expect("serve_tls_connection");
     });
 
-    let connector = build_public_tls_connector(vec![b"h2".to_vec()]);
+    let connector = build_public_tls_connector(&pki, vec![b"h2".to_vec()]);
     let sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
     let tls_client = connector
         .connect(sni, client_io)
@@ -622,7 +628,7 @@ async fn test_tls_http2_multiplexing_and_arcswap_hot_reload() {
         .expect("serve_tls_connection after hot-reload");
     });
 
-    let connector1 = build_public_tls_connector(vec![b"http/1.1".to_vec()]);
+    let connector1 = build_public_tls_connector(&pki, vec![b"http/1.1".to_vec()]);
     let sni2 = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
     let tls_client2 = connector1.connect(sni2, client_io2).await.unwrap();
     let (mut sender2, conn2) = hyper::client::conn::http1::handshake(TokioIo::new(tls_client2))
@@ -658,7 +664,9 @@ async fn test_tls_http2_multiplexing_and_arcswap_hot_reload() {
 async fn test_run_tunnel_over_stream_with_proxy_protocol_v2() {
     use tokio::io::AsyncBufReadExt;
 
-    let toml_cfg = r#"
+    let pki = common::test_pki::TestPki::new();
+    let toml_cfg = format!(
+        r#"
         [[Server]]
         name = "IntegrationTunneledServer"
         ip = "127.0.0.1"
@@ -668,8 +676,8 @@ async fn test_run_tunnel_over_stream_with_proxy_protocol_v2() {
         authentication = "None"
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{pub_cert}"
+        ssl_certificate_key = "{pub_key}"
 
         [Server.AllowedPathes.GET]
         "/*" = ["^/.*$"]
@@ -681,9 +689,12 @@ async fn test_run_tunnel_over_stream_with_proxy_protocol_v2() {
         allow_cidrs = ["203.0.113.0/24"]
         deny_cidrs = []
         trust_forwarded_headers = false
-    "#;
+    "#,
+        pub_cert = pki.praeco_public_pem.display(),
+        pub_key = pki.praeco_public_key.display(),
+    );
 
-    let server_config = parse_server_config(toml_cfg);
+    let server_config = parse_server_config(&toml_cfg);
     let rustls_cfg = Arc::new(build_rustls_config(&server_config).expect("build_rustls_config"));
     let stack = build_service_stack(&server_config).expect("build_service_stack");
     let dynamic_stack = Arc::new(ArcSwap::from_pointee(stack));
@@ -694,9 +705,9 @@ async fn test_run_tunnel_over_stream_with_proxy_protocol_v2() {
     let tunnel_cfg = TunnelConfig {
         target_url: "tls://localhost:7001".to_string(),
         sni_domain: "wurzelwerk.api.aweirich.eu".to_string(),
-        ca_cert_path: "../server_certs/self_signed/relay_ca.pem".to_string(),
-        client_cert_path: "../server_certs/self_signed/praeco_client.pem".to_string(),
-        client_key_path: "../server_certs/self_signed/praeco_client.key".to_string(),
+        ca_cert_path: pki.relay_ca_pem.to_string_lossy().to_string(),
+        client_cert_path: pki.praeco_client_pem.to_string_lossy().to_string(),
+        client_key_path: pki.praeco_client_key.to_string_lossy().to_string(),
         proxy_protocol: true,
         max_yamux_streams: Some(256),
     };
@@ -753,7 +764,7 @@ async fn test_run_tunnel_over_stream_with_proxy_protocol_v2() {
         .expect("write PROXY v2 header");
 
     // Perform end-to-end TLS handshake over the Yamux stream
-    let connector = build_public_tls_connector(vec![b"http/1.1".to_vec()]);
+    let connector = build_public_tls_connector(&pki, vec![b"http/1.1".to_vec()]);
     let sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
     let tls_stream = connector
         .connect(sni, compat_stream)
@@ -809,6 +820,7 @@ async fn test_mtls_client_cert_and_static_files_integration() {
     std::fs::write(tmp_dir.join("index.html"), b"<html>SPA Index</html>").unwrap();
     std::fs::write(tmp_dir.join("hello.txt"), b"Hello Static Asset").unwrap();
 
+    let pki = common::test_pki::TestPki::new();
     let toml_cfg = format!(
         r#"
         [[Server]]
@@ -820,14 +832,14 @@ async fn test_mtls_client_cert_and_static_files_integration() {
         authentication = "ClientCert"
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{pub_cert}"
+        ssl_certificate_key = "{pub_key}"
 
         [[Server.client_certs]]
-        ssl_client_ca = "../server_certs/self_signed/relay_ca.pem"
+        ssl_client_ca = "{relay_ca}"
 
         [Server.StaticFilesParams]
-        root = "{}"
+        root = "{root}"
         fallback_to_index = true
 
         [Server.AllowedPathes.GET]
@@ -836,7 +848,10 @@ async fn test_mtls_client_cert_and_static_files_integration() {
         [Server.Layers]
         enabled = ["TraceId", "Inspection"]
     "#,
-        tmp_dir.display()
+        pub_cert = pki.praeco_public_pem.display(),
+        pub_key = pki.praeco_public_key.display(),
+        relay_ca = pki.relay_ca_pem.display(),
+        root = tmp_dir.display()
     );
 
     let server_config = parse_server_config(&toml_cfg);
@@ -869,7 +884,7 @@ async fn test_mtls_client_cert_and_static_files_integration() {
             .await
         });
 
-        let no_cert_connector = build_public_tls_connector(vec![b"http/1.1".to_vec()]);
+        let no_cert_connector = build_public_tls_connector(&pki, vec![b"http/1.1".to_vec()]);
         let sni = ServerName::try_from("wurzelwerk.api.aweirich.eu".to_string()).unwrap();
         if let Ok(mut tls_stream) = no_cert_connector.connect(sni, client_io).await {
             // In TLS 1.3, client cert rejection is surfaced on the first read/write after ClientHello
@@ -912,18 +927,15 @@ async fn test_mtls_client_cert_and_static_files_integration() {
 
         // Build mTLS client config presenting `praeco_client.pem`
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem")
-            .unwrap()
-        {
+        for cert in CertificateDer::pem_file_iter(&pki.public_ca_pem).unwrap() {
             root_store.add(cert.unwrap()).unwrap();
         }
         let client_certs: Vec<CertificateDer<'static>> =
-            CertificateDer::pem_file_iter("../server_certs/self_signed/praeco_client.pem")
+            CertificateDer::pem_file_iter(&pki.praeco_client_pem)
                 .unwrap()
                 .map(|c| c.unwrap())
                 .collect();
-        let client_key =
-            PrivateKeyDer::from_pem_file("../server_certs/self_signed/praeco_client.key").unwrap();
+        let client_key = PrivateKeyDer::from_pem_file(&pki.praeco_client_key).unwrap();
 
         let mut mtls_client_cfg = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -1075,6 +1087,9 @@ async fn test_run_servers_http_listener_and_graceful_shutdown() {
 /// serves both TLS 1.3 HTTP/2 requests and QUIC HTTP/3 requests through `ConnectionHandler`.
 #[tokio::test]
 async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
+    let pki = common::test_pki::TestPki::new();
+    let cert_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+    let cert_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
     let port = reserve_free_dual_stack_port().await;
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
@@ -1090,8 +1105,8 @@ async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
         enabled = true
 
         [Server.server_certs]
-        ssl_certificate = "../server_certs/self_signed/praeco_public.pem"
-        ssl_certificate_key = "../server_certs/self_signed/praeco_public.key"
+        ssl_certificate = "{cert_pem}"
+        ssl_certificate_key = "{cert_key}"
 
         [Server.AllowedPathes.GET]
         "/*" = ["^/.*$"]
@@ -1129,7 +1144,7 @@ async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
     .expect("run_dual_stack must bind TCP and UDP");
 
     // --- Part A: TCP + TLS 1.3 + HTTP/2 ---
-    let connector = build_public_tls_connector(vec![b"h2".to_vec()]);
+    let connector = build_public_tls_connector(&pki, vec![b"h2".to_vec()]);
     let tcp_stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("TCP connect to dual-stack");
@@ -1161,9 +1176,7 @@ async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
 
     // --- Part B: UDP + QUIC + HTTP/3 ---
     let mut root_store = rustls::RootCertStore::empty();
-    for cert in
-        CertificateDer::pem_file_iter("../server_certs/self_signed/public_ca.pem").unwrap()
-    {
+    for cert in CertificateDer::pem_file_iter(&pki.public_ca_pem).unwrap() {
         root_store.add(cert.unwrap()).unwrap();
     }
     let mut quic_client_tls = rustls::ClientConfig::builder()

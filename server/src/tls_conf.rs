@@ -490,4 +490,25 @@ mod tests {
         assert!(pem.contains("bGVhZl9jZXJ0aWZpY2F0ZV9kdW1teV9wYXlsb2Fk"));
         assert!(!pem.contains("aW5qZWN0ZWRfaW50ZXJtZWRpYXRl"));
     }
+
+    #[test]
+    fn test_extract_oids_with_base_cert() {
+        let pki = common::test_pki::TestPki::new();
+        let certs = common::load_certs(
+            common::test_pki::TestPki::s(&pki.praeco_client_pem),
+            "test_oid",
+        )
+        .expect("load generated client cert");
+        let leaf_der = certs.first().unwrap().as_ref();
+
+        let matched = extract_oids_from_cert_with_base(leaf_der, Some(&[1, 3, 6, 1, 4, 1, 65111]));
+        assert_eq!(matched, vec!["1"]);
+
+        let non_matching =
+            extract_oids_from_cert_with_base(leaf_der, Some(&[1, 3, 6, 1, 4, 1, 99999]));
+        assert!(non_matching.is_empty());
+
+        assert!(extract_oids_from_cert_with_base(leaf_der, None).is_empty());
+        assert!(extract_oids_from_cert_with_base(leaf_der, Some(&[])).is_empty());
+    }
 }
