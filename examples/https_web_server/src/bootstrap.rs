@@ -39,7 +39,8 @@ fn resolve_workspace_path(env_key: &str, relative_from_root: &str) -> String {
 }
 
 /// Builds a hardened HTTPS + HTTP/3 [`ServerConfig`] purely in Rust, deriving the
-/// `Inspection` WAF allowlist directly from `allowed_pathes`.
+/// `Inspection` WAF allowlist directly from `allowed_pathes` and loading certificates
+/// from `PRAECO_TLS_CERT`/`PRAECO_TLS_KEY` or the default workspace paths.
 pub fn build_server_config(
     port: u16,
     allowed_pathes: AllowedPathes,
@@ -52,6 +53,17 @@ pub fn build_server_config(
         "PRAECO_TLS_KEY",
         "server_certs/self_signed/praeco_public.key",
     );
+    build_server_config_with_certs(port, allowed_pathes, cert_path, key_path)
+}
+
+/// Builds a hardened HTTPS + HTTP/3 [`ServerConfig`] with explicit TLS certificate
+/// and private-key paths.
+pub fn build_server_config_with_certs(
+    port: u16,
+    allowed_pathes: AllowedPathes,
+    cert_path: String,
+    key_path: String,
+) -> anyhow::Result<Arc<ServerConfig>> {
 
     let mut cfg = ServerConfig {
         name: "https_web_example".into(),
