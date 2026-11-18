@@ -2626,10 +2626,22 @@ pub struct CompiledRbac {
 }
 
 impl CompiledRbac {
+    /// Normalizes a path for exact RBAC matching by stripping trailing slashes
+    /// (preserving `"/"`).
+    #[inline]
+    fn normalize_exact_key(path: &str) -> &str {
+        if path.len() > 1 {
+            let trimmed = path.trim_end_matches('/');
+            if trimmed.is_empty() { "/" } else { trimmed }
+        } else {
+            path
+        }
+    }
+
     /// Compiles raw string patterns from the `[Server.rbac]` table.
     ///
     /// Keys ending with `*` are treated as prefix matches (e.g. `"/api/Admin*"` or `"/api/admin/*"`).
-    /// Other keys are treated as exact path matches.
+    /// Other keys are treated as exact path matches (normalized without trailing slashes).
     pub fn from_raw(raw: &HashMap<String, Vec<UserRole>>) -> Self {
         let mut exact = HashMap::new();
         let mut prefix = Vec::new();
@@ -2639,7 +2651,8 @@ impl CompiledRbac {
                 let pfx = &pattern[..pattern.len() - 1];
                 prefix.push((pfx.to_string(), roles.clone()));
             } else {
-                exact.insert(pattern.clone(), roles.clone());
+                let normalized = Self::normalize_exact_key(pattern).to_string();
+                exact.insert(normalized, roles.clone());
             }
         }
 
@@ -2651,10 +2664,12 @@ impl CompiledRbac {
 
     /// Matches a request path against exact and prefix RBAC rules.
     ///
-    /// Exact matches take precedence over prefix matches.
+    /// Exact matches take precedence over prefix matches. Trailing slashes on
+    /// exact paths are normalized (so `/api/Admin/` matches `/api/Admin`).
     /// Returns `Some(&[UserRole])` if a rule matched, or `None` if no rule matched.
     pub fn match_path<'a>(&'a self, path: &str) -> Option<&'a [UserRole]> {
-        if let Some(roles) = self.exact.get(path) {
+        let exact_key = Self::normalize_exact_key(path);
+        if let Some(roles) = self.exact.get(exact_key) {
             return Some(roles.as_slice());
         }
         for (pfx, roles) in &self.prefix {

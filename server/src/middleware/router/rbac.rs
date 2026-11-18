@@ -50,6 +50,14 @@ pub fn enforce_rbac(
     server_name: &str,
 ) -> Result<(), Box<Response<ServiceRespBody>>> {
     let path = parts.uri.path();
+    if path.contains(';') || path.to_ascii_lowercase().contains("%3b") {
+        crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
+        warn!(
+            "{}: Forbidden: matrix parameter ';' is not permitted in RBAC path '{}'",
+            server_name, path
+        );
+        return Err(Box::new(build_error_response("Forbidden", StatusCode::FORBIDDEN)));
+    }
     let user_roles = extract_user_roles(parts);
 
     // 1. Path-specific granular RBAC (Option B)
@@ -301,6 +309,30 @@ mod tests {
         let mut req3 = Request::builder().uri("/api/test").body(()).unwrap();
         req3.extensions_mut().insert(Arc::new(vec![UserRole("Admin".to_string())]));
         assert!(enforce_rbac(&req3.into_parts().0, &route, None, "test_srv").is_ok());
+    }
+
+    #[test]
+    fn test_path_rbac_blocks_trailing_slash_and_semicolon_bypass() {
+        // Route itself is unrestricted, relying on exact RBAC rule for /api/Admin
+        let route = create_test_route(vec![]);
+        let mut raw_rbac = HashMap::new();
+        raw_rbac.insert("/api/Admin".to_string(), vec![UserRole("Admin".to_string())]);
+        let compiled = CompiledRbac::from_raw(&raw_rbac);
+
+        // Trailing slash must still hit /api/Admin exact rule (not fall back to unrestricted)
+        let guest_slash = create_request("/api/Admin/", Some(vec!["Guest"]));
+        let res = enforce_rbac(&guest_slash, &route, Some(&compiled), "test_srv");
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().status(), StatusCode::FORBIDDEN);
+
+        let admin_slash = create_request("/api/Admin/", Some(vec!["Admin"]));
+        assert!(enforce_rbac(&admin_slash, &route, Some(&compiled), "test_srv").is_ok());
+
+        // Semicolon matrix parameter must be rejected even for Admin
+        let admin_semi = create_request("/api/Admin;v=1", Some(vec!["Admin"]));
+        let res = enforce_rbac(&admin_semi, &route, Some(&compiled), "test_srv");
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().status(), StatusCode::FORBIDDEN);
     }
 }
 

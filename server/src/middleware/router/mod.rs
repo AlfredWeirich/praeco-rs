@@ -358,13 +358,20 @@ impl Service<Request<SrvBody>> for RouterService {
                 || content_length_exceeds_retry_buf)
                 && !is_buffered_only;
 
+            let request_timeout = self_clone
+                .config
+                .router_params
+                .as_ref()
+                .and_then(|p| (p.request_timeout_seconds > 0).then(|| std::time::Duration::from_secs(p.request_timeout_seconds)));
+            let buffer_timeout = request_timeout.unwrap_or(std::time::Duration::from_secs(10));
+
             let request_body = if can_stream {
                 RequestBody::Stream(body)
             } else if is_buffered_only {
                 let limited = http_body_util::Limited::new(body, route_info.max_request_bytes);
-                match limited.collect().await {
-                    Ok(c) => RequestBody::Buffered(c.to_bytes()),
-                    Err(e) => {
+                match tokio::time::timeout(buffer_timeout, limited.collect()).await {
+                    Ok(Ok(c)) => RequestBody::Buffered(c.to_bytes()),
+                    Ok(Err(e)) => {
                         let err_str = e.to_string();
                         if e.downcast_ref::<http_body_util::LengthLimitError>().is_some()
                             || err_str.contains("length limit exceeded")
@@ -392,18 +399,40 @@ impl Service<Request<SrvBody>> for RouterService {
                         error!("{}: Failed to read request body: {}", server_name, e);
                         return Ok(build_error_response("Bad Request", StatusCode::BAD_REQUEST));
                     }
+                    Err(_) => {
+                        tracing::warn!(
+                            "{}: Request body buffering timed out after {:?}",
+                            server_name,
+                            buffer_timeout
+                        );
+                        return Ok(build_error_response(
+                            "Request Timeout",
+                            StatusCode::REQUEST_TIMEOUT,
+                        ));
+                    }
                 }
             } else {
-                // Bounded retry buffering: buffers up to max_retry_buffer_bytes (default 64 KiB)
-                // and seamlessly spills over into streaming mode for larger uploads.
-                match circuit_breaker::buffer_body_up_to(
-                    body,
-                    route_info.target.max_retry_buffer_bytes,
-                )
-                .await
-                {
-                    Ok(req_body) => req_body,
-                    Err(e) => {
+                // Bounded retry buffering: for gRPC passthrough, stop after the first
+                // complete frame unless EOF is already present (so bidi/client streams
+                // start immediately without waiting for EOF).
+                let buffer_fut = async {
+                    if is_passthrough {
+                        circuit_breaker::buffer_grpc_first_frame_or_stream(
+                            body,
+                            route_info.target.max_retry_buffer_bytes,
+                        )
+                        .await
+                    } else {
+                        circuit_breaker::buffer_body_up_to(
+                            body,
+                            route_info.target.max_retry_buffer_bytes,
+                        )
+                        .await
+                    }
+                };
+                match tokio::time::timeout(buffer_timeout, buffer_fut).await {
+                    Ok(Ok(req_body)) => req_body,
+                    Ok(Err(e)) => {
                         let err_str = e.to_string();
                         if matches!(e, SrvError::PayloadTooLarge { .. })
                             || err_str.contains("Payload Limit Exceeded")
@@ -419,14 +448,19 @@ impl Service<Request<SrvBody>> for RouterService {
                         error!("{}: Failed to read request body: {}", server_name, e);
                         return Ok(build_error_response("Bad Request", StatusCode::BAD_REQUEST));
                     }
+                    Err(_) => {
+                        tracing::warn!(
+                            "{}: Retry body buffering timed out after {:?}",
+                            server_name,
+                            buffer_timeout
+                        );
+                        return Ok(build_error_response(
+                            "Request Timeout",
+                            StatusCode::REQUEST_TIMEOUT,
+                        ));
+                    }
                 }
             };
-
-            let request_timeout = self_clone
-                .config
-                .router_params
-                .as_ref()
-                .and_then(|p| (p.request_timeout_seconds > 0).then(|| std::time::Duration::from_secs(p.request_timeout_seconds)));
 
             // Dispatch to the proper specialized terminal service
             match route_info.backend_type {

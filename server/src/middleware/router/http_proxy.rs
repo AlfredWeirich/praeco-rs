@@ -11,6 +11,19 @@ use super::upstreams::{ConnectionGuard, TrackedBody, build_upstream_uri};
 use super::{RequestBody, build_error_response};
 use crate::{ServiceRespBody, SrvError, configuration::RouteTarget};
 
+/// Reason a failed upstream attempt is evaluated for failover retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryReason {
+    /// TCP/TLS connection could not be established (`err.is_connect()`).
+    ConnectError,
+    /// Upstream connection/protocol error after connect (request may have been sent).
+    PostSendFailure,
+    /// Upstream request timed out after connect.
+    Timeout,
+    /// Upstream returned an outlier HTTP/gRPC response status.
+    Outlier,
+}
+
 /// Protocol-specific behavior differences between HTTP/REST proxying and raw HTTP/2 gRPC passthrough.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ProxyMode {
@@ -30,10 +43,22 @@ impl ProxyMode {
     }
 
     #[inline]
-    fn can_retry(self, is_stream: bool, is_idempotent: bool, attempts: usize, max_retries: usize) -> bool {
+    fn can_retry(
+        self,
+        is_stream: bool,
+        is_idempotent: bool,
+        attempts: usize,
+        max_retries: usize,
+        reason: RetryReason,
+    ) -> bool {
+        if is_stream || attempts > max_retries {
+            return false;
+        }
         match self {
-            Self::Http(_) => !is_stream && is_idempotent && attempts <= max_retries,
-            Self::GrpcPassthrough => !is_stream && attempts <= max_retries,
+            Self::Http(_) => is_idempotent,
+            // gRPC passthrough calls are always POST and may be non-idempotent mutations;
+            // only retry on connect failures where the upstream never received the request.
+            Self::GrpcPassthrough => reason == RetryReason::ConnectError,
         }
     }
 
@@ -244,7 +269,13 @@ pub(super) async fn forward_with_failover(
                     target.mark_dead(backend_base_uri);
                     failed_nodes.push(backend_base_uri.clone());
 
-                    if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
+                    if mode.can_retry(
+                        is_stream,
+                        is_idempotent,
+                        attempts,
+                        max_retries,
+                        RetryReason::Timeout,
+                    ) {
                         upstream_node
                             .failover_retries
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -254,8 +285,9 @@ pub(super) async fn forward_with_failover(
                         );
                         continue;
                     } else {
-                        if matches!(mode, ProxyMode::Http(_))
-                            && !is_idempotent
+                        if ((matches!(mode, ProxyMode::Http(_)) && !is_idempotent)
+                            || matches!(mode, ProxyMode::GrpcPassthrough))
+                            && !is_stream
                             && attempts <= max_retries
                         {
                             warn!(
@@ -316,7 +348,13 @@ pub(super) async fn forward_with_failover(
                         );
                     }
 
-                    if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
+                    if mode.can_retry(
+                        is_stream,
+                        is_idempotent,
+                        attempts,
+                        max_retries,
+                        RetryReason::Outlier,
+                    ) {
                         upstream_node
                             .failover_retries
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -402,7 +440,18 @@ pub(super) async fn forward_with_failover(
                         target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
-                        if mode.can_retry(is_stream, is_idempotent, attempts, max_retries) {
+                        let retry_reason = if e.is_connect() {
+                            RetryReason::ConnectError
+                        } else {
+                            RetryReason::PostSendFailure
+                        };
+                        if mode.can_retry(
+                            is_stream,
+                            is_idempotent,
+                            attempts,
+                            max_retries,
+                            retry_reason,
+                        ) {
                             upstream_node
                                 .failover_retries
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -412,8 +461,9 @@ pub(super) async fn forward_with_failover(
                             );
                             continue;
                         } else {
-                            if matches!(mode, ProxyMode::Http(_))
-                                && !is_idempotent
+                            if ((matches!(mode, ProxyMode::Http(_)) && !is_idempotent)
+                                || matches!(mode, ProxyMode::GrpcPassthrough))
+                                && !is_stream
                                 && attempts <= max_retries
                             {
                                 warn!(
@@ -1097,23 +1147,26 @@ mod tests {
     }
 
     /// Retry policy matrix of the shared proxy engine: HTTP retries only idempotent, buffered
-    /// requests; gRPC passthrough retries any buffered request; neither retries consumed streams
-    /// nor exceeds `max_retries`.
+    /// requests; gRPC passthrough retries only connect-time failures (where the request was never
+    /// sent to the upstream); neither retries consumed streams nor exceeds `max_retries`.
     #[test]
     fn test_proxy_mode_retry_policy_matrix() {
         let http = ProxyMode::Http(Version::HTTP_11);
         let grpc = ProxyMode::GrpcPassthrough;
 
-        // (is_stream, is_idempotent, attempts, max_retries)
-        assert!(http.can_retry(false, true, 1, 2), "HTTP idempotent buffered => retry");
-        assert!(!http.can_retry(false, false, 1, 2), "HTTP non-idempotent => never retry");
-        assert!(!http.can_retry(true, true, 1, 2), "HTTP stream => never retry");
-        assert!(!http.can_retry(false, true, 3, 2), "HTTP retries exhausted");
+        // (is_stream, is_idempotent, attempts, max_retries, reason)
+        assert!(http.can_retry(false, true, 1, 2, RetryReason::Timeout), "HTTP idempotent buffered => retry");
+        assert!(!http.can_retry(false, false, 1, 2, RetryReason::ConnectError), "HTTP non-idempotent => never retry");
+        assert!(!http.can_retry(true, true, 1, 2, RetryReason::ConnectError), "HTTP stream => never retry");
+        assert!(!http.can_retry(false, true, 3, 2, RetryReason::ConnectError), "HTTP retries exhausted");
 
-        assert!(grpc.can_retry(false, false, 1, 2), "gRPC buffered POST => retry");
-        assert!(grpc.can_retry(false, true, 2, 2), "gRPC last permitted retry");
-        assert!(!grpc.can_retry(true, false, 1, 2), "gRPC stream => never retry");
-        assert!(!grpc.can_retry(false, false, 3, 2), "gRPC retries exhausted");
+        assert!(grpc.can_retry(false, false, 1, 2, RetryReason::ConnectError), "gRPC buffered connect error => retry");
+        assert!(grpc.can_retry(false, true, 2, 2, RetryReason::ConnectError), "gRPC last permitted connect retry");
+        assert!(!grpc.can_retry(false, false, 1, 2, RetryReason::Timeout), "gRPC timeout after connect => never retry");
+        assert!(!grpc.can_retry(false, false, 1, 2, RetryReason::PostSendFailure), "gRPC post-send failure => never retry");
+        assert!(!grpc.can_retry(false, false, 1, 2, RetryReason::Outlier), "gRPC outlier => never retry");
+        assert!(!grpc.can_retry(true, false, 1, 2, RetryReason::ConnectError), "gRPC stream => never retry");
+        assert!(!grpc.can_retry(false, false, 3, 2, RetryReason::ConnectError), "gRPC retries exhausted");
     }
 
     /// Protocol header rules: HTTP preserves the negotiated version and headers untouched;

@@ -63,6 +63,10 @@ pub enum PathSanitizeError {
     #[error("Path must start with '/'")]
     InvalidPath,
 
+    /// Path contains a semicolon matrix parameter (`;` or `%3b`).
+    #[error("Path contains illegal semicolon matrix parameter (;)")]
+    IllegalSemicolon,
+
     /// Internal error constructing the canonical URI.
     #[error("Internal URI formatting error: {0}")]
     UriFormatError(String),
@@ -89,6 +93,9 @@ pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitiz
     if raw_path.contains('\\') {
         return Err(PathSanitizeError::IllegalBackslash);
     }
+    if raw_path.contains(';') {
+        return Err(PathSanitizeError::IllegalSemicolon);
+    }
 
     // 2. Case-insensitive checks for forbidden encodings
     let lower = raw_path.to_ascii_lowercase();
@@ -100,6 +107,9 @@ pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitiz
     }
     if lower.contains("%5c") {
         return Err(PathSanitizeError::IllegalBackslash);
+    }
+    if lower.contains("%3b") {
+        return Err(PathSanitizeError::IllegalSemicolon);
     }
 
     // Double-encoding checks (%25 followed by 2e, 2f, 00, 5c)
@@ -575,6 +585,15 @@ mod tests {
 
         // 6. Backslash rejected with 400 Bad Request
         let req = Request::builder().uri("/public\\admin").body(Full::new(Bytes::new())).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 7. Semicolon matrix parameters (raw and %3b) rejected with 400 Bad Request
+        let req = Request::builder().uri("/api/Admin;jsessionid=1").body(Full::new(Bytes::new())).unwrap();
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let req = Request::builder().uri("/api/Admin%3bv=1").body(Full::new(Bytes::new())).unwrap();
         let resp = svc.ready().await.unwrap().call(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 

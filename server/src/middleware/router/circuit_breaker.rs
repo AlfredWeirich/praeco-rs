@@ -165,6 +165,7 @@ impl<'a> Drop for ProbeGuard<'a> {
 #[pin_project]
 pub struct PrefixedStreamBody {
     prefix: Option<Bytes>,
+    next_frame: Option<Frame<Bytes>>,
     #[pin]
     remaining: SrvBody,
 }
@@ -179,9 +180,13 @@ impl Body for PrefixedStreamBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         if let Some(bytes) = this.prefix.take()
-            && !bytes.is_empty() {
-                return Poll::Ready(Some(Ok(Frame::data(bytes))));
-            }
+            && !bytes.is_empty()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(bytes))));
+        }
+        if let Some(frame) = this.next_frame.take() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
         this.remaining.poll_frame(cx)
     }
 }
@@ -209,6 +214,7 @@ pub async fn buffer_body_up_to(
                 let prefix = accumulated.freeze();
                 let combined = PrefixedStreamBody {
                     prefix: Some(prefix),
+                    next_frame: None,
                     remaining: body,
                 };
                 return Ok(RequestBody::Stream(combined.boxed()));
@@ -218,6 +224,101 @@ pub async fn buffer_body_up_to(
     }
 
     Ok(RequestBody::Buffered(accumulated.freeze()))
+}
+
+/// Buffers at most the first complete gRPC frame (up to `max_buffer_bytes`) and
+/// checks non-blockingly whether the client closed the stream (`EOF`):
+///
+/// - Unary / server-streaming calls (1 frame followed by immediate `EOF`) return
+///   [`RequestBody::Buffered`] so connect-time failover works seamlessly.
+/// - Client-streaming / bidirectional gRPC calls (where the client keeps the
+///   request stream open after frame 1) spill immediately into
+///   [`RequestBody::Stream`] without waiting for `EOF`, preventing deadlocks.
+pub async fn buffer_grpc_first_frame_or_stream(
+    mut body: SrvBody,
+    max_buffer_bytes: usize,
+) -> Result<RequestBody, SrvError> {
+    let mut accumulated = BytesMut::new();
+
+    loop {
+        if accumulated.len() >= 5 {
+            let frame_len =
+                u32::from_be_bytes([accumulated[1], accumulated[2], accumulated[3], accumulated[4]])
+                    as usize;
+            let first_frame_end = 5usize.saturating_add(frame_len);
+
+            if first_frame_end > max_buffer_bytes || accumulated.len() > first_frame_end {
+                let combined = PrefixedStreamBody {
+                    prefix: Some(accumulated.freeze()),
+                    next_frame: None,
+                    remaining: body,
+                };
+                return Ok(RequestBody::Stream(combined.boxed()));
+            }
+
+            if accumulated.len() == first_frame_end {
+                if body.is_end_stream() {
+                    return Ok(RequestBody::Buffered(accumulated.freeze()));
+                }
+                let next = std::future::poll_fn(|cx| {
+                    Poll::Ready(Pin::new(&mut body).poll_frame(cx))
+                })
+                .await;
+                match next {
+                    Poll::Ready(None) => {
+                        return Ok(RequestBody::Buffered(accumulated.freeze()));
+                    }
+                    Poll::Ready(Some(Err(e))) => return Err(e),
+                    Poll::Ready(Some(Ok(frame))) => {
+                        if frame.is_data() && frame.data_ref().is_some_and(|d| d.is_empty()) {
+                            continue;
+                        }
+                        let combined = PrefixedStreamBody {
+                            prefix: Some(accumulated.freeze()),
+                            next_frame: Some(frame),
+                            remaining: body,
+                        };
+                        return Ok(RequestBody::Stream(combined.boxed()));
+                    }
+                    Poll::Pending => {
+                        let combined = PrefixedStreamBody {
+                            prefix: Some(accumulated.freeze()),
+                            next_frame: None,
+                            remaining: body,
+                        };
+                        return Ok(RequestBody::Stream(combined.boxed()));
+                    }
+                }
+            }
+        }
+
+        match body.frame().await {
+            None => return Ok(RequestBody::Buffered(accumulated.freeze())),
+            Some(Err(e)) => return Err(e),
+            Some(Ok(frame)) => match frame.into_data() {
+                Ok(data) => {
+                    if accumulated.len().saturating_add(data.len()) > max_buffer_bytes {
+                        accumulated.extend_from_slice(&data);
+                        let combined = PrefixedStreamBody {
+                            prefix: Some(accumulated.freeze()),
+                            next_frame: None,
+                            remaining: body,
+                        };
+                        return Ok(RequestBody::Stream(combined.boxed()));
+                    }
+                    accumulated.extend_from_slice(&data);
+                }
+                Err(non_data_frame) => {
+                    let combined = PrefixedStreamBody {
+                        prefix: Some(accumulated.freeze()),
+                        next_frame: Some(non_data_frame),
+                        remaining: body,
+                    };
+                    return Ok(RequestBody::Stream(combined.boxed()));
+                }
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +432,56 @@ mod tests {
             RequestBody::Stream(stream_body) => {
                 let collected = stream_body.collect().await.unwrap().to_bytes();
                 assert_eq!(&collected[..], b"0123456789abcdefghijkl");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_buffer_grpc_first_frame_unary_vs_bidi_open_stream() {
+        // 1. Unary gRPC call (1 frame + immediate EOF) -> Buffered for connect failover
+        let mut unary_frame = vec![0u8, 0, 0, 0, 3];
+        unary_frame.extend_from_slice(b"abc");
+        let unary_body: SrvBody = http_body_util::Full::new(Bytes::from(unary_frame.clone()))
+            .map_err(SrvError::from)
+            .boxed();
+        match buffer_grpc_first_frame_or_stream(unary_body, 1024).await.unwrap() {
+            RequestBody::Buffered(b) => assert_eq!(&b[..], &unary_frame[..]),
+            RequestBody::Stream(_) => panic!("Unary 1-frame gRPC body must stay Buffered"),
+        }
+
+        // 2. Open bidirectional stream (1st frame arrives, sender kept open) -> Stream immediately!
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, SrvError>>(4);
+        tx.send(Ok(Frame::data(Bytes::from(unary_frame.clone()))))
+            .await
+            .unwrap();
+        let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let bidi_body: SrvBody = http_body_util::StreamBody::new(stream).boxed();
+
+        // Must return immediately without waiting for EOF!
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            buffer_grpc_first_frame_or_stream(bidi_body, 1024),
+        )
+        .await
+        .expect("bidi stream must not block waiting for EOF")
+        .unwrap();
+
+        match res {
+            RequestBody::Buffered(_) => panic!("Open bidi gRPC body must switch to Stream"),
+            RequestBody::Stream(mut stream_body) => {
+                // First frame is readable immediately while tx is still open
+                let first = stream_body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&first[..], &unary_frame[..]);
+
+                // Subsequent frame sent later on the bidi stream arrives intact
+                tx.send(Ok(Frame::data(Bytes::from_static(b"second"))))
+                    .await
+                    .unwrap();
+                drop(tx);
+                let second = stream_body.frame().await.unwrap().unwrap().into_data().unwrap();
+                assert_eq!(&second[..], b"second");
             }
         }
     }

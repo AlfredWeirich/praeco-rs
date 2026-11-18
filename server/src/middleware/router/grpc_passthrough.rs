@@ -298,6 +298,98 @@ mod tests {
             "Upstream gRPC node must NOT be marked dead on client payload limit error"
         );
     }
+
+    #[tokio::test]
+    async fn test_grpc_passthrough_timeout_does_not_retry_second_upstream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        // Node 1: Accepts connection and stalls past request timeout
+        let slow_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_port = slow_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((_socket, _)) = slow_listener.accept().await {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        });
+
+        // Node 2: Healthy upstream that MUST NOT be called after Node 1 times out
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits_clone = second_hits.clone();
+        let backup_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backup_port = backup_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((socket, _)) = backup_listener.accept().await {
+                second_hits_clone.fetch_add(1, Ordering::SeqCst);
+                let io = hyper_util::rt::TokioIo::new(socket);
+                let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async move {
+                            let res = hyper::Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/grpc")
+                                .header("grpc-status", "0")
+                                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                                .unwrap();
+                            Ok::<_, std::convert::Infallible>(res)
+                        }),
+                    )
+                    .await;
+            }
+        });
+
+        let target = Arc::new(RouteTarget {
+            upstreams: vec![
+                UpstreamNode::new(format!("http://127.0.0.1:{}", slow_port).parse().unwrap()),
+                UpstreamNode::new(format!("http://127.0.0.1:{}", backup_port).parse().unwrap()),
+            ],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 10,
+            max_retries: 2,
+            failure_threshold: 3,
+            max_retry_buffer_bytes: 65536,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        });
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let pool_config = common::client::ClientPoolConfig {
+            http2_only: true,
+            ..Default::default()
+        };
+        let client = common::client::build_hyper_client(tls_config, pool_config);
+
+        let req_uri: Uri = "http://localhost/chat.ChatService/CreateOrder".parse().unwrap();
+        let grpc_frame = bytes::Bytes::from_static(&[0, 0, 0, 0, 0]);
+
+        let response = handle_grpc_passthrough(
+            &target,
+            RequestBody::Buffered(grpc_frame),
+            Method::POST,
+            hyper::HeaderMap::new(),
+            &req_uri,
+            &matchit::Params::new(),
+            None,
+            "test_server",
+            &client,
+            Some(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            second_hits.load(Ordering::SeqCst),
+            0,
+            "Timed-out gRPC call must NOT retry on second upstream"
+        );
+    }
 }
 
 
