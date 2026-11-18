@@ -14,7 +14,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use praeco_relay_server::{
     RelayConfig, RelayConnectionTracker, SessionMap, new_session_map, run_control_plane,
-    run_data_plane, setup_mtls_acceptor,
+    run_data_plane_with_stream_timeout, setup_mtls_acceptor,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,10 +232,12 @@ async fn main() -> Result<()> {
     let max_ip_conn = config.max_concurrent_connections_per_ip.unwrap_or(100);
     let connection_tracker = Arc::new(RelayConnectionTracker::new(max_global_conn, max_ip_conn));
     let client_hello_timeout = Duration::from_secs(config.client_hello_timeout_secs.unwrap_or(10));
+    let tunnel_stream_open_timeout =
+        Duration::from_secs(config.tunnel_stream_open_timeout_secs.unwrap_or(5).max(1));
     let data_cancel = cancel_token.clone();
 
     let mut data_handle = tokio::spawn(async move {
-        if let Err(e) = run_data_plane(
+        if let Err(e) = run_data_plane_with_stream_timeout(
             data_listener,
             active_tunnels,
             rate_rate,
@@ -244,6 +246,7 @@ async fn main() -> Result<()> {
             tcp_keepalive,
             connection_tracker,
             client_hello_timeout,
+            tunnel_stream_open_timeout,
             data_cancel,
         )
         .await

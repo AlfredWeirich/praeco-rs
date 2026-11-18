@@ -87,6 +87,7 @@ max_concurrent_connections = 10000
 max_concurrent_connections_per_ip = 100
 client_hello_timeout_secs = 10
 control_plane_handshake_timeout_secs = 10
+tunnel_stream_open_timeout_secs = 5
 max_yamux_streams = 4096
 enable_proxy_protocol = true
 ```

@@ -58,6 +58,9 @@ pub struct RelayConfig {
     pub client_hello_timeout_secs: Option<u64>,
     /// Timeout in seconds for the mTLS handshake on the control plane (default: 10).
     pub control_plane_handshake_timeout_secs: Option<u64>,
+    /// Timeout in seconds for opening a Yamux tunnel stream and writing initial
+    /// PROXY-Protocol v2 / ClientHello data (default: 5).
+    pub tunnel_stream_open_timeout_secs: Option<u64>,
     /// Max concurrent Yamux streams per tunnel connection (default: 4096).
     pub max_yamux_streams: Option<usize>,
     /// Whether to enable PROXY-Protocol v2 for tunnels that negotiate it (default: true).
@@ -87,6 +90,7 @@ impl Default for RelayConfig {
             max_concurrent_connections_per_ip: Some(100),
             client_hello_timeout_secs: Some(10),
             control_plane_handshake_timeout_secs: Some(10),
+            tunnel_stream_open_timeout_secs: Some(5),
             max_yamux_streams: Some(4096),
             enable_proxy_protocol: Some(true),
         }
@@ -162,6 +166,7 @@ mod tests {
         assert_eq!(cfg.max_concurrent_connections_per_ip, Some(100));
         assert_eq!(cfg.client_hello_timeout_secs, Some(10));
         assert_eq!(cfg.control_plane_handshake_timeout_secs, Some(10));
+        assert_eq!(cfg.tunnel_stream_open_timeout_secs, Some(5));
         assert_eq!(cfg.max_yamux_streams, Some(4096));
         assert_eq!(cfg.enable_proxy_protocol, Some(true));
     }

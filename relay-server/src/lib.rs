@@ -38,6 +38,10 @@ use yamux::{Config as YamuxConfig, Connection, Mode, Stream as YamuxStream};
 /// Maximum time active control/data tasks get to finish on relay shutdown.
 const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default timeout for opening a Yamux tunnel stream and writing initial
+/// PROXY-Protocol v2 / ClientHello bytes.
+pub const DEFAULT_TUNNEL_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Backoff after a transient `accept()` error (e.g. `EMFILE`) to avoid a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -207,18 +211,14 @@ pub struct RelayConnectionGuard {
 impl Drop for RelayConnectionGuard {
     fn drop(&mut self) {
         self.tracker.global_count.fetch_sub(1, Ordering::SeqCst);
-        let mut remove = false;
-        if let Some(mut count) = self.tracker.ip_counts.get_mut(&self.ip) {
-            if *count > 0 {
-                *count -= 1;
-            }
-            if *count == 0 {
-                remove = true;
-            }
+        if let Some(mut count) = self.tracker.ip_counts.get_mut(&self.ip)
+            && *count > 0
+        {
+            *count -= 1;
         }
-        if remove {
-            self.tracker.ip_counts.remove(&self.ip);
-        }
+        // Atomically remove only if still zero under the shard write lock
+        // so a concurrent acquire() cannot have its increment wiped out.
+        self.tracker.ip_counts.remove_if(&self.ip, |_, c| *c == 0);
     }
 }
 
@@ -499,6 +499,25 @@ pub fn parse_register_command(line: &str, enable_proxy_protocol: bool) -> Option
     Some((sni, supports_proxy_v2))
 }
 
+/// Atomically registers `route` for `sni` using `DashMap::entry()` so concurrent
+/// `REGISTER` attempts for the same SNI cannot race past overwrite protection.
+fn try_register_tunnel(tunnels: &SessionMap, sni: String, route: TunnelRoute) -> bool {
+    match tunnels.entry(sni) {
+        dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+            if !occupied.get().control.is_closed() {
+                false
+            } else {
+                occupied.insert(route);
+                true
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(route);
+            true
+        }
+    }
+}
+
 /// Handles a single Control Plane connection from a Praeco Gateway.
 ///
 /// Performs the mTLS handshake, validates the client certificate's SANs against the
@@ -640,11 +659,22 @@ async fn handle_control_connection_with_cancel<S>(
         return;
     }
 
-    // --- Overwrite Protection (P0.3 / S-27) ---
-    // Prevent hijacking/blackholing of an active healthy tunnel
-    if let Some(existing) = tunnels.get(&sni)
-        && !existing.value().control.is_closed()
-    {
+    let (tx, mut rx) = mpsc::channel(32);
+    let control = Control::new(tx);
+
+    // --- Store with Generation ID (P0.5) & Atomic Overwrite Protection (P0.3 / S-27) ---
+    // To handle reconnects gracefully without race conditions (where an old dying connection
+    // might delete the newly established connection's map entry), we use an atomic Generation ID.
+    // `try_register_tunnel` uses `DashMap::entry()` so concurrent REGISTER attempts cannot race.
+    static GENERATION: AtomicU64 = AtomicU64::new(1);
+    let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+
+    let route = TunnelRoute {
+        control: control.clone(),
+        generation: my_generation,
+        supports_proxy_v2,
+    };
+    if !try_register_tunnel(&tunnels, sni.clone(), route) {
         warn!(
             target: "relay::control_plane",
             sni = %sni,
@@ -661,24 +691,6 @@ async fn handle_control_connection_with_cancel<S>(
     cfg.set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
     cfg.set_max_num_streams(max_yamux_streams);
     let mut connection = Connection::new(tls_stream.compat(), cfg, Mode::Server);
-
-    let (tx, mut rx) = mpsc::channel(32);
-    let control = Control::new(tx);
-
-    // --- Store with Generation ID (P0.5) ---
-    // To handle reconnects gracefully without race conditions (where an old dying connection
-    // might delete the newly established connection's map entry), we use an atomic Generation ID.
-    static GENERATION: AtomicU64 = AtomicU64::new(1);
-    let my_generation = GENERATION.fetch_add(1, Ordering::SeqCst);
-
-    tunnels.insert(
-        sni.clone(),
-        TunnelRoute {
-            control: control.clone(),
-            generation: my_generation,
-            supports_proxy_v2,
-        },
-    );
 
     // --- Connection Driver Loop ---
     // This loop polls the Yamux multiplexer. It constantly checks for new outbound
@@ -949,6 +961,31 @@ where
 /// Handles a single Data Plane client connection: reads the initial `ClientHello`,
 /// extracts the target SNI, opens a Yamux stream on the matching tunnel, optionally
 /// writes the PROXY Protocol v2 header, and forwards bidirectional traffic.
+pub async fn handle_data_connection<S>(
+    client_stream: S,
+    client_addr: SocketAddr,
+    local_addr: SocketAddr,
+    tunnels: SessionMap,
+    idle_timeout: Option<Duration>,
+    client_hello_timeout: Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_data_connection_with_stream_timeout(
+        client_stream,
+        client_addr,
+        local_addr,
+        tunnels,
+        idle_timeout,
+        client_hello_timeout,
+        DEFAULT_TUNNEL_STREAM_OPEN_TIMEOUT,
+    )
+    .await;
+}
+
+/// Like [`handle_data_connection`], with an explicit `stream_open_timeout` covering
+/// opening the Yamux tunnel stream and writing the initial PROXY-Protocol v2 header
+/// and TLS `ClientHello` bytes.
 #[tracing::instrument(
     name = "data_connection",
     skip(
@@ -956,17 +993,19 @@ where
         local_addr,
         tunnels,
         idle_timeout,
-        client_hello_timeout
+        client_hello_timeout,
+        stream_open_timeout
     ),
     fields(client_ip = %client_addr)
 )]
-pub async fn handle_data_connection<S>(
+pub async fn handle_data_connection_with_stream_timeout<S>(
     mut client_stream: S,
     client_addr: SocketAddr,
     local_addr: SocketAddr,
     tunnels: SessionMap,
     idle_timeout: Option<Duration>,
     client_hello_timeout: Duration,
+    stream_open_timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -1027,10 +1066,20 @@ pub async fn handle_data_connection<S>(
         }
     };
 
-    let tunnel_stream = match control.open_stream().await {
-        Ok(s) => s,
-        Err(e) => {
+    let tunnel_stream = match tokio::time::timeout(stream_open_timeout, control.open_stream()).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to open stream in tunnel");
+            return;
+        }
+        Err(_) => {
+            warn!(
+                target: "relay::data_plane",
+                sni = %sni,
+                timeout_ms = stream_open_timeout.as_millis() as u64,
+                "Timed out opening stream in tunnel"
+            );
             return;
         }
     };
@@ -1039,15 +1088,30 @@ pub async fn handle_data_connection<S>(
 
     if supports_proxy_v2 {
         let ppv2_header = common::proxy_protocol::encode_proxy_v2(client_addr, local_addr);
-        if let Err(e) = tokio_tunnel.write_all(&ppv2_header).await {
-            warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write PROXY-Protocol v2 header to tunnel");
-            return;
+        match tokio::time::timeout(stream_open_timeout, tokio_tunnel.write_all(&ppv2_header)).await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write PROXY-Protocol v2 header to tunnel");
+                return;
+            }
+            Err(_) => {
+                warn!(target: "relay::data_plane", sni = %sni, "Timed out writing PROXY-Protocol v2 header to tunnel");
+                return;
+            }
         }
     }
 
-    if let Err(e) = tokio_tunnel.write_all(&buf).await {
-        warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write ClientHello to tunnel");
-        return;
+    match tokio::time::timeout(stream_open_timeout, tokio_tunnel.write_all(&buf)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(target: "relay::data_plane", sni = %sni, error = %e, "Failed to write ClientHello to tunnel");
+            return;
+        }
+        Err(_) => {
+            warn!(target: "relay::data_plane", sni = %sni, "Timed out writing ClientHello to tunnel");
+            return;
+        }
     }
 
     info!(target: "relay::data_plane", sni = %sni, client_ip = %client_addr, "Routing connection via tunnel");
@@ -1080,6 +1144,37 @@ pub async fn run_data_plane(
     tcp_keepalive: Option<Duration>,
     connection_tracker: Arc<RelayConnectionTracker>,
     client_hello_timeout: Duration,
+    cancel_token: CancellationToken,
+) -> Result<(), RelayError> {
+    run_data_plane_with_stream_timeout(
+        listener,
+        tunnels,
+        rate,
+        burst,
+        idle_timeout,
+        tcp_keepalive,
+        connection_tracker,
+        client_hello_timeout,
+        DEFAULT_TUNNEL_STREAM_OPEN_TIMEOUT,
+        cancel_token,
+    )
+    .await
+}
+
+/// Like [`run_data_plane`], with an explicit `stream_open_timeout` for opening
+/// Yamux tunnel streams and writing initial PROXY-Protocol v2 / ClientHello bytes.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(listener, tunnels, connection_tracker, cancel_token), err)]
+pub async fn run_data_plane_with_stream_timeout(
+    listener: TcpListener,
+    tunnels: SessionMap,
+    rate: f32,
+    burst: f32,
+    idle_timeout: Option<Duration>,
+    tcp_keepalive: Option<Duration>,
+    connection_tracker: Arc<RelayConnectionTracker>,
+    client_hello_timeout: Duration,
+    stream_open_timeout: Duration,
     cancel_token: CancellationToken,
 ) -> Result<(), RelayError> {
     if let Ok(local_addr) = listener.local_addr() {
@@ -1170,13 +1265,14 @@ pub async fn run_data_plane(
         let tunnels = tunnels.clone();
         conn_tasks.spawn(async move {
             let _guard = connection_guard;
-            handle_data_connection(
+            handle_data_connection_with_stream_timeout(
                 client_stream,
                 client_addr,
                 local_addr,
                 tunnels,
                 idle_timeout,
                 client_hello_timeout,
+                stream_open_timeout,
             )
             .await;
         });
@@ -1795,5 +1891,120 @@ mod tests {
             active_task.await.unwrap(),
             CopyResult::Clean(20, 0)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_relay_connection_tracker_concurrent_acquire_drop_no_drift() {
+        let tracker = Arc::new(RelayConnectionTracker::new(1000, 16));
+        let ip: IpAddr = "10.20.30.40".parse().unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let t = tracker.clone();
+            handles.push(tokio::spawn(async move {
+                for _ in 0..250 {
+                    if let Ok(guard) = t.acquire(ip) {
+                        tokio::task::yield_now().await;
+                        drop(guard);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(tracker.current_global(), 0);
+        assert_eq!(tracker.current_for_ip(ip), 0);
+        assert!(tracker.ip_counts.is_empty(), "ip_counts must have no stale entries");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_try_register_tunnel_only_one_wins() {
+        let tunnels: SessionMap = new_session_map();
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        let mut receivers = Vec::new();
+        for gen_id in 1..=8u64 {
+            let (tx, rx) = mpsc::channel(4);
+            receivers.push(rx);
+            let t = tunnels.clone();
+            let b = barrier.clone();
+            let w = winners.clone();
+            handles.push(tokio::spawn(async move {
+                let route = TunnelRoute {
+                    control: Control::new(tx),
+                    generation: gen_id,
+                    supports_proxy_v2: true,
+                };
+                b.wait().await;
+                if try_register_tunnel(&t, "race.example.com".to_string(), route) {
+                    w.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "Exactly one concurrent REGISTER must win when channel stays open"
+        );
+        drop(receivers);
+    }
+
+    #[tokio::test]
+    async fn test_data_connection_times_out_when_open_stream_stalls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // Build a real TLS ClientHello with SNI "stalled.example.com"
+        let root_store = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        let server_name = rustls::pki_types::ServerName::try_from("stalled.example.com").unwrap();
+        let mut client_conn = rustls::ClientConnection::new(tls_cfg, server_name).unwrap();
+        let mut client_hello = Vec::new();
+        client_conn.write_tls(&mut client_hello).unwrap();
+
+        // Register a tunnel whose driver rx never responds to open_stream()
+        let tunnels: SessionMap = new_session_map();
+        let (tx, _rx_stalled) = mpsc::channel(32);
+        tunnels.insert(
+            "stalled.example.com".to_string(),
+            TunnelRoute {
+                control: Control::new(tx),
+                generation: 1,
+                supports_proxy_v2: false,
+            },
+        );
+
+        let (mut client_write, server_read) = tokio::io::duplex(client_hello.len() + 64);
+        client_write.write_all(&client_hello).await.unwrap();
+
+        let addr: SocketAddr = "127.0.0.1:44444".parse().unwrap();
+        let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
+
+        // Must return promptly after stream_open_timeout (50ms) rather than hanging
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            handle_data_connection_with_stream_timeout(
+                server_read,
+                addr,
+                local,
+                tunnels,
+                None,
+                Duration::from_secs(2),
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+        assert!(res.is_ok(), "handle_data_connection must time out when open_stream stalls");
     }
 }

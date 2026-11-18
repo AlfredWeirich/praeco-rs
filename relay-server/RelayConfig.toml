@@ -81,6 +81,11 @@ client_hello_timeout_secs = 10
 # Standard: 10
 control_plane_handshake_timeout_secs = 10
 
+# Timeout in Sekunden für das Öffnen eines Yamux-Streams und das Schreiben der
+# initialen Tunnel-Daten (PROXY-v2-Header & ClientHello).
+# Standard: 5
+tunnel_stream_open_timeout_secs = 5
+
 # Maximale Anzahl paralleler Yamux-Streams pro Tunnel.
 # Verhindert Flaschenhälse bei hoher Last (Standard: 4096, vorher 512).
 max_yamux_streams = 4096
