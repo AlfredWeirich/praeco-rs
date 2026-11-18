@@ -169,14 +169,10 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
     let now_unix_i64 = now_unix as i64;
 
     let global_cfg = Config::try_global();
-    let servers_slice: Vec<ServerConfig> = if let Some(ref cfg) = global_cfg {
-        cfg.servers
-            .iter()
-            .filter(|s| s.enabled)
-            .cloned()
-            .collect()
+    let servers_refs: Vec<&ServerConfig> = if let Some(ref cfg) = global_cfg {
+        cfg.servers.iter().filter(|s| s.enabled).collect()
     } else if let Some(srv) = fallback_server {
-        vec![srv.clone()]
+        vec![srv]
     } else {
         Vec::new()
     };
@@ -184,13 +180,13 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
     let revoked_jwt_tokens = crate::middleware::jwt::get_jwt_revocation_store().len();
 
     let mut summary = AdminSummary {
-        total_servers: servers_slice.len(),
+        total_servers: servers_refs.len(),
         revoked_jwt_tokens,
         ..Default::default()
     };
-    let mut servers = Vec::with_capacity(servers_slice.len());
+    let mut servers = Vec::with_capacity(servers_refs.len());
 
-    for srv in &servers_slice {
+    for srv in servers_refs {
         let listen = if let Some(ref tunnel) = srv.tunnel {
             format!("tunnel://{} ({})", tunnel.sni_domain, tunnel.target_url)
         } else {
@@ -586,15 +582,15 @@ fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerCon
     };
 
     let global_cfg = Config::try_global();
-    let servers_iter: Vec<ServerConfig> = if let Some(ref cfg) = global_cfg {
-        cfg.servers.clone()
+    let servers_slice: &[ServerConfig] = if let Some(ref cfg) = global_cfg {
+        &cfg.servers
     } else if let Some(srv) = fallback_server {
-        vec![srv.clone()]
+        std::slice::from_ref(srv)
     } else {
         return;
     };
 
-    for srv in &servers_iter {
+    for srv in servers_slice {
         for route in &srv.parsed_routes {
             for (_, _, target) in route.iter_targets() {
                 for node in &target.upstreams {
