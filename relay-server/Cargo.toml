@@ -2,7 +2,7 @@
 name = "praeco-relay-server"
 version = "0.3.3"
 edition.workspace = true
-description = "Relay server for praeco-rs"
+description = "Zero-Trust Layer-4 SNI Relay and Reverse Tunnel Server with mTLS SAN routing, Yamux multiplexing, E2EE TLS passthrough, and PROXY Protocol v2"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
