@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+* **Control-Plane Connection Limits & Live CRL / Certificate Expiry Enforcement (`src/config.rs`, `src/lib.rs`, `src/main.rs`):**
+  * Added optional `#[serde(default)]` settings `control_plane_max_concurrent_connections` (default: `256`), `control_plane_max_concurrent_connections_per_ip` (default: `16`), and `crl_reload_interval_secs` (default: `60`) to `RelayConfig`.
+  * Added `ControlPlaneOptions`, `ControlPlaneReloadState`, `run_control_plane_with_options`, `spawn_crl_reload_watcher`, `parse_revoked_serials_from_crl_pem`, and `extract_cert_expiry_and_serial` to enforce pre-mTLS connection limits on Port `7001`, periodically (and on `SIGHUP`) reload CRLs, and actively terminate existing Yamux tunnels when a client certificate expires (`notAfter`) or is revoked.
 * **Configurable Stream-Open Timeout (`src/config.rs`, `src/lib.rs`, `RelayConfig.toml`):**
   * Added `tunnel_stream_open_timeout_secs` (default: `5` s) plus SemVer-compatible `handle_data_connection_with_stream_timeout` and `run_data_plane_with_stream_timeout` to bound `control.open_stream()` and initial `PROXY v2` / `ClientHello` writes.
 

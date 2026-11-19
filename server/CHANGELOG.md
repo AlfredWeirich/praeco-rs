@@ -41,6 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Added anti-CSRF `Sec-Fetch-Site` / `Origin` checks on `POST /auth/confirm` and `GET /auth/session_info`, and required mTLS client certificate or valid `poll_secret` authentication (`verify_poll_secret`) to read `user_code` via `GET /auth/session_info`.
 
 ### Changed & Fixed
+* **Hot-Reload (`SIGHUP`) Completeness & Per-Request `dynamic_stack` (`src/lib.rs`, `src/connection_tracker.rs`, `src/stack.rs`, `src/runner.rs`, `src/server.rs`):**
+  * Added SemVer-compatible `ConnectionHandler::with_dynamic_stack`, `with_dynamic_stack_and_oids`, and `with_dynamic_stack_shared` so long-lived HTTP/1.1, HTTP/2, HTTP/3 (QUIC), and Relay-tunneled connections load the active `ArcSwap` service stack on every request and detect `oid_mapping` updates with a single `Arc::ptr_eq` check on the hot path.
+  * Added `ConnectionTracker::update_limits`, `ServerReloadUpdate`, and `start_single_server_reloadable` so `SIGHUP` hot-reloads live TLS/mTLS/CRL configurations (`TlsAcceptor` + `quinn::Endpoint::set_server_config`), `oid_mapping`, `pki_base_oid`, `connection_limits`, and restarts active router health-check loops against the newly built `UpstreamNode` instances without dropping listening sockets.
 * **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**
   * Handled `SIGTERM` (`SignalKind::terminate`) alongside `Ctrl-C` for graceful connection draining and OTLP flush.
   * Migrated all unit, integration, and relay E2E tests (plus `examples/https_web_server`) from gitignored `server_certs/` / `client_certs/` files to ephemeral `common::test_pki::TestPki` (`praeco-common` `test-pki` feature).
