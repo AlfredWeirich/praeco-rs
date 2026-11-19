@@ -47,6 +47,11 @@ const MAX_REVOKED_ENTRIES: usize = 50_000;
 const REVOCATION_CLEANUP_INTERVAL_SECS: u64 = 30;
 const MAX_JTI_LEN: usize = 256;
 
+/// Leeway in seconds applied by `jsonwebtoken::Validation::new` by default when
+/// checking `exp`. Revocation entries must outlive `exp + JWT_EXP_LEEWAY_SECS`
+/// so a token revoked near expiration cannot be replayed during the grace window.
+pub const JWT_EXP_LEEWAY_SECS: u64 = 60;
+
 /// Thread-safe storage for revoked JWT IDs (`jti`).
 #[derive(Clone, Default)]
 pub struct JwtRevocationStore {
@@ -373,7 +378,10 @@ where
                                             .as_secs()
                                             + 3600
                                     };
-                                    get_jwt_revocation_store().revoke(jti.clone(), exp);
+                                    get_jwt_revocation_store().revoke(
+                                        jti.clone(),
+                                        exp.saturating_add(JWT_EXP_LEEWAY_SECS),
+                                    );
                                     tracing::info!(
                                         "{}: Auto-revoked JWT jti '{}' on logout path '{}'",
                                         server_name,
@@ -899,6 +907,67 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_jwt_revocation_covers_exp_leeway_window() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Token expired 10s ago: still accepted by jsonwebtoken's default 60s leeway.
+        let jti = "leeway-window-jti-1".to_string();
+        let claims = Claims {
+            sub: "leeway-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: (now - 10) as usize,
+            oids: vec!["1".to_string()],
+            jti: Some(jti.clone()),
+        };
+        let token = common::sign_jwt(&claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|_req: Request<Full<Bytes>>| async {
+            let body: ServiceRespBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-leeway-server",
+            oid_mapping: Arc::new(vec![("1".to_string(), crate::configuration::UserRole("Admin".to_string()))]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(vec!["/logout".to_string()]),
+        };
+
+        // First call to /logout succeeds and revokes the jti until exp + JWT_EXP_LEEWAY_SECS.
+        let logout_req = Request::builder()
+            .uri("/logout")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let logout_resp = svc.ready().await.unwrap().call(logout_req).await.unwrap();
+        assert_eq!(logout_resp.status(), StatusCode::OK);
+        assert!(get_jwt_revocation_store().is_revoked(&jti));
+
+        // Replay within the remaining ~50s leeway window must be rejected (401).
+        let replay_req = Request::builder()
+            .uri("/api/data")
+            .header("Authorization", format!("Bearer {}", token))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let replay_resp = svc.ready().await.unwrap().call(replay_req).await.unwrap();
+        assert_eq!(replay_resp.status(), StatusCode::UNAUTHORIZED);
     }
 }
 

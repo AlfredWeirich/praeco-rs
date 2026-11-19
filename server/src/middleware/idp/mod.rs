@@ -400,7 +400,9 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             let sub = if let Some(san) = req.extensions().get::<crate::SanCertExtension>() {
                 san.0.clone()
             } else if let Some(pem_ext) = req.extensions().get::<crate::PemCertExtension>() {
-                extract_cn_from_pem(&pem_ext.0).unwrap_or_else(|| "device".to_string())
+                extract_cn_from_pem(&pem_ext.0)
+                    .or_else(|| cert_fingerprint_subject(&pem_ext.0))
+                    .unwrap_or_else(|| "device".to_string())
             } else {
                 "device".to_string()
             };
@@ -449,7 +451,11 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
                 match self.session_store.create_session(client_ip, target_aud) {
                     Ok(info) => {
-                        debug!("{}: Created login session {}", self.server_name, info.session_id);
+                        debug!(
+                            "{}: Created login session {}",
+                            self.server_name,
+                            session::redact_session_id(&info.session_id)
+                        );
                         let body = format!(
                             r#"{{"session":"{}","poll_secret":"{}","user_code":"{}"}}"#,
                             info.session_id, info.poll_secret, info.user_code
@@ -499,7 +505,11 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         Self::response_ok(r#"{"status":"pending"}"#)
                     }
                     Ok(SessionStatus::Confirmed(claims)) => {
-                        info!("{}: Session {} confirmed, issuing JWT.", self.server_name, sid);
+                        info!(
+                            "{}: Session {} confirmed, issuing JWT.",
+                            self.server_name,
+                            session::redact_session_id(&sid)
+                        );
                         match self.generate_jwt_cookie_response(claims) {
                             Ok(r) => r,
                             Err(e) => {
@@ -660,24 +670,50 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 let mut revoked_any = false;
 
                 if let Some(token_str) = token_opt {
+                    if self.decoding_keys.is_empty() {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "JWT revocation unavailable: no decoding keys configured",
+                            )),
+                        };
+                    }
+
+                    let mut verified_token = false;
                     for key in self.decoding_keys.iter() {
                         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
                         validation.validate_exp = false;
                         validation.validate_aud = false;
-                        if let Ok(data) = jsonwebtoken::decode::<Claims>(&token_str, key, &validation)
-                            && let Some(jti) = data.claims.jti {
-                                let exp = if data.claims.exp > 0 { data.claims.exp as u64 } else {
+                        if let Ok(data) = jsonwebtoken::decode::<Claims>(&token_str, key, &validation) {
+                            verified_token = true;
+                            if let Some(jti) = data.claims.jti {
+                                let exp = if data.claims.exp > 0 {
+                                    data.claims.exp as u64
+                                } else {
                                     let now = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap()
+                                        .unwrap_or_default()
                                         .as_secs();
                                     now + self.params.token_expiry_seconds
                                 };
-                                crate::middleware::jwt::get_jwt_revocation_store().revoke(&jti, exp);
+                                crate::middleware::jwt::get_jwt_revocation_store().revoke(
+                                    &jti,
+                                    exp.saturating_add(crate::middleware::jwt::JWT_EXP_LEEWAY_SECS),
+                                );
                                 info!("{}: Revoked JWT jti: {}", self.server_name, jti);
                                 revoked_any = true;
-                                break;
                             }
+                            break;
+                        }
+                    }
+
+                    if !verified_token {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::UNAUTHORIZED,
+                                "Unauthorized: invalid token for revocation",
+                            )),
+                        };
                     }
                 }
 
@@ -704,7 +740,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
-                        let exp = now + self.params.token_expiry_seconds;
+                        let exp = (now + self.params.token_expiry_seconds)
+                            .saturating_add(crate::middleware::jwt::JWT_EXP_LEEWAY_SECS);
                         crate::middleware::jwt::get_jwt_revocation_store().revoke(&explicit_jti, exp);
                         info!("{}: Explicitly revoked jti via mTLS: {}", self.server_name, explicit_jti);
                         revoked_any = true;
@@ -712,7 +749,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 }
 
                 let mut cookie_clear = format!(
-                    "{}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; SameSite=Lax",
+                    "{}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
                     self.params.cookie_name
                 );
                 if let Some(domain) = &self.params.cookie_domain
@@ -754,6 +791,28 @@ fn extract_cn_from_pem(pem_str: &str) -> Option<String> {
         .next()
         .and_then(|cn| cn.as_str().ok())
         .map(|s| s.to_string())
+}
+
+/// Computes a deterministic `"sha256:<hex>"` subject identifier from the leaf X.509
+/// certificate's DER bytes when neither SAN nor CN is present.
+///
+/// Returns `None` if `pem_str` is not a valid PEM-encoded X.509 certificate.
+fn cert_fingerprint_subject(pem_str: &str) -> Option<String> {
+    let pem = pem::parse(pem_str).ok()?;
+    use x509_parser::prelude::FromDer;
+    let _ = x509_parser::prelude::X509Certificate::from_der(pem.contents()).ok()?;
+    let sha256 = rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
+        .tls13()?
+        .common
+        .hash_provider;
+    let digest = sha256.hash(pem.contents());
+    let mut sub = String::with_capacity("sha256:".len() + digest.as_ref().len() * 2);
+    sub.push_str("sha256:");
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut sub, "{:02x}", byte);
+    }
+    Some(sub)
 }
 
 #[cfg(test)]
@@ -909,7 +968,83 @@ mod tests {
 
         let set_cookie = resp_mtls.headers().get("Set-Cookie").unwrap().to_str().unwrap();
         assert!(set_cookie.contains("jwt=;"));
+        assert!(set_cookie.contains("; HttpOnly; Secure; SameSite=Lax"));
 
         assert!(crate::middleware::jwt::get_jwt_revocation_store().is_revoked(jti));
+    }
+
+    #[tokio::test]
+    async fn test_idp_revoke_fails_closed_without_keys_or_valid_signature() {
+        let mut idp = create_test_idp_service();
+
+        // 1. Valid decoding keys present, but provided token has an invalid/forged signature -> 401
+        let forged_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhdHRhY2tlciIsImlzcyI6InByYWVjby1pZHAiLCJleHAiOjk5OTk5OTk5OTksIm9pZHMiOltdLCJqdGkiOiJmb3JnZWQtanRpIn0.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let body1: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_forged = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header(hyper::header::AUTHORIZATION, format!("Bearer {}", forged_token))
+            .body(body1)
+            .unwrap();
+        let resp_forged = idp.ready().await.unwrap().call(req_forged).await.unwrap();
+        assert_eq!(resp_forged.status(), StatusCode::UNAUTHORIZED);
+        assert!(!crate::middleware::jwt::get_jwt_revocation_store().is_revoked("forged-jti"));
+
+        // 2. Cookie-only forged token must also fail closed -> 401
+        let body2: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_cookie_forged = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header(hyper::header::COOKIE, format!("jwt={}", forged_token))
+            .body(body2)
+            .unwrap();
+        let resp_cookie_forged = idp.ready().await.unwrap().call(req_cookie_forged).await.unwrap();
+        assert_eq!(resp_cookie_forged.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Decoding keys unconfigured while token is present -> 503 Service Unavailable
+        idp.decoding_keys = Arc::new(Vec::new());
+        let body3: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_no_keys = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header(hyper::header::AUTHORIZATION, format!("Bearer {}", forged_token))
+            .body(body3)
+            .unwrap();
+        let resp_no_keys = idp.ready().await.unwrap().call(req_no_keys).await.unwrap();
+        assert_eq!(resp_no_keys.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 4. Logout without any token still clears cookie cleanly (200 OK + Secure flag)
+        let body4: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_clear = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .body(body4)
+            .unwrap();
+        let resp_clear = idp.ready().await.unwrap().call(req_clear).await.unwrap();
+        assert_eq!(resp_clear.status(), StatusCode::OK);
+        let clear_cookie = resp_clear
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(clear_cookie.contains("; Secure"));
+    }
+
+    #[test]
+    fn test_idp_cert_fingerprint_subject_uniqueness() {
+        let pki = common::test_pki::TestPki::new();
+        let cert_a = std::fs::read_to_string(&pki.nosan_client_pem).unwrap();
+        let cert_b = std::fs::read_to_string(&pki.praeco_client_pem).unwrap();
+
+        let sub_a1 = cert_fingerprint_subject(&cert_a).expect("valid cert A fingerprint");
+        let sub_a2 = cert_fingerprint_subject(&cert_a).expect("deterministic cert A fingerprint");
+        let sub_b = cert_fingerprint_subject(&cert_b).expect("valid cert B fingerprint");
+
+        assert_eq!(sub_a1, sub_a2);
+        assert_ne!(sub_a1, sub_b);
+        assert!(sub_a1.starts_with("sha256:"));
+        assert_eq!(sub_a1.len(), "sha256:".len() + 64);
+        assert_eq!(cert_fingerprint_subject("dummy-pem"), None);
     }
 }

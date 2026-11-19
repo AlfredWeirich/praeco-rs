@@ -210,8 +210,8 @@ impl SessionStore {
         );
 
         trace!(
-            "Created new IdP session: {} (user_code: {})",
-            session_id, user_code
+            "Created new IdP session: {}",
+            redact_session_id(&session_id)
         );
 
         Ok(SessionInfo {
@@ -237,7 +237,10 @@ impl SessionStore {
         };
 
         if entry.created_at.elapsed() > self.ttl {
-            debug!("Attempted to confirm expired session: {}", session_id);
+            debug!(
+                "Attempted to confirm expired session: {}",
+                redact_session_id(session_id)
+            );
             drop(entry);
             self.sessions.remove(session_id);
             return Err(ConfirmError::Expired);
@@ -269,14 +272,15 @@ impl SessionStore {
         if !code_matches {
             entry.failed_attempts = entry.failed_attempts.saturating_add(1);
             let attempts = entry.failed_attempts;
+            let redacted_sid = redact_session_id(session_id);
             warn!(
                 "Invalid or missing user_code for session {} (attempt {}/{})",
-                session_id, attempts, MAX_CONFIRM_ATTEMPTS
+                redacted_sid, attempts, MAX_CONFIRM_ATTEMPTS
             );
             if attempts >= MAX_CONFIRM_ATTEMPTS {
                 warn!(
                     "Session {} invalidated after {} failed user_code attempts",
-                    session_id, attempts
+                    redacted_sid, attempts
                 );
                 drop(entry);
                 self.sessions.remove(session_id);
@@ -312,7 +316,7 @@ impl SessionStore {
         }
 
         entry.status = SessionStatus::Confirmed(claims);
-        trace!("Confirmed IdP session: {}", session_id);
+        trace!("Confirmed IdP session: {}", redact_session_id(session_id));
         Ok(())
     }
 
@@ -333,7 +337,7 @@ impl SessionStore {
         if !constant_time_eq(entry_ref.poll_secret.as_bytes(), poll_secret.as_bytes()) {
             warn!(
                 "IdP status poll unauthorized: invalid poll_secret for session {}",
-                session_id
+                redact_session_id(session_id)
             );
             return Err(PollError::Unauthorized);
         }
@@ -389,6 +393,17 @@ impl SessionStore {
         self.sessions.retain(|_k, v| v.created_at.elapsed() <= ttl);
         self.ip_rate_limits
             .retain(|_k, (_count, start)| start.elapsed() <= RATE_LIMIT_WINDOW);
+    }
+}
+
+/// Returns a redacted representation of a session ID for safe logging
+/// (at most the first 8 characters followed by `"…"`).
+pub(crate) fn redact_session_id(session_id: &str) -> String {
+    if session_id.chars().count() <= 8 {
+        session_id.to_string()
+    } else {
+        let prefix: String = session_id.chars().take(8).collect();
+        format!("{prefix}…")
     }
 }
 
@@ -558,5 +573,12 @@ mod tests {
             store.confirm_session(&info2.session_id, None, claims),
             Err(ConfirmError::Expired)
         );
+    }
+
+    #[test]
+    fn test_redact_session_id() {
+        assert_eq!(redact_session_id("0123456789abcdef0123456789abcdef"), "01234567…");
+        assert_eq!(redact_session_id("12345678"), "12345678");
+        assert_eq!(redact_session_id("short"), "short");
     }
 }
