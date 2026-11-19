@@ -58,6 +58,7 @@ pub mod tls_conf;
 /// Composable HTTP endpoint router and typed extractors (enabled via the `web` feature).
 #[cfg(feature = "web")]
 pub mod web;
+pub use common::Claims;
 pub use error::SrvError;
 pub use runner::{
     CONNECTION_DRAIN_TIMEOUT, DualStackHandles, run_dual_stack, run_servers, run_tunnel,
@@ -639,5 +640,21 @@ impl Clone for ConnectionHandler {
             client_cert_san: self.client_cert_san.clone(),
             client_oids: self.client_oids.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_reexported_claims_matches_common_claims() {
+        let claims: super::Claims = common::Claims {
+            sub: "embedder".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("api".to_string()),
+            exp: 1_900_000_000,
+            oids: vec!["1".to_string()],
+            jti: None,
+        };
+        assert_eq!(claims.sub, "embedder");
     }
 }

@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+* **Library Re-Export (`src/lib.rs`):**
+  * Re-exported `common::Claims` at the crate root (`praeco_rs::Claims`) so library embedders do not need an explicit dependency on `praeco-common`.
 * **Per-Server `pki_base_oid` (`src/configuration.rs`, `src/tls_conf.rs`, `src/runner.rs`, `src/stack.rs`):**
   * Added optional `pki_base_oid` on `[[Server]]` blocks with fallback to global `Config::pki_base_oid`, plus SemVer-safe `*_with_base` / `*_with_base_oid` variants so multi-server setups can use separate client PKIs without changing existing public signatures.
 
