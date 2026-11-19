@@ -17,36 +17,11 @@
 //! ```
 
 // === Standard Library ===
-use std::fs::{read_to_string, write};
+use std::fs::write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// === External Crates ===
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize};
-
-/// Represents the claims contained within the JWT (Version 1).
-/// Includes standard fields like sub, iat, exp, and jti, as well as a custom 'oids' field.
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims1 {
-    sub: String,
-    name: String,
-    iat: u64,
-    exp: u64,
-    jti: String, // Unique identifier for the token
-    iss: String,
-    aud: String,
-    oids: Vec<String>,
-}
-
-/// Represents a simplified version of the claims (Version 2).
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims2 {
-    sub: String,
-    name: String,
-    iss: String,
-    aud: String,
-    oids: Vec<String>,
-}
+// === Internal Crates ===
+use common::{Claims, load_decoding_keys, load_encoding_key, sign_jwt, verify_jwt};
 
 /// Returns the current Unix timestamp in seconds.
 fn current_timestamp() -> Result<u64, String> {
@@ -56,89 +31,102 @@ fn current_timestamp() -> Result<u64, String> {
         .map_err(|e| format!("Time error: {e}"))
 }
 
-/// Creates a new JWT using the EdDSA algorithm and a private key.
-fn create_jwt(claims: &Claims1, private_key_path: &str) -> Result<String, String> {
-    let private_key =
-        read_to_string(private_key_path).map_err(|e| format!("Failed to read private key: {e}"))?;
-
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(private_key.as_bytes())
-            .map_err(|e| format!("Encoding key error: {e}"))?,
-    )
-    .map_err(|e| format!("JWT creation error: {e}"))
-}
-
-/// Verifies a JWT using a public key and returns the decoded claims.
-fn verify_jwt<C: serde::de::DeserializeOwned + std::fmt::Debug>(
-    token: &str,
+/// Builds signed JWTs for long-lived (`30d`) and short-lived (`1h`) test claims
+/// using shared `common::Claims` and verifies them against `public_key_path`.
+fn create_and_verify_pair(
+    private_key_path: &str,
     public_key_path: &str,
-) -> Result<C, String> {
-    let public_key =
-        read_to_string(public_key_path).map_err(|e| format!("Failed to read public key: {e}"))?;
+    issuer: &str,
+    audience: &str,
+    now: u64,
+) -> Result<(String, String, Claims, Claims), String> {
+    let encoding_key = load_encoding_key(private_key_path).map_err(|e| format!("{e:#}"))?;
+    let decoding_keys =
+        load_decoding_keys(&[public_key_path.to_string()]).map_err(|e| format!("{e:#}"))?;
 
-    let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_audience(&["praeco-gateway"]);
-    validation.set_issuer(&["praeco-auth"]);
+    let claims1 = Claims {
+        sub: "1234567890".to_string(),
+        iss: issuer.to_string(),
+        aud: Some(audience.to_string()),
+        exp: (now + 3600 * 24 * 30) as usize,
+        oids: vec!["1".to_string(), "2".to_string()],
+        jti: Some(uuid::Uuid::new_v4().to_string()),
+    };
 
-    decode::<C>(
-        token,
-        &DecodingKey::from_ed_pem(public_key.as_bytes())
-            .map_err(|e| format!("Decoding key error: {e}"))?,
-        &validation,
-    )
-    .map(|data| data.claims)
-    .map_err(|e| format!("JWT verification error: {e}"))
+    let claims2 = Claims {
+        sub: "1234567890".to_string(),
+        iss: issuer.to_string(),
+        aud: Some(audience.to_string()),
+        exp: (now + 3600) as usize,
+        oids: vec!["1".to_string(), "2".to_string()],
+        jti: Some(uuid::Uuid::new_v4().to_string()),
+    };
+
+    let token1 = sign_jwt(&claims1, &encoding_key).map_err(|e| format!("{e:#}"))?;
+    let token2 = sign_jwt(&claims2, &encoding_key).map_err(|e| format!("{e:#}"))?;
+
+    let decoded1 = verify_jwt(&token1, &decoding_keys, issuer, audience).map_err(|e| format!("{e:#}"))?;
+    let decoded2 = verify_jwt(&token2, &decoding_keys, issuer, audience).map_err(|e| format!("{e:#}"))?;
+
+    Ok((token1, token2, decoded1, decoded2))
 }
 
 /// Entry point for the JWT creator utility.
 /// Demonstrates creating two different JWTs and verifying them.
 fn main() -> Result<(), String> {
     let now = current_timestamp()?;
+    let (token1, token2, decoded_claims1, decoded_claims2) = create_and_verify_pair(
+        "./jwt_creator/private_key.pem",
+        "./jwt_creator/public_key.pem",
+        "praeco-auth",
+        "praeco-gateway",
+        now,
+    )?;
 
-    // Create claims for a long-lived admin token.
-    let claims1 = Claims1 {
-        sub: "1234567890".to_string(),
-        name: "John Doe".to_string(),
-        iat: now,
-        exp: now + 3600 * 24 * 30, // 30 days
-        jti: uuid::Uuid::new_v4().to_string(),
-        iss: "praeco-auth".to_string(),
-        aud: "praeco-gateway".to_string(),
-        oids: ["1".to_string(), "2".to_string()].to_vec(),
-    };
-
-    // Create claims for a short-lived user token.
-    let claims2 = Claims1 {
-        sub: "1234567890".to_string(),
-        name: "John Doe".to_string(),
-        iat: now,
-        exp: now + 3600, // 1h
-        jti: uuid::Uuid::new_v4().to_string(),
-        iss: "praeco-auth".to_string(),
-        aud: "praeco-gateway".to_string(),
-        oids: ["1".to_string(), "2".to_string()].to_vec(),
-    };
-
-    // Create and save JWT 1
-    let token1 = create_jwt(&claims1, "./jwt_creator/private_key.pem")?;
     println!("JWT 1: {token1}");
     write("./jwt_creator/token1.jwt", &token1)
         .map_err(|e| format!("Failed to write token1: {e}"))?;
 
-    // Create and save JWT 2
-    let token2 = create_jwt(&claims2, "./jwt_creator/private_key.pem")?;
     println!("JWT 2: {token2}");
     write("./jwt_creator/token2.jwt", &token2)
         .map_err(|e| format!("Failed to write token2: {e}"))?;
 
-    // Verify the tokens and print the results to stdout.
-    let decoded_claims1 = verify_jwt::<Claims2>(&token1, "./jwt_creator/public_key.pem")?;
     println!("Decoded Claims 1: {decoded_claims1:?}");
-
-    let decoded_claims2 = verify_jwt::<Claims2>(&token2, "./jwt_creator/public_key.pem")?;
     println!("Decoded Claims 2: {decoded_claims2:?}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_and_verify_pair_uses_common_claims() {
+        let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+        let pub_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+
+        let dir = std::env::temp_dir().join(format!("praeco_jwt_creator_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let priv_path = dir.join("priv.pem");
+        let pub_path = dir.join("pub.pem");
+        std::fs::write(&priv_path, priv_pem).unwrap();
+        std::fs::write(&pub_path, pub_pem).unwrap();
+
+        let now = current_timestamp().unwrap();
+        let res = create_and_verify_pair(
+            priv_path.to_str().unwrap(),
+            pub_path.to_str().unwrap(),
+            "praeco-auth",
+            "praeco-gateway",
+            now,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (_t1, _t2, d1, d2) = res.expect("create_and_verify_pair must succeed");
+        assert_eq!(d1.iss, "praeco-auth");
+        assert_eq!(d1.aud.as_deref(), Some("praeco-gateway"));
+        assert_eq!(d1.oids, vec!["1", "2"]);
+        assert_eq!(d2.exp, (now + 3600) as usize);
+    }
 }

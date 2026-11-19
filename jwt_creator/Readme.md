@@ -22,7 +22,7 @@ To generate a fresh Ed25519 key pair (`jwt_private.pem` / `jwt_public.pem`) safe
 
 ## Usage
 
-Run the utility from the workspace root to generate a new token:
+Run the utility from the workspace root to generate a new token (backed directly by `praeco-common`'s shared `Claims`, `sign_jwt`, and `verify_jwt` helpers with the `jwt` feature):
 
 ```bash
 cargo run -p praeco-jwt-creator --release
@@ -30,33 +30,23 @@ cargo run -p praeco-jwt-creator --release
 
 ## Example (Rust Claims)
 
-The JWT utility generates tokens containing the following payload structure (`Claims`), which includes the custom `oids` array used for authorization mapping in the gateway:
+The JWT utility generates tokens using `common::Claims`, which includes the custom `oids` array used for authorization mapping in the gateway:
 
 ```rust
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,       // Subject ID (e.g. "1234567890")
-    name: String,      // User Name (e.g. "John Doe")
-    iat: u64,          // Issued At Timestamp
-    exp: u64,          // Expiration Timestamp
-    jti: String,       // Unique Token Identifier (UUID)
-    oids: Vec<String>, // Custom RBAC OIDs (e.g. ["1", "2"])
-}
+use common::Claims;
 
 fn main() {
-    // Example of constructing the Claims payload for serialization
+    // Example of constructing the shared Claims payload for serialization
     let my_claims = Claims {
         sub: "1234567890".to_string(),
-        name: "Admin User".to_string(),
-        iat: 1690000000,
+        iss: "praeco-auth".to_string(),
+        aud: Some("praeco-gateway".to_string()),
         exp: 1690003600,
-        jti: "550e8400-e29b-41d4-a716-446655440000".to_string(),
         oids: vec!["1".to_string(), "2".to_string()],
+        jti: Some("550e8400-e29b-41d4-a716-446655440000".to_string()),
     };
-    
-    // In reality, you'd pass this struct to the jsonwebtoken::encode function
+
+    // Pass this struct to `common::sign_jwt(&my_claims, &encoding_key)`
     println!("Claims struct created: {:?}", my_claims);
 }
 ```

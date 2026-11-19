@@ -12,6 +12,5 @@ keywords = ["jwt", "eddsa", "ed25519", "tokens", "cli"]
 categories = ["command-line-utilities", "cryptography", "authentication"]
 
 [dependencies]
-jsonwebtoken = { workspace = true }
-serde = { workspace = true }
+common = { workspace = true, default-features = false, features = ["jwt"] }
 uuid = { workspace = true }
