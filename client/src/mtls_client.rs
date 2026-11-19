@@ -102,11 +102,11 @@ async fn main() -> Result<(), Error> {
     // This is required by both `rustls` (TCP+TLS path) and `quinn` (QUIC path).
     rustls::crypto::ring::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .map_err(|_| anyhow::anyhow!("Failed to install rustls crypto provider"))?;
 
     let cli = Cli::parse();
     // Validate that required flags are present for the chosen protocol
-    validate_cli(&cli);
+    validate_cli(&cli)?;
 
     // Dispatch to the appropriate transport layer
     match cli.http_version {
@@ -139,23 +139,29 @@ async fn main() -> Result<(), Error> {
 /// connection pool) while maintaining maximum throughput.
 async fn run_h2(cli: &Cli) -> Result<(), Error> {
     // Load JWT token from file (only used when `-s jwt`)
-    let jwt_token = read_jwt(cli);
+    let jwt_token = read_jwt(cli)?;
 
     // Construct the hyper HTTP client (with TLS connector) and target URI
     let client = build_h2_client(cli)?;
-    let uri = build_uri(cli);
+    let uri = build_uri(cli)?;
 
     let concurrency = cli.num_parallel as usize;
     let total_requests = cli.num_req as usize;
 
     // --- Sliding-window request loop ---
-    run_sliding_window(total_requests, concurrency, "Request failed", || {
+    let failed = run_sliding_window(total_requests, concurrency, "Request failed", || {
         let uri = uri.clone();
         let client_clone = client.clone();
         let jwt_token_clone = jwt_token.as_deref().map(|s| s.to_string());
         async move { do_request_h2(&client_clone, cli, jwt_token_clone.as_deref(), uri).await }
     })
     .await;
+
+    if failed > 0 {
+        return Err(anyhow::anyhow!(
+            "{failed} of {total_requests} H2 requests failed"
+        ));
+    }
 
     Ok(())
 }
@@ -263,40 +269,29 @@ enum Protocol {
 /// | `Jwt` | `--ca` (soft), `--jwt` |
 /// | `Mtls` | `--ca` (soft), `--cert`, `--key` |
 ///
-/// Missing **hard** requirements cause an immediate `exit(1)`.
-fn validate_cli(cli: &Cli) {
+/// Missing **hard** requirements return an [`Error`].
+fn validate_cli(cli: &Cli) -> Result<(), Error> {
     match cli.security {
         Protocol::Https => {
             if cli.ca.is_none() {
                 // Soft warning — the system WebPKI roots may suffice for
                 // public servers, so we do not hard-fail here.
-                // error!("--ca <Root ca> must be set for HTTPS");
-                // std::process::exit(1);
             }
         }
         Protocol::Jwt => {
-            if cli.ca.is_none() {
-                // error!("--ca <Root ca> must be set for JWT");
-                // std::process::exit(1);
-            }
             if cli.jwt.is_none() {
-                error!("--jwt <jwt file> must be set for JWT");
-                std::process::exit(1);
+                anyhow::bail!("--jwt <jwt file> must be set for JWT");
             }
         }
         Protocol::Mtls => {
-            if cli.ca.is_none() {
-                // error!("--ca <Root ca> must be set for mTLS");
-                // std::process::exit(1);
-            }
             // mTLS requires both the client certificate and its private key
             if cli.cert.is_none() || cli.key.is_none() {
-                error!("--cert <client cert> and --key <client-key> must be set for mTLS");
-                std::process::exit(1);
+                anyhow::bail!("--cert <client cert> and --key <client-key> must be set for mTLS");
             }
         }
         Protocol::Http => {} // No TLS, nothing to validate
     }
+    Ok(())
 }
 
 // =============================================================================
@@ -348,46 +343,58 @@ fn build_h2_client(
 
 /// Reads a JWT token from the file specified by `--jwt`, trimming whitespace.
 ///
-/// Returns `None` if the current protocol is **not** `Jwt` (the token is
+/// Returns `Ok(None)` if the current protocol is **not** `Jwt` (the token is
 /// simply not needed).
-///
-/// # Panics
-///
-/// Panics if the file cannot be read (the path was already validated by
-/// [`validate_cli`]).
-fn read_jwt(cli: &Cli) -> Option<String> {
+fn read_jwt(cli: &Cli) -> Result<Option<String>, Error> {
     if let Protocol::Jwt = cli.security {
-        let path = cli.jwt.as_ref().unwrap();
-        Some(
-            std::fs::read_to_string(path)
-                .expect("Failed to read JWT")
-                .trim()
-                .to_string(),
-        )
+        let path = cli
+            .jwt
+            .as_deref()
+            .context("--jwt <jwt file> must be set for JWT")?;
+        let token = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read JWT file '{path}'"))?
+            .trim()
+            .to_string();
+        Ok(Some(token))
     } else {
-        None
+        Ok(None)
     }
 }
 
 /// Constructs the full request URI from the CLI flags.
 ///
 /// Combines `--security` (to pick `http://` or `https://`), `--uri`
-/// (host:port), and `--path` into a single [`Uri`].
+/// (host:port or `[ipv6]:port`), and `--path` into a single [`Uri`].
 ///
 /// # Example
 ///
 /// With `-s mtls -u 192.168.178.31:1337 -p /api/health`:
 ///
 /// → `https://192.168.178.31:1337/api/health`
-fn build_uri(cli: &Cli) -> Uri {
+fn build_uri(cli: &Cli) -> Result<Uri, Error> {
     let scheme = match cli.security {
         Protocol::Https | Protocol::Mtls | Protocol::Jwt => "https",
         Protocol::Http => "http",
     };
-    let uri = format!("{}://{}{}", scheme, cli.uri, cli.path);
-    let uri = uri.parse().expect("Invalid URI");
+    let raw = format!("{}://{}{}", scheme, cli.uri, cli.path);
+    let uri: Uri = raw
+        .parse()
+        .with_context(|| format!("Invalid target URI '{raw}'"))?;
     trace!("Built URI: {}", uri);
-    uri
+    Ok(uri)
+}
+
+/// Extracts the SNI / server host name from `host:port`, `[ipv6]:port`, or bare hosts.
+fn extract_server_name(target: &str) -> &str {
+    if let Some(rest) = target.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host;
+    }
+    if target.matches(':').count() > 1 {
+        return target;
+    }
+    target.split(':').next().unwrap_or(target)
 }
 
 // =============================================================================
@@ -422,7 +429,7 @@ async fn do_request_h2(
 
     let request = prepare_request_builder(cli, jwt_token, &uri)
         .body(body)
-        .expect("Failed to build request");
+        .context("Failed to build request")?;
 
     // trace!("Request: {:#?}", request);
 
@@ -522,11 +529,12 @@ async fn run_h3(cli: &Cli) -> Result<(), Error> {
     client_config.transport_config(Arc::new(transport));
 
     // ---- Step 2: Create QUIC endpoint on an ephemeral UDP port ----
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+    let bind_addr = std::net::SocketAddr::from(([0, 0, 0, 0], 0));
+    let mut endpoint = quinn::Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
 
     // ---- Step 3: Resolve target address and connect ----
-    // Resolve "host:port" to a SocketAddr (supports DNS names and raw IPs)
+    // Resolve "host:port" or "[ipv6]:port" to a SocketAddr
     let server_addr = cli
         .uri
         .to_socket_addrs()
@@ -534,9 +542,7 @@ async fn run_h3(cli: &Cli) -> Result<(), Error> {
         .next()
         .context("No socket address resolved")?;
 
-    // Extract the hostname part (before the colon) for TLS SNI verification.
-    // For IP addresses this will be the IP itself; for DNS names, the hostname.
-    let server_name = cli.uri.split(':').next().unwrap_or(&cli.uri);
+    let server_name = extract_server_name(&cli.uri);
 
     trace!("HTTP/3: Connecting to {} ({})", server_name, server_addr);
 
@@ -574,16 +580,22 @@ async fn run_h3(cli: &Cli) -> Result<(), Error> {
 
     // jwt_token and uri must be declared BEFORE the sliding window so they
     // live long enough for the async requests to borrow them.
-    let jwt_token = read_jwt(cli);
-    let uri = build_uri(cli);
+    let jwt_token = read_jwt(cli)?;
+    let uri = build_uri(cli)?;
 
-    run_sliding_window(total_requests, concurrency, "H3 request failed", || {
+    let failed = run_sliding_window(total_requests, concurrency, "H3 request failed", || {
         let uri = uri.clone();
         let send_request = send_request.clone();
         let jwt_token_clone = jwt_token.as_deref().map(|s| s.to_string());
         async move { do_request_h3(&send_request, cli, jwt_token_clone.as_deref(), uri).await }
     })
     .await;
+
+    if failed > 0 {
+        return Err(anyhow::anyhow!(
+            "{failed} of {total_requests} H3 requests failed"
+        ));
+    }
 
     Ok(())
 }
@@ -623,7 +635,7 @@ async fn do_request_h3(
     // h3 requests have `()` body — data is sent separately via send_data()
     let request = prepare_request_builder(cli, jwt_token, &uri)
         .body(())
-        .expect("Failed to build h3 request");
+        .context("Failed to build h3 request")?;
 
     // Clone the SendRequest handle to open a fresh QUIC bidirectional stream.
     // This is the h3 equivalent of opening a new HTTP/2 stream.
@@ -713,18 +725,20 @@ async fn run_sliding_window<F, Fut>(
     concurrency: usize,
     err_prefix: &str,
     mut make_future: F,
-) where
+) -> usize
+where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<String, Error>>,
 {
     if concurrency == 0 || total_requests == 0 {
-        return;
+        return 0;
     }
 
     let mut futs = FuturesUnordered::new();
     let start = Instant::now();
     let mut completed = 0;
     let mut launched = 0;
+    let mut failed = 0;
 
     // Seed the initial batch
     let first_batch = std::cmp::min(concurrency, total_requests);
@@ -741,7 +755,10 @@ async fn run_sliding_window<F, Fut>(
         completed += 1;
         match res {
             Ok(_) => {}
-            Err(e) => error!("{err_prefix}: {e}"),
+            Err(e) => {
+                failed += 1;
+                error!("{err_prefix}: {e}");
+            }
         }
 
         if launched < total_requests {
@@ -750,24 +767,27 @@ async fn run_sliding_window<F, Fut>(
         }
     }
 
-    print_stats(start, total_requests, concurrency);
+    print_stats(start, total_requests, failed, concurrency);
+    failed
 }
 
 /// Prints throughput statistics after all requests have completed.
 ///
 /// Reports:
 /// - Total wall-clock duration in milliseconds.
-/// - Mean requests per second.
+/// - Mean requests per second and failed request count.
 /// - Mean latency per request in microseconds.
-fn print_stats(start: Instant, total_requests: usize, concurrency: usize) {
+fn print_stats(start: Instant, total_requests: usize, failed: usize, concurrency: usize) {
     let duration = start.elapsed();
-    let mean = total_requests as f64 / duration.as_secs_f64();
+    let secs = duration.as_secs_f64().max(1e-9);
+    let mean = total_requests as f64 / secs;
     tracing::info!(
-        "\nDuration: {}ms with {} total requests at concurrency {}\nMean requests per second: {mean:.0}  --> per request: {:.1}us",
+        "\nDuration: {}ms with {} total requests ({} failed) at concurrency {}\nMean requests per second: {mean:.0}  --> per request: {:.1}us",
         duration.as_millis(),
         total_requests,
+        failed,
         concurrency,
-        1000000. / mean
+        1_000_000. / mean
     );
 }
 
@@ -782,13 +802,42 @@ mod tests {
         assert_eq!(ok.num_parallel, 1);
     }
 
+    #[test]
+    fn test_extract_server_name_handles_ipv6_ipv4_and_dns() {
+        assert_eq!(extract_server_name("[::1]:1337"), "::1");
+        assert_eq!(extract_server_name("[::1]"), "::1");
+        assert_eq!(extract_server_name("::1"), "::1");
+        assert_eq!(extract_server_name("example.com:8443"), "example.com");
+        assert_eq!(extract_server_name("127.0.0.1:1337"), "127.0.0.1");
+        assert_eq!(extract_server_name("localhost"), "localhost");
+    }
+
     #[tokio::test]
     async fn test_run_sliding_window_zero_concurrency_returns_immediately() {
-        tokio::time::timeout(
+        let failed = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             run_sliding_window(10, 0, "err", || async { Ok(String::new()) }),
         )
         .await
         .expect("run_sliding_window with concurrency=0 must not spin");
+        assert_eq!(failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_sliding_window_counts_failures() {
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = run_sliding_window(5, 2, "test err", || {
+            let c = count.clone();
+            async move {
+                let idx = c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx.is_multiple_of(2) {
+                    Err(anyhow::anyhow!("boom"))
+                } else {
+                    Ok("ok".to_string())
+                }
+            }
+        })
+        .await;
+        assert_eq!(failed, 3);
     }
 }
