@@ -528,14 +528,32 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 IdpFuture::Ready { response: Some(resp) }
             }
 
-            // 2b. View session user_code on device (for Quishing verification by Swift URLSession before mTLS confirm)
+            // 2b. View session user_code on device (requires mTLS client cert or valid poll_secret)
             (Method::GET, "/auth/session_info") => {
+                if let Err(msg) = verify_same_origin(req.headers()) {
+                    tracing::warn!("{}: Blocked cross-site GET /auth/session_info", self.server_name);
+                    return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
+                    };
+                }
                 let sid = match session_id {
                     Some(sid) => sid,
                     None => return IdpFuture::Ready {
                         response: Some(Self::response_err(StatusCode::BAD_REQUEST, "Missing session parameter")),
                     },
                 };
+                let authorized = mtls_claims.is_some()
+                    || poll_secret
+                        .as_deref()
+                        .is_some_and(|secret| self.session_store.verify_poll_secret(&sid, secret));
+                if !authorized {
+                    return IdpFuture::Ready {
+                        response: Some(Self::response_err(
+                            StatusCode::UNAUTHORIZED,
+                            "Unauthorized: mTLS certificate or valid poll_secret required",
+                        )),
+                    };
+                }
                 let resp = match self.session_store.get_session_user_code(&sid) {
                     Some(code) => {
                         let body = format!(r#"{{"user_code":"{}"}}"#, code);
@@ -548,6 +566,12 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 3. Confirm a session (Device with mTLS calls this)
             (Method::POST, "/auth/confirm") => {
+                if let Err(msg) = verify_same_origin(req.headers()) {
+                    tracing::warn!("{}: Blocked cross-site POST /auth/confirm", self.server_name);
+                    return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
+                    };
+                }
                 let sid = match session_id {
                     Some(sid) => sid,
                     None => return IdpFuture::Ready {
@@ -815,6 +839,34 @@ fn cert_fingerprint_subject(pem_str: &str) -> Option<String> {
     Some(sub)
 }
 
+/// Rejects browser cross-site / cross-origin requests while permitting native
+/// non-browser clients (e.g., mobile apps or `curl`) that omit `Sec-Fetch-Site`
+/// and `Origin` headers.
+fn verify_same_origin(headers: &hyper::HeaderMap) -> Result<(), &'static str> {
+    if let Some(sec_fetch_site) = headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        && !sec_fetch_site.eq_ignore_ascii_case("same-origin")
+        && !sec_fetch_site.eq_ignore_ascii_case("none")
+    {
+        return Err("Cross-site request blocked");
+    }
+
+    if let Some(origin) = headers.get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        let origin_authority = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .map(|rest| rest.split('/').next().unwrap_or(rest));
+        let host = headers.get(hyper::header::HOST).and_then(|v| v.to_str().ok());
+        match (origin_authority, host) {
+            (Some(orig_host), Some(req_host)) if orig_host.eq_ignore_ascii_case(req_host) => {}
+            _ => return Err("Cross-origin request blocked"),
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,5 +1098,100 @@ mod tests {
         assert!(sub_a1.starts_with("sha256:"));
         assert_eq!(sub_a1.len(), "sha256:".len() + 64);
         assert_eq!(cert_fingerprint_subject("dummy-pem"), None);
+    }
+
+    #[tokio::test]
+    async fn test_idp_confirm_blocks_cross_site_csrf_and_session_info_requires_auth() {
+        let mut idp = create_test_idp_service();
+
+        // 1. Start a login session
+        let body_login: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_login = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .body(body_login)
+            .unwrap();
+        let resp_login = idp.ready().await.unwrap().call(req_login).await.unwrap();
+        assert_eq!(resp_login.status(), StatusCode::OK);
+        let login_bytes = resp_login.into_body().collect().await.unwrap().to_bytes();
+        let login_json: serde_json::Value = serde_json::from_slice(&login_bytes).unwrap();
+        let session = login_json["session"].as_str().unwrap().to_string();
+        let poll_secret = login_json["poll_secret"].as_str().unwrap().to_string();
+        let user_code = login_json["user_code"].as_str().unwrap().to_string();
+
+        // 2. Unauthenticated /auth/session_info without mTLS or poll_secret -> 401
+        let body_info1: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_info_unauth = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/auth/session_info?session={session}"))
+            .body(body_info1)
+            .unwrap();
+        let resp_info_unauth = idp.ready().await.unwrap().call(req_info_unauth).await.unwrap();
+        assert_eq!(resp_info_unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. /auth/session_info with matching poll_secret -> 200
+        let body_info2: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let req_info_secret = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/auth/session_info?session={session}&poll_secret={poll_secret}"))
+            .body(body_info2)
+            .unwrap();
+        let resp_info_secret = idp.ready().await.unwrap().call(req_info_secret).await.unwrap();
+        assert_eq!(resp_info_secret.status(), StatusCode::OK);
+
+        // 4. /auth/session_info with mTLS cert -> 200
+        let body_info3: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let mut req_info_mtls = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/auth/session_info?session={session}"))
+            .body(body_info3)
+            .unwrap();
+        req_info_mtls
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        let resp_info_mtls = idp.ready().await.unwrap().call(req_info_mtls).await.unwrap();
+        assert_eq!(resp_info_mtls.status(), StatusCode::OK);
+
+        // 5. POST /auth/confirm with Sec-Fetch-Site: cross-site -> 403 Forbidden
+        let body_csrf1: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let mut req_confirm_csrf = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/auth/confirm?session={session}&code={user_code}"))
+            .header("sec-fetch-site", "cross-site")
+            .body(body_csrf1)
+            .unwrap();
+        req_confirm_csrf
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        let resp_confirm_csrf = idp.ready().await.unwrap().call(req_confirm_csrf).await.unwrap();
+        assert_eq!(resp_confirm_csrf.status(), StatusCode::FORBIDDEN);
+
+        // 6. POST /auth/confirm with mismatched Origin vs Host -> 403 Forbidden
+        let body_csrf2: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let mut req_confirm_origin = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/auth/confirm?session={session}&code={user_code}"))
+            .header(hyper::header::HOST, "idp.example.test")
+            .header(hyper::header::ORIGIN, "https://evil.example.net")
+            .body(body_csrf2)
+            .unwrap();
+        req_confirm_origin
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        let resp_confirm_origin = idp.ready().await.unwrap().call(req_confirm_origin).await.unwrap();
+        assert_eq!(resp_confirm_origin.status(), StatusCode::FORBIDDEN);
+
+        // 7. Native/same-origin POST /auth/confirm with mTLS + valid user_code -> 200 OK
+        let body_ok: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
+        let mut req_confirm_ok = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/auth/confirm?session={session}&code={user_code}"))
+            .body(body_ok)
+            .unwrap();
+        req_confirm_ok
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        let resp_confirm_ok = idp.ready().await.unwrap().call(req_confirm_ok).await.unwrap();
+        assert_eq!(resp_confirm_ok.status(), StatusCode::OK);
     }
 }

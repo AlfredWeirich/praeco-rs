@@ -377,6 +377,14 @@ impl SessionStore {
         })
     }
 
+    /// Checks in constant time whether `poll_secret` matches an active (unexpired) session.
+    pub fn verify_poll_secret(&self, session_id: &str, poll_secret: &str) -> bool {
+        self.sessions.get(session_id).is_some_and(|entry| {
+            entry.created_at.elapsed() <= self.ttl
+                && constant_time_eq(entry.poll_secret.as_bytes(), poll_secret.as_bytes())
+        })
+    }
+
     /// Throttled cleanup of expired sessions and stale IP rate-limiting records.
     fn maybe_cleanup_expired(&self) {
         if let Ok(mut last) = self.last_cleanup.try_lock()
