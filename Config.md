@@ -138,7 +138,7 @@ includes = [
 
 ### Tokio Worker Threads (`tokio_threads`)
 
-- **Data Type:** Integer (`usize`)
+- **Data Type:** Integer (`usize`, must be `>= 1` when specified)
 - **Requirement:** Optional
 - **Default Value:** `Available Logical CPU Cores * 2` (e.g. `16` on an 8-core CPU)
 
@@ -320,8 +320,8 @@ Controls how clients are verified during the TLS handshake or request lifecycle:
 | Value | Handshake & Request Behavior | Use Case |
 | :--- | :--- | :--- |
 | `"None"` | Public access. No client certificate is requested during TLS. No JWT verification is performed unless explicitly added to `[Server.Layers]`. | Public APIs, static file downloads, health-check endpoints. |
-| `"ClientCert"` or `"mTLS"` | **Strict mutual TLS.** During the TLS handshake, Praeco's `WebPkiClientVerifier` demands a client certificate signed by a CA in `[[Server.client_certs]]`. If missing, expired, or revoked by a CRL, the connection is aborted with a TLS fatal alert before any HTTP data is exchanged. | Zero-Trust microservice communication, enterprise device backends. |
-| `"OptionalClientCert"` | **Permissive mutual TLS.** The server requests a client certificate during the TLS handshake (`allow_unauthenticated()`), but allows the connection to proceed if omitted. | **Identity Provider (IdP):** Allows browsers without client certs to load the HTML login page, while allowing mobile scanners to authenticate with device certs. |
+| `"ClientCert"` or `"mTLS"` | **Strict mutual TLS (`protocol = "https"` required).** During the TLS handshake, Praeco's `WebPkiClientVerifier` demands a client certificate signed by a CA in `[[Server.client_certs]]`. If missing, expired, or revoked by a CRL, the connection is aborted with a TLS fatal alert before any HTTP data is exchanged. | Zero-Trust microservice communication, enterprise device backends. |
+| `"OptionalClientCert"` | **Permissive mutual TLS (`protocol = "https"` required).** The server requests a client certificate during the TLS handshake (`allow_unauthenticated()`), but allows the connection to proceed if omitted. | **Identity Provider (IdP):** Allows browsers without client certs to load the HTML login page, while allowing mobile scanners to authenticate with device certs. |
 | `"JWT"` | Inbound HTTP requests must contain a valid JWT in `Authorization: Bearer <token>` or in a configured cookie fallback. Validates signature, `iss`, and `aud`. | Web application dashboards, mobile APIs. |
 
 ---
