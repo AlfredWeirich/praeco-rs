@@ -1412,9 +1412,10 @@ async fn test_data_plane_case_insensitive_sni_routing() {
         compat.write_all(b"ROUTED_OK").await.unwrap();
         compat.flush().await.unwrap();
         let _ = compat.shutdown().await;
-        // Wait for external client to read ROUTED_OK and close its half before aborting Yamux driver
-        let mut eof = [0u8; 1];
-        let _ = compat.read(&mut eof).await;
+        // Drain any trailing ClientHello bytes and wait until the external client reads ROUTED_OK
+        // and closes its half (EOF == 0) before aborting the Yamux driver.
+        let mut drain_buf = [0u8; 256];
+        while matches!(compat.read(&mut drain_buf).await, Ok(n) if n > 0) {}
         driver.abort();
     });
 
