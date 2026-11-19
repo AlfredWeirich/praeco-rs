@@ -123,22 +123,28 @@ where
                     );
                 }
 
-                let safe_headers = sanitize_headers(res.headers());
                 if status.is_server_error() {
-                    tracing::error!(
-                        "{}: <-- Response: Status {} | Headers: {:?}",
-                        this.server_name,
-                        status,
-                        safe_headers
-                    );
+                    if tracing::enabled!(tracing::Level::ERROR) {
+                        let safe_headers = sanitize_headers(res.headers());
+                        tracing::error!(
+                            "{}: <-- Response: Status {} | Headers: {:?}",
+                            this.server_name,
+                            status,
+                            safe_headers
+                        );
+                    }
                 } else if status.is_client_error() || is_cors_preflight_failed {
-                    tracing::warn!(
-                        "{}: <-- Response: Status {} | Headers: {:?}",
-                        this.server_name,
-                        status,
-                        safe_headers
-                    );
-                } else {
+                    if tracing::enabled!(tracing::Level::WARN) {
+                        let safe_headers = sanitize_headers(res.headers());
+                        tracing::warn!(
+                            "{}: <-- Response: Status {} | Headers: {:?}",
+                            this.server_name,
+                            status,
+                            safe_headers
+                        );
+                    }
+                } else if tracing::enabled!(tracing::Level::INFO) {
+                    let safe_headers = sanitize_headers(res.headers());
                     tracing::info!(
                         "{}: <-- Response: Status {} | Headers: {:?}",
                         this.server_name,
@@ -234,37 +240,35 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let server_name = self.server_name;
 
-        // === EXTENSION TRACING START ===
-        let ext = req.extensions();
-
-        // 1. Extract SocketAddr (IP)
-        let client_ip = ext
-            .get::<std::net::SocketAddr>()
-            .map(|addr| addr.to_string())
-            .unwrap_or_else(|| "Unknown IP".to_string());
-
-        // 2. Extract User Roles
-        // Supports both stack-allocated RoleVec<6> and legacy Vec<UserRole>
-        let roles_str = if let Some(roles) = ext.get::<Arc<crate::configuration::RoleVec<6>>>() {
-            format!("{:?}", roles)
-        } else if let Some(roles) = ext.get::<Arc<Vec<UserRole>>>() {
-            format!("{:?}", roles)
-        } else {
-            "No Roles".to_string()
-        };
-
         let req_method = req.method().clone();
         let req_origin = req.headers().get(hyper::header::ORIGIN).cloned();
 
-        tracing::info!(
-            "{}: --> {} {} | IP: {} | Roles: {} ",
-            server_name,
-            req.method(),
-            sanitize_uri(req.uri()),
-            client_ip,
-            roles_str,
-        );
-        // === EXTENSION TRACING END ===
+        if tracing::enabled!(tracing::Level::INFO) {
+            let ext = req.extensions();
+
+            let client_ip = ext
+                .get::<std::net::SocketAddr>()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "Unknown IP".to_string());
+
+            let roles_str = if let Some(roles) = ext.get::<Arc<crate::configuration::RoleVec<6>>>()
+            {
+                format!("{:?}", roles)
+            } else if let Some(roles) = ext.get::<Arc<Vec<UserRole>>>() {
+                format!("{:?}", roles)
+            } else {
+                "No Roles".to_string()
+            };
+
+            tracing::info!(
+                "{}: --> {} {} | IP: {} | Roles: {} ",
+                server_name,
+                req.method(),
+                sanitize_uri(req.uri()),
+                client_ip,
+                roles_str,
+            );
+        }
 
         let fut = self.inner.call(req);
 

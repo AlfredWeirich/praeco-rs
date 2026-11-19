@@ -64,32 +64,34 @@ where
     S::Error: std::fmt::Display + 'static,
 {
     /// Wraps `tower_http::services::ServeFileSystemResponseBody` (which is
-    /// `Send` but not `Sync`) to satisfy the `BoxBody<Bytes, SrvError>`
-    /// (`Send + Sync`) requirement of Praeco's middleware pipeline.
+    /// `Send` but not `Sync`) in a `std::sync::Mutex` so it satisfies the
+    /// `BoxBody<Bytes, SrvError>` (`Send + Sync`) bound cleanly in 100% safe Rust.
     ///
-    /// # Safety
-    /// The inner body is only ever accessed from a single `async move` task
-    /// context (by Hyper). No concurrent `&self` access occurs across threads,
-    /// so the `Sync` bound is trivially satisfied.
-    struct SyncWrapper<B>(B);
-    unsafe impl<B: Send> Sync for SyncWrapper<B> {}
-    impl<B: hyper::body::Body + Unpin> hyper::body::Body for SyncWrapper<B> {
+    /// Because Hyper polls `poll_frame` through `Pin<&mut Self>`, `Mutex::get_mut`
+    /// provides lock-free mutable access with zero runtime overhead.
+    struct SyncWrapper<B>(std::sync::Mutex<B>);
+    impl<B: hyper::body::Body + Unpin + Send> hyper::body::Body for SyncWrapper<B> {
         type Data = B::Data;
         type Error = B::Error;
 
         fn poll_frame(
-            mut self: std::pin::Pin<&mut Self>,
+            self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
-            std::pin::Pin::new(&mut self.0).poll_frame(cx)
+            let wrapper = std::pin::Pin::into_inner(self);
+            let inner = wrapper.0.get_mut().unwrap_or_else(|e| e.into_inner());
+            std::pin::Pin::new(inner).poll_frame(cx)
         }
 
         fn is_end_stream(&self) -> bool {
-            self.0.is_end_stream()
+            self.0
+                .lock()
+                .map(|b| b.is_end_stream())
+                .unwrap_or(false)
         }
 
         fn size_hint(&self) -> hyper::body::SizeHint {
-            self.0.size_hint()
+            self.0.lock().map(|b| b.size_hint()).unwrap_or_default()
         }
     }
 
@@ -100,7 +102,7 @@ where
             match s.oneshot(req).await {
                 Ok(response) => {
                     let mapped = response.map(|b| {
-                        SyncWrapper(b)
+                        SyncWrapper(std::sync::Mutex::new(b))
                             .map_err(|e| SrvError::from(e.to_string()))
                             .boxed()
                     });
@@ -220,9 +222,7 @@ pub fn build_service_stack_with_base(
         .static_name
         .ok_or_else(|| SrvError::Other(format!("{}: static_name missing", server_config.name)))?;
 
-    let has_sanitizer = layers
-        .iter()
-        .any(|l| matches!(l, MiddlewareLayer::PathSanitizer));
+    let has_outer_sanitizer = sanitizer_precedes_security_layers(&layers);
     let applied = apply_layers(
         base_service,
         layers,
@@ -232,8 +232,9 @@ pub fn build_service_stack_with_base(
         Arc::new(server_config.oid_mapping.clone()),
     )?;
 
-    // Security: Enforce RFC 3986 path canonicalization and reject traversal/illegal encodings across all servers
-    let sanitized = if has_sanitizer {
+    // Security: Enforce RFC 3986 path canonicalization and reject traversal/illegal encodings
+    // before any path-consuming security middleware (IpFilter, RateLimiter, JwtAuth, Inspection).
+    let sanitized = if has_outer_sanitizer {
         applied
     } else {
         PathSanitizerLayer::new(static_name)
@@ -1034,12 +1035,15 @@ where
         .await
         .map_err(|e| SrvError::Other(format!("Failed to flush REGISTER command: {e}")))?;
 
-    // 2. Setup Yamux (S-27: configurable concurrent streams + scaled receive window)
-    let max_streams = tunnel.max_yamux_streams.unwrap_or(4096);
+    // 2. Setup Yamux (S-27: configurable concurrent streams + bounded receive window)
+    let max_streams = tunnel.max_yamux_streams.unwrap_or(4096).max(1);
     let mut cfg = yamux::Config::default();
+    cfg.set_max_connection_receive_window(None);
     cfg.set_max_num_streams(max_streams);
-    let min_window = max_streams * 256 * 1024;
-    cfg.set_max_connection_receive_window(Some(std::cmp::max(min_window, 1024 * 1024 * 1024)));
+    let bounded_window = max_streams
+        .saturating_mul(256 * 1024)
+        .max(4 * 1024 * 1024);
+    cfg.set_max_connection_receive_window(Some(bounded_window));
     let mut connection = yamux::Connection::new(control_stream.compat(), cfg, yamux::Mode::Client);
 
     info!(
@@ -1206,6 +1210,27 @@ where
     Ok(())
 }
 
+/// Returns `true` only if `MiddlewareLayer::PathSanitizer` appears before any
+/// path-consuming security middleware (such as `IpFilter`, `RateLimiter`, `JwtAuth`,
+/// or `Inspection`). If placed later, `build_service_stack_with_base` prepends an
+/// outer `PathSanitizerLayer` so security checks always inspect canonicalized URIs.
+fn sanitizer_precedes_security_layers(layers: &[MiddlewareLayer]) -> bool {
+    for layer in layers {
+        match layer {
+            MiddlewareLayer::PathSanitizer => return true,
+            MiddlewareLayer::Logger
+            | MiddlewareLayer::SecurityHeaders(_)
+            | MiddlewareLayer::TraceId
+            | MiddlewareLayer::Timing
+            | MiddlewareLayer::Counter
+            | MiddlewareLayer::AltSvc
+            | MiddlewareLayer::Cors(_) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tunnel_peer_tests {
     use super::resolve_tunnel_peer;
@@ -1277,5 +1302,33 @@ mod tunnel_peer_tests {
                 .await
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_sanitizer_precedence_helper_enforces_outer_positioning() {
+        use super::{MiddlewareLayer, sanitizer_precedes_security_layers};
+        assert!(sanitizer_precedes_security_layers(&[
+            MiddlewareLayer::Logger,
+            MiddlewareLayer::TraceId,
+            MiddlewareLayer::PathSanitizer,
+            MiddlewareLayer::Inspection,
+        ]));
+        assert!(!sanitizer_precedes_security_layers(&[
+            MiddlewareLayer::Logger,
+            MiddlewareLayer::Inspection,
+            MiddlewareLayer::PathSanitizer,
+        ]));
+        assert!(!sanitizer_precedes_security_layers(&[
+            MiddlewareLayer::Logger,
+            MiddlewareLayer::JwtAuth(crate::configuration::JwtAuthConfig {
+                jwt_public_keys: vec!["k.pem".to_string()],
+                cookie_fallback: None,
+                redirect_on_failure: None,
+                expected_issuer: "iss".to_string(),
+                expected_audience: "aud".to_string(),
+                revoke_on_paths: vec![],
+            }),
+            MiddlewareLayer::PathSanitizer,
+        ]));
     }
 }

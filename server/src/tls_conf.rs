@@ -179,7 +179,12 @@ pub fn tls_config(
                         "{server_name}: Failed to load CRL from '{crl_path}': {e}"
                     ))
                 })?;
-                warn_if_crl_expired(server_name, crl_path, crl.as_ref());
+                if !warn_if_crl_expired(server_name, crl_path, crl.as_ref()) && strict_crl_enabled()
+                {
+                    return Err(Error::msg(format!(
+                        "{server_name}: Rejecting CRL '{crl_path}' because PRAECO_STRICT_CRL is enabled and the CRL is expired or invalid"
+                    )));
+                }
                 trace!("{server_name}: Added CRL from {crl_path}");
                 crls.push(crl);
             }
@@ -231,6 +236,33 @@ pub fn tls_config(
     );
 
     Ok(config)
+}
+
+/// Returns `true` when strict CRL expiration enforcement is enabled via
+/// `PRAECO_STRICT_CRL` (`"1"` or `"true"`).
+#[inline]
+pub fn strict_crl_enabled() -> bool {
+    std::env::var("PRAECO_STRICT_CRL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Validates a DER-encoded X.509 CRL against expiration (`nextUpdate`) and returns
+/// an `Err` when `strict` is `true` and the CRL is expired, lacks `nextUpdate`, or
+/// cannot be parsed.
+pub fn validate_crl_not_expired(
+    server_name: &str,
+    crl_path: &str,
+    crl_der: &[u8],
+    strict: bool,
+) -> Result<(), String> {
+    if warn_if_crl_expired(server_name, crl_path, crl_der) || !strict {
+        Ok(())
+    } else {
+        Err(format!(
+            "{server_name}: CRL '{crl_path}' is expired, lacks nextUpdate, or failed parsing"
+        ))
+    }
 }
 
 /// Checks a DER-encoded X.509 CRL for expiration (`nextUpdate` in the past) or missing
@@ -510,5 +542,14 @@ mod tests {
 
         assert!(extract_oids_from_cert_with_base(leaf_der, None).is_empty());
         assert!(extract_oids_from_cert_with_base(leaf_der, Some(&[])).is_empty());
+    }
+
+    #[test]
+    fn test_validate_crl_not_expired_strict_vs_permissive() {
+        let invalid_der = b"not-a-valid-crl";
+        // Non-strict emits warning and allows fallback compatibility
+        assert!(validate_crl_not_expired("srv", "stale.crl", invalid_der, false).is_ok());
+        // Strict mode fails hard
+        assert!(validate_crl_not_expired("srv", "stale.crl", invalid_der, true).is_err());
     }
 }

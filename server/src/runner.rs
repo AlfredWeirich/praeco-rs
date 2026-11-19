@@ -40,6 +40,7 @@ use crate::{
 
 /// Spawns and drives all enabled [`ServerConfig`] instances in `config` until
 /// `cancel_token` is cancelled, then waits for graceful shutdown.
+#[tracing::instrument(skip(config, cancel_token))]
 pub async fn run_servers(config: Arc<Config>, cancel_token: CancellationToken) {
     let mut server_join_set = JoinSet::new();
 
@@ -68,7 +69,29 @@ pub async fn run_servers(config: Arc<Config>, cancel_token: CancellationToken) {
         });
     }
 
-    cancel_token.cancelled().await;
+    if server_join_set.is_empty() {
+        error!("No enabled servers started; exiting run_servers instead of idling");
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => break,
+            res = server_join_set.join_next() => {
+                match res {
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        error!("Server task panicked or failed prematurely: {:?}", e);
+                    }
+                    None => break,
+                }
+                if server_join_set.is_empty() {
+                    error!("All server listeners stopped unexpectedly; exiting run_servers");
+                    return;
+                }
+            }
+        }
+    }
 
     while let Some(res) = server_join_set.join_next().await {
         if let Err(e) = res {
@@ -236,6 +259,7 @@ pub async fn start_single_server_with_socket_signal(
 /// Like [`start_single_server_with_socket_signal`], but also listens on `reload_rx`
 /// to hot-reload TLS/mTLS/CRL configurations, OID mappings, connection limits, and
 /// active router health-check loops in place on `SIGHUP`.
+#[tracing::instrument(skip(server_config, cancel_token, dynamic_stack, sockets_released, reload_rx), fields(server = %server_config.name))]
 pub async fn start_single_server_reloadable(
     server_config: Arc<ServerConfig>,
     cancel_token: CancellationToken,
@@ -1518,8 +1542,8 @@ async fn handle_h3_connection(
         extract_client_metadata_with_base(client_certs, pki_base_oid.as_deref())
     };
     let oids = client_meta.oids;
-    let client_cert_pem = client_meta.pem;
-    let client_cert_san = client_meta.san;
+    let client_cert_pem: Option<Arc<str>> = client_meta.pem.map(Arc::from);
+    let client_cert_san: Option<Arc<str>> = client_meta.san.map(Arc::from);
 
     let mut cached_oid_map = live_oid_mapping.load_full();
     let mut shared_roles = Arc::new(map_h3_oids_to_roles(&oids, &cached_oid_map));
@@ -1577,7 +1601,7 @@ async fn handle_h3_connection(
                             Ok(Ok((req, stream))) => {
                                 let (mut sender, receiver) = stream.split();
 
-                                let handler = ConnectionHandler::with_dynamic_stack_shared(
+                                let handler = ConnectionHandler::with_dynamic_stack_shared_arc(
                                     dynamic_stack_for_req,
                                     peer_addr,
                                     roles_for_req,
@@ -2381,5 +2405,38 @@ mod tests {
             .await
             .expect("server must exit right after in-flight request completes")
             .expect("server task must not panic");
+    }
+
+    #[tokio::test]
+    async fn test_run_servers_exits_when_all_listeners_fail_instead_of_idling() {
+        ensure_crypto_provider();
+        // Occupy a TCP port to force bind failure on the single configured server.
+        let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let toml_cfg = format!(
+            r#"
+            [[Server]]
+            name = "bind_fail_srv"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = {port}
+            [Server.Layers]
+            enabled = []
+        "#
+        );
+        let mut config: Config = toml::from_str(&toml_cfg).unwrap();
+        for s in config.servers.iter_mut() {
+            s.finalize().unwrap();
+        }
+        let token = CancellationToken::new();
+
+        // `run_servers` must exit on its own even though `token` was NOT cancelled.
+        tokio::time::timeout(Duration::from_secs(3), run_servers(Arc::new(config), token))
+            .await
+            .expect("run_servers must not idle when all listeners fail to start");
+        drop(occupied);
     }
 }

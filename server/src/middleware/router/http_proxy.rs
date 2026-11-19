@@ -130,6 +130,7 @@ fn build_grpc_error_response(
 
 /// Forwards an HTTP/REST request to a load-balanced upstream pool with 3-state circuit breaking,
 /// passive outlier detection, idempotent failover retries, and client-error isolation.
+#[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_http_proxy(
     target: &Arc<RouteTarget>,

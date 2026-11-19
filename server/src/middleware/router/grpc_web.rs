@@ -121,6 +121,7 @@ fn build_grpc_status_error(code: u32, message: Option<String>) -> Response<Servi
 ///
 /// Returns an HTTP [`Response<ServiceRespBody>`] with `content-type: application/json` on success,
 /// or an appropriate synthetic HTTP error status (`400`, `401`, `403`, `404`, `409`, `429`, `501`, `502`, `503`, `504`) on failure.
+#[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_grpc_web(
     target: &Arc<RouteTarget>,

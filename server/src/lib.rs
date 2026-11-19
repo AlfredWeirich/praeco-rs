@@ -445,11 +445,11 @@ pub struct ConnectionHandler {
     /// updates via a single `Arc::ptr_eq` check per request.
     dynamic_oid_mapping: Option<DynamicOidMapping>,
 
-    /// The client's full certificate in PEM format, URL-encoded.
-    client_cert_pem: Option<String>,
+    /// The client's full certificate in PEM format, URL-encoded (shared across clones).
+    client_cert_pem: Option<Arc<str>>,
 
-    /// The client's Subject Alternative Name (SAN).
-    client_cert_san: Option<String>,
+    /// The client's Subject Alternative Name (SAN, shared across clones).
+    client_cert_san: Option<Arc<str>>,
 
     /// The raw OID suffixes extracted from the client certificate.
     client_oids: Arc<Vec<String>>,
@@ -492,8 +492,8 @@ impl ConnectionHandler {
             client_addr: addr,
             client_roles: Arc::new(final_roles),
             dynamic_oid_mapping: None,
-            client_cert_pem,
-            client_cert_san,
+            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
     }
@@ -516,8 +516,8 @@ impl ConnectionHandler {
             client_addr: addr,
             client_roles: Arc::new(final_roles),
             dynamic_oid_mapping: None,
-            client_cert_pem,
-            client_cert_san,
+            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
     }
@@ -547,8 +547,8 @@ impl ConnectionHandler {
                 live: oid_mapping,
                 cached_map,
             }),
-            client_cert_pem,
-            client_cert_san,
+            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
     }
@@ -578,8 +578,8 @@ impl ConnectionHandler {
             client_addr: addr,
             client_roles: roles,
             dynamic_oid_mapping: None,
-            client_cert_pem,
-            client_cert_san,
+            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids,
         }
     }
@@ -592,6 +592,26 @@ impl ConnectionHandler {
         roles: Arc<crate::configuration::RoleVec<6>>,
         client_cert_pem: Option<String>,
         client_cert_san: Option<String>,
+        client_oids: Arc<Vec<String>>,
+    ) -> Self {
+        Self::with_dynamic_stack_shared_arc(
+            dynamic_stack,
+            addr,
+            roles,
+            client_cert_pem.map(Arc::<str>::from),
+            client_cert_san.map(Arc::<str>::from),
+            client_oids,
+        )
+    }
+
+    /// Internal zero-allocation variant sharing pre-allocated `Arc<str>` cert metadata
+    /// across multiplexed HTTP/3 streams on the same connection.
+    pub(crate) fn with_dynamic_stack_shared_arc(
+        dynamic_stack: Arc<arc_swap::ArcSwap<BoxedCloneService>>,
+        addr: SocketAddr,
+        roles: Arc<crate::configuration::RoleVec<6>>,
+        client_cert_pem: Option<Arc<str>>,
+        client_cert_san: Option<Arc<str>>,
         client_oids: Arc<Vec<String>>,
     ) -> Self {
         Self {
@@ -632,6 +652,7 @@ impl ConnectionHandler {
     /// # Errors
     ///
     /// Returns `Err(SrvError)` if the inner service stack returns an error.
+    #[tracing::instrument(skip(self, req), fields(client_addr = %self.client_addr), err)]
     pub async fn handle(
         self,
         mut req: Request<SrvBody>,
@@ -652,11 +673,13 @@ impl ConnectionHandler {
         req.extensions_mut().insert(roles_to_inject);
 
         // 3. Inject cert information if present
-        if let Some(pem) = self.client_cert_pem.clone() {
-            req.extensions_mut().insert(PemCertExtension(pem));
+        if let Some(ref pem) = self.client_cert_pem {
+            req.extensions_mut()
+                .insert(PemCertExtension(pem.to_string()));
         }
-        if let Some(san) = self.client_cert_san.clone() {
-            req.extensions_mut().insert(SanCertExtension(san));
+        if let Some(ref san) = self.client_cert_san {
+            req.extensions_mut()
+                .insert(SanCertExtension(san.to_string()));
         }
 
         // 4. Inject raw OIDs for downstream services (e.g. IdP) to embed in JWTs

@@ -555,21 +555,30 @@ where
 
             // Enforce optional bounded queue capacity before allocating a waiting future.
             let queue_guard = if let Some(max_q) = self.max_queue_size {
-                let reserved = self.queued_requests.try_update(
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    |cur| if cur < max_q { Some(cur + 1) } else { None },
-                );
-                if reserved.is_err() {
-                    crate::configuration::ServerMetrics::inc_concurrency_limited(self.server_name);
-                    tracing::warn!(
-                        "{}: Concurrency queue full (max_queue_size = {}), rejecting request",
-                        self.server_name,
-                        max_q
-                    );
-                    return ConcurrencyLimitFuture::Immediate {
-                        response: Some(build_503_response()),
-                    };
+                let mut cur = self.queued_requests.load(Ordering::Acquire);
+                loop {
+                    if cur >= max_q {
+                        crate::configuration::ServerMetrics::inc_concurrency_limited(
+                            self.server_name,
+                        );
+                        tracing::warn!(
+                            "{}: Concurrency queue full (max_queue_size = {}), rejecting request",
+                            self.server_name,
+                            max_q
+                        );
+                        return ConcurrencyLimitFuture::Immediate {
+                            response: Some(build_503_response()),
+                        };
+                    }
+                    match self.queued_requests.compare_exchange_weak(
+                        cur,
+                        cur + 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(actual) => cur = actual,
+                    }
                 }
                 Some(QueueSlotGuard {
                     queued: self.queued_requests.clone(),

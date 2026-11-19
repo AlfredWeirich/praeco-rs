@@ -9,6 +9,7 @@ use crate::{ServiceRespBody, SrvError, configuration::RouteTarget};
 /// Forwards a binary HTTP/2 gRPC request (`backend_type = "grpc_passthrough"`) through the
 /// shared failover/circuit-breaker proxy engine with `HTTP/2` enforcement, `TE: trailers`,
 /// gRPC outlier detection, and gRPC Trailers-Only error responses.
+#[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_grpc_passthrough(
     target: &Arc<RouteTarget>,

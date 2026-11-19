@@ -25,41 +25,41 @@ static HOP_BY_HOP_HEADERS: [header::HeaderName; 9] = [
 ];
 
 /// Global deny-list of identity and client-cert headers that MUST ALWAYS be stripped
-/// from incoming client requests to prevent Identity Spoofing.
-static IDENTITY_HEADERS_DENYLIST: &[&str] = &[
+/// from incoming client requests to prevent Identity Spoofing (pre-parsed `HeaderName::from_static`).
+static IDENTITY_HEADER_NAMES: [header::HeaderName; 28] = [
     // Client certificates
-    "x-client-cert",
-    "x-client-certificate",
-    "x-ssl-client-cert",
-    "x-ssl-certificate",
-    "ssl-client-cert",
-    "x-forwarded-tls-client-cert",
-    "x-forwarded-client-cert",
+    header::HeaderName::from_static("x-client-cert"),
+    header::HeaderName::from_static("x-client-certificate"),
+    header::HeaderName::from_static("x-ssl-client-cert"),
+    header::HeaderName::from_static("x-ssl-certificate"),
+    header::HeaderName::from_static("ssl-client-cert"),
+    header::HeaderName::from_static("x-forwarded-tls-client-cert"),
+    header::HeaderName::from_static("x-forwarded-client-cert"),
     // Subject Alternative Name (SAN)
-    "x-client-san",
-    "x-ssl-client-san",
-    "ssl-client-san",
-    "x-client-cert-san",
+    header::HeaderName::from_static("x-client-san"),
+    header::HeaderName::from_static("x-ssl-client-san"),
+    header::HeaderName::from_static("ssl-client-san"),
+    header::HeaderName::from_static("x-client-cert-san"),
     // User Roles / OIDs
-    "x-client-roles",
-    "x-client-role",
-    "x-user-roles",
-    "x-user-role",
-    "x-auth-roles",
-    "x-auth-role",
-    "x-user-role-oid",
-    "x-authenticated-user",
+    header::HeaderName::from_static("x-client-roles"),
+    header::HeaderName::from_static("x-client-role"),
+    header::HeaderName::from_static("x-user-roles"),
+    header::HeaderName::from_static("x-user-role"),
+    header::HeaderName::from_static("x-auth-roles"),
+    header::HeaderName::from_static("x-auth-role"),
+    header::HeaderName::from_static("x-user-role-oid"),
+    header::HeaderName::from_static("x-authenticated-user"),
     // Certificate metadata & DNs
-    "x-client-dn",
-    "x-client-subject-dn",
-    "x-client-issuer-dn",
-    "x-client-serial",
-    "x-ssl-client-subject-dn",
-    "x-ssl-client-issuer-dn",
-    "x-ssl-client-serial",
-    "x-ssl-client-verify",
+    header::HeaderName::from_static("x-client-dn"),
+    header::HeaderName::from_static("x-client-subject-dn"),
+    header::HeaderName::from_static("x-client-issuer-dn"),
+    header::HeaderName::from_static("x-client-serial"),
+    header::HeaderName::from_static("x-ssl-client-subject-dn"),
+    header::HeaderName::from_static("x-ssl-client-issuer-dn"),
+    header::HeaderName::from_static("x-ssl-client-serial"),
+    header::HeaderName::from_static("x-ssl-client-verify"),
     // Client IP header if forwarded via client-cert config
-    "x-client-ip",
+    header::HeaderName::from_static("x-client-ip"),
 ];
 
 /// Extracts the client's IP from request extensions and injects it as the `X-Real-IP` header.
@@ -130,30 +130,24 @@ pub fn prepare_proxy_headers(
     }
 
     // 3. Unconditionally strip all known identity headers to prevent identity spoofing
-    for h in IDENTITY_HEADERS_DENYLIST {
-        if let Ok(hdr_name) = header::HeaderName::from_bytes(h.as_bytes()) {
-            original_headers.remove(&hdr_name);
-        }
+    for hdr_name in &IDENTITY_HEADER_NAMES {
+        original_headers.remove(hdr_name);
     }
 
     // Also strip any custom header names configured for this server
     if let Some(forward_config) = &config.client_cert_forwarding {
-        if let Some(h) = &forward_config.header_cert
-            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
-                original_headers.remove(&hdr);
-            }
-        if let Some(h) = &forward_config.header_san
-            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
-                original_headers.remove(&hdr);
-            }
-        if let Some(h) = &forward_config.header_roles
-            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
-                original_headers.remove(&hdr);
-            }
-        if let Some(h) = &forward_config.header_client_ip
-            && let Ok(hdr) = header::HeaderName::from_bytes(h.as_bytes()) {
-                original_headers.remove(&hdr);
-            }
+        if let Some(h) = &forward_config.header_cert {
+            original_headers.remove(h.as_str());
+        }
+        if let Some(h) = &forward_config.header_san {
+            original_headers.remove(h.as_str());
+        }
+        if let Some(h) = &forward_config.header_roles {
+            original_headers.remove(h.as_str());
+        }
+        if let Some(h) = &forward_config.header_client_ip {
+            original_headers.remove(h.as_str());
+        }
     }
 
     // 4. Sanitize and manage Forwarded / X-Forwarded-* headers

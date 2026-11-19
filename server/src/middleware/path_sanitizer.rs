@@ -77,64 +77,96 @@ pub enum PathSanitizeError {
 /// # Errors
 ///
 /// Returns a [`PathSanitizeError`] if traversal, illegal characters, or invalid encodings are detected.
-pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitizeError> {
+/// Searches `haystack` for an ASCII slice matching `needle_lower` case-insensitively
+/// without allocating a lowercased `String`.
+#[inline]
+fn contains_ascii_ignore_case(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() || haystack.len() < needle_lower.len() {
+        return false;
+    }
+    haystack
+        .windows(needle_lower.len())
+        .any(|w| w.eq_ignore_ascii_case(needle_lower))
+}
+
+/// Validates and canonicalizes a raw URL path, returning `Cow::Borrowed` without
+/// any heap allocation on clean normalized paths.
+pub fn sanitize_and_normalize_path_cow(
+    raw_path: &str,
+) -> Result<std::borrow::Cow<'_, str>, PathSanitizeError> {
     if raw_path.is_empty() {
-        return Ok("/".to_string());
+        return Ok(std::borrow::Cow::Borrowed("/"));
     }
 
     if !raw_path.starts_with('/') {
         return Err(PathSanitizeError::InvalidPath);
     }
 
-    // 1. Fast checks for raw illegal characters
-    if raw_path.contains('\0') {
-        return Err(PathSanitizeError::IllegalNullByte);
-    }
-    if raw_path.contains('\\') {
-        return Err(PathSanitizeError::IllegalBackslash);
-    }
-    if raw_path.contains(';') {
-        return Err(PathSanitizeError::IllegalSemicolon);
-    }
-
-    // 2. Case-insensitive checks for forbidden encodings
-    let lower = raw_path.to_ascii_lowercase();
-    if lower.contains("%00") {
-        return Err(PathSanitizeError::IllegalNullByte);
-    }
-    if lower.contains("%2f") {
-        return Err(PathSanitizeError::IllegalEncodedSlash);
-    }
-    if lower.contains("%5c") {
-        return Err(PathSanitizeError::IllegalBackslash);
-    }
-    if lower.contains("%3b") {
-        return Err(PathSanitizeError::IllegalSemicolon);
-    }
-
-    // Double-encoding checks (%25 followed by 2e, 2f, 00, 5c)
-    if lower.contains("%252e")
-        || lower.contains("%252f")
-        || lower.contains("%2500")
-        || lower.contains("%255c")
-    {
-        return Err(PathSanitizeError::DoubleEncoding);
-    }
-
-    // 3. Verify that all '%' signs are valid two-digit hex sequences
     let bytes = raw_path.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len()
-                || !bytes[i + 1].is_ascii_hexdigit()
-                || !bytes[i + 2].is_ascii_hexdigit()
-            {
-                return Err(PathSanitizeError::InvalidEncoding);
+    // 1. Single-pass scan for illegal characters, percent encodings, dot segments, or empty slashes
+    let mut has_percent = false;
+    let mut needs_normalization = false;
+    let mut prev_slash = false;
+    for &b in bytes {
+        match b {
+            b'\0' => return Err(PathSanitizeError::IllegalNullByte),
+            b'\\' => return Err(PathSanitizeError::IllegalBackslash),
+            b';' => return Err(PathSanitizeError::IllegalSemicolon),
+            b'%' => {
+                has_percent = true;
+                needs_normalization = true;
             }
-            i += 3;
-        } else {
-            i += 1;
+            b'.' => {
+                needs_normalization = true;
+            }
+            b'/' if prev_slash => {
+                needs_normalization = true;
+            }
+            _ => {}
+        }
+        prev_slash = b == b'/';
+    }
+
+    if !needs_normalization {
+        return Ok(std::borrow::Cow::Borrowed(raw_path));
+    }
+
+    // 2. Zero-allocation case-insensitive checks for forbidden encodings when '%' is present
+    if has_percent {
+        if contains_ascii_ignore_case(bytes, b"%00") {
+            return Err(PathSanitizeError::IllegalNullByte);
+        }
+        if contains_ascii_ignore_case(bytes, b"%2f") {
+            return Err(PathSanitizeError::IllegalEncodedSlash);
+        }
+        if contains_ascii_ignore_case(bytes, b"%5c") {
+            return Err(PathSanitizeError::IllegalBackslash);
+        }
+        if contains_ascii_ignore_case(bytes, b"%3b") {
+            return Err(PathSanitizeError::IllegalSemicolon);
+        }
+        if contains_ascii_ignore_case(bytes, b"%252e")
+            || contains_ascii_ignore_case(bytes, b"%252f")
+            || contains_ascii_ignore_case(bytes, b"%2500")
+            || contains_ascii_ignore_case(bytes, b"%255c")
+        {
+            return Err(PathSanitizeError::DoubleEncoding);
+        }
+
+        // 3. Verify that all '%' signs are valid two-digit hex sequences
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 2 >= bytes.len()
+                    || !bytes[i + 1].is_ascii_hexdigit()
+                    || !bytes[i + 2].is_ascii_hexdigit()
+                {
+                    return Err(PathSanitizeError::InvalidEncoding);
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
         }
     }
 
@@ -164,7 +196,7 @@ pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitiz
     }
 
     if normalized_segments.is_empty() {
-        return Ok("/".to_string());
+        return Ok(std::borrow::Cow::Borrowed("/"));
     }
 
     let mut result = String::with_capacity(raw_path.len());
@@ -176,7 +208,11 @@ pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitiz
         result.push('/');
     }
 
-    Ok(result)
+    Ok(std::borrow::Cow::Owned(result))
+}
+
+pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitizeError> {
+    sanitize_and_normalize_path_cow(raw_path).map(|c| c.into_owned())
 }
 
 /// Normalizes a single path segment by decoding unreserved ASCII characters
@@ -233,12 +269,16 @@ fn is_unreserved(b: u8) -> bool {
 /// Returns [`PathSanitizeError`] if the path is invalid or cannot be reformatted into a valid URI.
 pub fn sanitize_and_normalize_uri(uri: &Uri) -> Result<Uri, PathSanitizeError> {
     let raw_path = uri.path();
-    let canonical_path = sanitize_and_normalize_path(raw_path)?;
+    let canonical_path = sanitize_and_normalize_path_cow(raw_path)?;
+
+    if matches!(canonical_path, std::borrow::Cow::Borrowed(_)) && !raw_path.is_empty() {
+        return Ok(uri.clone());
+    }
 
     let query = uri.query();
     let new_pq_str = match query {
         Some(q) => format!("{}?{}", canonical_path, q),
-        None => canonical_path,
+        None => canonical_path.into_owned(),
     };
 
     let pq = new_pq_str
