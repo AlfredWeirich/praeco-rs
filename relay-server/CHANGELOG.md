@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Concurrency & Config Hardening (`src/config.rs`, `src/lib.rs`):**
   * Added `#[serde(deny_unknown_fields)]` to `RelayConfig` so unknown configuration keys fail fast.
   * Fixed `RelayConnectionGuard::drop` race using atomic `DashMap::remove_if` cleanup and made `try_register_tunnel` atomic via `DashMap::entry()` to eliminate concurrent `REGISTER` races.
-* **Self-Contained Test PKI (`Cargo.toml`, `src/lib.rs`, `tests/integration_tests.rs`):**
+* **Self-Contained Test PKI & Leaner Dependencies (`Cargo.toml`, `src/lib.rs`, `tests/integration_tests.rs`):**
+  * Enabled `praeco-common` with `default-features = false` (omitting unused `hyper`, `hyper-rustls`, and `jsonwebtoken` dependencies from non-test builds) and delegated `canonicalize_ip` via SemVer-compatible `pub use common::canonical_client_ip as canonicalize_ip` (preserving `::1` and `::`).
   * Replaced all `server_certs/` / `client_certs/` references and external `openssl` CLI calls in unit and integration tests with ephemeral `common::test_pki::TestPki` (`praeco-common/test-pki`).
 
 ---

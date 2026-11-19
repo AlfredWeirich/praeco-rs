@@ -176,22 +176,12 @@ impl TokenBucket {
 /// Canonicalizes an IP address:
 /// - IPv4 addresses remain unchanged.
 /// - IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) are unwrapped to IPv4.
+/// - Loopback (`::1`) and unspecified (`::`) IPv6 addresses remain unchanged.
 /// - Standard IPv6 addresses are masked to a `/64` subnet prefix to prevent rate-limit and connection-limit evasion.
-pub fn canonicalize_ip(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(v4) => IpAddr::V4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                IpAddr::V4(v4)
-            } else {
-                let segs = v6.segments();
-                IpAddr::V6(std::net::Ipv6Addr::new(
-                    segs[0], segs[1], segs[2], segs[3], 0, 0, 0, 0,
-                ))
-            }
-        }
-    }
-}
+///
+/// Re-exported from [`common::canonical_client_ip`] to keep the public
+/// `praeco_relay_server::canonicalize_ip` API SemVer-compatible without duplicating logic.
+pub use common::canonical_client_ip as canonicalize_ip;
 
 /// Central connection tracker for the Relay Server.
 /// Enforces global and per-canonical-IP concurrency limits using RAII guards.
@@ -1452,6 +1442,10 @@ mod tests {
         // IPv4-mapped IPv6
         let ip4_mapped: IpAddr = "::ffff:192.168.1.50".parse().unwrap();
         assert_eq!(canonicalize_ip(ip4_mapped), ip4);
+
+        // IPv6 loopback preserved
+        let loopback6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(canonicalize_ip(loopback6), loopback6);
 
         // IPv6 /64 aggregation
         let ip6_a: IpAddr = "2001:db8:abcd:0012:0000:0000:0000:0001".parse().unwrap();

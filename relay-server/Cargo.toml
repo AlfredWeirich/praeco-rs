@@ -12,7 +12,7 @@ categories = ["network-programming", "cryptography", "authentication", "asynchro
 
 [dependencies]
 anyhow = { workspace = true }
-common = { workspace = true }
+common = { workspace = true, default-features = false }
 dashmap = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
