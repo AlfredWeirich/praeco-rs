@@ -13,6 +13,10 @@ use crate::configuration::IdpParams;
 
 /// Maximum allowed response body size from the claims webhook (64 KB).
 const MAX_WEBHOOK_BODY_SIZE: usize = 65_536;
+/// Maximum number of OID suffixes accepted from a single webhook response.
+const MAX_WEBHOOK_OIDS: usize = 64;
+/// Maximum string length of a single OID suffix returned by a webhook.
+const MAX_WEBHOOK_OID_LEN: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum WebhookError {
@@ -28,6 +32,8 @@ pub enum WebhookError {
     Timeout,
     #[error("Body read error: {0}")]
     Body(String),
+    #[error("Invalid webhook response: {0}")]
+    InvalidResponse(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -60,6 +66,53 @@ impl Future for WebhookFetchFuture {
     }
 }
 
+/// Validates that `claims_webhook_url` uses HTTPS, or plain HTTP strictly on loopback/localhost,
+/// and contains no embedded userinfo.
+fn validate_webhook_url(raw: &str) -> Result<(), anyhow::Error> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("Invalid claims_webhook_url '{raw}': {e}"))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow::anyhow!(
+            "claims_webhook_url must not contain embedded userinfo"
+        ));
+    }
+    match (parsed.scheme(), parsed.host()) {
+        ("https", Some(_)) => Ok(()),
+        ("http", Some(url::Host::Ipv4(ip))) if ip.is_loopback() => Ok(()),
+        ("http", Some(url::Host::Ipv6(ip))) if ip.is_loopback() => Ok(()),
+        ("http", Some(url::Host::Domain(domain))) if domain.eq_ignore_ascii_case("localhost") => {
+            Ok(())
+        }
+        _ => Err(anyhow::anyhow!(
+            "claims_webhook_url must use HTTPS for secure claims transport (plain HTTP is only allowed for localhost / loopback)"
+        )),
+    }
+}
+
+/// Validates that returned OID suffixes are bounded in count, length, and numeric dot-arc syntax.
+fn validate_webhook_oids(oids: &[String]) -> Result<(), WebhookError> {
+    if oids.len() > MAX_WEBHOOK_OIDS {
+        return Err(WebhookError::InvalidResponse(format!(
+            "too many OIDs returned ({}, max {})",
+            oids.len(),
+            MAX_WEBHOOK_OIDS
+        )));
+    }
+    for oid in oids {
+        if oid.is_empty()
+            || oid.len() > MAX_WEBHOOK_OID_LEN
+            || !oid
+                .split('.')
+                .all(|arc| !arc.is_empty() && arc.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(WebhookError::InvalidResponse(
+                "invalid OID suffix format in webhook response".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl WebhookClient {
     pub fn new(params: &IdpParams) -> Result<Option<Self>, anyhow::Error> {
         let url = match &params.claims_webhook_url {
@@ -67,12 +120,7 @@ impl WebhookClient {
             None => return Ok(None),
         };
 
-        // Enforce HTTPS for non-localhost endpoints to prevent token/claims interception
-        if !url.starts_with("https://") && !url.starts_with("http://127.0.0.1") && !url.starts_with("http://localhost") {
-            return Err(anyhow::anyhow!(
-                "claims_webhook_url must use HTTPS for secure claims transport (plain HTTP is only allowed for localhost / 127.0.0.1)"
-            ));
-        }
+        validate_webhook_url(&url)?;
 
         // If webhook uses HTTPS, load mTLS configs if provided
         let root_store = common::build_root_store(&params.claims_webhook_ca_cert)?;
@@ -126,6 +174,7 @@ impl WebhookClient {
             let collected = limited.collect().await.map_err(|e| WebhookError::Body(e.to_string()))?;
             let body_bytes = collected.to_bytes();
             let resp: WebhookResponse = serde_json::from_slice(&body_bytes)?;
+            validate_webhook_oids(&resp.oids)?;
             Ok(resp.oids)
         };
 
@@ -194,5 +243,41 @@ mod tests {
         let params = dummy_idp_params(Some("https://secure.example.com/claims".to_string()));
         let client = WebhookClient::new(&params);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_webhook_rejects_localhost_prefix_spoofing_and_userinfo() {
+        for bad_url in [
+            "http://localhost.evil.example/claims",
+            "http://127.0.0.1.evil.example/claims",
+            "http://user@localhost:50053/claims",
+            "https://user:pass@secure.example.com/claims",
+            "ftp://secure.example.com/claims",
+        ] {
+            let params = dummy_idp_params(Some(bad_url.to_string()));
+            assert!(
+                WebhookClient::new(&params).is_err(),
+                "URL '{bad_url}' must be rejected"
+            );
+        }
+
+        let ipv6_loopback = dummy_idp_params(Some("http://[::1]:50053/claims".to_string()));
+        assert!(WebhookClient::new(&ipv6_loopback).is_ok());
+    }
+
+    #[test]
+    fn test_validate_webhook_oids_bounds_and_syntax() {
+        assert!(validate_webhook_oids(&["1".to_string(), "2.3.4".to_string()]).is_ok());
+        assert!(validate_webhook_oids(&[]).is_ok());
+
+        // Reject malformed/non-numeric OIDs
+        assert!(validate_webhook_oids(&["".to_string()]).is_err());
+        assert!(validate_webhook_oids(&["1..2".to_string()]).is_err());
+        assert!(validate_webhook_oids(&["admin".to_string()]).is_err());
+        assert!(validate_webhook_oids(&["1".repeat(MAX_WEBHOOK_OID_LEN + 1)]).is_err());
+
+        // Reject excessive OID list count
+        let too_many = vec!["1".to_string(); MAX_WEBHOOK_OIDS + 1];
+        assert!(validate_webhook_oids(&too_many).is_err());
     }
 }

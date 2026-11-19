@@ -792,21 +792,36 @@ use std::net::IpAddr;
     }
 
     #[test]
-    fn test_rate_limit_table_evicts_lru_instead_of_failing_closed() {
+    fn test_rate_limit_table_uses_overflow_bucket_on_saturation_without_eviction() {
         let table = RateLimitTable::with_capacity(2);
         let ip1: IpAddr = "198.51.100.1".parse().unwrap();
         let ip2: IpAddr = "198.51.100.2".parse().unwrap();
         let ip3: IpAddr = "198.51.100.3".parse().unwrap();
+        let ip4: IpAddr = "198.51.100.4".parse().unwrap();
 
-        assert!(table.check_and_consume(ip1, 1.0, 2.0));
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(table.check_and_consume(ip2, 1.0, 2.0));
+        assert!(table.check_and_consume(ip1, 0.0, 2.0));
+        assert!(table.check_and_consume(ip2, 0.0, 2.0));
         assert_eq!(table.buckets.len(), 2);
 
-        // New legitimate ip3 evicts LRU ip1 instead of being dropped fail-closed
-        assert!(table.check_and_consume(ip3, 1.0, 2.0));
+        // At capacity: unknown IPs share the O(1) overflow bucket (burst = 2.0)
+        assert!(table.check_and_consume(ip3, 0.0, 2.0));
+        assert!(table.check_and_consume(ip4, 0.0, 2.0));
+        assert!(
+            !table.check_and_consume("198.51.100.5".parse().unwrap(), 0.0, 2.0),
+            "overflow bucket must rate-limit saturated unknown IP floods"
+        );
         assert_eq!(table.buckets.len(), 2);
-        assert!(!table.buckets.contains_key(&ip1));
+
+        // Tracked IPs were NOT evicted by the unknown-IP flood and retain their remaining token
+        assert!(table.buckets.contains_key(&ip1));
+        assert!(table.buckets.contains_key(&ip2));
+        assert!(table.check_and_consume(ip1, 0.0, 2.0));
+        assert!(!table.check_and_consume(ip1, 0.0, 2.0));
+
+        // After idle entries are swept, capacity recovers and ip3 gets its own tracked bucket
+        table.sweep_expired(Duration::ZERO);
+        assert!(table.buckets.is_empty());
+        assert!(table.check_and_consume(ip3, 0.0, 2.0));
         assert!(table.buckets.contains_key(&ip3));
     }
 

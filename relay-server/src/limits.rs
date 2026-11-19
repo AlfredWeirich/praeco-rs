@@ -10,11 +10,19 @@ use std::time::{Duration, Instant};
 /// sweeping expired entries and evicting the least-recently-used bucket.
 pub(crate) const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
 
-/// Bounded per-IP rate-limit map with expiry sweep and LRU eviction so table
-/// saturation never fails closed against legitimate new client IPs.
+/// Minimum interval between expiry sweeps when the rate-limit table is at capacity.
+const SATURATED_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Idle age after which rate-limit buckets are purged during sweeps.
+const BUCKET_IDLE_TTL: Duration = Duration::from_secs(120);
+
+/// Bounded per-IP rate-limit map with throttled expiry sweeps and an O(1) shared
+/// overflow bucket on saturation, preventing O(n) scans and cache-thrashing attacks.
 pub(crate) struct RateLimitTable {
     pub(crate) buckets: DashMap<IpAddr, TokenBucket>,
     max_entries: usize,
+    last_sweep: std::sync::Mutex<Instant>,
+    overflow_bucket: std::sync::Mutex<Option<TokenBucket>>,
 }
 
 impl RateLimitTable {
@@ -22,6 +30,8 @@ impl RateLimitTable {
         Self {
             buckets: DashMap::new(),
             max_entries: max_entries.max(1),
+            last_sweep: std::sync::Mutex::new(Instant::now()),
+            overflow_bucket: std::sync::Mutex::new(None),
         }
     }
 
@@ -30,17 +40,30 @@ impl RateLimitTable {
             .retain(|_, bucket| bucket.last_update().elapsed() < max_idle);
     }
 
+    fn maybe_sweep_when_saturated(&self) {
+        if let Ok(mut last) = self.last_sweep.try_lock()
+            && last.elapsed() >= SATURATED_SWEEP_INTERVAL
+        {
+            *last = Instant::now();
+            drop(last);
+            self.sweep_expired(BUCKET_IDLE_TTL);
+        }
+    }
+
     pub(crate) fn check_and_consume(&self, ip: IpAddr, rate: f32, burst: f32) -> bool {
-        if !self.buckets.contains_key(&ip) && self.buckets.len() >= self.max_entries {
-            self.sweep_expired(Duration::from_secs(120));
-            if self.buckets.len() >= self.max_entries
-                && let Some(oldest_ip) = self
-                    .buckets
-                    .iter()
-                    .min_by_key(|entry| entry.value().last_update())
-                    .map(|entry| *entry.key())
-            {
-                self.buckets.remove(&oldest_ip);
+        if let Some(mut bucket) = self.buckets.get_mut(&ip) {
+            return bucket.consume(rate, burst);
+        }
+
+        if self.buckets.len() >= self.max_entries {
+            self.maybe_sweep_when_saturated();
+            if self.buckets.len() >= self.max_entries {
+                let mut guard = self
+                    .overflow_bucket
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let bucket = guard.get_or_insert_with(|| TokenBucket::new(burst));
+                return bucket.consume(rate, burst);
             }
         }
 

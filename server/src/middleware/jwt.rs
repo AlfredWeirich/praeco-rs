@@ -22,6 +22,8 @@
 
 // === Standard Library ===
 use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
     future::Future,
     pin::Pin,
     sync::Arc,
@@ -52,11 +54,16 @@ const MAX_JTI_LEN: usize = 256;
 /// so a token revoked near expiration cannot be replayed during the grace window.
 pub const JWT_EXP_LEEWAY_SECS: u64 = 60;
 
+/// Min-heap of `(expires_at, jti)` pairs ordered by earliest expiration timestamp.
+type ExpiryMinHeap = BinaryHeap<Reverse<(u64, String)>>;
+
 /// Thread-safe storage for revoked JWT IDs (`jti`).
 #[derive(Clone, Default)]
 pub struct JwtRevocationStore {
     /// Maps `jti` to expiration UNIX timestamp (seconds).
     revoked: Arc<DashMap<String, u64>>,
+    /// Min-heap index of `(expires_at, jti)` for O(log n) earliest-expiry eviction and sweeping.
+    exp_index: Arc<std::sync::Mutex<ExpiryMinHeap>>,
     /// Timestamp (UNIX seconds) of last expired-entries cleanup.
     last_cleanup: Arc<std::sync::atomic::AtomicU64>,
     /// Number of revocations dropped because all capacity was held by >= `expires_at` entries.
@@ -67,8 +74,32 @@ impl JwtRevocationStore {
     pub fn new() -> Self {
         Self {
             revoked: Arc::new(DashMap::new()),
+            exp_index: Arc::new(std::sync::Mutex::new(BinaryHeap::new())),
             last_cleanup: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             overflow_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn lock_exp_index(&self) -> std::sync::MutexGuard<'_, ExpiryMinHeap> {
+        self.exp_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn insert_with_index(
+        &self,
+        jti_str: String,
+        expires_at: u64,
+        heap: &mut ExpiryMinHeap,
+    ) {
+        self.revoked.insert(jti_str.clone(), expires_at);
+        heap.push(Reverse((expires_at, jti_str)));
+        if heap.len() > MAX_REVOKED_ENTRIES * 2 {
+            *heap = self
+                .revoked
+                .iter()
+                .map(|entry| Reverse((*entry.value(), entry.key().clone())))
+                .collect();
         }
     }
 
@@ -82,9 +113,10 @@ impl JwtRevocationStore {
     /// entries.
     ///
     /// When at `MAX_REVOKED_ENTRIES`:
-    /// 1. Immediately sweeps expired entries regardless of cleanup interval.
-    /// 2. If still full, evicts the earliest-expiring entry if `expires_at > min_exp` so
-    ///    shorter-lived revocations do not silently block longer-lived token revocations.
+    /// 1. Sweeps expired entries from the min-heap head in O(k log n).
+    /// 2. If still full, evicts the earliest-expiring active entry in O(log n) if
+    ///    `expires_at > min_exp` so shorter-lived revocations do not silently block
+    ///    longer-lived token revocations.
     /// 3. If all retained entries live at least as long as `expires_at`, refuses eviction to
     ///    prevent revocation-eviction DoS attacks, increments [`Self::overflow_drops`], and
     ///    returns `false`.
@@ -100,11 +132,8 @@ impl JwtRevocationStore {
             .as_secs();
 
         let last = self.last_cleanup.load(std::sync::atomic::Ordering::Relaxed);
-        if self.revoked.len() >= MAX_REVOKED_ENTRIES {
-            self.last_cleanup
-                .store(now, std::sync::atomic::Ordering::Relaxed);
-            self.cleanup_expired();
-        } else if now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS
+        if self.revoked.len() < MAX_REVOKED_ENTRIES
+            && now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS
             && self
                 .last_cleanup
                 .compare_exchange(
@@ -118,21 +147,42 @@ impl JwtRevocationStore {
             self.cleanup_expired();
         }
 
+        let mut heap = self.lock_exp_index();
+
         if self.revoked.len() < MAX_REVOKED_ENTRIES || self.revoked.contains_key(&jti_str) {
-            self.revoked.insert(jti_str, expires_at);
+            self.insert_with_index(jti_str, expires_at, &mut heap);
             return true;
         }
 
-        // Store is still full with non-expired entries: evict the earliest-expiring entry
-        // only when the incoming revocation protects a strictly longer lifetime.
-        let earliest = self
-            .revoked
-            .iter()
-            .min_by_key(|entry| *entry.value())
-            .map(|entry| (entry.key().clone(), *entry.value()));
+        // Store is at capacity: pop expired entries and locate the earliest active entry in O(log n).
+        let earliest = loop {
+            let Some(Reverse((heap_exp, heap_jti))) = heap.peek().cloned() else {
+                break None;
+            };
+            match self.revoked.get(&heap_jti) {
+                Some(entry) if *entry.value() == heap_exp => {
+                    drop(entry);
+                    if heap_exp <= now {
+                        heap.pop();
+                        self.revoked.remove_if(&heap_jti, |_, v| *v == heap_exp);
+                        continue;
+                    }
+                    break Some((heap_jti, heap_exp));
+                }
+                _ => {
+                    heap.pop();
+                }
+            }
+        };
+
+        if self.revoked.len() < MAX_REVOKED_ENTRIES {
+            self.insert_with_index(jti_str, expires_at, &mut heap);
+            return true;
+        }
 
         if let Some((min_key, min_exp)) = earliest
             && expires_at > min_exp
+            && heap.pop().is_some()
             && self.revoked.remove_if(&min_key, |_, exp| *exp == min_exp).is_some()
             && self.revoked.len() < MAX_REVOKED_ENTRIES
         {
@@ -142,10 +192,11 @@ impl JwtRevocationStore {
                 min_exp,
                 expires_at
             );
-            self.revoked.insert(jti_str, expires_at);
+            self.insert_with_index(jti_str, expires_at, &mut heap);
             return true;
         }
 
+        drop(heap);
         self.overflow_drops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::error!(
@@ -186,6 +237,15 @@ impl JwtRevocationStore {
             .unwrap_or_default()
             .as_secs();
         self.revoked.retain(|_, exp| now < *exp);
+        if let Ok(mut heap) = self.exp_index.try_lock()
+            && heap.len() > MAX_REVOKED_ENTRIES * 2
+        {
+            *heap = self
+                .revoked
+                .iter()
+                .map(|entry| Reverse((*entry.value(), entry.key().clone())))
+                .collect();
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -724,6 +784,52 @@ mod tests {
         assert!(!store.try_revoke("too-short", now + 30));
         assert_eq!(store.overflow_drops(), 1);
         assert!(store.is_revoked("long-jti"));
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_skips_stale_heap_entries_after_refresh() {
+        let store = JwtRevocationStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Insert with short exp, then refresh to a long exp so a stale (now+10) entry remains in heap.
+        assert!(store.try_revoke("refreshed-jti", now + 10));
+        assert!(store.try_revoke("true-earliest", now + 60));
+        assert!(store.try_revoke("refreshed-jti", now + 5000));
+
+        for i in 2..MAX_REVOKED_ENTRIES {
+            assert!(store.try_revoke(format!("filler-{i}"), now + 600));
+        }
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+
+        // Eviction must discard the stale heap entry for "refreshed-jti" and evict "true-earliest".
+        assert!(store.try_revoke("incoming-long", now + 3600));
+        assert!(store.is_revoked("refreshed-jti"));
+        assert!(!store.is_revoked("true-earliest"));
+        assert!(store.is_revoked("incoming-long"));
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_rebuilds_oversized_heap_and_stays_bounded() {
+        let store = JwtRevocationStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let total_updates = (MAX_REVOKED_ENTRIES * 2) + 10;
+        for i in 0..total_updates {
+            assert!(store.try_revoke("churn-jti", now + 1000 + i as u64));
+        }
+
+        assert_eq!(store.len(), 1);
+        assert!(store.is_revoked("churn-jti"));
+        assert!(
+            store.lock_exp_index().len() <= MAX_REVOKED_ENTRIES,
+            "min-heap index must stay bounded after rebuild"
+        );
     }
 
     #[tokio::test]

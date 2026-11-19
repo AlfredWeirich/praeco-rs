@@ -26,7 +26,7 @@ Das System besteht aus zwei Ebenen:
 2. **Data Plane (Standard Port 443 / SNI-Routing):**
    - Nimmt öffentliche Client-Verbindungen (z.B. aus dem Webbrowser) unverschlüsselt auf TCP-Ebene an.
    - Der Server akkumuliert den initialen TLS-Handshake (`ClientHello`, bis zu 16 KB) geschützt gegen Slowloris (`client_hello_timeout_secs`, Standard: 10s) und handhabt TCP-Fragmentierung sowie große Post-Quantum Key Shares sauber.
-   - Schützt vor DoS-Angriffen über globale Verbindungs-Limits, Concurrency-Caps pro IP (`RelayConnectionTracker`) und eine auf `100.000` Einträge begrenzte L4-Rate-Limiting-Tabelle (`TokenBucket`) mittels `canonicalize_ip` (IPv4-mapped IPv6 Unwrapping sowie IPv6 `/64`-Subnetz-Maskierung).
+   - Schützt vor DoS-Angriffen über globale Verbindungs-Limits, Concurrency-Caps pro IP (`RelayConnectionTracker`) und eine auf `100.000` Einträge begrenzte L4-Rate-Limiting-Tabelle (`TokenBucket`, mit gedrosseltem 1-s-Sweep und gemeinsamem O(1)-Overflow-Bucket bei Sättigung statt O(n)-Eviction) mittels `canonicalize_ip` (IPv4-mapped IPv6 Unwrapping sowie IPv6 `/64`-Subnetz-Maskierung).
    - Er sucht case-insensitiv nach einer aktiven Praeco-Verbindung für diese SNI.
    - Es wird asynchron ein neuer **Yamux-Stream** (standardmäßig bis zu 4096 Streams pro Tunnel) in der bestehenden Control-Plane-Verbindung geöffnet.
    - Bei ausgehandeltem `PROXY_V2` wird zuerst der 28-Byte (IPv4) bzw. 52-Byte (IPv6) PPv2-Header und danach der TLS-Stream weitergeleitet. Praeco terminiert das TLS lokal und nutzt die echte Client-IP für Rate-Limiting, Concurrency-Limits und Access-Logs.

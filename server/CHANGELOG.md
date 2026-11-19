@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Fail-Closed CRL Defaults & Handshake Expiration Enforcement (`src/tls_conf.rs`, `src/configuration/mod.rs`, `common/src/crl.rs`):**
   * Centralised CRL parsing/expiration checks in `praeco-common::crl`, removed the `PRAECO_STRICT_CRL` environment variable and `strict_crl_enabled()` in favour of pure TOML configuration, and switched strict CRL mode to **fail-closed by default** (`ClientCertConfig::strict_crl: bool` defaulting to `true`).
   * Enabled `WebPkiClientVerifierBuilder::enforce_revocation_expiration()` in strict mode so `rustls` enforces CRL `nextUpdate` on every handshake, and rejected empty CRL PEM files at load/reload time.
+* **IdP Webhook Validation & O(log n) `JwtRevocationStore` Index (`src/middleware/idp/webhook.rs`, `src/middleware/jwt.rs`):**
+  * Replaced prefix-based `claims_webhook_url` validation with strict `url::Url` host/scheme checking (rejecting embedded userinfo and spoofed prefixes like `http://localhost.evil.example`) and bounded returned `oids` (`<= 64` entries, `<= 64` chars each, numeric dot-arc format only).
+  * Added an `ExpiryMinHeap` (`BinaryHeap<Reverse<(u64, String)>>` with lazy deletion) to `JwtRevocationStore` so capacity-saturation sweeps and earliest-expiry eviction run in O(log n) instead of scanning all `50,000` entries via `min_by_key`.
 
 ---
 

@@ -496,7 +496,7 @@ The built-in IdP issues Ed25519-signed JWTs via device mTLS authentication or vi
 | `debug_show_session_id` | Boolean | Optional | `false` | When `true`, displays raw session UUID on web UI for testing. |
 | `issuer` | String | Optional | `"praeco-idp"` | Issuer claim (`iss`) written into issued JWTs. |
 | `allowed_audiences` | Array of Strings | Optional | `[]` | Allowed audience values (`aud`). If client requests `?aud=...`, it must match an entry here; unlisted audiences return `400 Bad Request`. |
-| `claims_webhook_url` | String | Optional | `None` | HTTPS webhook URL for dynamic role resolution. Praeco POSTs to this endpoint during authentication to fetch current roles from a database, overriding certificate OIDs. Response body cap is 64 KB. |
+| `claims_webhook_url` | String | Optional | `None` | HTTPS webhook URL (or `http://localhost` / loopback IP only, without embedded userinfo) for dynamic role resolution. Praeco POSTs to this endpoint during authentication to fetch current roles from a database, overriding certificate OIDs. Response body cap is 64 KB; `oids` is bounded to 64 numeric dot-separated entries (max 64 chars each). |
 | `claims_webhook_timeout_ms`| Integer | Optional | `3000` (3s) | Network timeout in milliseconds for claims webhook execution. |
 | `on_webhook_failure` | String | Optional | `"reject"` | Failure handling: `"reject"` (fail-closed: denies login with 503) or `"fallback_to_cert"` (fail-open: falls back to certificate OIDs). |
 | `claims_webhook_client_cert`| String | Optional | `None` | Path to PEM client certificate for mTLS against webhook. |

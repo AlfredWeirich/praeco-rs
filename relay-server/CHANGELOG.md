@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Propagated CRL PEM/DER parse errors and empty-CRL errors in `parse_revoked_serials_from_crl_pem` and `setup_mtls_acceptor_with_strict` (using shared `common::crl`) instead of silently downgrading to an empty revocation set.
   * Changed `spawn_crl_reload_watcher` (and added `spawn_crl_reload_watcher_with_strict`) to return `Result<watch::Receiver<ControlPlaneReloadState>, RelayError>` so corrupt initial CRLs fail startup fast, while failed live/SIGHUP reloads preserve the previous CRL state and run off the async executor via `tokio::task::spawn_blocking`.
   * Removed the `PRAECO_STRICT_CRL` environment variable and made strict CRL validation the TOML-only default (`RelayConfig::strict_crl: Option<bool>`, default `Some(true)`), enabling `rustls`'s `enforce_revocation_expiration()` on `WebPkiClientVerifier`.
+* **O(1) Data-Plane Rate-Limit Saturation (`src/limits.rs`):**
+  * Replaced unthrottled O(n) `sweep_expired` + `min_by_key` LRU eviction on `RateLimitTable` saturation with a 1-second throttled sweep and a shared O(1) `overflow_bucket` (`Mutex<Option<TokenBucket>>`), preventing O(n) CPU DoS and eviction of active IP buckets under IPv6 `/64` floods.
 
 ---
 
