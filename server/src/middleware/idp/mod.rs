@@ -42,6 +42,8 @@ pub struct IdpService {
 impl IdpService {
     /// Creates a new IdpService.
     pub fn new(params: IdpParams, server_name: &'static str) -> Result<Self, anyhow::Error> {
+        crate::configuration::validate_idp_cookie_and_redirect(&params, server_name)?;
+
         let session_store = SessionStore::new(params.session_ttl_seconds);
         
         let webhook_client = WebhookClient::new(&params).context("Failed to init webhook client")?;
@@ -83,10 +85,16 @@ impl IdpService {
                         if let Some(key_bytes) = raw_key {
                             use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
                             let x = URL_SAFE_NO_PAD.encode(key_bytes);
-                            let jwks = format!(
-                                r#"{{"keys":[{{"kty":"OKP","crv":"Ed25519","use":"sig","kid":"praeco-key-1","x":"{}"}}]}}"#,
-                                x
-                            );
+                            let jwks = serde_json::json!({
+                                "keys": [{
+                                    "kty": "OKP",
+                                    "crv": "Ed25519",
+                                    "use": "sig",
+                                    "kid": "praeco-key-1",
+                                    "x": x,
+                                }]
+                            })
+                            .to_string();
                             jwks_payload = Some(Arc::new(jwks));
                         } else {
                             tracing::warn!(
@@ -115,21 +123,34 @@ impl IdpService {
         })
     }
 
+    fn response_with_content_type(
+        status: StatusCode,
+        content_type: &'static str,
+        body: Bytes,
+    ) -> Response<ServiceRespBody> {
+        let mut resp = Response::new(Full::new(body).map_err(SrvError::from).boxed());
+        *resp.status_mut() = status;
+        resp.headers_mut().insert(
+            hyper::header::CONTENT_TYPE,
+            hyper::header::HeaderValue::from_static(content_type),
+        );
+        resp
+    }
+
     fn response_ok(body: impl Into<String>) -> Response<ServiceRespBody> {
-        let body_bytes = Bytes::from(body.into());
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(body_bytes).map_err(SrvError::from).boxed())
-            .unwrap()
+        Self::response_with_content_type(
+            StatusCode::OK,
+            "application/json",
+            Bytes::from(body.into()),
+        )
     }
 
     fn response_err(status: StatusCode, msg: &str) -> Response<ServiceRespBody> {
-        Response::builder()
-            .status(status)
-            .header(hyper::header::CONTENT_TYPE, "text/plain")
-            .body(Full::new(Bytes::from(msg.to_string())).map_err(SrvError::from).boxed())
-            .unwrap()
+        Self::response_with_content_type(
+            status,
+            "text/plain",
+            Bytes::from(msg.to_string()),
+        )
     }
 
     fn generate_jwt_cookie_response(
@@ -139,7 +160,7 @@ impl IdpService {
         // Update exp and ensure jti is assigned
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         claims.exp = now as usize + self.params.token_expiry_seconds as usize;
         if claims.jti.is_none() {
@@ -163,15 +184,18 @@ impl IdpService {
             }
         }
 
-        let body = format!(r#"{{"status":"confirmed","redirect":"{}"}}"#, self.params.redirect_after_login);
-        
-        let resp = Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::SET_COOKIE, cookie_val)
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body)).map_err(SrvError::from).boxed())
-            .unwrap();
-            
+        let cookie_header = hyper::header::HeaderValue::from_str(&cookie_val)
+            .context("Failed to encode Set-Cookie header value")?;
+        let body = serde_json::json!({
+            "status": "confirmed",
+            "redirect": self.params.redirect_after_login,
+        })
+        .to_string();
+
+        let mut resp =
+            Self::response_with_content_type(StatusCode::OK, "application/json", Bytes::from(body));
+        resp.headers_mut()
+            .insert(hyper::header::SET_COOKIE, cookie_header);
         Ok(resp)
     }
 
@@ -237,7 +261,7 @@ impl IdpService {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         claims.exp = now as usize + self.params.token_expiry_seconds as usize;
         if claims.jti.is_none() {
@@ -246,7 +270,7 @@ impl IdpService {
 
         match sign_jwt(&claims, &self.encoding_key) {
             Ok(token) => {
-                let body = format!(r#"{{"token":"{}"}}"#, token);
+                let body = serde_json::json!({ "token": token }).to_string();
                 Self::response_ok(body)
             }
             Err(e) => {
@@ -257,13 +281,16 @@ impl IdpService {
     }
 }
 
+enum WebhookEndpoint {
+    Token,
+    Confirm { sid: String, code: Option<String> },
+}
+
 /// Deferred state for an IdP request awaiting an external claims webhook.
 pub struct IdpWebhookState {
     claims: Claims,
-    sid: Option<String>,
-    code: Option<String>,
+    endpoint: WebhookEndpoint,
     idp: IdpService,
-    is_token_endpoint: bool,
 }
 
 #[pin_project(project = IdpFutureProj)]
@@ -285,22 +312,28 @@ impl Future for IdpFuture {
         let this = self.project();
         match this {
             IdpFutureProj::Ready { response } => {
-                Poll::Ready(Ok(response.take().unwrap()))
+                let resp = response.take().unwrap_or_else(|| {
+                    IdpService::response_err(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Future Error",
+                    )
+                });
+                Poll::Ready(Ok(resp))
             }
             IdpFutureProj::Webhook { fetch_fut, state } => {
                 let dynamic_oids_res = std::task::ready!(fetch_fut.poll(cx));
 
                 let claims_owned = state.claims.clone();
-                let resp = if state.is_token_endpoint {
-                    state.idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
-                } else {
-                    let sid_str = state.sid.as_ref().unwrap();
-                    state.idp.handle_auth_confirm(
-                        sid_str,
-                        state.code.as_deref(),
+                let resp = match &state.endpoint {
+                    WebhookEndpoint::Token => {
+                        state.idp.handle_auth_token(claims_owned, Some(dynamic_oids_res))
+                    }
+                    WebhookEndpoint::Confirm { sid, code } => state.idp.handle_auth_confirm(
+                        sid,
+                        code.as_deref(),
                         claims_owned,
                         Some(dynamic_oids_res),
-                    )
+                    ),
                 };
                 Poll::Ready(Ok(resp))
             }
@@ -324,12 +357,11 @@ impl Service<Request<crate::SrvBody>> for IdpService {
         // Handle JWKS endpoint directly
         if method == Method::GET && path == "/.well-known/jwks.json" {
             if let Some(jwks) = &self.jwks_payload {
-                let body_bytes = Bytes::from(jwks.as_str().to_string());
-                let resp = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(hyper::header::CONTENT_TYPE, "application/jwk-set+json")
-                    .body(Full::new(body_bytes).map_err(SrvError::from).boxed())
-                    .unwrap();
+                let resp = Self::response_with_content_type(
+                    StatusCode::OK,
+                    "application/jwk-set+json",
+                    Bytes::from(jwks.as_str().to_string()),
+                );
                 return IdpFuture::Ready { response: Some(resp) };
             } else {
                 return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::NOT_FOUND, "JWKS not configured")) };
@@ -427,12 +459,15 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             // 0. Serve the generic HTML login page (Frontend UI)
             (Method::GET, "/auth/login_page") => {
                 let html = include_str!("idp_login.html");
-                let res = Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", "text/html; charset=utf-8")
-                    .header("Cache-Control", "no-store, no-cache, must-revalidate")
-                    .body(Full::new(Bytes::from(html)).map_err(SrvError::from).boxed())
-                    .unwrap();
+                let mut res = Self::response_with_content_type(
+                    StatusCode::OK,
+                    "text/html; charset=utf-8",
+                    Bytes::from_static(html.as_bytes()),
+                );
+                res.headers_mut().insert(
+                    hyper::header::CACHE_CONTROL,
+                    hyper::header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+                );
                 IdpFuture::Ready { response: Some(res) }
             }
 
@@ -456,10 +491,12 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             self.server_name,
                             session::redact_session_id(&info.session_id)
                         );
-                        let body = format!(
-                            r#"{{"session":"{}","poll_secret":"{}","user_code":"{}"}}"#,
-                            info.session_id, info.poll_secret, info.user_code
-                        );
+                        let body = serde_json::json!({
+                            "session": info.session_id,
+                            "poll_secret": info.poll_secret,
+                            "user_code": info.user_code,
+                        })
+                        .to_string();
                         IdpFuture::Ready { response: Some(Self::response_ok(body)) }
                     }
                     Err(CreateSessionError::RateLimited) => {
@@ -556,7 +593,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 }
                 let resp = match self.session_store.get_session_user_code(&sid) {
                     Some(code) => {
-                        let body = format!(r#"{{"user_code":"{}"}}"#, code);
+                        let body = serde_json::json!({ "user_code": code }).to_string();
                         Self::response_ok(body)
                     }
                     None => Self::response_err(StatusCode::NOT_FOUND, "Session not found or expired"),
@@ -612,10 +649,11 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                 fetch_fut,
                                 state: Box::new(IdpWebhookState {
                                     claims,
-                                    sid: Some(sid),
-                                    code: user_code,
+                                    endpoint: WebhookEndpoint::Confirm {
+                                        sid,
+                                        code: user_code,
+                                    },
                                     idp: self.clone(),
-                                    is_token_endpoint: false,
                                 }),
                             };
                         }
@@ -647,10 +685,8 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                 fetch_fut,
                                 state: Box::new(IdpWebhookState {
                                     claims,
-                                    sid: None,
-                                    code: None,
+                                    endpoint: WebhookEndpoint::Token,
                                     idp: self.clone(),
-                                    is_token_endpoint: true,
                                 }),
                             };
                         }
@@ -822,12 +858,27 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                     r#"{"status":"cleared"}"#
                 };
 
-                let res = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(hyper::header::SET_COOKIE, cookie_clear)
-                    .header(hyper::header::CONTENT_TYPE, "application/json")
-                    .body(Full::new(Bytes::from(body)).map_err(SrvError::from).boxed())
-                    .unwrap();
+                let res = match hyper::header::HeaderValue::from_str(&cookie_clear) {
+                    Ok(cookie_hv) => {
+                        let mut r = Self::response_with_content_type(
+                            StatusCode::OK,
+                            "application/json",
+                            Bytes::from_static(body.as_bytes()),
+                        );
+                        r.headers_mut().insert(hyper::header::SET_COOKIE, cookie_hv);
+                        r
+                    }
+                    Err(e) => {
+                        error!(
+                            "{}: Invalid Set-Cookie clear header during /auth/revoke: {}",
+                            self.server_name, e
+                        );
+                        Self::response_err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Cookie Configuration Error",
+                        )
+                    }
+                };
 
                 IdpFuture::Ready { response: Some(res) }
             }
@@ -1258,5 +1309,135 @@ mod tests {
             .insert(crate::PemCertExtension("dummy-pem".to_string()));
         let resp_confirm_ok = idp.ready().await.unwrap().call(req_confirm_ok).await.unwrap();
         assert_eq!(resp_confirm_ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_idp_status_escapes_redirect_json_and_validates_params() {
+        let mut idp = create_test_idp_service();
+        idp.params.redirect_after_login = r#"/admin?q="quoted"&ok=1"#.to_string();
+
+        let claims = Claims {
+            sub: "alice".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("praeco-admin".to_string()),
+            exp: 0,
+            oids: vec!["1".to_string()],
+            jti: None,
+        };
+        let resp = idp.generate_jwt_cookie_response(claims).unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(parsed["status"], "confirmed");
+        assert_eq!(parsed["redirect"], r#"/admin?q="quoted"&ok=1"#);
+
+        // IdpService::new rejects malformed cookie/redirect settings at startup
+        let pki = common::test_pki::TestPki::new();
+        let dir = std::env::temp_dir().join(format!("praeco_idp_s07_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("idp_priv.pem");
+        std::fs::write(&key_path, TEST_PRIV_KEY).unwrap();
+        let mut bad_params = idp.params.clone();
+        bad_params.jwt_private_key = key_path.display().to_string();
+        bad_params.cookie_name = "bad;cookie".to_string();
+        let res = IdpService::new(bad_params, "test-idp");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = pki;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_idp_http_login_confirm_status_cookie_and_auth_token_flow() {
+        // 1. Confirm __Host- cookie omits Domain while delivering safe serialized redirect JSON
+        let mut idp_host = create_test_idp_service();
+        idp_host.params.cookie_name = "__Host-jwt".to_string();
+        idp_host.params.cookie_domain = Some("ignored.example.test".to_string());
+        idp_host.params.redirect_after_login = "/admin?tab=\"users\"".to_string();
+
+        let req_login = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp_login = idp_host.ready().await.unwrap().call(req_login).await.unwrap();
+        assert_eq!(resp_login.status(), StatusCode::OK);
+        let login_json: serde_json::Value = serde_json::from_slice(
+            &resp_login.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        let sid = login_json["session"].as_str().unwrap().to_string();
+        let poll_secret = login_json["poll_secret"].as_str().unwrap().to_string();
+        let user_code = login_json["user_code"].as_str().unwrap().to_string();
+
+        let mut req_confirm = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/auth/confirm?session={sid}&code={user_code}"))
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        req_confirm
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        req_confirm
+            .extensions_mut()
+            .insert(crate::SanCertExtension("alice@example.test".to_string()));
+        let resp_confirm = idp_host.ready().await.unwrap().call(req_confirm).await.unwrap();
+        assert_eq!(resp_confirm.status(), StatusCode::OK);
+
+        let req_status = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/auth/status?session={sid}&poll_secret={poll_secret}"))
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp_status = idp_host.ready().await.unwrap().call(req_status).await.unwrap();
+        assert_eq!(resp_status.status(), StatusCode::OK);
+        let set_cookie = resp_status
+            .headers()
+            .get(hyper::header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(set_cookie.starts_with("__Host-jwt="));
+        assert!(set_cookie.contains("; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=3600"));
+        assert!(!set_cookie.contains("Domain="));
+
+        let status_json: serde_json::Value = serde_json::from_slice(
+            &resp_status.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        assert_eq!(status_json["status"], "confirmed");
+        assert_eq!(status_json["redirect"], "/admin?tab=\"users\"");
+
+        // 2. Non-__Host- cookie includes validated Domain and POST /auth/token issues verifiable JWT JSON
+        let mut idp_domain = create_test_idp_service();
+        idp_domain.params.cookie_name = "admin-jwt".to_string();
+        idp_domain.params.cookie_domain = Some("idp.example.test".to_string());
+
+        let mut req_token = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/token")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        req_token
+            .extensions_mut()
+            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+        req_token
+            .extensions_mut()
+            .insert(crate::SanCertExtension("svc@example.test".to_string()));
+        let resp_token = idp_domain.ready().await.unwrap().call(req_token).await.unwrap();
+        assert_eq!(resp_token.status(), StatusCode::OK);
+        let token_json: serde_json::Value = serde_json::from_slice(
+            &resp_token.into_body().collect().await.unwrap().to_bytes(),
+        )
+        .unwrap();
+        let token_str = token_json["token"].as_str().unwrap();
+        let claims = common::verify_jwt(
+            token_str,
+            &idp_domain.decoding_keys,
+            "praeco-idp",
+            "praeco-admin",
+        )
+        .expect("token from POST /auth/token must pass verify_jwt");
+        assert_eq!(claims.sub, "svc@example.test");
     }
 }

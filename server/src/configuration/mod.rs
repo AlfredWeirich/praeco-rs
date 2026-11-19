@@ -1063,6 +1063,97 @@ fn default_issuer() -> String { "praeco-idp".to_string() }
 fn default_webhook_timeout() -> u64 { 3000 }
 fn default_on_webhook_failure() -> String { "reject".to_string() }
 
+/// Validates RFC 6265 cookie name token syntax (RFC 7230 `tchar`: no CTLs, whitespace, or separators).
+fn is_valid_rfc6265_cookie_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Validates RFC 6265 `Domain` attribute syntax (optional leading dot + DNS hostname or IP literal).
+fn is_valid_cookie_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    if domain.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let host = domain.strip_prefix('.').unwrap_or(domain);
+    if host.is_empty() || host.len() > 253 || host.ends_with('.') {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+/// Validates `IdpParams.redirect_after_login`: must be a relative path starting with `/` (not `//`)
+/// or an explicit `http://` / `https://` URL without control characters or backslashes (`S-07`).
+fn is_valid_redirect_after_login(redirect: &str) -> bool {
+    if redirect.is_empty() || redirect.chars().any(|c| c.is_control()) || redirect.contains('\\') {
+        return false;
+    }
+    if redirect.starts_with('/') {
+        return !redirect.starts_with("//");
+    }
+    let Ok(parsed) = url::Url::parse(redirect) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https") && parsed.has_host()
+}
+
+/// Validates IdP cookie attributes and `redirect_after_login` at startup (`S-07`).
+pub(crate) fn validate_idp_cookie_and_redirect(
+    params: &IdpParams,
+    server_name: &str,
+) -> Result<(), Error> {
+    if !is_valid_rfc6265_cookie_name(&params.cookie_name) {
+        return Err(Error::msg(format!(
+            "Configuration error in Server '{}': IdpParams.cookie_name '{}' is not a valid RFC 6265 cookie token.",
+            server_name, params.cookie_name
+        )));
+    }
+    if let Some(domain) = &params.cookie_domain
+        && !is_valid_cookie_domain(domain)
+    {
+        return Err(Error::msg(format!(
+            "Configuration error in Server '{}': IdpParams.cookie_domain '{}' is not a valid cookie domain or IP.",
+            server_name, domain
+        )));
+    }
+    if !is_valid_redirect_after_login(&params.redirect_after_login) {
+        return Err(Error::msg(format!(
+            "Configuration error in Server '{}': IdpParams.redirect_after_login '{}' must be a safe relative path starting with '/' (not '//') or an http(s) URL.",
+            server_name, params.redirect_after_login
+        )));
+    }
+    Ok(())
+}
+
 
 /// Server TLS certificate and key paths.
 #[derive(Debug, Deserialize, Clone)]
@@ -1812,6 +1903,8 @@ impl ServerConfig {
             // Validate that IdP private key can be loaded
             common::load_encoding_key(&idp_params.jwt_private_key)
                 .with_context(|| format!("{}: Failed to load IdP private key", self.name))?;
+
+            validate_idp_cookie_and_redirect(idp_params, &self.name)?;
 
             if idp_params.cookie_name.starts_with("__Host-") {
                 if self.protocol != Protocol::Https {

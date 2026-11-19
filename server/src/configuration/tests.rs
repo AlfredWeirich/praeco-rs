@@ -1193,3 +1193,123 @@ enabled = []
         let mut s3: ServerConfig = toml::from_str(invalid_header_name).unwrap();
         assert!(s3.finalize().is_err());
     }
+
+    #[test]
+    fn test_idp_cookie_domain_and_redirect_validation() {
+        let base_params = |cookie_name: &str, cookie_domain: Option<&str>, redirect: &str| IdpParams {
+            jwt_private_key: "priv.pem".to_string(),
+            token_expiry_seconds: 900,
+            session_ttl_seconds: 120,
+            cookie_name: cookie_name.to_string(),
+            cookie_domain: cookie_domain.map(ToString::to_string),
+            redirect_after_login: redirect.to_string(),
+            debug_show_session_id: None,
+            issuer: "praeco-idp".to_string(),
+            allowed_audiences: Vec::new(),
+            jwt_public_key: None,
+            claims_webhook_url: None,
+            claims_webhook_timeout_ms: 3000,
+            on_webhook_failure: "reject".to_string(),
+            claims_webhook_client_cert: None,
+            claims_webhook_client_key: None,
+            claims_webhook_ca_cert: None,
+        };
+
+        // Valid configurations
+        assert!(validate_idp_cookie_and_redirect(&base_params("__Host-jwt", None, "/"), "idp").is_ok());
+        assert!(
+            validate_idp_cookie_and_redirect(
+                &base_params("admin-jwt", Some("192.168.178.45"), "https://192.168.178.45:1338/admin"),
+                "idp"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_idp_cookie_and_redirect(
+                &base_params("admin-jwt", Some(".example.com"), "/dashboard?tab=1"),
+                "idp"
+            )
+            .is_ok()
+        );
+
+        // Invalid cookie names
+        for bad_name in ["", "bad;name", "bad=name", "bad name", "bad\r\nname"] {
+            assert!(
+                validate_idp_cookie_and_redirect(&base_params(bad_name, None, "/"), "idp").is_err(),
+                "cookie_name '{bad_name}' must be rejected"
+            );
+        }
+
+        // Invalid cookie domains
+        for bad_domain in ["", "evil.com; HttpOnly", "bad domain", "host\r\n", "-bad.example", "example."] {
+            assert!(
+                validate_idp_cookie_and_redirect(&base_params("admin-jwt", Some(bad_domain), "/"), "idp").is_err(),
+                "cookie_domain '{bad_domain}' must be rejected"
+            );
+        }
+
+        // Invalid redirect targets
+        for bad_redirect in [
+            "",
+            "//evil.example/phish",
+            "javascript:alert(1)",
+            "data:text/html,<script>1</script>",
+            "/admin\r\nX-Injected: 1",
+            "/admin\\evil",
+            "relative-without-slash",
+        ] {
+            assert!(
+                validate_idp_cookie_and_redirect(&base_params("__Host-jwt", None, bad_redirect), "idp").is_err(),
+                "redirect_after_login '{bad_redirect}' must be rejected"
+            );
+        }
+
+        // End-to-end TOML -> ServerConfig::finalize() verification
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let pub_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+        let pub_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
+        let dir = std::env::temp_dir().join(format!("praeco_idp_toml_s07_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jwt_priv_path = dir.join("jwt_priv.pem");
+        std::fs::write(
+            &jwt_priv_path,
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let make_idp_toml = |extra: &str| {
+            format!(
+                r#"
+                name = "idp_toml_s07"
+                ip = "127.0.0.1"
+                port = 1339
+                protocol = "https"
+                service = "Idp"
+                [Layers]
+                enabled = []
+                [server_certs]
+                ssl_certificate = "{pub_pem}"
+                ssl_certificate_key = "{pub_key}"
+                [IdpParams]
+                jwt_private_key = "{}"
+                {extra}
+            "#,
+                jwt_priv_path.display()
+            )
+        };
+
+        let mut valid_srv: ServerConfig = toml::from_str(&make_idp_toml("")).unwrap();
+        let valid_res = valid_srv.finalize();
+        assert!(valid_res.is_ok(), "default IdP TOML config must finalize cleanly: {:?}", valid_res.err());
+
+        let mut bad_cookie_srv: ServerConfig =
+            toml::from_str(&make_idp_toml(r#"cookie_name = "bad;cookie""#)).unwrap();
+        assert!(bad_cookie_srv.finalize().is_err());
+
+        let mut bad_redirect_srv: ServerConfig =
+            toml::from_str(&make_idp_toml(r#"redirect_after_login = "javascript:alert(1)""#)).unwrap();
+        assert!(bad_redirect_srv.finalize().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }

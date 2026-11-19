@@ -490,9 +490,9 @@ The built-in IdP issues Ed25519-signed JWTs via device mTLS authentication or vi
 | `jwt_public_key` | String | Optional | `None` | Path to PEM-encoded public key. When configured, automatically exposed in RFC 7517 format at `/.well-known/jwks.json` for key rotation. |
 | `token_expiry_seconds` | Integer | Optional | `900` (15 mins) | Lifetime of issued JWTs in seconds (`exp` claim). |
 | `session_ttl_seconds` | Integer | Optional | `120` (2 mins) | Lifetime of QR-code login sessions. |
-| `cookie_name` | String | Optional | `"__Host-jwt"` | Name of auth cookie set upon login. If prefixed with `__Host-`, protocol **must** be `"https"` and `cookie_domain` must be omitted per RFC 6265bis. |
-| `cookie_domain` | String | Optional | `None` | Domain scope for cookie sharing across subdomains (e.g. `".example.com"`). Ignored if `cookie_name` starts with `__Host-`. |
-| `redirect_after_login` | String | Optional | `"/"` | Default redirect URL after successful browser login if no `?redirect=` parameter was provided. |
+| `cookie_name` | String | Optional | `"__Host-jwt"` | Name of auth cookie set upon login (validated against RFC 6265 token syntax at startup). If prefixed with `__Host-`, protocol **must** be `"https"` and `cookie_domain` must be omitted per RFC 6265bis. |
+| `cookie_domain` | String | Optional | `None` | Domain scope for cookie sharing across subdomains (e.g. `".example.com"` or IP address, validated at startup). Ignored/forbidden if `cookie_name` starts with `__Host-`. |
+| `redirect_after_login` | String | Optional | `"/"` | Default redirect URL after successful browser login (validated at startup: relative path starting with `/` except `//`, or explicit `http://`/`https://` URL without control chars or backslashes). |
 | `debug_show_session_id` | Boolean | Optional | `false` | When `true`, displays raw session UUID on web UI for testing. |
 | `issuer` | String | Optional | `"praeco-idp"` | Issuer claim (`iss`) written into issued JWTs. |
 | `allowed_audiences` | Array of Strings | Optional | `[]` | Allowed audience values (`aud`). If client requests `?aud=...`, it must match an entry here; unlisted audiences return `400 Bad Request`. |

@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Replaced the fixed 28-header identity denylist in `headers::prepare_proxy_headers` with prefix/exact matching (`is_identity_like`: `x-forwarded-*`, `x-auth-*`, `x-authenticated-*`, `x-remote-*`, `x-user*`, `x-client-*`, `x-ssl-*`, `ssl-client-*`, `x-original-*`, `x-rewrite-*`, `remote-*`, `true-client-ip`, `cf-connecting-ip`, etc.) before authoritative header injection.
   * Added `RouteHeaderPolicy` on `ParsedRoute` and per-route `RouteConfig` fields (`strip_authorization`, `forward_authorization`, `strip_cookies`, `strip_cookie_names`, `forward_headers`) stripping client `Authorization` and `Cookie` headers by default (with automatic `[Server.Layers.JWT].cookie_fallback` redaction when selective cookie forwarding is enabled), rejecting contradictory configs at startup, and preserving per-target `forward_headers` opt-ins on `aggregate` routes.
   * Extracted `execute_health_probe` in `src/runner.rs` so both `client.request(req)` and the bounded (`64 KiB`) health-check response body read run inside the shared 5-second timeout (`ACTIVE_HEALTH_CHECK_TIMEOUT`).
+* **IdP JSON/Cookie Validation & Panic Removal (`src/middleware/idp/mod.rs`, `src/configuration/mod.rs`):**
+  * Replaced all manual `format!` JSON string construction in `IdpService` with `serde_json::json!`, eliminated all `.unwrap()` calls across production IdP paths (`Response::new`, `unwrap_or_default`, and typed `WebhookEndpoint` state enum), and validated `cookie_name`, `cookie_domain`, and `redirect_after_login` at startup in both `ServerConfig::finalize` and `IdpService::new`.
 
 ---
 
