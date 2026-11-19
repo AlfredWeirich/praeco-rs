@@ -42,7 +42,32 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 // 1. Identity Service Implementation
 // -----------------------------------------------------------------------------
 #[derive(Default)]
-pub struct MyIdentityService {}
+pub struct MyIdentityService {
+    demo_user: String,
+    demo_password: Option<String>,
+}
+
+impl MyIdentityService {
+    fn new(demo_user: String, demo_password: Option<String>) -> Self {
+        Self {
+            demo_user,
+            demo_password,
+        }
+    }
+}
+
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 #[tonic::async_trait]
 impl IdentityService for MyIdentityService {
@@ -51,12 +76,19 @@ impl IdentityService for MyIdentityService {
         &self,
         request: Request<LoginRequest>,
     ) -> Result<Response<AuthTokenResponse>, Status> {
+        let Some(expected_password) = self.demo_password.as_deref() else {
+            return Err(Status::failed_precondition(
+                "Demo login disabled: configure PRAECO_DEMO_PASSWORD or --demo-password",
+            ));
+        };
+
         // Extract the inner request
         let req = request.into_inner();
         info!("IdentityService handling Login");
 
-        // Dummy authentication logic
-        if req.username == "admin" && req.password == "admin123" {
+        if constant_time_eq_str(&req.username, &self.demo_user)
+            && constant_time_eq_str(&req.password, expected_password)
+        {
             Ok(Response::new(AuthTokenResponse {
                 token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy_token".into(),
                 expires_in_seconds: 3600,
@@ -176,9 +208,18 @@ struct Cli {
     #[clap(short = 's', long, value_enum, default_value_t = Protocol::Mtls)]
     security: Protocol,
 
-    /// Server address and port to bind to.
-    #[clap(short = 'u', long, default_value = "0.0.0.0:50051")]
+    /// Server address and port to bind to (loopback by default).
+    #[clap(short = 'u', long, default_value = "[::1]:50051")]
     uri: String,
+
+    /// Demo username for IdentityService::Login (falls back to PRAECO_DEMO_USER or "admin").
+    #[clap(long)]
+    demo_user: Option<String>,
+
+    /// Demo password for IdentityService::Login (falls back to PRAECO_DEMO_PASSWORD).
+    /// Login remains disabled unless explicitly provided.
+    #[clap(long)]
+    demo_password: Option<String>,
 
     /// Path to the server's certificate (PEM).
     #[clap(long, default_value = "./server_certs/self_signed/fullchain_self.pem")]
@@ -212,7 +253,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = cli.uri.parse()?;
 
     // Instantiate all our services
-    let identity_service = MyIdentityService::default();
+    let demo_user = cli
+        .demo_user
+        .clone()
+        .or_else(|| std::env::var("PRAECO_DEMO_USER").ok())
+        .unwrap_or_else(|| "admin".to_string());
+    let demo_password = cli
+        .demo_password
+        .clone()
+        .or_else(|| std::env::var("PRAECO_DEMO_PASSWORD").ok());
+    let identity_service = MyIdentityService::new(demo_user, demo_password);
     let system_metrics = MySystemMetrics::default();
     let store_service = MyStoreService::default();
 
@@ -221,7 +271,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(FILE_DESCRIPTOR_SET)
         .build_v1()?; // Implements grpc.reflection.v1.ServerReflection
 
-    let mut server = Server::builder();
+    let mut server = Server::builder()
+        .concurrency_limit_per_connection(64)
+        .timeout(std::time::Duration::from_secs(15));
 
     if cli.security == Protocol::Https || cli.security == Protocol::Mtls {
         info!(
@@ -258,4 +310,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_identity_service_requires_configured_demo_password() {
+        let disabled = MyIdentityService::default();
+        let err = disabled
+            .login(Request::new(LoginRequest {
+                username: "admin".into(),
+                password: "wrong".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+
+        let configured = MyIdentityService::new("demo".into(), Some("s3cr3t!".into()));
+        let bad = configured
+            .login(Request::new(LoginRequest {
+                username: "demo".into(),
+                password: "wrong".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(bad.code(), tonic::Code::Unauthenticated);
+
+        let ok = configured
+            .login(Request::new(LoginRequest {
+                username: "demo".into(),
+                password: "s3cr3t!".into(),
+            }))
+            .await
+            .expect("valid credentials must succeed");
+        assert!(!ok.into_inner().token.is_empty());
+    }
 }
