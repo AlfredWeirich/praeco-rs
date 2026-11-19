@@ -163,6 +163,7 @@ pub fn tls_config(
         // Collect Certificate Revocation Lists (CRLs) if specified in client CA configs.
         // CRLs allow the server to reject certificates that have been revoked by the CA.
         let mut crls: Vec<CertificateRevocationListDer<'_>> = Vec::with_capacity(20);
+        let mut enforce_crl_expiration = false;
         for config in client_certs {
             // Load one or more CA certs for this config
             let ca_certs = load_certs(&config.ssl_client_ca, server_name)?;
@@ -174,19 +175,36 @@ pub fn tls_config(
                 trace!("{server_name}: Added CA from {}", config.ssl_client_ca);
             }
             if let Some(ref crl_path) = config.ssl_client_crl {
-                let crl = CertificateRevocationListDer::from_pem_file(crl_path).map_err(|e| {
-                    Error::msg(format!(
-                        "{server_name}: Failed to load CRL from '{crl_path}': {e}"
-                    ))
-                })?;
-                if !warn_if_crl_expired(server_name, crl_path, crl.as_ref()) && strict_crl_enabled()
-                {
+                let loaded_crls = CertificateRevocationListDer::pem_file_iter(crl_path)
+                    .map_err(|e| {
+                        Error::msg(format!(
+                            "{server_name}: Failed to open CRL '{crl_path}': {e}"
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| {
+                        Error::msg(format!(
+                            "{server_name}: Failed to load CRL from '{crl_path}': {e}"
+                        ))
+                    })?;
+                if loaded_crls.is_empty() {
                     return Err(Error::msg(format!(
-                        "{server_name}: Rejecting CRL '{crl_path}' because PRAECO_STRICT_CRL is enabled and the CRL is expired or invalid"
+                        "{server_name}: CRL file '{crl_path}' contains no CRL entries"
                     )));
                 }
-                trace!("{server_name}: Added CRL from {crl_path}");
-                crls.push(crl);
+                let strict = common::crl::resolve_strict_crl(config.strict_crl);
+                if strict {
+                    enforce_crl_expiration = true;
+                }
+                for crl in loaded_crls {
+                    if !warn_if_crl_expired(server_name, crl_path, crl.as_ref()) && strict {
+                        return Err(Error::msg(format!(
+                            "{server_name}: Rejecting CRL '{crl_path}' because strict CRL validation is enabled and the CRL is expired or invalid"
+                        )));
+                    }
+                    trace!("{server_name}: Added CRL from {crl_path}");
+                    crls.push(crl);
+                }
             }
         }
 
@@ -195,6 +213,10 @@ pub fn tls_config(
         // and have not been revoked (if CRLs are provided).
         let mut builder = rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
             .with_crls(crls);
+
+        if enforce_crl_expiration {
+            builder = builder.enforce_revocation_expiration();
+        }
 
         if authentication_method == crate::configuration::AuthenticationMethod::OptionalClientCert {
             builder = builder.allow_unauthenticated();
@@ -238,13 +260,13 @@ pub fn tls_config(
     Ok(config)
 }
 
-/// Returns `true` when strict CRL expiration enforcement is enabled via
-/// `PRAECO_STRICT_CRL` (`"1"` or `"true"`).
+/// Returns `true` when strict CRL expiration enforcement is enabled.
+///
+/// Defaults to `true` (fail-closed) and can be explicitly overridden via
+/// `PRAECO_STRICT_CRL` (`"1"`/`"true"`/`"yes"` to enable, `"0"`/`"false"`/`"no"` to disable).
 #[inline]
 pub fn strict_crl_enabled() -> bool {
-    std::env::var("PRAECO_STRICT_CRL")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    common::crl::resolve_strict_crl(true)
 }
 
 /// Validates a DER-encoded X.509 CRL against expiration (`nextUpdate`) and returns
@@ -269,39 +291,10 @@ pub fn validate_crl_not_expired(
 /// `nextUpdate` field, emitting a warning log if stale. Returns `true` if the CRL is
 /// valid and not expired, or `false` if expired, missing `nextUpdate`, or unparseable.
 pub fn warn_if_crl_expired(server_name: &str, crl_path: &str, crl_der: &[u8]) -> bool {
-    match x509_parser::parse_x509_crl(crl_der) {
-        Ok((_, parsed_crl)) => {
-            if let Some(next_update) = parsed_crl.next_update() {
-                let now_ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                if next_update.timestamp() < now_ts {
-                    tracing::warn!(
-                        "{}: CRL '{}' has expired (nextUpdate: {}). Revocation checks may use stale data!",
-                        server_name,
-                        crl_path,
-                        next_update
-                    );
-                    return false;
-                }
-                true
-            } else {
-                tracing::warn!(
-                    "{}: CRL '{}' does not contain a nextUpdate field.",
-                    server_name,
-                    crl_path
-                );
-                false
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "{}: Failed to parse CRL '{}' with x509-parser for expiration check: {}",
-                server_name,
-                crl_path,
-                e
-            );
+    match common::crl::check_crl_not_expired(crl_der) {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!("{}: CRL '{}' check failed: {}", server_name, crl_path, err);
             false
         }
     }
@@ -551,5 +544,35 @@ mod tests {
         assert!(validate_crl_not_expired("srv", "stale.crl", invalid_der, false).is_ok());
         // Strict mode fails hard
         assert!(validate_crl_not_expired("srv", "stale.crl", invalid_der, true).is_err());
+    }
+
+    #[test]
+    fn test_tls_config_strict_crl_rejects_empty_and_corrupt_crl_by_default() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let empty_crl = std::env::temp_dir().join(format!(
+            "praeco_server_empty_crl_{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&empty_crl, "").unwrap();
+
+        let srv_cert = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+        };
+        let client_ca = vec![ClientCertConfig {
+            ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+            ssl_client_crl: Some(empty_crl.to_string_lossy().to_string()),
+            strict_crl: true,
+        }];
+
+        let res = tls_config(
+            "test_srv",
+            &srv_cert,
+            Some(&client_ca),
+            crate::configuration::AuthenticationMethod::ClientCert,
+        );
+        let _ = std::fs::remove_file(&empty_crl);
+        assert!(res.is_err(), "empty CRL file must be rejected");
     }
 }

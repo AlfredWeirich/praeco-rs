@@ -30,7 +30,8 @@ pub(crate) fn cert_sha256_fingerprint(cert_der: &[u8]) -> Option<[u8; 32]> {
 }
 
 
-/// Loads certificates and constructs a [`TlsAcceptor`] configured for strict mTLS.
+/// Loads certificates and constructs a [`TlsAcceptor`] configured for strict mTLS
+/// with strict CRL enforcement enabled by default (`strict_crl = true`).
 ///
 /// # Errors
 ///
@@ -42,6 +43,22 @@ pub fn setup_mtls_acceptor(
     key_path: &str,
     crl_path: Option<&String>,
 ) -> Result<TlsAcceptor, RelayError> {
+    setup_mtls_acceptor_with_strict(ca_path, cert_path, key_path, crl_path, true)
+}
+
+/// Like [`setup_mtls_acceptor`], with an explicit `strict_crl` default (still overridable via
+/// `PRAECO_STRICT_CRL`).
+///
+/// When strict CRL mode is active, expired, empty, unparseable, or `nextUpdate`-less CRLs are
+/// rejected at load time and `rustls`'s `enforce_revocation_expiration()` enforces `nextUpdate`
+/// during every subsequent mTLS handshake.
+pub fn setup_mtls_acceptor_with_strict(
+    ca_path: &str,
+    cert_path: &str,
+    key_path: &str,
+    crl_path: Option<&String>,
+    strict_crl_default: bool,
+) -> Result<TlsAcceptor, RelayError> {
     let mut root_store = RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(ca_path)? {
         root_store.add(cert?)?;
@@ -50,48 +67,32 @@ pub fn setup_mtls_acceptor(
     let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
 
     if let Some(path) = crl_path {
-        let strict_crl = std::env::var("PRAECO_STRICT_CRL")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let strict_crl = common::crl::resolve_strict_crl(strict_crl_default);
         let crls =
             CertificateRevocationListDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
+        if crls.is_empty() {
+            return Err(RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CRL file '{path}' contains no CRL entries"),
+            )));
+        }
         for crl_der in &crls {
-            let mut crl_invalid_or_expired = false;
-            match x509_parser::parse_x509_crl(crl_der.as_ref()) {
-                Ok((_, parsed_crl)) => {
-                    if let Some(next_update) = parsed_crl.next_update() {
-                        let now_ts = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        if next_update.timestamp() < now_ts {
-                            warn!(
-                                crl_path = %path,
-                                next_update = %next_update,
-                                "Loaded CRL has expired (nextUpdate is in the past)! Revocation checks may use stale data."
-                            );
-                            crl_invalid_or_expired = true;
-                        }
-                    } else {
-                        warn!(crl_path = %path, "Loaded CRL does not contain a nextUpdate field.");
-                        crl_invalid_or_expired = true;
-                    }
+            if let Err(err) = common::crl::check_crl_not_expired(crl_der.as_ref()) {
+                warn!(crl_path = %path, error = %err, "CRL validation check failed");
+                if strict_crl {
+                    return Err(RelayError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "Rejecting CRL '{path}' because strict CRL validation is enabled: {err}"
+                        ),
+                    )));
                 }
-                Err(e) => {
-                    warn!(crl_path = %path, error = %e, "Failed to parse CRL with x509-parser for expiration check");
-                    crl_invalid_or_expired = true;
-                }
-            }
-            if crl_invalid_or_expired && strict_crl {
-                return Err(RelayError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "Rejecting CRL '{path}' because PRAECO_STRICT_CRL is enabled and the CRL is expired or invalid"
-                    ),
-                )));
             }
         }
         verifier_builder = verifier_builder.with_crls(crls);
+        if strict_crl {
+            verifier_builder = verifier_builder.enforce_revocation_expiration();
+        }
     }
 
     let verifier = verifier_builder.build()?;
@@ -108,20 +109,19 @@ pub fn setup_mtls_acceptor(
 }
 
 /// Parses all revoked certificate serial numbers (raw DER integer bytes) from a PEM-encoded CRL file.
+///
+/// Fails closed if the file contains no CRL PEM blocks or any CRL fails DER parsing.
 pub fn parse_revoked_serials_from_crl_pem(
     crl_path: &str,
 ) -> Result<std::collections::HashSet<Vec<u8>>, RelayError> {
-    let mut serials = std::collections::HashSet::new();
     let crls =
         CertificateRevocationListDer::pem_file_iter(crl_path)?.collect::<Result<Vec<_>, _>>()?;
-    for crl_der in &crls {
-        if let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
-            for revoked in parsed_crl.iter_revoked_certificates() {
-                serials.insert(revoked.raw_serial().to_vec());
-            }
-        }
-    }
-    Ok(serials)
+    common::crl::extract_revoked_serials_from_crls(&crls).map_err(|err| {
+        RelayError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid CRL '{crl_path}': {err}"),
+        ))
+    })
 }
 
 /// Extracts the leaf certificate's `notAfter` UNIX timestamp (seconds) and raw serial bytes.
@@ -152,6 +152,10 @@ pub struct ControlPlaneReloadState {
 /// Spawns a background task that periodically reloads the mTLS [`TlsAcceptor`] and CRL serial
 /// denylist from disk (and on `SIGHUP` on Unix), broadcasting updates to the Control Plane
 /// and all active tunnel drivers.
+///
+/// # Errors
+///
+/// Fails closed if `crl_path` is configured and the initial CRL cannot be parsed.
 pub fn spawn_crl_reload_watcher(
     ca_path: String,
     cert_path: String,
@@ -160,11 +164,35 @@ pub fn spawn_crl_reload_watcher(
     initial_acceptor: TlsAcceptor,
     reload_interval: Duration,
     cancel_token: CancellationToken,
-) -> tokio::sync::watch::Receiver<ControlPlaneReloadState> {
-    let initial_serials = crl_path
-        .as_deref()
-        .and_then(|p| parse_revoked_serials_from_crl_pem(p).ok())
-        .unwrap_or_default();
+) -> Result<tokio::sync::watch::Receiver<ControlPlaneReloadState>, RelayError> {
+    spawn_crl_reload_watcher_with_strict(
+        ca_path,
+        cert_path,
+        key_path,
+        crl_path,
+        initial_acceptor,
+        reload_interval,
+        cancel_token,
+        true,
+    )
+}
+
+/// Like [`spawn_crl_reload_watcher`], with an explicit `strict_crl_default` flag.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_crl_reload_watcher_with_strict(
+    ca_path: String,
+    cert_path: String,
+    key_path: String,
+    crl_path: Option<String>,
+    initial_acceptor: TlsAcceptor,
+    reload_interval: Duration,
+    cancel_token: CancellationToken,
+    strict_crl_default: bool,
+) -> Result<tokio::sync::watch::Receiver<ControlPlaneReloadState>, RelayError> {
+    let initial_serials = match crl_path.as_deref() {
+        Some(p) => parse_revoked_serials_from_crl_pem(p)?,
+        None => std::collections::HashSet::new(),
+    };
     let (tx, rx) = tokio::sync::watch::channel(ControlPlaneReloadState {
         acceptor: initial_acceptor,
         revoked_serials: Arc::new(initial_serials),
@@ -176,7 +204,7 @@ pub fn spawn_crl_reload_watcher(
             let _tx = tx;
             cancel_token.cancelled().await;
         });
-        return rx;
+        return Ok(rx);
     }
 
     tokio::spawn(async move {
@@ -212,17 +240,28 @@ pub fn spawn_crl_reload_watcher(
             let Some(ref path) = crl_path else {
                 continue;
             };
-            match (
-                setup_mtls_acceptor(&ca_path, &cert_path, &key_path, Some(path)),
-                parse_revoked_serials_from_crl_pem(path),
-            ) {
-                (Ok(new_acceptor), Ok(serials)) => {
+            let reload_res = tokio::task::spawn_blocking({
+                let ca = ca_path.clone();
+                let cert = cert_path.clone();
+                let key = key_path.clone();
+                let crl = path.clone();
+                move || -> Result<(TlsAcceptor, std::collections::HashSet<Vec<u8>>), RelayError> {
+                    let acceptor =
+                        setup_mtls_acceptor_with_strict(&ca, &cert, &key, Some(&crl), strict_crl_default)?;
+                    let serials = parse_revoked_serials_from_crl_pem(&crl)?;
+                    Ok((acceptor, serials))
+                }
+            })
+            .await;
+
+            match reload_res {
+                Ok(Ok((new_acceptor, serials))) => {
                     let _ = tx.send(ControlPlaneReloadState {
                         acceptor: new_acceptor,
                         revoked_serials: Arc::new(serials),
                     });
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Ok(Err(e)) => {
                     warn!(
                         target: "relay::control_plane",
                         crl_path = %path,
@@ -230,11 +269,19 @@ pub fn spawn_crl_reload_watcher(
                         "Failed to reload CRL on control plane; keeping previous CRL state"
                     );
                 }
+                Err(e) => {
+                    warn!(
+                        target: "relay::control_plane",
+                        crl_path = %path,
+                        error = %e,
+                        "CRL reload task failed; keeping previous CRL state"
+                    );
+                }
             }
         }
     });
 
-    rx
+    Ok(rx)
 }
 
 /// Extracts all DNS Subject Alternative Names (SANs) from a DER-encoded X.509 certificate.

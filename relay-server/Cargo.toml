@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-common = { workspace = true, default-features = false }
+common = { workspace = true, default-features = false, features = ["crl"] }
 dashmap = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }

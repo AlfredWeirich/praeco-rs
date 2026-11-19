@@ -16,7 +16,7 @@ Das System besteht aus zwei Ebenen:
 
 1. **Control Plane (Standard Port 7001 / mTLS + Yamux):**
    - Lokale Praeco-Instanzen verbinden sich ausgehend (outbound) mit diesem Port.
-   - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) sowie eine optionale Certificate Revocation List (`crl_path`, inkl. automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start) abgesichert.
+   - Die Verbindung ist zwingend durch strenges gegenseitiges TLS (mTLS) sowie eine optionale Certificate Revocation List (`crl_path`, standardmäßig mit fail-closed `strict_crl = true`, handshake-seitiger `enforce_revocation_expiration()`-Prüfung sowie ausfallsicherem Live-Reload über `spawn_blocking`, bei dem der vorherige Zustand bei korrupten CRLs erhalten bleibt) abgesichert.
    - **SAN-zu-SNI Autorisierung:** Der Relay-Server extrahiert die X.509 DNS Subject Alternative Names (SANs) aus dem präsentierten Client-Zertifikat und stellt kryptografisch sicher, dass eine Praeco-Instanz via `REGISTER <sni_domain>\n` ausschließlich Domains registrieren darf, für die ihr Zertifikat autorisiert ist (case-insensitiv; Zertifikate ohne DNS-SANs werden sofort abgewiesen).
    - Anschließend wird die Verbindung auf das **Yamux** Multiplexing-Protokoll umgeschaltet, sodass mehrere unabhängige Streams durch eine einzige TCP-Verbindung geleitet werden können.
    - **Health Checks & Keepalive:** Der Relay-Server überwacht die Tunnel-Gesundheit durch OS-Level TCP-Keepalive auf Socket-Ebene (30s Probe, 10s Intervall). Tote Verbindungen werden zuverlässig bereinigt, ohne störende Dummy-Streams oder TLS-Handshake-Fehlalarme am Gateway zu verursachen.
@@ -65,7 +65,8 @@ data_plane_addr = "0.0.0.0:443"
 
 # Zertifikate für die Control-Plane Authentifizierung
 ca_cert_path = "server_certs/self_signed/relay_ca.pem"
-# crl_path = "server_certs/self_signed/myca.crl.pem" # Optional: CRL mit nextUpdate-Prüfung
+# crl_path = "server_certs/self_signed/myca.crl.pem" # Optional: CRL (strict_crl = true als Standard)
+# strict_crl = true
 server_cert_path = "server_certs/self_signed/relay_server.pem"
 server_key_path = "server_certs/self_signed/relay_server.key"
 
@@ -110,7 +111,7 @@ cargo run -p praeco-relay-server -- RelayConfig.toml
 
 ## Tests
 
-Die Unit- und Integration-Tests für `praeco-relay-server` (aktuell 24 Unit-Tests und 17 Integration-Tests, inkl. TCP-Accept-Loop-, Rate-Limit-, Concurrency-, CRL-Widerrufs-, Slowloris-, Stream-Open-Timeout- und Graceful-Shutdown-Tests) werden ausgeführt mit:
+Die Unit- und Integration-Tests für `praeco-relay-server` (aktuell 31 Unit-Tests und 17 Integration-Tests, inkl. TCP-Accept-Loop-, Rate-Limit-, Concurrency-, CRL-Widerrufs-, Slowloris-, Stream-Open-Timeout- und Graceful-Shutdown-Tests) werden ausgeführt mit:
 
 ```bash
 cargo test -p praeco-relay-server

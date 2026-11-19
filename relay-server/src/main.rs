@@ -14,8 +14,8 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use praeco_relay_server::{
     ControlPlaneOptions, RelayConfig, RelayConnectionTracker, SessionMap, new_session_map,
-    run_control_plane_with_options, run_data_plane_with_stream_timeout, setup_mtls_acceptor,
-    spawn_crl_reload_watcher,
+    run_control_plane_with_options, run_data_plane_with_stream_timeout,
+    setup_mtls_acceptor_with_strict, spawn_crl_reload_watcher_with_strict,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,11 +175,13 @@ async fn main() -> Result<()> {
     let active_tunnels: SessionMap = new_session_map();
     let cancel_token = CancellationToken::new();
 
-    let tls_acceptor = setup_mtls_acceptor(
+    let strict_crl = config.strict_crl.unwrap_or(true);
+    let tls_acceptor = setup_mtls_acceptor_with_strict(
         &config.ca_cert_path,
         &config.server_cert_path,
         &config.server_key_path,
         config.crl_path.as_ref(),
+        strict_crl,
     )
     .context("Failed to setup mTLS acceptor")?;
 
@@ -210,7 +212,7 @@ async fn main() -> Result<()> {
     ));
     let crl_reload_interval =
         Duration::from_secs(config.crl_reload_interval_secs.unwrap_or(60));
-    let reload_rx = spawn_crl_reload_watcher(
+    let reload_rx = spawn_crl_reload_watcher_with_strict(
         config.ca_cert_path.clone(),
         config.server_cert_path.clone(),
         config.server_key_path.clone(),
@@ -218,7 +220,9 @@ async fn main() -> Result<()> {
         tls_acceptor.clone(),
         crl_reload_interval,
         cancel_token.clone(),
-    );
+        strict_crl,
+    )
+    .context("Failed to initialize CRL reload watcher")?;
     let control_options = ControlPlaneOptions {
         connection_tracker: control_tracker,
         reload_rx: Some(reload_rx),

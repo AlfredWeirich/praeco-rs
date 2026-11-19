@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 // Note: tracing 'info' was unused, so it was removed.
 
+#[cfg(feature = "crl")]
+pub mod crl;
 #[cfg(any(test, feature = "test-pki"))]
 pub mod test_pki;
 
@@ -360,6 +362,28 @@ pub fn canonical_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+/// Extracts the client IP address from an `X-Forwarded-For` header value by
+/// walking from the **right** and skipping `trusted_hops - 1` trusted proxy entries.
+///
+/// Reverse proxies append entries to the right of `X-Forwarded-For`, making the
+/// leftmost entries client-controlled and easily spoofed. Walking from the right
+/// ensures only entries appended by trusted proxies are honored.
+///
+/// Returns `None` if `trusted_hops == 0`, if the header has fewer than
+/// `trusted_hops` entries, if the selected entry cannot be parsed as an `IpAddr`,
+/// or if the parsed IP is unspecified (`0.0.0.0` or `::`).
+pub fn client_ip_from_xff(header: &str, trusted_hops: usize) -> Option<std::net::IpAddr> {
+    if trusted_hops == 0 {
+        return None;
+    }
+    header
+        .rsplit(',')
+        .map(str::trim)
+        .nth(trusted_hops - 1)
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .filter(|ip| !ip.is_unspecified())
+}
+
 #[cfg(feature = "client")]
 pub mod client;
 pub mod proxy_protocol;
@@ -495,5 +519,32 @@ mod tests {
         let ip6_masked: IpAddr = "2001:db8:abcd:0012::".parse().unwrap();
         assert_eq!(canonical_client_ip(ip6_a), ip6_masked);
         assert_eq!(canonical_client_ip(ip6_b), ip6_masked);
+    }
+
+    #[test]
+    fn test_client_ip_from_xff_right_to_left() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // 1 trusted hop: rightmost entry wins, spoofed leftmost is ignored
+        assert_eq!(
+            client_ip_from_xff("1.2.3.4, 198.51.100.7", 1),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+
+        // 2 trusted hops: skips outermost proxy (10.0.0.1) and picks inner client
+        assert_eq!(
+            client_ip_from_xff("1.2.3.4, 198.51.100.7, 10.0.0.1", 2),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)))
+        );
+
+        // trusted_hops == 0 disables XFF extraction
+        assert_eq!(client_ip_from_xff("198.51.100.7", 0), None);
+
+        // Fewer entries than trusted_hops fails closed (no fallback to spoofed left)
+        assert_eq!(client_ip_from_xff("1.2.3.4", 2), None);
+
+        // Unspecified or invalid entries are rejected
+        assert_eq!(client_ip_from_xff("1.2.3.4, 0.0.0.0", 1), None);
+        assert_eq!(client_ip_from_xff("1.2.3.4, garbage", 1), None);
     }
 }

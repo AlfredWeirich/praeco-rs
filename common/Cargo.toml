@@ -23,10 +23,12 @@ hyper-rustls = { workspace = true, optional = true }
 hyper-util = { workspace = true, features = ["tokio", "service", "client-legacy", "http1", "http2"], optional = true }
 jsonwebtoken = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
 webpki-roots = { workspace = true, optional = true }
+x509-parser = { workspace = true, optional = true }
 
 # Optional runtime test PKI utilities (enabled via `test-pki` feature in dev-dependencies)
 rcgen = { workspace = true, optional = true }
@@ -34,7 +36,8 @@ tempfile = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 
 [features]
-default = ["client", "jwt", "tls"]
+default = ["client", "crl", "jwt", "tls"]
+crl = ["dep:rustls-pki-types", "dep:x509-parser"]
 tls = ["dep:anyhow", "dep:rustls", "dep:webpki-roots"]
 jwt = ["dep:anyhow", "dep:jsonwebtoken", "dep:serde"]
 client = ["tls", "dep:hyper", "dep:hyper-rustls", "dep:hyper-util"]

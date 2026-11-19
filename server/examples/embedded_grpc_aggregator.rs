@@ -415,6 +415,7 @@ async fn main() -> anyhow::Result<()> {
                 allow_cidrs: vec!["127.0.0.1/32".into()],
                 deny_cidrs: vec![],
                 trust_forwarded_headers: false,
+                ..Default::default()
             }),
             max_payload_config: Some(MaxPayloadConfig {
                 max_bytes: 1024 * 1024,

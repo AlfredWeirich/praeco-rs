@@ -1567,6 +1567,7 @@ async fn test_grpc_request_blocked_by_ip_filter_returns_grpc_trailers_only_statu
                 allow_cidrs: vec!["128.0.0.1/32".into()],
                 deny_cidrs: vec![],
                 trust_forwarded_headers: false,
+                ..Default::default()
             }),
             security_headers_config: Some(SecurityHeadersConfig::default()),
             ..Default::default()

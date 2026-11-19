@@ -24,7 +24,8 @@ pub use protocol::{
 };
 pub use tls::{
     ControlPlaneReloadState, extract_allowed_snis, extract_cert_expiry_and_serial,
-    parse_revoked_serials_from_crl_pem, setup_mtls_acceptor, spawn_crl_reload_watcher,
+    parse_revoked_serials_from_crl_pem, setup_mtls_acceptor, setup_mtls_acceptor_with_strict,
+    spawn_crl_reload_watcher, spawn_crl_reload_watcher_with_strict,
 };
 
 use limits::{MAX_RATE_LIMIT_ENTRIES, RateLimitTable};

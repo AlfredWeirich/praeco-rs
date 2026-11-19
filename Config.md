@@ -415,7 +415,8 @@ Maps OID suffix numbers extracted from certificates or JWT claims to internal `U
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `ssl_client_ca` | String | **Mandatory** | *None* | Path to PEM-encoded CA certificate used to verify client certificates. |
-| `ssl_client_crl` | String | Optional | `None` | Path to PEM-encoded Certificate Revocation List (CRL). Parsed at startup and reload. Praeco validates the X.509 `nextUpdate` timestamp and logs an explicit security warning if the CRL has expired. |
+| `ssl_client_crl` | String | Optional | `None` | Path to PEM-encoded Certificate Revocation List (CRL). Parsed at startup and reload; rejects empty or malformed PEM/DER files fail-closed. |
+| `strict_crl` | Boolean | Optional | `true` | Enables fail-closed CRL validation: rejects expired, unparseable, or `nextUpdate`-less CRLs at startup/reload and enforces `nextUpdate` expiration at TLS handshake time via `rustls` `enforce_revocation_expiration()`. Overridable via `PRAECO_STRICT_CRL` (`1`/`true`/`yes` or `0`/`false`/`no`). |
 
 ---
 
@@ -968,7 +969,8 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 | `key_by` | String | Optional | `"identity"` | Partitioning strategy: `"identity"`, `"ip"`, or `"global"`. |
 | `max_entries` | Integer | Optional | `10000` | Maximum client keys tracked in memory. When full, unknown keys fail closed (`429 Too Many Requests`). |
 | `ttl_seconds` | Integer | Optional | `300` | Inactive key TTL in seconds before pruning. |
-| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust `X-Forwarded-For` / `X-Real-IP` headers for client IP extraction. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust `X-Forwarded-For` / `X-Real-IP` headers for client IP extraction when the socket IP is unspecified (`0.0.0.0` / `::`). |
+| `trusted_proxy_hops` | Integer | Optional | `1` | Number of trusted reverse-proxy hops counted from the **right** of `X-Forwarded-For` (`0` disables `X-Forwarded-For` parsing). |
 
 #### `[Server.Layers.TokenBucketRateLimiter]`
 | Parameter | Data Type | Requirement | Default Value | Description |
@@ -979,7 +981,8 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 | `key_by` | String | Optional | `"identity"` | Partitioning strategy: `"identity"`, `"ip"`, or `"global"`. |
 | `max_entries` | Integer | Optional | `10000` | Maximum tracked client buckets in memory before fail-closed protection activates. |
 | `ttl_seconds` | Integer | Optional | `300` | Inactive bucket TTL in seconds. |
-| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust forwarded headers for client IP extraction. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to trust forwarded headers for client IP extraction when the socket IP is unspecified (`0.0.0.0` / `::`). |
+| `trusted_proxy_hops` | Integer | Optional | `1` | Number of trusted reverse-proxy hops counted from the **right** of `X-Forwarded-For` (`0` disables `X-Forwarded-For` parsing). |
 
 #### `[Server.Layers.IpFilter]` (CIDR Allowlist & Blocklist)
 Enforces zero-allocation bitwise IPv4 and IPv6 CIDR filtering (`IpCidr`). Recommended near the top of `[Server.Layers].enabled` (e.g. right after `TraceId` / `Logger`) so blocked IPs are rejected with `403 Forbidden` before JWT verification or upstream routing.
@@ -988,7 +991,8 @@ Enforces zero-allocation bitwise IPv4 and IPv6 CIDR filtering (`IpCidr`). Recomm
 | :--- | :--- | :--- | :--- | :--- |
 | `allow_cidrs` | Array of Strings | Optional | `[]` | Allowed IPv4/IPv6 CIDR blocks or single host IPs (e.g. `["10.0.0.0/8", "192.168.1.0/24", "127.0.0.1/32", "::1/128"]`). If non-empty, any client IP not matching at least one entry is rejected with `403 Forbidden` (fail-closed if client IP is missing). If empty, all IPs not in `deny_cidrs` are permitted. |
 | `deny_cidrs` | Array of Strings | Optional | `[]` | Blocked IPv4/IPv6 CIDR blocks or single host IPs (e.g. `["10.99.0.0/16", "203.0.113.0/24"]`). **Evaluated first (`deny` takes precedence over `allow`)**, allowing sub-ranges to be carved out of a broader allowed network. |
-| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to fall back to `X-Forwarded-For` / `X-Real-IP` when the peer socket IP is unspecified (`0.0.0.0` / `::`). Note: Relay Server tunnels (`proxy_protocol = true`) already populate the verified peer `SocketAddr` directly without needing HTTP headers. |
+| `trust_forwarded_headers` | Boolean | Optional | `false` | Whether to fall back to `X-Forwarded-For` (right-to-left) / `X-Real-IP` when the peer socket IP is unspecified (`0.0.0.0` / `::`). Note: Relay Server tunnels (`proxy_protocol = true`) already populate the verified peer `SocketAddr` directly without needing HTTP headers. |
+| `trusted_proxy_hops` | Integer | Optional | `1` | Number of trusted reverse-proxy hops counted from the **right** of `X-Forwarded-For` (`0` disables `X-Forwarded-For` parsing). |
 
 ```toml
 [Server.Layers]
@@ -1013,7 +1017,9 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `ca_cert_path` | String | Optional | `"server_certs/self_signed/myca.pem"` | Path to PEM CA certificate used to verify connecting Praeco backend instances. |
 | `server_cert_path` | String | Optional | `"server_certs/self_signed/fullchain_self.pem"` | Path to Relay's own server TLS certificate for the control-plane listener. |
 | `server_key_path` | String | Optional | `"server_certs/self_signed/privkey_self.pem"` | Path to Relay's private key for the control plane. |
-| `crl_path` | String | Optional | `None` | Path to Certificate Revocation List (CRL) for revoking compromised backend gateways. Parsed with `nextUpdate` expiration checks. |
+| `crl_path` | String | Optional | `None` | Path to Certificate Revocation List (CRL) for revoking compromised backend gateways. Fail-closed parsing on startup/reload (preserves previous CRL state if a reload fails). |
+| `crl_reload_interval_secs` | Integer | Optional | `60` | Interval in seconds for background CRL reloading and active tunnel re-verification (`0` disables periodic reloads; `SIGHUP` still supported). |
+| `strict_crl` | Boolean | Optional | `true` | Enforces fail-closed `nextUpdate` validation at startup/reload and handshake-time `enforce_revocation_expiration()` (`PRAECO_STRICT_CRL` can override). |
 | `enable_opentelemetry` | Boolean | Optional | `false` | Enables OpenTelemetry tracing for Relay connection events. |
 | `jaeger_endpoint` | String | Optional | `"http://localhost:4317"` | OTLP gRPC endpoint for Relay traces. |
 | `otel_log_level` | String | Optional | `"info"` | Log level filter for exported Relay telemetry spans. |

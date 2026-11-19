@@ -877,3 +877,92 @@ use std::net::IpAddr;
         assert_eq!(tunnels.get("svc.example.com").unwrap().generation, 3);
         assert!(token1.is_cancelled());
     }
+
+    #[test]
+    fn test_parse_revoked_serials_rejects_empty_and_corrupt_pem() {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+
+        let empty_path = base.join(format!("praeco_empty_crl_{pid}.pem"));
+        std::fs::write(&empty_path, "").unwrap();
+        let empty_res = parse_revoked_serials_from_crl_pem(&empty_path.to_string_lossy());
+        let _ = std::fs::remove_file(&empty_path);
+        assert!(empty_res.is_err(), "empty CRL PEM must fail closed");
+
+        let corrupt_path = base.join(format!("praeco_corrupt_crl_{pid}.pem"));
+        std::fs::write(
+            &corrupt_path,
+            "-----BEGIN X509 CRL-----\nbm90LWEtY3Js\n-----END X509 CRL-----\n",
+        )
+        .unwrap();
+        let corrupt_res = parse_revoked_serials_from_crl_pem(&corrupt_path.to_string_lossy());
+        let _ = std::fs::remove_file(&corrupt_path);
+        assert!(corrupt_res.is_err(), "corrupt CRL DER must fail closed");
+    }
+
+    #[tokio::test]
+    async fn test_crl_reload_watcher_fails_closed_on_init_and_preserves_state_on_corrupt_reload() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let ca = common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string();
+        let srv_cert = common::test_pki::TestPki::s(&pki.relay_server_pem).to_string();
+        let srv_key = common::test_pki::TestPki::s(&pki.relay_server_key).to_string();
+
+        let working_crl = std::env::temp_dir().join(format!(
+            "praeco_watcher_crl_{}.pem",
+            std::process::id()
+        ));
+        // 1. Corrupt initial CRL must fail spawn_crl_reload_watcher
+        std::fs::write(
+            &working_crl,
+            "-----BEGIN X509 CRL-----\nbm90LWEtY3Js\n-----END X509 CRL-----\n",
+        )
+        .unwrap();
+        let valid_acceptor = setup_mtls_acceptor(&ca, &srv_cert, &srv_key, None).unwrap();
+        let cancel_bad = CancellationToken::new();
+        let init_err = spawn_crl_reload_watcher(
+            ca.clone(),
+            srv_cert.clone(),
+            srv_key.clone(),
+            Some(working_crl.to_string_lossy().to_string()),
+            valid_acceptor,
+            Duration::from_secs(60),
+            cancel_bad.clone(),
+        );
+        cancel_bad.cancel();
+        assert!(init_err.is_err(), "corrupt initial CRL must fail startup");
+
+        // 2. Copy valid revoking CRL, start watcher, then corrupt the file on disk
+        let valid_bytes = std::fs::read(&pki.relay_crl_revoking_client_pem).unwrap();
+        std::fs::write(&working_crl, &valid_bytes).unwrap();
+        let crl_str = working_crl.to_string_lossy().to_string();
+        let acceptor = setup_mtls_acceptor(&ca, &srv_cert, &srv_key, Some(&crl_str)).unwrap();
+
+        let cancel = CancellationToken::new();
+        let rx = spawn_crl_reload_watcher(
+            ca,
+            srv_cert,
+            srv_key,
+            Some(crl_str),
+            acceptor,
+            Duration::from_millis(25),
+            cancel.clone(),
+        )
+        .expect("valid CRL must initialize watcher");
+
+        let initial_count = rx.borrow().revoked_serials.len();
+        assert_eq!(initial_count, 1);
+
+        // Overwrite CRL with corrupt content and wait past reload interval
+        std::fs::write(&working_crl, "").unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        assert_eq!(
+            rx.borrow().revoked_serials.len(),
+            initial_count,
+            "corrupt CRL reload must keep previous revoked serials"
+        );
+
+        cancel.cancel();
+        let _ = std::fs::remove_file(&working_crl);
+    }

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Security & Hardening (Breaking API Changes for Next Minor `0.4.0`)
+* **Fail-Closed CRL Loading, Handshake Expiration Enforcement & Non-Blocking Reload (`src/tls.rs`, `src/config.rs`, `src/lib.rs`, `src/main.rs`):**
+  * Propagated CRL PEM/DER parse errors and empty-CRL errors in `parse_revoked_serials_from_crl_pem` and `setup_mtls_acceptor_with_strict` (using shared `common::crl`) instead of silently downgrading to an empty revocation set.
+  * Changed `spawn_crl_reload_watcher` (and added `spawn_crl_reload_watcher_with_strict`) to return `Result<watch::Receiver<ControlPlaneReloadState>, RelayError>` so corrupt initial CRLs fail startup fast, while failed live/SIGHUP reloads preserve the previous CRL state and run off the async executor via `tokio::task::spawn_blocking`.
+  * Made strict CRL validation the default (`RelayConfig::strict_crl: Option<bool>`, default `Some(true)`, overridable via `PRAECO_STRICT_CRL`) and enabled `rustls`'s `enforce_revocation_expiration()` on `WebPkiClientVerifier`.
+
+---
+
 ## [0.3.4] - 2026-11-19
 
 Control-plane limits, live CRL & certificate expiry enforcement, Yamux/SNI/LRU runtime hardening, and modularization.

@@ -309,16 +309,64 @@ impl fmt::Display for IpFilterRejection {
     }
 }
 
-/// Extracts the client [`IpAddr`] from the request.
+/// Extracts the client [`IpAddr`] from `X-Forwarded-For` (walking from the right
+/// by `trusted_proxy_hops`) or `X-Real-IP` when `X-Forwarded-For` is absent or
+/// `trusted_proxy_hops == 0`.
+pub(crate) fn extract_forwarded_ip_from_headers(
+    headers: &hyper::HeaderMap,
+    trusted_proxy_hops: usize,
+) -> Option<IpAddr> {
+    if trusted_proxy_hops > 0 && headers.contains_key("x-forwarded-for") {
+        let mut remaining = trusted_proxy_hops;
+        for val in headers.get_all("x-forwarded-for").iter().rev() {
+            let Ok(s) = val.to_str() else {
+                return None;
+            };
+            for part in s.rsplit(',') {
+                if remaining == 1 {
+                    return part
+                        .trim()
+                        .parse::<IpAddr>()
+                        .ok()
+                        .filter(|ip| !ip.is_unspecified());
+                }
+                remaining -= 1;
+            }
+        }
+        return None;
+    }
+
+    if let Some(xrip) = headers.get_all("x-real-ip").iter().next_back()
+        && let Ok(s) = xrip.to_str()
+        && let Ok(ip) = s.trim().parse::<IpAddr>()
+        && !ip.is_unspecified()
+    {
+        return Some(ip);
+    }
+
+    None
+}
+
+/// Extracts the client [`IpAddr`] from the request using the default `trusted_proxy_hops = 1`.
 ///
 /// 1. Checks the peer [`SocketAddr`] extension injected by `ConnectionHandler`
 ///    (from a direct TCP/QUIC socket or a Relay Server `PROXY v2` tunnel stream).
 /// 2. If the socket address is absent or unspecified (`0.0.0.0` / `::`) **and**
-///    `trust_forwarded_headers` is `true`, inspects `X-Forwarded-For` (leftmost IP)
-///    and `X-Real-IP`.
+///    `trust_forwarded_headers` is `true`, inspects `X-Forwarded-For` (from the right)
+///    or `X-Real-IP`.
 pub fn extract_client_ip<ReqBody>(
     req: &Request<ReqBody>,
     trust_forwarded_headers: bool,
+) -> Option<IpAddr> {
+    extract_client_ip_with_hops(req, trust_forwarded_headers, 1)
+}
+
+/// Extracts the client [`IpAddr`] from the request with an explicit `trusted_proxy_hops`
+/// count for right-to-left `X-Forwarded-For` resolution.
+pub fn extract_client_ip_with_hops<ReqBody>(
+    req: &Request<ReqBody>,
+    trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
 ) -> Option<IpAddr> {
     if let Some(addr) = req.extensions().get::<SocketAddr>() {
         let ip = addr.ip();
@@ -328,20 +376,8 @@ pub fn extract_client_ip<ReqBody>(
     }
 
     if trust_forwarded_headers {
-        if let Some(xff) = req.headers().get("x-forwarded-for")
-            && let Ok(s) = xff.to_str()
-                && let Some(first_ip) = s.split(',').next()
-                    && let Ok(ip) = first_ip.trim().parse::<IpAddr>()
-                        && !ip.is_unspecified() {
-                            return Some(unwrap_ipv4_mapped(ip));
-                        }
-
-        if let Some(xrip) = req.headers().get("x-real-ip")
-            && let Ok(s) = xrip.to_str()
-                && let Ok(ip) = s.trim().parse::<IpAddr>()
-                    && !ip.is_unspecified() {
-                        return Some(unwrap_ipv4_mapped(ip));
-                    }
+        return extract_forwarded_ip_from_headers(req.headers(), trusted_proxy_hops)
+            .map(unwrap_ipv4_mapped);
     }
 
     None
@@ -358,6 +394,7 @@ pub struct IpFilterLayer {
     allow_cidrs: Arc<Vec<IpCidr>>,
     deny_cidrs: Arc<Vec<IpCidr>>,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -372,6 +409,7 @@ impl IpFilterLayer {
             allow_cidrs: Arc::new(allow_cidrs),
             deny_cidrs: Arc::new(deny_cidrs),
             trust_forwarded_headers: false,
+            trusted_proxy_hops: 1,
             server_name,
         }
     }
@@ -415,6 +453,7 @@ impl IpFilterLayer {
             allow_cidrs: Arc::new(allow_cidrs),
             deny_cidrs: Arc::new(deny_cidrs),
             trust_forwarded_headers,
+            trusted_proxy_hops: 1,
             server_name,
         })
     }
@@ -423,6 +462,13 @@ impl IpFilterLayer {
     /// trusted when the underlying socket IP is unspecified (`0.0.0.0` / `::`).
     pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
+        self
+    }
+
+    /// Configures how many trusted reverse-proxy hops are skipped from the right
+    /// of `X-Forwarded-For` (default: `1`; `0` ignores `X-Forwarded-For`).
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 }
@@ -436,6 +482,7 @@ impl<S> Layer<S> for IpFilterLayer {
             allow_cidrs: self.allow_cidrs.clone(),
             deny_cidrs: self.deny_cidrs.clone(),
             trust_forwarded_headers: self.trust_forwarded_headers,
+            trusted_proxy_hops: self.trusted_proxy_hops,
             server_name: self.server_name,
         }
     }
@@ -448,6 +495,7 @@ pub struct IpFilterService<S> {
     allow_cidrs: Arc<Vec<IpCidr>>,
     deny_cidrs: Arc<Vec<IpCidr>>,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -554,7 +602,11 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let client_ip = extract_client_ip(&req, self.trust_forwarded_headers);
+        let client_ip = extract_client_ip_with_hops(
+            &req,
+            self.trust_forwarded_headers,
+            self.trusted_proxy_hops,
+        );
 
         match self.evaluate_ip(client_ip) {
             Ok(()) => IpFilterFuture::Allowed {
@@ -711,10 +763,10 @@ mod tests {
 
         let svc = layer.layer(inner);
 
-        // Unspecified socket IP + allowed X-Forwarded-For -> 200 OK
+        // 1. Default trusted_proxy_hops = 1: rightmost entry wins; spoofed leftmost is ignored
         let mut req_allowed = Request::builder()
             .uri("/api")
-            .header("x-forwarded-for", "198.51.100.42, 10.0.0.1")
+            .header("x-forwarded-for", "203.0.113.55, 198.51.100.42")
             .body(Full::new(Bytes::new()))
             .unwrap();
         req_allowed
@@ -723,7 +775,19 @@ mod tests {
         let resp_allowed = svc.clone().oneshot(req_allowed).await.unwrap();
         assert_eq!(resp_allowed.status(), StatusCode::OK);
 
-        // Unspecified socket IP + denied X-Forwarded-For -> 403 Forbidden
+        // 2. Spoofing attack: client puts allowed IP on the left while proxy appends untrusted 10.0.0.1 on the right -> 403
+        let mut req_spoof = Request::builder()
+            .uri("/api")
+            .header("x-forwarded-for", "198.51.100.42, 10.0.0.1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req_spoof
+            .extensions_mut()
+            .insert("0.0.0.0:0".parse::<SocketAddr>().unwrap());
+        let resp_spoof = svc.clone().oneshot(req_spoof).await.unwrap();
+        assert_eq!(resp_spoof.status(), StatusCode::FORBIDDEN);
+
+        // 3. Unspecified socket IP + denied X-Forwarded-For -> 403 Forbidden
         let mut req_denied = Request::builder()
             .uri("/api")
             .header("x-forwarded-for", "198.51.100.99")
@@ -734,5 +798,31 @@ mod tests {
             .insert("0.0.0.0:0".parse::<SocketAddr>().unwrap());
         let resp_denied = svc.oneshot(req_denied).await.unwrap();
         assert_eq!(resp_denied.status(), StatusCode::FORBIDDEN);
+
+        // 4. Multi-hop configuration (trusted_proxy_hops = 2) skips outer proxy 10.0.0.1
+        let two_hop_svc = IpFilterLayer::from_cidr_strings(
+            &["198.51.100.0/24".to_string()],
+            &["198.51.100.99/32".to_string()],
+            true,
+            "test_srv",
+        )
+        .unwrap()
+        .with_trusted_proxy_hops(2)
+        .layer(tower::service_fn(|_req: Request<Full<Bytes>>| async move {
+            let body: ServiceRespBody = Full::new(Bytes::from_static(b"OK"))
+                .map_err(SrvError::from)
+                .boxed();
+            Ok::<_, Infallible>(Response::new(body))
+        }));
+        let mut req_two_hop = Request::builder()
+            .uri("/api")
+            .header("x-forwarded-for", "203.0.113.1, 198.51.100.42, 10.0.0.1")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req_two_hop
+            .extensions_mut()
+            .insert("0.0.0.0:0".parse::<SocketAddr>().unwrap());
+        let resp_two_hop = two_hop_svc.oneshot(req_two_hop).await.unwrap();
+        assert_eq!(resp_two_hop.status(), StatusCode::OK);
     }
 }

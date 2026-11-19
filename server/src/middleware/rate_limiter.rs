@@ -83,33 +83,53 @@ impl std::fmt::Display for RateLimitKey {
     }
 }
 
-/// Extracts a [`RateLimitKey`] from a request based on the selected [`RateLimitKeyStrategy`].
+/// Extracts a [`RateLimitKey`] from a request based on the selected [`RateLimitKeyStrategy`]
+/// using the default `trusted_proxy_hops = 1`.
 pub fn extract_rate_limit_key<ReqBody>(
     req: &Request<ReqBody>,
     strategy: RateLimitKeyStrategy,
     trust_forwarded_headers: bool,
 ) -> RateLimitKey {
+    extract_rate_limit_key_with_hops(req, strategy, trust_forwarded_headers, 1)
+}
+
+/// Extracts a [`RateLimitKey`] from a request with an explicit `trusted_proxy_hops`
+/// count for right-to-left `X-Forwarded-For` resolution.
+pub fn extract_rate_limit_key_with_hops<ReqBody>(
+    req: &Request<ReqBody>,
+    strategy: RateLimitKeyStrategy,
+    trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
+) -> RateLimitKey {
     match strategy {
         RateLimitKeyStrategy::Global => RateLimitKey::Global,
-        RateLimitKeyStrategy::Ip => extract_ip_key(req, trust_forwarded_headers),
+        RateLimitKeyStrategy::Ip => {
+            extract_ip_key(req, trust_forwarded_headers, trusted_proxy_hops)
+        }
         RateLimitKeyStrategy::Identity => {
             // 1. Try JWT Claims `sub`
             if let Some(claims) = req.extensions().get::<common::Claims>()
-                && !claims.sub.is_empty() {
-                    return RateLimitKey::User(claims.sub.clone());
-                }
+                && !claims.sub.is_empty()
+            {
+                return RateLimitKey::User(claims.sub.clone());
+            }
             // 2. Try mTLS client certificate SAN
             if let Some(san) = req.extensions().get::<crate::SanCertExtension>()
-                && !san.0.is_empty() {
-                    return RateLimitKey::ClientCert(san.0.clone());
-                }
+                && !san.0.is_empty()
+            {
+                return RateLimitKey::ClientCert(san.0.clone());
+            }
             // 3. Fallback to client IP
-            extract_ip_key(req, trust_forwarded_headers)
+            extract_ip_key(req, trust_forwarded_headers, trusted_proxy_hops)
         }
     }
 }
 
-fn extract_ip_key<ReqBody>(req: &Request<ReqBody>, trust_forwarded_headers: bool) -> RateLimitKey {
+fn extract_ip_key<ReqBody>(
+    req: &Request<ReqBody>,
+    trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
+) -> RateLimitKey {
     // 1. Direct TCP / QUIC / PROXY-v2 connection socket address
     if let Some(addr) = req.extensions().get::<std::net::SocketAddr>() {
         let ip = addr.ip();
@@ -119,21 +139,11 @@ fn extract_ip_key<ReqBody>(req: &Request<ReqBody>, trust_forwarded_headers: bool
     }
 
     // Only inspect X-Forwarded-For / X-Real-IP when explicitly configured as behind a trusted HTTP proxy
-    if trust_forwarded_headers {
-        // 2. Check X-Forwarded-For if socket address was unspecified
-        if let Some(xff) = req.headers().get("x-forwarded-for")
-            && let Ok(s) = xff.to_str()
-                && let Some(first_ip) = s.split(',').next()
-                    && let Ok(ip) = first_ip.trim().parse::<std::net::IpAddr>() {
-                        return RateLimitKey::Ip(common::canonical_client_ip(ip));
-                    }
-
-        // 3. Check X-Real-IP
-        if let Some(xrip) = req.headers().get("x-real-ip")
-            && let Ok(s) = xrip.to_str()
-                && let Ok(ip) = s.trim().parse::<std::net::IpAddr>() {
-                    return RateLimitKey::Ip(common::canonical_client_ip(ip));
-                }
+    if trust_forwarded_headers
+        && let Some(ip) =
+            super::ip_filter::extract_forwarded_ip_from_headers(req.headers(), trusted_proxy_hops)
+    {
+        return RateLimitKey::Ip(common::canonical_client_ip(ip));
     }
 
     RateLimitKey::Global
@@ -243,6 +253,7 @@ pub struct SimpleRateLimiterLayer {
     max_entries: usize,
     ttl: Duration,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -272,6 +283,7 @@ impl SimpleRateLimiterLayer {
             max_entries,
             ttl,
             trust_forwarded_headers: false,
+            trusted_proxy_hops: 1,
             server_name,
         }
     }
@@ -279,6 +291,12 @@ impl SimpleRateLimiterLayer {
     /// Sets whether to trust `X-Forwarded-For` / `X-Real-IP` headers when the socket IP is unspecified.
     pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
+        self
+    }
+
+    /// Sets how many trusted reverse-proxy hops are skipped from the right of `X-Forwarded-For` (default: `1`).
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 }
@@ -295,6 +313,7 @@ impl<S> Layer<S> for SimpleRateLimiterLayer {
             self.server_name,
         )
         .with_trust_forwarded_headers(self.trust_forwarded_headers)
+        .with_trusted_proxy_hops(self.trusted_proxy_hops)
     }
 }
 
@@ -306,6 +325,7 @@ pub struct SimpleRateLimiterService<S> {
     limit_duration: Duration,
     key_by: RateLimitKeyStrategy,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -335,12 +355,18 @@ impl<S> SimpleRateLimiterService<S> {
             limit_duration: per,
             key_by,
             trust_forwarded_headers: false,
+            trusted_proxy_hops: 1,
             server_name,
         }
     }
 
     pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
+        self
+    }
+
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 }
@@ -388,7 +414,12 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key(&req, self.key_by, self.trust_forwarded_headers);
+        let key = extract_rate_limit_key_with_hops(
+            &req,
+            self.key_by,
+            self.trust_forwarded_headers,
+            self.trusted_proxy_hops,
+        );
         let server_name = self.server_name;
 
         match self.store.check_and_record(&key, self.limit_duration) {
@@ -545,6 +576,7 @@ pub struct TokenBucketRateLimiterLayer {
     max_entries: usize,
     ttl: Duration,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -585,6 +617,7 @@ impl TokenBucketRateLimiterLayer {
             max_entries,
             ttl,
             trust_forwarded_headers: false,
+            trusted_proxy_hops: 1,
             server_name,
         }
     }
@@ -592,6 +625,12 @@ impl TokenBucketRateLimiterLayer {
     /// Sets whether to trust `X-Forwarded-For` / `X-Real-IP` headers when the socket IP is unspecified.
     pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
+        self
+    }
+
+    /// Sets how many trusted reverse-proxy hops are skipped from the right of `X-Forwarded-For` (default: `1`).
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 }
@@ -610,6 +649,7 @@ impl<S> Layer<S> for TokenBucketRateLimiterLayer {
             self.server_name,
         )
         .with_trust_forwarded_headers(self.trust_forwarded_headers)
+        .with_trusted_proxy_hops(self.trusted_proxy_hops)
     }
 }
 
@@ -623,6 +663,7 @@ pub struct TokenBucketRateLimiterService<S> {
     interval: Duration,
     key_by: RateLimitKeyStrategy,
     trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
     server_name: &'static str,
 }
 
@@ -665,12 +706,18 @@ impl<S> TokenBucketRateLimiterService<S> {
             interval,
             key_by,
             trust_forwarded_headers: false,
+            trusted_proxy_hops: 1,
             server_name,
         }
     }
 
     pub fn with_trust_forwarded_headers(mut self, trust: bool) -> Self {
         self.trust_forwarded_headers = trust;
+        self
+    }
+
+    pub fn with_trusted_proxy_hops(mut self, hops: usize) -> Self {
+        self.trusted_proxy_hops = hops;
         self
     }
 }
@@ -718,7 +765,12 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key(&req, self.key_by, self.trust_forwarded_headers);
+        let key = extract_rate_limit_key_with_hops(
+            &req,
+            self.key_by,
+            self.trust_forwarded_headers,
+            self.trusted_proxy_hops,
+        );
         let server_name = self.server_name;
 
         match self.store.try_consume(&key, self.capacity, self.refill_tokens, self.interval) {
@@ -995,5 +1047,43 @@ mod tests {
         assert!(store.try_consume(&key1, 2, 1, Duration::from_secs(60)).is_ok());
         // Third request on key1 is now rate-limited as expected
         assert!(store.try_consume(&key1, 2, 1, Duration::from_secs(60)).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_forwarded_headers_uses_rightmost_hop_and_blocks_leftmost_spoofing() {
+        let svc = DummyOkService;
+        let mut limiter = TokenBucketRateLimiterService::with_config(
+            svc,
+            1, // capacity = 1
+            1,
+            Duration::from_secs(60),
+            RateLimitKeyStrategy::Ip,
+            100,
+            Duration::from_secs(300),
+            "test_server",
+        )
+        .with_trust_forwarded_headers(true);
+
+        let unspecified_peer: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        // Request 1: attacker spoofs leftmost XFF (203.0.113.1), proxy appends real client 198.51.100.7
+        let mut req1 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "203.0.113.1, 198.51.100.7")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req1.extensions_mut().insert(unspecified_peer);
+        let resp1 = limiter.call(req1).await.unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+
+        // Request 2: attacker rotates leftmost XFF (203.0.113.2), proxy still appends 198.51.100.7 -> 429!
+        let mut req2 = Request::builder()
+            .uri("/")
+            .header("x-forwarded-for", "203.0.113.2, 198.51.100.7")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        req2.extensions_mut().insert(unspecified_peer);
+        let resp2 = limiter.call(req2).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

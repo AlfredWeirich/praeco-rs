@@ -1021,6 +1021,10 @@ pub struct ServerCertConfig {
     pub ssl_certificate_key: String,
 }
 
+fn default_strict_crl() -> bool {
+    true
+}
+
 /// Client CA certificate configuration for mTLS.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1029,6 +1033,10 @@ pub struct ClientCertConfig {
     pub ssl_client_ca: String,
     /// Optional path to a PEM-encoded Certificate Revocation List.
     pub ssl_client_crl: Option<String>,
+    /// Enforce strict CRL validation (reject expired/malformed/missing-nextUpdate CRLs
+    /// and enforce `nextUpdate` expiration at TLS handshake time). Defaults to `true` (fail-closed).
+    #[serde(default = "default_strict_crl")]
+    pub strict_crl: bool,
 }
 
 /// Configuration for client certificate forwarding.
@@ -1066,6 +1074,10 @@ fn default_ttl_seconds() -> u64 {
     300
 }
 
+fn default_trusted_proxy_hops() -> usize {
+    1
+}
+
 fn default_load_shed() -> bool {
     true
 }
@@ -1088,6 +1100,10 @@ pub struct SimpleRateLimiterConfig {
     /// Whether to trust `X-Forwarded-For` / `X-Real-IP` headers when socket IP is unspecified (default: false).
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+    /// Number of trusted reverse-proxy hops counted from the right of `X-Forwarded-For` (default: 1).
+    /// Set to `0` to ignore `X-Forwarded-For` completely.
+    #[serde(default = "default_trusted_proxy_hops")]
+    pub trusted_proxy_hops: usize,
 }
 
 /// Configuration for the token-bucket rate limiter.
@@ -1112,6 +1128,10 @@ pub struct TokenBucketRateLimiterConfig {
     /// Whether to trust `X-Forwarded-For` / `X-Real-IP` headers when socket IP is unspecified (default: false).
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+    /// Number of trusted reverse-proxy hops counted from the right of `X-Forwarded-For` (default: 1).
+    /// Set to `0` to ignore `X-Forwarded-For` completely.
+    #[serde(default = "default_trusted_proxy_hops")]
+    pub trusted_proxy_hops: usize,
 }
 
 /// Configuration for the artificial delay layer.
@@ -1220,7 +1240,7 @@ pub struct SecurityHeadersConfig {
 ///
 /// Evaluates `deny_cidrs` first (explicit blocklist) and `allow_cidrs` second
 /// (when non-empty, only IPs matching at least one allowed CIDR are permitted).
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct IpFilterConfig {
     /// Optional list of allowed IPv4/IPv6 CIDR blocks or single IPs
@@ -1237,6 +1257,21 @@ pub struct IpFilterConfig {
     /// underlying socket IP is unspecified (`0.0.0.0` / `::`) (default: `false`).
     #[serde(default)]
     pub trust_forwarded_headers: bool,
+    /// Number of trusted reverse-proxy hops counted from the right of `X-Forwarded-For` (default: 1).
+    /// Set to `0` to ignore `X-Forwarded-For` completely.
+    #[serde(default = "default_trusted_proxy_hops")]
+    pub trusted_proxy_hops: usize,
+}
+
+impl Default for IpFilterConfig {
+    fn default() -> Self {
+        Self {
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            trust_forwarded_headers: false,
+            trusted_proxy_hops: default_trusted_proxy_hops(),
+        }
+    }
 }
 
 fn default_referrer_policy() -> String {

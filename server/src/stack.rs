@@ -433,6 +433,7 @@ pub fn apply_layers(
                     server_name,
                 )
                 .with_trust_forwarded_headers(cfg.trust_forwarded_headers)
+                .with_trusted_proxy_hops(cfg.trusted_proxy_hops)
                 .layer(svc)
                 .boxed_clone_sync()
             }
@@ -452,6 +453,7 @@ pub fn apply_layers(
                     server_name,
                 )
                 .with_trust_forwarded_headers(cfg.trust_forwarded_headers)
+                .with_trusted_proxy_hops(cfg.trusted_proxy_hops)
                 .layer(svc)
                 .boxed_clone_sync()
             }
@@ -579,7 +581,8 @@ pub fn apply_layers(
                     cfg.trust_forwarded_headers,
                     server_name,
                 )
-                .map_err(|e| SrvError::Other(e.to_string()))?;
+                .map_err(|e| SrvError::Other(e.to_string()))?
+                .with_trusted_proxy_hops(cfg.trusted_proxy_hops);
                 layer.layer(svc).boxed_clone_sync()
             }
         };

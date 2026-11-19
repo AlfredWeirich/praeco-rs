@@ -1915,12 +1915,14 @@ dependencies = [
  "jsonwebtoken",
  "rcgen",
  "rustls",
+ "rustls-pki-types",
  "serde",
  "tempfile",
  "thiserror",
  "time",
  "tokio",
  "webpki-roots",
+ "x509-parser",
 ]
 
 [[package]]

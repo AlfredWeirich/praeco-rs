@@ -74,6 +74,10 @@ pub struct RelayConfig {
     /// Optional interval in seconds for reloading `crl_path` and re-verifying active tunnels (default: 60, 0 = disabled).
     #[serde(default)]
     pub crl_reload_interval_secs: Option<u64>,
+    /// Enforce strict CRL validation (reject expired/malformed/empty/missing-nextUpdate CRLs
+    /// and enforce `nextUpdate` expiration at mTLS handshake time). Defaults to `true` (fail-closed).
+    #[serde(default)]
+    pub strict_crl: Option<bool>,
 }
 
 impl Default for RelayConfig {
@@ -105,6 +109,7 @@ impl Default for RelayConfig {
             control_plane_max_concurrent_connections: Some(256),
             control_plane_max_concurrent_connections_per_ip: Some(16),
             crl_reload_interval_secs: Some(60),
+            strict_crl: Some(true),
         }
     }
 }

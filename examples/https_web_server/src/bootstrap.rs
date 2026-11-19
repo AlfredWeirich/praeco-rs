@@ -96,6 +96,7 @@ pub fn build_server_config_with_certs(
                 allow_cidrs: vec!["127.0.0.1/32".into(), "::1/128".into()],
                 deny_cidrs: vec![],
                 trust_forwarded_headers: false,
+                ..Default::default()
             }),
             token_bucket_config: Some(TokenBucketRateLimiterConfig {
                 max_capacity: 20,
@@ -105,6 +106,7 @@ pub fn build_server_config_with_certs(
                 max_entries: 10_000,
                 ttl_seconds: 300,
                 trust_forwarded_headers: false,
+                trusted_proxy_hops: 1,
             }),
             concurrency_limit_config: Some(ConcurrencyLimitConfig {
                 max_concurrent_requests: 128,

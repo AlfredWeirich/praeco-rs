@@ -13,7 +13,7 @@ Verbindet die iOS-App, das Praeco Gateway und das ChatApp Backend über striktes
 - **Root of Trust:** `ca.pem` (ChatApp) — strikt isolierter Root-Store ohne Vermischung mit öffentlichen Mozilla-WebPKI-Wurzeln (`build_root_store`).
 - **Abhängigkeiten:**
   - **ChatApp (`Config.toml`):** Nutzt `ca.key`, um Zertifikate für iOS-Geräte auszustellen (Onboarding).
-  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren, sowie optional `ssl_client_crl` (mit automatischer Prüfung des X.509 `nextUpdate`-Ablaufdatums beim Start und Hot-Reload). Die Custom-OID-Auswertung (`pki_base_oid`) wird dabei pro `[[Server]]`-Block konfiguriert (mit optionalem globalen Fallback in `Config.toml`).
+  - **Praeco (`01_chatapp.toml`):** Nutzt `ca.pem` (`ssl_client_ca`), um eingehende iOS-Requests zu verifizieren, sowie optional `ssl_client_crl` (standardmäßig im Strict-Modus `strict_crl = true` inkl. fail-closed `nextUpdate`-Prüfung beim Start/Hot-Reload und `enforce_revocation_expiration()` beim TLS-Handshake). Die Custom-OID-Auswertung (`pki_base_oid`) wird dabei pro `[[Server]]`-Block konfiguriert (mit optionalem globalen Fallback in `Config.toml`).
   - **Praeco Intern:** Praeco leitet Traffic an die ChatApp weiter und authentifiziert sich dabei selbst per mTLS mit `proxy-client.pem`.
   - **ChatApp Server:** Der gRPC-Server der ChatApp vertraut eingehenden Praeco-Verbindungen, da auch `proxy-client.pem` von `ca.pem` signiert wurde.
 
@@ -31,7 +31,7 @@ Sichert den Tunnel zwischen dem lokalen Praeco-Netzwerk und dem Cloud-Relay.
 - **Root of Trust:** `relay_ca.pem`
 - **Abhängigkeiten:**
   - **Praeco Tunnel-Client:** Nutzt `praeco_client.pem` als Ausweis (dessen X.509 SANs/CN die zu registrierende `sni_domain` abdecken müssen) und prüft den Server gegen `relay_ca.pem`.
-  - **Relay Server (`RelayConfig.toml`):** Nutzt `relay_server.pem` als Ausweis, prüft eingehende Praeco-Verbindungen gegen `relay_ca.pem` (sowie optional `crl_path` inkl. `nextUpdate`-Prüfung) und autorisiert `REGISTER <sni> [PROXY_V2]` strikt anhand der Zertifikats-SANs.
+  - **Relay Server (`RelayConfig.toml`):** Nutzt `relay_server.pem` als Ausweis, prüft eingehende Praeco-Verbindungen gegen `relay_ca.pem` (sowie optional `crl_path` standardmäßig im Strict-Modus `strict_crl = true` inkl. `enforce_revocation_expiration()` und nicht-downgradendem Live-Reload) und autorisiert `REGISTER <sni> [PROXY_V2]` strikt anhand der Zertifikats-SANs.
   - Beide Endpunkt-Zertifikate **müssen** von der isolierten `relay_ca.pem` ausgestellt worden sein.
 
 ---
