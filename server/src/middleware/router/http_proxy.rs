@@ -211,6 +211,14 @@ pub(super) async fn forward_with_failover(
         let mut probe_guard = is_multi_node.then(|| {
             super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds)
         });
+        let request_epoch = probe_guard.as_ref().map_or_else(
+            || {
+                upstream_node
+                    .circuit_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+            },
+            |pg| pg.epoch(),
+        );
         let conn_guard = ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
         let target_uri = build_upstream_uri(backend_base_uri, matched_params, original_uri)?;
@@ -266,7 +274,14 @@ pub(super) async fn forward_with_failover(
                     if let Some(ref mut pg) = probe_guard {
                         pg.complete();
                     }
-                    target.mark_dead(backend_base_uri);
+                    let tripped = upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
+                    if tripped {
+                        warn!(
+                            "{}: Upstream {} {} timed out — circuit breaker tripped to OPEN",
+                            server_name, proto_label, backend_base_uri
+                        );
+                    }
                     failed_nodes.push(backend_base_uri.clone());
 
                     if mode.can_retry(
@@ -320,7 +335,8 @@ pub(super) async fn forward_with_failover(
                 }
                 if mode.is_outlier(res.status(), res.headers()) {
                     let status = res.status();
-                    let tripped = target.record_failure(backend_base_uri);
+                    let tripped = upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     if is_multi_node {
                         failed_nodes.push(backend_base_uri.clone());
                     }
@@ -373,7 +389,7 @@ pub(super) async fn forward_with_failover(
                     ));
                 }
 
-                upstream_node.record_success();
+                upstream_node.record_success_with_epoch(request_epoch);
                 let (mut res_parts, res_body) = res.into_parts();
                 super::headers::clean_response_headers(&mut res_parts.headers);
                 return Ok(Response::from_parts(
@@ -527,16 +543,18 @@ where
                         SrvError::DecompressionLimitExceeded { max: *max }
                     }
                     SrvError::ClientAborted(msg) => SrvError::ClientAborted(msg.clone()),
-                    other => {
-                        let msg = other.to_string();
-                        if msg.contains("Payload Limit Exceeded") {
+                    other => match classify_error_chain(other) {
+                        ProxyErrorKind::PayloadTooLarge => {
                             SrvError::PayloadTooLarge { current: 0, max: 0 }
-                        } else if msg.contains("Decompressed payload") {
-                            SrvError::DecompressionLimitExceeded { max: 0 }
-                        } else {
-                            SrvError::ClientAborted(msg)
                         }
-                    }
+                        ProxyErrorKind::DecompressionLimitExceeded => {
+                            SrvError::DecompressionLimitExceeded { max: 0 }
+                        }
+                        ProxyErrorKind::ClientAborted(msg) => SrvError::ClientAborted(msg),
+                        ProxyErrorKind::UpstreamFailure => {
+                            SrvError::ClientAborted(other.to_string())
+                        }
+                    },
                 };
                 if let Ok(mut lock) = this.last_error.lock() {
                     *lock = Some(recorded);
@@ -561,15 +579,9 @@ pub enum ProxyErrorKind {
     UpstreamFailure,
 }
 
-/// Inspects the nested error chain from Hyper and Tower middleware to determine whether
-/// a proxy request failure was caused by the upstream server (dead/unavailable) or by the client
-/// (aborted, payload limit exceeded, decompression bomb).
-pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErrorKind {
-    // 1. Upstream connection errors (refused, DNS, network unreachable) are genuine upstream failures
-    if err.is_connect() {
-        return ProxyErrorKind::UpstreamFailure;
-    }
-
+/// Inspects an error's typed `.source()` chain (`SrvError`, `LengthLimitError`, `hyper::Error`,
+/// `std::io::Error`) without relying on brittle `Display` string matching.
+pub(crate) fn classify_error_chain(err: &(dyn std::error::Error + 'static)) -> ProxyErrorKind {
     let mut curr: Option<&(dyn std::error::Error + 'static)> = Some(err);
     let mut is_user_body = false;
 
@@ -587,33 +599,30 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
             }
         }
 
-        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>()
-            && (hyper_err.is_user() || hyper_err.is_body_write_aborted()) {
-                is_user_body = true;
-            }
-
-        if is_user_body
-            && let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                match io_err.kind() {
-                    std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::UnexpectedEof => {
-                        return ProxyErrorKind::ClientAborted(io_err.to_string());
-                    }
-                    _ => {}
-                }
-            }
-
-        let msg = e.to_string();
-        if msg.contains("Payload Limit Exceeded") {
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
             return ProxyErrorKind::PayloadTooLarge;
         }
-        if msg.contains("Decompressed payload exceeds maximum allowed size") {
-            return ProxyErrorKind::DecompressionLimitExceeded;
+
+        if let Some(hyper_err) = e.downcast_ref::<hyper::Error>()
+            && (hyper_err.is_user()
+                || hyper_err.is_body_write_aborted()
+                || hyper_err.is_canceled())
+        {
+            is_user_body = true;
         }
-        if msg.contains("sent by user") || msg.contains("user body write aborted") {
-            return ProxyErrorKind::ClientAborted(msg);
+
+        if is_user_body
+            && let Some(io_err) = e.downcast_ref::<std::io::Error>()
+        {
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    return ProxyErrorKind::ClientAborted(io_err.to_string());
+                }
+                _ => {}
+            }
         }
 
         curr = e.source();
@@ -624,6 +633,18 @@ pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErr
     }
 
     ProxyErrorKind::UpstreamFailure
+}
+
+/// Inspects the nested error chain from Hyper and Tower middleware to determine whether
+/// a proxy request failure was caused by the upstream server (dead/unavailable) or by the client
+/// (aborted, payload limit exceeded, decompression bomb).
+pub fn classify_proxy_error(err: &hyper_util::client::legacy::Error) -> ProxyErrorKind {
+    // 1. Upstream connection errors (refused, DNS, network unreachable) are genuine upstream failures
+    if err.is_connect() {
+        return ProxyErrorKind::UpstreamFailure;
+    }
+
+    classify_error_chain(err)
 }
 
 #[cfg(test)]
@@ -639,13 +660,18 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Spawn a slow upstream that accepts but delays sending any HTTP response
+        // Spawn a slow upstream that accepts 3 connections and delays sending any HTTP response
         tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                // Sleep longer than the request timeout
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                use tokio::io::AsyncWriteExt;
-                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+            for _ in 0..3 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        use tokio::io::AsyncWriteExt;
+                        let _ = socket
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                            .await;
+                    });
+                }
             }
         });
 
@@ -665,7 +691,6 @@ mod tests {
             grpc_reflection_lock: tokio::sync::Mutex::new(()),
         });
 
-
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -677,7 +702,36 @@ mod tests {
         let req_uri: Uri = "http://localhost/api/slow".parse().unwrap();
         let prepared_headers = hyper::HeaderMap::new();
 
-        // Send with a short timeout of 50ms (mock server sleeps 300ms)
+        // 1st and 2nd timeouts respect failure_threshold=3 and keep node alive.
+        for expected_failures in 1..=2 {
+            let response = handle_http_proxy(
+                &target,
+                RequestBody::Buffered(bytes::Bytes::new()),
+                Method::GET,
+                Version::HTTP_11,
+                prepared_headers.clone(),
+                &req_uri,
+                &matched_params,
+                None,
+                "test_server",
+                &client,
+                Some(Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert!(
+                target.upstreams[0].is_alive.load(Ordering::Relaxed),
+                "Node should stay alive below failure_threshold"
+            );
+            assert_eq!(
+                target.upstreams[0].consecutive_failures.load(Ordering::Relaxed),
+                expected_failures
+            );
+        }
+
+        // 3rd timeout reaches failure_threshold=3 and trips circuit breaker to Open.
         let response = handle_http_proxy(
             &target,
             RequestBody::Buffered(bytes::Bytes::new()),
@@ -695,7 +749,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "Timed out node must be marked dead");
+        assert!(
+            !target.upstreams[0].is_alive.load(Ordering::Relaxed),
+            "3rd timed out request must trip circuit breaker to Open"
+        );
     }
 
     #[tokio::test]

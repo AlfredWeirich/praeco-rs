@@ -720,10 +720,21 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                                         .as_secs();
                                     now + self.params.token_expiry_seconds
                                 };
-                                crate::middleware::jwt::get_jwt_revocation_store().revoke(
+                                if !crate::middleware::jwt::get_jwt_revocation_store().try_revoke(
                                     &jti,
                                     exp.saturating_add(crate::middleware::jwt::JWT_EXP_LEEWAY_SECS),
-                                );
+                                ) {
+                                    error!(
+                                        "{}: JwtRevocationStore capacity exhausted during /auth/revoke",
+                                        self.server_name
+                                    );
+                                    return IdpFuture::Ready {
+                                        response: Some(Self::response_err(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            "Service Unavailable: revocation store capacity exceeded",
+                                        )),
+                                    };
+                                }
                                 info!("{}: Revoked JWT jti: {}", self.server_name, jti);
                                 revoked_any = true;
                             }
@@ -766,7 +777,18 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             .as_secs();
                         let exp = (now + self.params.token_expiry_seconds)
                             .saturating_add(crate::middleware::jwt::JWT_EXP_LEEWAY_SECS);
-                        crate::middleware::jwt::get_jwt_revocation_store().revoke(&explicit_jti, exp);
+                        if !crate::middleware::jwt::get_jwt_revocation_store().try_revoke(&explicit_jti, exp) {
+                            error!(
+                                "{}: JwtRevocationStore capacity exhausted during explicit /auth/revoke",
+                                self.server_name
+                            );
+                            return IdpFuture::Ready {
+                                response: Some(Self::response_err(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "Service Unavailable: revocation store capacity exceeded",
+                                )),
+                            };
+                        }
                         info!("{}: Explicitly revoked jti via mTLS: {}", self.server_name, explicit_jti);
                         revoked_any = true;
                     }

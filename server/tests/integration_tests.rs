@@ -30,7 +30,7 @@ static INIT_CRYPTO: Once = Once::new();
 
 fn ensure_crypto_provider() {
     INIT_CRYPTO.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         praeco_rs::middleware::admin::init_process_start_time();
     });
 }

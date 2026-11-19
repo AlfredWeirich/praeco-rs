@@ -720,6 +720,9 @@ pub struct UpstreamNode {
     pub consecutive_failures: std::sync::atomic::AtomicUsize,
     /// Current circuit breaker state (`0 = Closed`, `1 = Open`, `2 = HalfOpen`).
     pub circuit_state: std::sync::atomic::AtomicU8,
+    /// Monotonic generation counter incremented whenever the circuit transitions
+    /// between states, preventing stale in-flight requests from corrupting newer states.
+    pub circuit_epoch: std::sync::atomic::AtomicU64,
     /// True while a single `HalfOpen` probe request is actively testing node recovery.
     pub half_open_probe_in_flight: std::sync::atomic::AtomicBool,
     /// Total number of requests dispatched to this upstream node since startup.
@@ -749,6 +752,7 @@ impl UpstreamNode {
             circuit_state: std::sync::atomic::AtomicU8::new(
                 crate::middleware::router::circuit_breaker::CircuitState::Closed as u8,
             ),
+            circuit_epoch: std::sync::atomic::AtomicU64::new(0),
             half_open_probe_in_flight: std::sync::atomic::AtomicBool::new(false),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             total_failures: std::sync::atomic::AtomicU64::new(0),
@@ -776,6 +780,8 @@ impl UpstreamNode {
     /// Immediately trips the circuit breaker to `Open`, marks the node as dead,
     /// releases any in-flight `HalfOpen` probe lock, and records the current failure timestamp.
     pub fn mark_dead(&self) {
+        self.circuit_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.total_failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let was_alive = self
@@ -809,6 +815,8 @@ impl UpstreamNode {
     /// Marks the node as alive (`CircuitState::Closed`), clears the failure timestamp,
     /// and resets consecutive failure counters.
     pub fn mark_alive(&self) {
+        self.circuit_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.consecutive_failures
             .store(0, std::sync::atomic::Ordering::Release);
         self.half_open_probe_in_flight
@@ -834,17 +842,44 @@ impl UpstreamNode {
     }
 
     /// Records a successful upstream response, closing the circuit breaker if it was `HalfOpen`
-    /// and resetting `consecutive_failures` to `0`.
+    /// and resetting `consecutive_failures` to `0` while `Closed`.
+    ///
+    /// **Guard:** If the circuit is currently `Open`, a late `2xx` response never closes it
+    /// directly; recovery must go through a `HalfOpen` probe or explicit [`UpstreamNode::mark_alive`].
     #[inline]
     pub fn record_success(&self) {
-        if !self.is_alive.load(std::sync::atomic::Ordering::Relaxed)
-            || self
-                .consecutive_failures
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-        {
-            self.mark_alive();
+        match self.circuit_state() {
+            crate::middleware::router::circuit_breaker::CircuitState::Open => {
+                // Never allow a late in-flight 2xx to close an Open circuit.
+            }
+            crate::middleware::router::circuit_breaker::CircuitState::HalfOpen => {
+                self.mark_alive();
+            }
+            crate::middleware::router::circuit_breaker::CircuitState::Closed => {
+                if self
+                    .consecutive_failures
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+                {
+                    self.consecutive_failures
+                        .store(0, std::sync::atomic::Ordering::Release);
+                }
+            }
         }
+    }
+
+    /// Epoch-checked variant of [`UpstreamNode::record_success`] that ignores stale
+    /// in-flight responses belonging to an earlier [`UpstreamNode::circuit_epoch`].
+    #[inline]
+    pub fn record_success_with_epoch(&self, expected_epoch: u64) {
+        if self
+            .circuit_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+            != expected_epoch
+        {
+            return;
+        }
+        self.record_success();
     }
 
     /// Records an upstream outlier failure (e.g. HTTP `502`/`503`/`504` or gRPC `UNAVAILABLE`).
@@ -880,27 +915,49 @@ impl UpstreamNode {
         }
     }
 
+    /// Epoch-checked variant of [`UpstreamNode::record_failure`] that avoids letting a
+    /// stale in-flight failure from an earlier epoch abort a newer `HalfOpen` probe.
+    pub fn record_failure_with_epoch(&self, failure_threshold: usize, expected_epoch: u64) -> bool {
+        let current_epoch = self
+            .circuit_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        if current_epoch != expected_epoch
+            && self.circuit_state()
+                == crate::middleware::router::circuit_breaker::CircuitState::HalfOpen
+        {
+            return false;
+        }
+        self.record_failure(failure_threshold)
+    }
+
     /// Attempts to claim the single `HalfOpen` probe slot for an `Open` node whose
     /// `cooldown_seconds` has elapsed.
     ///
     /// Returns `true` if and only if this caller transitioned the node into `HalfOpen`.
     /// All other concurrent callers will receive `false` and avoid a thundering herd.
     pub fn try_enter_half_open_probe(&self, cooldown_seconds: u64) -> bool {
+        self.try_enter_half_open_probe_epoch(cooldown_seconds)
+            .is_some()
+    }
+
+    /// Atomically transitions `Open -> HalfOpen` under `half_open_probe_in_flight` and
+    /// returns the new `circuit_epoch` for epoch-checked completion/rollback.
+    pub fn try_enter_half_open_probe_epoch(&self, cooldown_seconds: u64) -> Option<u64> {
         if self.is_alive.load(std::sync::atomic::Ordering::Acquire) {
-            return false;
+            return None;
         }
         let last_fail = self
             .last_failure_time
             .load(std::sync::atomic::Ordering::Acquire);
         if last_fail == 0 {
-            return false;
+            return None;
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         if now <= last_fail + cooldown_seconds {
-            return false;
+            return None;
         }
 
         if self
@@ -913,18 +970,32 @@ impl UpstreamNode {
             )
             .is_ok()
         {
-            self.circuit_state.store(
-                crate::middleware::router::circuit_breaker::CircuitState::HalfOpen as u8,
-                std::sync::atomic::Ordering::Release,
-            );
+            if self
+                .circuit_state
+                .compare_exchange(
+                    crate::middleware::router::circuit_breaker::CircuitState::Open as u8,
+                    crate::middleware::router::circuit_breaker::CircuitState::HalfOpen as u8,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+            {
+                self.half_open_probe_in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return None;
+            }
+            let epoch = self
+                .circuit_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .wrapping_add(1);
             tracing::warn!(
                 "[CIRCUIT BREAKER] State -> HALF-OPEN (single probe): {} (cooldown {}s elapsed)",
                 self.uri,
                 cooldown_seconds
             );
-            true
+            Some(epoch)
         } else {
-            false
+            None
         }
     }
 

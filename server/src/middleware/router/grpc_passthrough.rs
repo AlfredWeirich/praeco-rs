@@ -58,10 +58,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Spawn a slow upstream that delays responding
+        // Spawn a slow upstream that accepts 3 connections and holds them open past timeout
         tokio::spawn(async move {
-            if let Ok((_socket, _)) = listener.accept().await {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+            for _ in 0..3 {
+                if let Ok((socket, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _keep = socket;
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    });
+                }
             }
         });
 
@@ -96,6 +101,43 @@ mod tests {
         let prepared_headers = hyper::HeaderMap::new();
         let matched_params = matchit::Params::new();
 
+        for expected_failures in 1..=2 {
+            let response = handle_grpc_passthrough(
+                &target,
+                RequestBody::Buffered(bytes::Bytes::new()),
+                Method::POST,
+                prepared_headers.clone(),
+                &req_uri,
+                &matched_params,
+                None,
+                "test_server",
+                &client,
+                Some(Duration::from_millis(50)),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert_eq!(
+                response.headers().get("grpc-status").and_then(|v| v.to_str().ok()),
+                Some("4"),
+                "504 timeout must return gRPC Trailers-Only DEADLINE_EXCEEDED (4)"
+            );
+            assert_eq!(
+                response.headers().get(hyper::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+                Some("application/grpc")
+            );
+            assert!(
+                target.upstreams[0].is_alive.load(Ordering::Relaxed),
+                "Node should stay alive below failure_threshold"
+            );
+            assert_eq!(
+                target.upstreams[0].consecutive_failures.load(Ordering::Relaxed),
+                expected_failures
+            );
+        }
+
+        // 3rd timeout reaches failure_threshold=3 and trips circuit breaker to Open
         let response = handle_grpc_passthrough(
             &target,
             RequestBody::Buffered(bytes::Bytes::new()),
@@ -112,16 +154,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(
-            response.headers().get("grpc-status").and_then(|v| v.to_str().ok()),
-            Some("4"),
-            "504 timeout must return gRPC Trailers-Only DEADLINE_EXCEEDED (4)"
-        );
-        assert_eq!(
-            response.headers().get(hyper::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
-            Some("application/grpc")
-        );
-        assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "Timed out gRPC node must be marked dead");
+        assert!(!target.upstreams[0].is_alive.load(Ordering::Relaxed), "3rd timed out gRPC node must trip circuit breaker to Open");
     }
 
     #[tokio::test]

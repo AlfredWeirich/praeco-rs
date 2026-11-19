@@ -151,6 +151,18 @@ pub async fn handle_grpc_web(
 
         let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
+        let is_multi_node = target.upstreams.len() > 1;
+        let mut probe_guard = is_multi_node.then(|| {
+            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds)
+        });
+        let request_epoch = probe_guard.as_ref().map_or_else(
+            || {
+                upstream_node
+                    .circuit_epoch
+                    .load(std::sync::atomic::Ordering::Acquire)
+            },
+            |pg| pg.epoch(),
+        );
         let _conn_guard =
             super::upstreams::ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
@@ -165,71 +177,85 @@ pub async fn handle_grpc_web(
             .map(|p| std::time::Duration::from_secs(p.grpc_reflection_ttl_seconds))
             .unwrap_or(std::time::Duration::from_secs(600));
 
-        // 1. Fast path: check if cached pool is valid under read lock
-        let mut pool_opt = {
+        // 1. Fast path: check if cached pool is valid under read lock (also retain stale pool if expired)
+        let (mut pool_opt, stale_pool) = {
             let read_guard = target.grpc_pool.read().await;
             if let Some(cached) = &*read_guard {
                 if cached.created_at.elapsed() < reflection_ttl {
-                    Some(cached.pool.clone())
+                    (Some(cached.pool.clone()), Some(cached.pool.clone()))
                 } else {
-                    None
+                    (None, Some(cached.pool.clone()))
                 }
             } else {
-                None
+                (None, None)
             }
         };
 
-        // 2. Slow path: fetch reflection without holding write lock across network I/O
+        // 2. Slow path: if cache is expired AND we have a stale pool, avoid blocking callers
+        //    behind `grpc_reflection_lock` while another task refreshes (stale-while-revalidate).
         if pool_opt.is_none() {
-            let _fetch_guard = target.grpc_reflection_lock.lock().await;
+            let fetch_guard_opt = if stale_pool.is_some() {
+                target.grpc_reflection_lock.try_lock().ok()
+            } else {
+                Some(target.grpc_reflection_lock.lock().await)
+            };
 
-            // Double check if another task refreshed it while we waited for the fetch lock
-            let recheck = {
-                let read_guard = target.grpc_pool.read().await;
-                if let Some(cached) = &*read_guard {
-                    if cached.created_at.elapsed() < reflection_ttl {
-                        Some(cached.pool.clone())
+            if let Some(_fetch_guard) = fetch_guard_opt {
+                // Double check if another task refreshed it while we acquired the fetch lock
+                let recheck = {
+                    let read_guard = target.grpc_pool.read().await;
+                    if let Some(cached) = &*read_guard {
+                        if cached.created_at.elapsed() < reflection_ttl {
+                            Some(cached.pool.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            };
+                };
 
-            if let Some(p) = recheck {
-                pool_opt = Some(p);
-            } else {
-                match build_grpc_pool(&upstream_node.uri, config.router_params.as_ref()).await {
-                    Ok(new_pool) => {
-                        let mut write_guard = target.grpc_pool.write().await;
-                        *write_guard = Some(crate::configuration::CachedDescriptorPool {
-                            pool: new_pool.clone(),
-                            created_at: std::time::Instant::now(),
-                        });
-                        pool_opt = Some(new_pool);
-                    }
-                    Err(e) => {
-                        error!(
-                            "{}: Failed to fetch gRPC reflection schema: {:?}",
-                            server_name, e
-                        );
-                        // Stale-while-revalidate fallback: if we have an expired pool, use it rather than failing
-                        let read_guard = target.grpc_pool.read().await;
-                        if let Some(cached) = &*read_guard {
-                            warn!(
-                                "{}: Using stale gRPC reflection schema due to upstream fetch failure",
-                                server_name
+                if let Some(p) = recheck {
+                    pool_opt = Some(p);
+                } else {
+                    match build_grpc_pool(&upstream_node.uri, config.router_params.as_ref()).await {
+                        Ok(new_pool) => {
+                            let mut write_guard = target.grpc_pool.write().await;
+                            *write_guard = Some(crate::configuration::CachedDescriptorPool {
+                                pool: new_pool.clone(),
+                                created_at: std::time::Instant::now(),
+                            });
+                            pool_opt = Some(new_pool);
+                        }
+                        Err(e) => {
+                            error!(
+                                "{}: Failed to fetch gRPC reflection schema from {}: {:?}",
+                                server_name, backend_base_uri, e
                             );
-                            pool_opt = Some(cached.pool.clone());
-                        } else {
-                            return Ok(build_error_response(
-                                "Failed to fetch gRPC schema",
-                                StatusCode::BAD_GATEWAY,
-                            ));
+                            if let Some(stale) = stale_pool {
+                                warn!(
+                                    "{}: Using stale gRPC reflection schema due to upstream fetch failure",
+                                    server_name
+                                );
+                                pool_opt = Some(stale);
+                            } else {
+                                if let Some(ref mut pg) = probe_guard {
+                                    pg.complete();
+                                }
+                                upstream_node.record_failure_with_epoch(
+                                    target.failure_threshold,
+                                    request_epoch,
+                                );
+                                return Ok(build_error_response(
+                                    "Failed to fetch gRPC schema",
+                                    StatusCode::BAD_GATEWAY,
+                                ));
+                            }
                         }
                     }
                 }
+            } else if let Some(stale) = stale_pool {
+                pool_opt = Some(stale);
             }
         }
 
@@ -281,8 +307,9 @@ pub async fn handle_grpc_web(
         let dynamic_req_msg = match method_desc.input().deserialize(&mut deserializer) {
             Ok(msg) => msg,
             Err(e) => {
+                warn!("{}: Invalid JSON payload for gRPC transcoding: {}", server_name, e);
                 return Ok(build_error_response(
-                    &format!("Invalid JSON payload: {}", e),
+                    "Invalid JSON payload",
                     StatusCode::BAD_REQUEST,
                 ));
             }
@@ -293,8 +320,9 @@ pub async fn handle_grpc_web(
         grpc_frame.put_u8(0);
         grpc_frame.put_u32(encoded_len as u32);
         if let Err(e) = dynamic_req_msg.encode(&mut grpc_frame) {
+            error!("{}: Failed to encode gRPC protobuf request: {}", server_name, e);
             return Ok(build_error_response(
-                &format!("Encode error: {}", e),
+                "Internal Server Error",
                 StatusCode::INTERNAL_SERVER_ERROR,
             ));
         }
@@ -309,8 +337,9 @@ pub async fn handle_grpc_web(
             match hyper::http::uri::PathAndQuery::from_maybe_shared(grpc_target_path) {
                 Ok(pq) => Some(pq),
                 Err(e) => {
+                    warn!("{}: Invalid gRPC target path: {}", server_name, e);
                     return Ok(build_error_response(
-                        &format!("Invalid gRPC target path: {}", e),
+                        "Invalid Request URI",
                         StatusCode::BAD_REQUEST,
                     ));
                 }
@@ -318,8 +347,9 @@ pub async fn handle_grpc_web(
         let final_target_uri = match Uri::from_parts(proxy_uri_parts) {
             Ok(u) => u,
             Err(e) => {
+                warn!("{}: Invalid gRPC target URI: {}", server_name, e);
                 return Ok(build_error_response(
-                    &format!("Invalid gRPC target URI: {}", e),
+                    "Invalid Request URI",
                     StatusCode::BAD_REQUEST,
                 ));
             }
@@ -333,8 +363,9 @@ pub async fn handle_grpc_web(
         let mut proxy_req = match builder.body(boxed_body) {
             Ok(req) => req,
             Err(e) => {
+                error!("{}: Failed to build gRPC request: {}", server_name, e);
                 return Ok(build_error_response(
-                    &format!("Failed to build gRPC request: {}", e),
+                    "Internal Server Error",
                     StatusCode::INTERNAL_SERVER_ERROR,
                 ));
             }
@@ -347,6 +378,7 @@ pub async fn handle_grpc_web(
         current_headers.remove(header::CONNECTION);
         current_headers.remove(header::TRANSFER_ENCODING);
         current_headers.remove(header::UPGRADE);
+        current_headers.remove("grpc-encoding");
         current_headers.insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/grpc"),
@@ -354,6 +386,10 @@ pub async fn handle_grpc_web(
         current_headers.insert(
             header::TE,
             header::HeaderValue::from_static("trailers"),
+        );
+        current_headers.insert(
+            header::HeaderName::from_static("grpc-accept-encoding"),
+            header::HeaderValue::from_static("identity"),
         );
 
         *proxy_req.headers_mut() = current_headers;
@@ -395,6 +431,22 @@ pub async fn handle_grpc_web(
                     "{}: gRPC transcoding request to {} timed out after {:?}",
                     server_name, backend_base_uri, req_timeout
                 );
+                if let Some(ref mut pg) = probe_guard {
+                    pg.complete();
+                }
+                upstream_node.record_failure_with_epoch(target.failure_threshold, request_epoch);
+                failed_nodes.push(backend_base_uri.clone());
+
+                if attempts <= max_retries {
+                    upstream_node
+                        .failover_retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        "{}: Retrying gRPC transcoding request after timeout... (Attempt {}/{})",
+                        server_name, attempts, max_retries
+                    );
+                    continue;
+                }
                 return Ok(build_error_response(
                     "Gateway Timeout",
                     StatusCode::GATEWAY_TIMEOUT,
@@ -405,11 +457,32 @@ pub async fn handle_grpc_web(
         match req_result {
             Ok(mut res) => {
                 upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
+                if let Some(ref mut pg) = probe_guard {
+                    pg.complete();
+                }
                 if res.status() != StatusCode::OK {
-                    return Ok(build_error_response(
-                        &format!("Backend Error: {}", res.status()),
-                        res.status(),
-                    ));
+                    let status = res.status();
+                    warn!(
+                        "{}: Upstream gRPC backend {} returned HTTP {}",
+                        server_name, backend_base_uri, status
+                    );
+                    if super::circuit_breaker::is_outlier_status(status) {
+                        upstream_node
+                            .record_failure_with_epoch(target.failure_threshold, request_epoch);
+                        failed_nodes.push(backend_base_uri.clone());
+                        if attempts <= max_retries {
+                            upstream_node
+                                .failover_retries
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            warn!(
+                                "{}: Retrying gRPC transcoding request after HTTP {}... (Attempt {}/{})",
+                                server_name, status, attempts, max_retries
+                            );
+                            continue;
+                        }
+                    }
+                    let msg = status.canonical_reason().unwrap_or("Bad Gateway");
+                    return Ok(build_error_response(msg, status));
                 }
 
                 // Check Trailers-Only gRPC error status in initial HTTP/2 response headers
@@ -417,7 +490,10 @@ pub async fn handle_grpc_web(
                     && grpc_code != 0
                 {
                     if grpc_code == 14 {
-                        target.record_failure(backend_base_uri);
+                        upstream_node
+                            .record_failure_with_epoch(target.failure_threshold, request_epoch);
+                    } else {
+                        upstream_node.record_success_with_epoch(request_epoch);
                     }
                     return Ok(build_grpc_status_error(grpc_code, grpc_msg));
                 }
@@ -434,14 +510,26 @@ pub async fn handle_grpc_web(
                 let collected = match collect_res {
                     Ok(Ok(c)) => c,
                     Ok(Err(e)) => {
+                        warn!(
+                            "{}: Failed to read gRPC response body from {}: {}",
+                            server_name, backend_base_uri, e
+                        );
+                        upstream_node
+                            .record_failure_with_epoch(target.failure_threshold, request_epoch);
                         return Ok(build_error_response(
-                            &format!("Failed to read gRPC body: {}", e),
+                            "Bad Gateway",
                             StatusCode::BAD_GATEWAY,
                         ));
                     }
                     Err(_) => {
+                        warn!(
+                            "{}: Gateway timeout reading gRPC response body from {}",
+                            server_name, backend_base_uri
+                        );
+                        upstream_node
+                            .record_failure_with_epoch(target.failure_threshold, request_epoch);
                         return Ok(build_error_response(
-                            "Gateway Timeout reading gRPC response body",
+                            "Gateway Timeout",
                             StatusCode::GATEWAY_TIMEOUT,
                         ));
                     }
@@ -453,7 +541,10 @@ pub async fn handle_grpc_web(
                     && grpc_code != 0
                 {
                     if grpc_code == 14 {
-                        target.record_failure(backend_base_uri);
+                        upstream_node
+                            .record_failure_with_epoch(target.failure_threshold, request_epoch);
+                    } else {
+                        upstream_node.record_success_with_epoch(request_epoch);
                     }
                     return Ok(build_grpc_status_error(grpc_code, grpc_msg));
                 }
@@ -461,8 +552,21 @@ pub async fn handle_grpc_web(
                 let res_body_bytes = collected.to_bytes();
 
                 if res_body_bytes.len() < 5 {
+                    upstream_node.record_success_with_epoch(request_epoch);
                     return Ok(build_error_response(
                         "Invalid gRPC Response",
+                        StatusCode::BAD_GATEWAY,
+                    ));
+                }
+
+                if res_body_bytes[0] != 0 {
+                    warn!(
+                        "{}: Upstream gRPC response used unsupported compression flag ({})",
+                        server_name, res_body_bytes[0]
+                    );
+                    upstream_node.record_success_with_epoch(request_epoch);
+                    return Ok(build_error_response(
+                        "Unsupported gRPC Response Compression",
                         StatusCode::BAD_GATEWAY,
                     ));
                 }
@@ -473,19 +577,30 @@ pub async fn handle_grpc_web(
                     res_body_bytes[3],
                     res_body_bytes[4],
                 ]) as usize;
-                if res_body_bytes.len() < 5 + payload_len {
+                let Some(frame_end) = 5usize.checked_add(payload_len) else {
+                    return Ok(build_error_response(
+                        "Invalid gRPC Response",
+                        StatusCode::BAD_GATEWAY,
+                    ));
+                };
+                if res_body_bytes.len() < frame_end {
+                    upstream_node.record_success_with_epoch(request_epoch);
                     return Ok(build_error_response(
                         "Truncated gRPC Response",
                         StatusCode::BAD_GATEWAY,
                     ));
                 }
 
-                let raw_protobuf_res = &res_body_bytes[5..5 + payload_len];
+                let raw_protobuf_res = &res_body_bytes[5..frame_end];
 
                 let mut dynamic_res_msg = DynamicMessage::new(method_desc.output());
                 if let Err(e) = dynamic_res_msg.merge(raw_protobuf_res) {
+                    warn!(
+                        "{}: Failed to decode protobuf response from {}: {}",
+                        server_name, backend_base_uri, e
+                    );
                     return Ok(build_error_response(
-                        &format!("Parse error: {}", e),
+                        "Invalid Protobuf Response",
                         StatusCode::BAD_GATEWAY,
                     ));
                 }
@@ -493,12 +608,18 @@ pub async fn handle_grpc_web(
                 let response_json = match serde_json::to_vec(&dynamic_res_msg) {
                     Ok(v) => v,
                     Err(e) => {
+                        error!(
+                            "{}: Failed to serialize decoded protobuf response to JSON: {}",
+                            server_name, e
+                        );
                         return Ok(build_error_response(
-                            &format!("JSON encode error: {}", e),
+                            "Internal Server Error",
                             StatusCode::INTERNAL_SERVER_ERROR,
                         ));
                     }
                 };
+
+                upstream_node.record_success_with_epoch(request_epoch);
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -511,6 +632,9 @@ pub async fn handle_grpc_web(
                     .unwrap());
             }
             Err(e) => {
+                if let Some(ref mut pg) = probe_guard {
+                    pg.complete();
+                }
                 error!(
                     "{}: Backend connection failed to {}: {}",
                     server_name, backend_base_uri, e
@@ -1040,5 +1164,115 @@ mod tests {
             seen_x_trace, seen_tp,
             "x-trace-id must match the authoritative outgoing traceparent header"
         );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_rejects_compressed_frame_and_sends_identity_accept_encoding() {
+        let captured = Arc::new(std::sync::Mutex::new(None::<hyper::HeaderMap>));
+        let cap = captured.clone();
+        let port = spawn_h2_upstream(move |req| {
+            let cap = cap.clone();
+            async move {
+                *cap.lock().unwrap() = Some(req.headers().clone());
+                let _ = req.into_body().collect().await;
+                // Compressed flag = 1 (unsupported when identity requested)
+                let frame = Bytes::from_static(&[1, 0, 0, 0, 4, 0x0a, 0x02, b'h', b'i']);
+                Ok(hyper::Response::builder()
+                    .status(200)
+                    .body(Full::new(frame))
+                    .unwrap())
+            }
+        })
+        .await;
+
+        let target = test_target(port);
+        let config = test_server_config(5);
+
+        let resp = call_grpc_web(&target, &config, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+        let seen = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            seen.get("grpc-accept-encoding").and_then(|v| v.to_str().ok()),
+            Some("identity")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_records_success_resets_consecutive_failures_and_timeout_records_failure() {
+        // 1. Success resets consecutive_failures to 0
+        let port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            let frame = Bytes::from_static(&[0, 0, 0, 0, 4, 0x0a, 0x02, b'o', b'k']);
+            Ok(hyper::Response::builder()
+                .status(200)
+                .body(Full::new(frame))
+                .unwrap())
+        })
+        .await;
+        let target = test_target(port);
+        target.upstreams[0].consecutive_failures.store(2, std::sync::atomic::Ordering::Release);
+        let config = test_server_config(5);
+
+        let resp = call_grpc_web(&target, &config, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            target.upstreams[0]
+                .consecutive_failures
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
+
+        // 2. Timeout increments failure counter instead of silently succeeding
+        let slow_port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(hyper::Response::new(Full::new(Bytes::new())))
+        })
+        .await;
+        let slow_target = test_target(slow_port);
+        let short_cfg = test_server_config(1);
+        let resp = call_grpc_web(&slow_target, &short_cfg, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            slow_target.upstreams[0]
+                .consecutive_failures
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_stale_while_revalidate_does_not_block_on_refresh_lock() {
+        let port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            let frame = Bytes::from_static(&[0, 0, 0, 0, 4, 0x0a, 0x02, b'o', b'k']);
+            Ok(hyper::Response::builder()
+                .status(200)
+                .body(Full::new(frame))
+                .unwrap())
+        })
+        .await;
+        let target = test_target(port);
+        // Mark cached pool as expired while another task holds grpc_reflection_lock
+        {
+            let mut w = target.grpc_pool.write().await;
+            if let Some(ref mut cached) = *w {
+                cached.created_at = std::time::Instant::now() - Duration::from_secs(3600);
+            }
+        }
+        let held_lock = target.grpc_reflection_lock.lock().await;
+
+        let config = test_server_config(5);
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_millis(500),
+            call_grpc_web(&target, &config, hyper::HeaderMap::new()),
+        )
+        .await
+        .expect("stale-while-revalidate must not deadlock or block waiting for reflection lock");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        drop(held_lock);
     }
 }

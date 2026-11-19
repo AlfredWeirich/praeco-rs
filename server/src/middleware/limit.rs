@@ -15,7 +15,10 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -35,22 +38,55 @@ use crate::{SrvBody, SrvError};
 //  MAX PAYLOAD LAYER & SERVICE
 // ============================================================================
 
+/// Returns `true` if `err` or any error in its `.source()` chain is a payload-size
+/// limit violation (`SrvError::PayloadTooLarge` or `http_body_util::LengthLimitError`).
+pub(crate) fn is_payload_too_large_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        if let Some(SrvError::PayloadTooLarge { .. }) = e.downcast_ref::<SrvError>() {
+            return true;
+        }
+        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// Default multiplier applied to `max_bytes` for cumulative `application/grpc`
+/// stream body limits when no explicit stream cap is configured.
+const DEFAULT_GRPC_STREAM_MULTIPLIER: usize = 64;
+
 /// A Tower [`Layer`] that wraps a service with payload size enforcement.
 #[derive(Clone)]
 pub struct MaxPayloadLayer {
-    /// Maximum allowed request body size in bytes.
+    /// Maximum allowed request body size in bytes (or per-message cap for gRPC).
     max_bytes: usize,
+    /// Optional cumulative maximum stream body size in bytes for `application/grpc` requests.
+    max_stream_bytes: Option<usize>,
     /// Server name label for tracing output.
     server_name: &'static str,
 }
 
 impl MaxPayloadLayer {
     /// Creates a new `MaxPayloadLayer`.
+    ///
+    /// For `application/grpc` streams, enforces `max_bytes` per gRPC message frame
+    /// and a cumulative stream cap of `max_bytes.saturating_mul(64)` by default
+    /// (override via [`MaxPayloadLayer::with_max_stream_bytes`]).
     pub fn new(max_bytes: usize, server_name: &'static str) -> Self {
         Self {
             max_bytes,
+            max_stream_bytes: Some(max_bytes.saturating_mul(DEFAULT_GRPC_STREAM_MULTIPLIER)),
             server_name,
         }
+    }
+
+    /// Configures the cumulative stream body byte limit for `application/grpc` requests.
+    pub fn with_max_stream_bytes(mut self, max_stream_bytes: Option<usize>) -> Self {
+        self.max_stream_bytes = max_stream_bytes;
+        self
     }
 }
 
@@ -61,6 +97,7 @@ impl<S> Layer<S> for MaxPayloadLayer {
         MaxPayloadService {
             inner,
             max_bytes: self.max_bytes,
+            max_stream_bytes: self.max_stream_bytes,
             server_name: self.server_name,
         }
     }
@@ -71,6 +108,7 @@ impl<S> Layer<S> for MaxPayloadLayer {
 pub struct MaxPayloadService<S> {
     inner: S,
     max_bytes: usize,
+    max_stream_bytes: Option<usize>,
     server_name: &'static str,
 }
 
@@ -112,9 +150,7 @@ where
                     Ok(resp) => Poll::Ready(Ok(resp)),
                     Err(e) => {
                         let srv_err: SrvError = e.into();
-                        if matches!(srv_err, SrvError::PayloadTooLarge { .. })
-                            || srv_err.to_string().contains("Payload Limit Exceeded")
-                        {
+                        if is_payload_too_large_error(&srv_err) {
                             crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
                             let msg = "Payload too large (Streaming check)";
                             tracing::warn!("{}: {}", server_name, msg);
@@ -183,6 +219,7 @@ where
         let limited_body = LimitedBody {
             inner: body,
             max_bytes,
+            max_stream_bytes: self.max_stream_bytes,
             current_bytes: 0,
             grpc_state,
         };
@@ -220,6 +257,7 @@ pub struct LimitedBody<B> {
     #[pin]
     inner: B,
     max_bytes: usize,
+    max_stream_bytes: Option<usize>,
     current_bytes: usize,
     grpc_state: Option<GrpcFramingState>,
 }
@@ -241,6 +279,16 @@ where
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     if let Some(state) = this.grpc_state {
+                        *this.current_bytes = this.current_bytes.saturating_add(data.len());
+                        if let Some(max_stream) = *this.max_stream_bytes
+                            && *this.current_bytes > max_stream
+                        {
+                            return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
+                                current: *this.current_bytes,
+                                max: max_stream,
+                            })));
+                        }
+
                         let mut offset = 0;
                         while offset < data.len() {
                             match state {
@@ -359,6 +407,20 @@ where
     }
 }
 
+/// Default maximum queue capacity when `load_shed = false` and no explicit queue limit is set.
+/// Setting `with_queue_limit(None)` allows unbounded waiting for backward compatibility unless
+/// overridden via `ConcurrencyLimitConfig::max_queue_size`.
+#[derive(Debug)]
+struct QueueSlotGuard {
+    queued: Arc<AtomicUsize>,
+}
+
+impl Drop for QueueSlotGuard {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// A Tower [`Layer`] that limits concurrent in-flight requests.
 #[derive(Clone)]
 pub struct ConcurrencyLimitLayer {
@@ -366,6 +428,8 @@ pub struct ConcurrencyLimitLayer {
     server_name: &'static str,
     load_shed: bool,
     queue_timeout: Option<Duration>,
+    max_queue_size: Option<usize>,
+    queued_requests: Arc<AtomicUsize>,
 }
 
 impl ConcurrencyLimitLayer {
@@ -379,12 +443,23 @@ impl ConcurrencyLimitLayer {
         queue_timeout: Option<Duration>,
         server_name: &'static str,
     ) -> Self {
+        // Bound the waiting queue by default to prevent unbounded RAM growth under load.
+        let default_queue_cap = max_requests.saturating_mul(4).clamp(64, 4096);
         Self {
             semaphore: Arc::new(tokio::sync::Semaphore::new(max_requests)),
             server_name,
             load_shed,
             queue_timeout,
+            max_queue_size: Some(default_queue_cap),
+            queued_requests: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Sets an upper bound on the number of requests waiting in the queue when
+    /// `load_shed` is `false`. Excess requests fail fast with `503 Service Unavailable`.
+    pub fn with_queue_limit(mut self, max_queue_size: Option<usize>) -> Self {
+        self.max_queue_size = max_queue_size;
+        self
     }
 }
 
@@ -398,6 +473,8 @@ impl<S> Layer<S> for ConcurrencyLimitLayer {
             server_name: self.server_name,
             load_shed: self.load_shed,
             queue_timeout: self.queue_timeout,
+            max_queue_size: self.max_queue_size,
+            queued_requests: self.queued_requests.clone(),
         }
     }
 }
@@ -410,6 +487,8 @@ pub struct ConcurrencyLimitService<S> {
     server_name: &'static str,
     load_shed: bool,
     queue_timeout: Option<Duration>,
+    max_queue_size: Option<usize>,
+    queued_requests: Arc<AtomicUsize>,
 }
 
 #[pin_project(project = ConcurrencyLimitFutureProj)]
@@ -464,25 +543,59 @@ where
                     }
                 }
             }
-        } else if let Some(timeout_dur) = self.queue_timeout {
-            let sem = self.semaphore.clone();
-            let acquire_task = Box::pin(async move {
-                match tokio::time::timeout(timeout_dur, sem.acquire_owned()).await {
-                    Ok(Ok(p)) => Ok(p),
-                    _ => Err(()),
-                }
-            });
-            ConcurrencyLimitFuture::Waiting {
-                acquire_task,
-                req: Some(req),
-                inner: self.inner.clone(),
-                server_name: self.server_name,
-            }
         } else {
+            // Fast path: if a permit is immediately available, avoid queuing overhead.
+            if let Ok(permit) = self.semaphore.clone().try_acquire_owned() {
+                let fut = self.inner.call(req);
+                return ConcurrencyLimitFuture::Processing {
+                    inner: fut,
+                    permit: Some(permit),
+                };
+            }
+
+            // Enforce optional bounded queue capacity before allocating a waiting future.
+            let queue_guard = if let Some(max_q) = self.max_queue_size {
+                let reserved = self.queued_requests.try_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |cur| if cur < max_q { Some(cur + 1) } else { None },
+                );
+                if reserved.is_err() {
+                    crate::configuration::ServerMetrics::inc_concurrency_limited(self.server_name);
+                    tracing::warn!(
+                        "{}: Concurrency queue full (max_queue_size = {}), rejecting request",
+                        self.server_name,
+                        max_q
+                    );
+                    return ConcurrencyLimitFuture::Immediate {
+                        response: Some(build_503_response()),
+                    };
+                }
+                Some(QueueSlotGuard {
+                    queued: self.queued_requests.clone(),
+                })
+            } else {
+                None
+            };
+
             let sem = self.semaphore.clone();
-            let acquire_task = Box::pin(async move {
-                sem.acquire_owned().await.map_err(|_| ())
-            });
+            let acquire_task: Pin<
+                Box<dyn Future<Output = Result<tokio::sync::OwnedSemaphorePermit, ()>> + Send>,
+            > = if let Some(timeout_dur) = self.queue_timeout {
+                Box::pin(async move {
+                    let _guard = queue_guard;
+                    match tokio::time::timeout(timeout_dur, sem.acquire_owned()).await {
+                        Ok(Ok(p)) => Ok(p),
+                        _ => Err(()),
+                    }
+                })
+            } else {
+                Box::pin(async move {
+                    let _guard = queue_guard;
+                    sem.acquire_owned().await.map_err(|_| ())
+                })
+            };
+
             ConcurrencyLimitFuture::Waiting {
                 acquire_task,
                 req: Some(req),
@@ -509,26 +622,27 @@ where
                     let res = response.take().expect("polled after completion");
                     return Poll::Ready(Ok(res));
                 }
-                ConcurrencyLimitFutureProj::Waiting { acquire_task, req, inner, server_name } => {
-                    match acquire_task.poll(cx) {
-                        Poll::Ready(Ok(permit)) => {
-                            let request = req.take().expect("polled after completion");
-                            let fut = inner.call(request);
-                            self.set(ConcurrencyLimitFuture::Processing {
-                                inner: fut,
-                                permit: Some(permit),
-                            });
-                            continue;
-                        }
-                        Poll::Ready(Err(())) => {
-                            crate::configuration::ServerMetrics::inc_concurrency_limited(
-                                server_name,
-                            );
-                            return Poll::Ready(Ok(build_503_response()));
-                        }
-                        Poll::Pending => return Poll::Pending,
+                ConcurrencyLimitFutureProj::Waiting {
+                    acquire_task,
+                    req,
+                    inner,
+                    server_name,
+                } => match acquire_task.poll(cx) {
+                    Poll::Ready(Ok(permit)) => {
+                        let request = req.take().expect("polled after completion");
+                        let fut = inner.call(request);
+                        self.set(ConcurrencyLimitFuture::Processing {
+                            inner: fut,
+                            permit: Some(permit),
+                        });
+                        continue;
                     }
-                }
+                    Poll::Ready(Err(())) => {
+                        crate::configuration::ServerMetrics::inc_concurrency_limited(server_name);
+                        return Poll::Ready(Ok(build_503_response()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
                 ConcurrencyLimitFutureProj::Processing { inner, permit } => {
                     match inner.poll(cx) {
                         Poll::Ready(Ok(resp)) => {
@@ -596,6 +710,8 @@ mod tests {
             server_name: "test_concurrency",
             load_shed: true,
             queue_timeout: None,
+            max_queue_size: None,
+            queued_requests: Arc::new(AtomicUsize::new(0)),
         };
 
         // First request acquires the single permit and waits on the channel
@@ -673,6 +789,8 @@ mod tests {
             server_name: "test_streaming",
             load_shed: true,
             queue_timeout: None,
+            max_queue_size: None,
+            queued_requests: Arc::new(AtomicUsize::new(0)),
         };
 
         // Request 1 arrives and gets headers response, but body stream is still active
@@ -864,5 +982,99 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_grpc_streaming_cumulative_cap_rejects_excess() {
+        let inner_svc = service_fn(|mut req: Request<SrvBody>| async move {
+            while let Some(frame) = req.body_mut().frame().await {
+                frame?;
+            }
+            let body: SrvBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<SrvBody>, SrvError>(Response::new(body))
+        });
+
+        // Per-message limit = 25, cumulative stream cap = 35
+        let layer = MaxPayloadLayer::new(25, "test_grpc_stream_cap").with_max_stream_bytes(Some(35));
+        let mut svc = layer.layer(inner_svc);
+
+        let make_grpc_msg = |payload: &[u8]| -> Vec<u8> {
+            let mut buf = Vec::with_capacity(5 + payload.len());
+            buf.push(0x00);
+            buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            buf.extend_from_slice(payload);
+            buf
+        };
+
+        // 3 messages of 10 B payload => 15 B each => 45 B total > 35 B cumulative cap
+        let combined = [
+            make_grpc_msg(&[b'A'; 10]),
+            make_grpc_msg(&[b'B'; 10]),
+            make_grpc_msg(&[b'C'; 10]),
+        ]
+        .concat();
+
+        let req = Request::builder()
+            .uri("/chat.ChatService/StreamMessages")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::from(combined)).map_err(SrvError::from).boxed())
+            .unwrap();
+
+        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limit_bounded_queue_rejects_excess() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notify_clone = notify.clone();
+        let inner_svc = service_fn(move |_req: Request<SrvBody>| {
+            let notify = notify_clone.clone();
+            async move {
+                notify.notified().await;
+                Ok::<Response<SrvBody>, SrvError>(Response::new(
+                    Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed(),
+                ))
+            }
+        });
+
+        let layer = ConcurrencyLimitLayer::with_config(
+            1,
+            false,
+            Some(Duration::from_secs(5)),
+            "test_bounded_queue",
+        )
+        .with_queue_limit(Some(1));
+        let mut svc = layer.layer(inner_svc);
+
+        let make_req = || {
+            Request::builder()
+                .uri("/work")
+                .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+                .unwrap()
+        };
+
+        // 1st request acquires the single active permit and blocks on notify.
+        let fut1 = tokio::spawn(svc.ready().await.unwrap().call(make_req()));
+        tokio::task::yield_now().await;
+
+        // 2nd request waits in the queue (occupies queue slot 1/1).
+        let fut2 = tokio::spawn(svc.ready().await.unwrap().call(make_req()));
+        tokio::task::yield_now().await;
+
+        // 3rd request exceeds max_queue_size=1 and must fail fast with 503.
+        let resp3 = svc.ready().await.unwrap().call(make_req()).await.unwrap();
+        assert_eq!(resp3.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Release 1st request's execution, then drop `resp1` so its `PermittedBody`
+        // releases the semaphore permit for the queued 2nd request (`fut2`).
+        notify.notify_one();
+        let resp1 = fut1.await.unwrap().unwrap();
+        assert_eq!(resp1.status(), StatusCode::OK);
+        drop(resp1);
+
+        notify.notify_one();
+        let resp2 = fut2.await.unwrap().unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 }

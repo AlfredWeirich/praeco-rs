@@ -35,8 +35,8 @@ use hyper::{
 // use pin_project::pin_project;
 use std::future::Future;
 use std::pin::Pin;
-
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tower::Service;
 
 // ── Public Modules ───────────────────────────────────────────────────────────
@@ -199,31 +199,116 @@ pub struct H3Body {
     inner: Pin<Box<dyn Stream<Item = Result<http_body::Frame<Bytes>, SrvError>> + Send + Sync>>,
 }
 
+/// Default per-frame idle timeout enforced while reading an in-flight HTTP request body.
+pub(crate) const DEFAULT_BODY_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wraps an inbound HTTP/1.1 or HTTP/2 request body to abort stalled/Slowloris uploads
+/// if no body frame arrives within [`Self::timeout`] while the body is actively polled.
+///
+/// Connections sitting idle between keep-alive requests are unaffected because the timer
+/// only runs while awaiting a pending frame from the request body stream.
+#[pin_project::pin_project]
+pub(crate) struct IdleTimeoutBody<B> {
+    #[pin]
+    inner: B,
+    #[pin]
+    sleep: tokio::time::Sleep,
+    deadline_armed: bool,
+    timed_out: bool,
+    timeout: Duration,
+}
+
+impl<B> IdleTimeoutBody<B> {
+    pub(crate) fn new(inner: B, timeout: Duration) -> Self {
+        Self {
+            inner,
+            sleep: tokio::time::sleep(timeout),
+            deadline_armed: false,
+            timed_out: false,
+            timeout,
+        }
+    }
+}
+
+impl<B> http_body::Body for IdleTimeoutBody<B>
+where
+    B: http_body::Body<Data = Bytes>,
+    B::Error: Into<SrvError>,
+{
+    type Data = Bytes;
+    type Error = SrvError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        if *this.timed_out {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.poll_frame(cx) {
+            Poll::Ready(res) => {
+                *this.deadline_armed = false;
+                Poll::Ready(res.map(|r| r.map_err(Into::into)))
+            }
+            Poll::Pending => {
+                if !*this.deadline_armed {
+                    this.sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + *this.timeout);
+                    *this.deadline_armed = true;
+                }
+                match this.sleep.poll(cx) {
+                    Poll::Ready(()) => {
+                        *this.timed_out = true;
+                        Poll::Ready(Some(Err(SrvError::ClientAborted(format!(
+                            "Request body idle timeout after {:?}",
+                            *this.timeout
+                        )))))
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 impl H3Body {
     /// Creates a new `H3Body` by converting an HTTP/3 receive stream into
-    /// an async [`Stream`] of body frames.
-    ///
-    /// Internally uses [`futures::stream::unfold`] to drive the `h3`
-    /// receive loop:
-    /// - **`Ok(Some(bytes))`** – a chunk of data arrived; copy it into a
-    ///   contiguous [`Bytes`] buffer and wrap it in a [`http_body::Frame`].
-    /// - **`Ok(None)`** – the peer has finished sending (EOF); end the stream.
-    /// - **`Err(e)`** – a transport-level error occurred; surface it as
-    ///   [`SrvError`] and let the consumer decide how to handle it.
-    ///
-    /// # Arguments
-    ///
-    /// * `stream` – The HTTP/3 receive stream obtained after splitting the
-    ///   bidirectional QUIC stream.
+    /// an async [`Stream`] of body frames with a 30-second per-frame idle timeout.
     pub fn new(stream: H3RecvStream) -> Self {
-        let s = futures::stream::unfold(stream, |mut s| async move {
-            match s.recv_data().await {
-                Ok(Some(mut bytes)) => {
+        Self::with_timeout(stream, DEFAULT_BODY_FRAME_TIMEOUT)
+    }
+
+    /// Creates a new `H3Body` with an explicit per-frame receive idle timeout.
+    pub fn with_timeout(stream: H3RecvStream, timeout: Duration) -> Self {
+        let s = futures::stream::unfold((stream, false), move |(mut s, finished)| async move {
+            if finished {
+                return None;
+            }
+            match tokio::time::timeout(timeout, s.recv_data()).await {
+                Ok(Ok(Some(mut bytes))) => {
                     let frame = http_body::Frame::data(bytes.copy_to_bytes(bytes.remaining()));
-                    Some((Ok(frame), s))
+                    Some((Ok(frame), (s, false)))
                 }
-                Ok(None) => None, // EOF
-                Err(e) => Some((Err(SrvError::from(e.to_string())), s)),
+                Ok(Ok(None)) => None, // EOF
+                Ok(Err(e)) => Some((Err(SrvError::from(e.to_string())), (s, true))),
+                Err(_) => Some((
+                    Err(SrvError::ClientAborted(format!(
+                        "HTTP/3 request body idle timeout after {:?}",
+                        timeout
+                    ))),
+                    (s, true),
+                )),
             }
         });
 
@@ -731,7 +816,7 @@ impl hyper::service::Service<Request<Incoming>> for ConnectionHandler {
     ///    [`ConnectionHandler::handle`] consumes `self` for `Send` safety.
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let (parts, body) = req.into_parts();
-        let boxed_body = body.map_err(SrvError::from).boxed();
+        let boxed_body = IdleTimeoutBody::new(body, DEFAULT_BODY_FRAME_TIMEOUT).boxed();
         let req = Request::from_parts(parts, boxed_body);
         let this = self.clone();
         Box::pin(async move { this.handle(req).await })
@@ -838,5 +923,40 @@ mod tests {
         let resp2 = handler.clone().handle(req2).await.unwrap();
         let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body2[..], b"v2:Admin");
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_body_aborts_stalled_upload_and_allows_timely_chunks() {
+        use tokio::sync::mpsc;
+
+        struct ChannelBody {
+            rx: mpsc::Receiver<Result<http_body::Frame<Bytes>, SrvError>>,
+        }
+        impl http_body::Body for ChannelBody {
+            type Data = Bytes;
+            type Error = SrvError;
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.rx.poll_recv(cx)
+            }
+        }
+
+        // 1. Chunk arrives within idle timeout -> succeeds, then stalls past timeout -> ClientAborted
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Ok(http_body::Frame::data(Bytes::from_static(b"chunk1"))))
+            .await
+            .unwrap();
+        let timed = IdleTimeoutBody::new(ChannelBody { rx }, Duration::from_millis(60));
+        tokio::pin!(timed);
+
+        let first = timed.frame().await.unwrap().unwrap();
+        assert_eq!(first.into_data().unwrap(), Bytes::from_static(b"chunk1"));
+
+        // Keep sender alive without sending a second chunk -> idle timer fires
+        let err = timed.frame().await.unwrap().unwrap_err();
+        assert!(matches!(err, SrvError::ClientAborted(_)));
+        drop(tx);
     }
 }

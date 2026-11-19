@@ -349,11 +349,30 @@ impl Service<Request<SrvBody>> for RouterService {
                     | hyper::Method::OPTIONS
             );
 
-            // Check if Content-Length already exceeds max_retry_buffer_bytes
-            let content_length_exceeds_retry_buf = prepared_headers
+            let parsed_content_length = prepared_headers
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<usize>().ok())
+                .and_then(|s| s.parse::<usize>().ok());
+
+            // Early Content-Length check before buffering body frames into RAM.
+            if is_buffered_only
+                && let Some(content_len) = parsed_content_length
+                && content_len > route_info.max_request_bytes
+            {
+                tracing::warn!(
+                    "{}: Request Content-Length ({} bytes) exceeded route buffered limit ({} bytes)",
+                    server_name,
+                    content_len,
+                    route_info.max_request_bytes
+                );
+                return Ok(build_error_response(
+                    "Payload Too Large",
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                ));
+            }
+
+            // Check if Content-Length already exceeds max_retry_buffer_bytes
+            let content_length_exceeds_retry_buf = parsed_content_length
                 .is_some_and(|len| len > route_info.target.max_retry_buffer_bytes);
 
             // Fast-path:
@@ -382,19 +401,11 @@ impl Service<Request<SrvBody>> for RouterService {
                 match tokio::time::timeout(buffer_timeout, limited.collect()).await {
                     Ok(Ok(c)) => RequestBody::Buffered(c.to_bytes()),
                     Ok(Err(e)) => {
-                        let err_str = e.to_string();
-                        if e.downcast_ref::<http_body_util::LengthLimitError>().is_some()
-                            || err_str.contains("length limit exceeded")
-                            || err_str.contains("Payload Limit Exceeded")
-                            || err_str.contains("Decompressed payload")
-                            || e.downcast_ref::<SrvError>().is_some_and(|srv_err| {
-                                matches!(
-                                    srv_err,
-                                    SrvError::PayloadTooLarge { .. }
-                                        | SrvError::DecompressionLimitExceeded { .. }
-                                )
-                            })
-                        {
+                        if matches!(
+                            http_proxy::classify_error_chain(e.as_ref()),
+                            http_proxy::ProxyErrorKind::PayloadTooLarge
+                                | http_proxy::ProxyErrorKind::DecompressionLimitExceeded
+                        ) {
                             tracing::warn!(
                                 "{}: Request body exceeded buffered limit ({} bytes): {}",
                                 server_name,
@@ -443,12 +454,11 @@ impl Service<Request<SrvBody>> for RouterService {
                 match tokio::time::timeout(buffer_timeout, buffer_fut).await {
                     Ok(Ok(req_body)) => req_body,
                     Ok(Err(e)) => {
-                        let err_str = e.to_string();
-                        if matches!(e, SrvError::PayloadTooLarge { .. })
-                            || err_str.contains("Payload Limit Exceeded")
-                            || matches!(e, SrvError::DecompressionLimitExceeded { .. })
-                            || err_str.contains("Decompressed payload")
-                        {
+                        if matches!(
+                            http_proxy::classify_error_chain(&e),
+                            http_proxy::ProxyErrorKind::PayloadTooLarge
+                                | http_proxy::ProxyErrorKind::DecompressionLimitExceeded
+                        ) {
                             tracing::warn!("{}: Request body exceeded payload limit: {}", server_name, e);
                             return Ok(build_error_response(
                                 "Payload Too Large",
@@ -684,5 +694,88 @@ mod tests {
             .err()
             .expect("invalid HeaderValue in RouterParams.jwt must return Err");
         assert!(err.to_string().contains("Invalid [Server.RouterParams].jwt"));
+    }
+
+    #[tokio::test]
+    async fn test_router_early_content_length_rejects_buffered_route_before_reading_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tower::Service;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let toml_cfg = r#"
+            name = "early_cl_router"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+
+            [Layers]
+            enabled = []
+
+            [ReverseRoutes."/agg"]
+            strategy = "RoundRobin"
+            backend_type = "aggregate"
+            max_request_bytes = 64
+
+            [[ReverseRoutes."/agg".targets]]
+            key = "a"
+            backend_type = "rest"
+            upstreams = ["http://127.0.0.1:9001"]
+            path = "/a"
+        "#;
+        let mut cfg: ServerConfig = toml::from_str(toml_cfg).unwrap();
+        cfg.finalize().unwrap();
+        let mut svc = RouterService::new(Arc::new(cfg)).unwrap();
+
+        struct FlagBody {
+            polled: Arc<AtomicBool>,
+        }
+        impl http_body::Body for FlagBody {
+            type Data = bytes::Bytes;
+            type Error = SrvError;
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.polled.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(None)
+            }
+        }
+
+        let polled = Arc::new(AtomicBool::new(false));
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/agg")
+            .header(hyper::header::CONTENT_LENGTH, "1024")
+            .body(FlagBody { polled: polled.clone() }.boxed())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "Early Content-Length check must reject before polling request body"
+        );
+    }
+
+    #[test]
+    fn test_typed_error_classification_via_source_chain() {
+        let len_err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(SrvError::PayloadTooLarge { current: 20, max: 10 });
+        assert_eq!(
+            http_proxy::classify_error_chain(len_err.as_ref()),
+            http_proxy::ProxyErrorKind::PayloadTooLarge
+        );
+
+        let dec_err: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(SrvError::DecompressionLimitExceeded { max: 100 });
+        assert_eq!(
+            http_proxy::classify_error_chain(dec_err.as_ref()),
+            http_proxy::ProxyErrorKind::DecompressionLimitExceeded
+        );
     }
 }

@@ -1354,7 +1354,8 @@ fn build_quinn_server_config(
     let idle_timeout = quinn::IdleTimeout::try_from(Duration::from_secs(30))
         .map_err(|e| SrvError::Other(format!("Invalid QUIC idle timeout: {e}")))?;
     transport.max_idle_timeout(Some(idle_timeout));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    // Disable server-side QUIC PING keep-alives so `max_idle_timeout` actually closes idle connections.
+    transport.keep_alive_interval(None);
     quinn_server_config.transport_config(Arc::new(transport));
 
     Ok(quinn_server_config)
@@ -1565,9 +1566,15 @@ async fn handle_h3_connection(
                     let req_cert_san = client_cert_san.clone();
 
                     stream_tasks.spawn(async move {
+                        const H3_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
                         let _permit = permit;
-                        match resolver.resolve_request().await {
-                            Ok((req, stream)) => {
+                        match tokio::time::timeout(
+                            H3_HEADER_READ_TIMEOUT,
+                            resolver.resolve_request(),
+                        )
+                        .await
+                        {
+                            Ok(Ok((req, stream))) => {
                                 let (mut sender, receiver) = stream.split();
 
                                 let handler = ConnectionHandler::with_dynamic_stack_shared(
@@ -1583,46 +1590,73 @@ async fn handle_h3_connection(
                                 let body = H3Body::new(receiver);
                                 let hyper_req = Request::from_parts(parts, body.boxed());
 
-                                if let Ok(res) = handler.handle(hyper_req).await {
-                                    let (res_parts, mut res_body) = res.into_parts();
+                                match handler.handle(hyper_req).await {
+                                    Ok(res) => {
+                                        let (res_parts, mut res_body) = res.into_parts();
+                                        if let Err(e) = sender
+                                            .send_response(Response::from_parts(res_parts, ()))
+                                            .await
+                                        {
+                                            warn!("H3 send_response error: {e}");
+                                            return;
+                                        }
 
-                                    if sender
-                                        .send_response(Response::from_parts(res_parts, ()))
-                                        .await
-                                        .is_ok()
-                                    {
                                         while let Some(frame_res) = res_body.frame().await {
                                             match frame_res {
                                                 Ok(frame) => {
                                                     let frame = match frame.into_data() {
                                                         Ok(data) => {
-                                                            if sender.send_data(data).await.is_err() {
-                                                                break;
+                                                            if let Err(e) =
+                                                                sender.send_data(data).await
+                                                            {
+                                                                warn!("H3 send_data error: {e}");
+                                                                return;
                                                             }
                                                             continue;
                                                         }
                                                         Err(f) => f,
                                                     };
                                                     if let Ok(trailers) = frame.into_trailers()
-                                                        && sender.send_trailers(trailers).await.is_err()
+                                                        && let Err(e) =
+                                                            sender.send_trailers(trailers).await
                                                     {
-                                                        break;
+                                                        warn!("H3 send_trailers error: {e}");
+                                                        return;
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    tracing::error!(
-                                                        "H3 Response body stream error: {:?}",
-                                                        e
-                                                    );
+                                                    error!("H3 Response body stream error: {:?}", e);
                                                     break;
                                                 }
                                             }
                                         }
-                                        let _ = sender.finish().await;
+                                        if let Err(e) = sender.finish().await {
+                                            trace!("H3 stream finish notice: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("H3 handler error: {e}");
+                                        let mut err_resp = Response::new(());
+                                        *err_resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                        if let Err(send_err) = sender.send_response(err_resp).await {
+                                            warn!(
+                                                "H3 failed sending 500 fallback response: {send_err}"
+                                            );
+                                            return;
+                                        }
+                                        if let Err(fin_err) = sender.finish().await {
+                                            trace!("H3 fallback finish notice: {fin_err}");
+                                        }
                                     }
                                 }
                             }
-                            Err(e) => error!("H3 Request Error: {e}"),
+                            Ok(Err(e)) => error!("H3 Request Error: {e}"),
+                            Err(_) => {
+                                warn!(
+                                    "H3 request header read timeout after {:?}",
+                                    H3_HEADER_READ_TIMEOUT
+                                );
+                            }
                         }
                     });
                 }
@@ -1818,7 +1852,7 @@ mod tests {
 
     fn ensure_crypto_provider() {
         INIT_CRYPTO.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 

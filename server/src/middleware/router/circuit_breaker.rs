@@ -117,6 +117,7 @@ pub fn is_grpc_outlier_response(status: StatusCode, headers: &HeaderMap) -> bool
 pub struct ProbeGuard<'a> {
     node: &'a UpstreamNode,
     is_probe: bool,
+    captured_epoch: u64,
     completed: bool,
 }
 
@@ -126,12 +127,28 @@ impl<'a> ProbeGuard<'a> {
     /// Automatically checks if the node's cooldown just elapsed and attempts to
     /// claim the single `HalfOpen` probe slot.
     pub fn new(node: &'a UpstreamNode, cooldown_seconds: u64) -> Self {
-        let is_probe = node.try_enter_half_open_probe(cooldown_seconds);
-        Self {
-            node,
-            is_probe,
-            completed: false,
+        if let Some(probe_epoch) = node.try_enter_half_open_probe_epoch(cooldown_seconds) {
+            Self {
+                node,
+                is_probe: true,
+                captured_epoch: probe_epoch,
+                completed: false,
+            }
+        } else {
+            Self {
+                node,
+                is_probe: false,
+                captured_epoch: node.circuit_epoch.load(Ordering::Acquire),
+                completed: false,
+            }
         }
+    }
+
+    /// Returns the monotonic `circuit_epoch` captured when this request started
+    /// (or entered `HalfOpen`).
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.captured_epoch
     }
 
     /// Marks the request as having reached a definitive outcome (`record_success` or `record_failure`).
@@ -143,15 +160,28 @@ impl<'a> ProbeGuard<'a> {
 
 impl<'a> Drop for ProbeGuard<'a> {
     fn drop(&mut self) {
-        if self.is_probe && !self.completed {
+        if self.is_probe
+            && !self.completed
+            && self.node.circuit_epoch.load(Ordering::Acquire) == self.captured_epoch
+        {
             // Probe was aborted mid-flight without a definitive upstream verdict:
-            // release the probe lock and return the circuit to Open.
-            self.node
-                .half_open_probe_in_flight
-                .store(false, Ordering::Release);
-            self.node
+            // revert the circuit from HalfOpen -> Open atomically if still in the same epoch.
+            if self
+                .node
                 .circuit_state
-                .store(CircuitState::Open as u8, Ordering::Release);
+                .compare_exchange(
+                    CircuitState::HalfOpen as u8,
+                    CircuitState::Open as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.node.circuit_epoch.fetch_add(1, Ordering::AcqRel);
+                self.node
+                    .half_open_probe_in_flight
+                    .store(false, Ordering::Release);
+            }
         }
     }
 }
@@ -405,6 +435,42 @@ mod tests {
         assert!(node.record_failure(5));
         assert_eq!(node.circuit_state(), CircuitState::Open);
         assert!(!node.is_available(10));
+    }
+
+    #[test]
+    fn test_circuit_breaker_late_success_does_not_close_open_or_corrupt_epoch() {
+        let uri: Uri = "http://127.0.0.1:8080".parse().unwrap();
+        let node = UpstreamNode::new(uri);
+        let initial_epoch = node.circuit_epoch.load(Ordering::Acquire);
+
+        // Trip circuit open
+        node.mark_dead();
+        assert_eq!(node.circuit_state(), CircuitState::Open);
+        assert!(!node.is_available(10));
+
+        // A late 2xx response must never close an Open circuit
+        node.record_success();
+        assert_eq!(node.circuit_state(), CircuitState::Open);
+        assert!(!node.is_available(10));
+
+        // Even once cooldown elapses and a new HalfOpen probe starts (new epoch),
+        // an epoch-stamped late success from the earlier epoch must be ignored.
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 15;
+        node.last_failure_time.store(past, Ordering::Relaxed);
+        let guard = ProbeGuard::new(&node, 10);
+        assert_eq!(node.circuit_state(), CircuitState::HalfOpen);
+        assert_ne!(guard.epoch(), initial_epoch);
+
+        node.record_success_with_epoch(initial_epoch);
+        assert_eq!(node.circuit_state(), CircuitState::HalfOpen);
+
+        // Dropping the uncompleted ProbeGuard reverts HalfOpen back to Open safely.
+        drop(guard);
+        assert_eq!(node.circuit_state(), CircuitState::Open);
     }
 
     #[tokio::test]

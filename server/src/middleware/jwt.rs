@@ -59,6 +59,8 @@ pub struct JwtRevocationStore {
     revoked: Arc<DashMap<String, u64>>,
     /// Timestamp (UNIX seconds) of last expired-entries cleanup.
     last_cleanup: Arc<std::sync::atomic::AtomicU64>,
+    /// Number of revocations dropped because all capacity was held by >= `expires_at` entries.
+    overflow_drops: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JwtRevocationStore {
@@ -66,14 +68,30 @@ impl JwtRevocationStore {
         Self {
             revoked: Arc::new(DashMap::new()),
             last_cleanup: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            overflow_drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Marks a JWT with the given `jti` as revoked until `expires_at`.
     pub fn revoke(&self, jti: impl Into<String>, expires_at: u64) {
+        let _ = self.try_revoke(jti, expires_at);
+    }
+
+    /// Marks a JWT with the given `jti` as revoked until `expires_at`, returning `false`
+    /// only if the input is invalid or the store is at capacity with exclusively equal/longer-lived
+    /// entries.
+    ///
+    /// When at `MAX_REVOKED_ENTRIES`:
+    /// 1. Immediately sweeps expired entries regardless of cleanup interval.
+    /// 2. If still full, evicts the earliest-expiring entry if `expires_at > min_exp` so
+    ///    shorter-lived revocations do not silently block longer-lived token revocations.
+    /// 3. If all retained entries live at least as long as `expires_at`, refuses eviction to
+    ///    prevent revocation-eviction DoS attacks, increments [`Self::overflow_drops`], and
+    ///    returns `false`.
+    pub fn try_revoke(&self, jti: impl Into<String>, expires_at: u64) -> bool {
         let jti_str = jti.into();
         if jti_str.is_empty() || jti_str.len() > MAX_JTI_LEN {
-            return;
+            return false;
         }
 
         let now = std::time::SystemTime::now()
@@ -82,8 +100,11 @@ impl JwtRevocationStore {
             .as_secs();
 
         let last = self.last_cleanup.load(std::sync::atomic::Ordering::Relaxed);
-        if (self.revoked.len() >= MAX_REVOKED_ENTRIES
-            || now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS)
+        if self.revoked.len() >= MAX_REVOKED_ENTRIES {
+            self.last_cleanup
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+            self.cleanup_expired();
+        } else if now.saturating_sub(last) >= REVOCATION_CLEANUP_INTERVAL_SECS
             && self
                 .last_cleanup
                 .compare_exchange(
@@ -93,18 +114,51 @@ impl JwtRevocationStore {
                     std::sync::atomic::Ordering::Relaxed,
                 )
                 .is_ok()
-            {
-                self.cleanup_expired();
-            }
+        {
+            self.cleanup_expired();
+        }
 
         if self.revoked.len() < MAX_REVOKED_ENTRIES || self.revoked.contains_key(&jti_str) {
             self.revoked.insert(jti_str, expires_at);
-        } else {
-            tracing::warn!(
-                "JwtRevocationStore capacity ({}) reached; dropping revocation for jti",
-                MAX_REVOKED_ENTRIES
-            );
+            return true;
         }
+
+        // Store is still full with non-expired entries: evict the earliest-expiring entry
+        // only when the incoming revocation protects a strictly longer lifetime.
+        let earliest = self
+            .revoked
+            .iter()
+            .min_by_key(|entry| *entry.value())
+            .map(|entry| (entry.key().clone(), *entry.value()));
+
+        if let Some((min_key, min_exp)) = earliest
+            && expires_at > min_exp
+            && self.revoked.remove_if(&min_key, |_, exp| *exp == min_exp).is_some()
+            && self.revoked.len() < MAX_REVOKED_ENTRIES
+        {
+            tracing::warn!(
+                "JwtRevocationStore capacity ({}) reached; evicted earliest-expiring entry (exp={}) for longer-lived jti (exp={})",
+                MAX_REVOKED_ENTRIES,
+                min_exp,
+                expires_at
+            );
+            self.revoked.insert(jti_str, expires_at);
+            return true;
+        }
+
+        self.overflow_drops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::error!(
+            "JwtRevocationStore capacity ({}) exhausted by active entries (>= exp {}); dropping revocation for jti",
+            MAX_REVOKED_ENTRIES,
+            expires_at
+        );
+        false
+    }
+
+    /// Returns the cumulative number of revocations dropped due to store saturation.
+    pub fn overflow_drops(&self) -> u64 {
+        self.overflow_drops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Checks if a `jti` has been revoked. If expired, lazily prunes it.
@@ -640,6 +694,36 @@ mod tests {
 
         store.revoke("x".repeat(MAX_JTI_LEN), far_future);
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn test_jwt_revocation_store_evicts_earliest_expiring_when_longer_jti_revoked() {
+        let store = JwtRevocationStore::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let shorter_exp = now + 60;
+        let medium_exp = now + 600;
+        let longer_exp = now + 3600;
+
+        store.revoke("short-jti", shorter_exp);
+        for i in 1..MAX_REVOKED_ENTRIES {
+            store.revoke(format!("med-{i}"), medium_exp);
+        }
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+
+        // Longer-lived token evicts the earliest-expiring entry ("short-jti")
+        assert!(store.try_revoke("long-jti", longer_exp));
+        assert_eq!(store.len(), MAX_REVOKED_ENTRIES);
+        assert!(store.is_revoked("long-jti"));
+        assert!(!store.is_revoked("short-jti"));
+        assert_eq!(store.overflow_drops(), 0);
+
+        // Shorter/equal token cannot evict longer-lived active entries and increments overflow_drops
+        assert!(!store.try_revoke("too-short", now + 30));
+        assert_eq!(store.overflow_drops(), 1);
+        assert!(store.is_revoked("long-jti"));
     }
 
     #[tokio::test]
