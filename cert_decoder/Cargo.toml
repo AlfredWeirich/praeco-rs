@@ -1,9 +1,10 @@
 [package]
 name = "praeco-cert-decoder"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
-description = "Certificate decoder utility for praeco-rs"
+description = "Lightweight PEM X.509 certificate inspection CLI that decodes ASN.1 extensions and custom enterprise OID payloads for Praeco zero-trust RBAC role debugging"
+readme = "Readme.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -1877,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-cert-decoder"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "asn1-rs",
  "x509-parser",
@@ -1885,7 +1885,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1906,7 +1906,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "hyper",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-jwt-creator"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "praeco-common",
  "uuid",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-reflection"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bytes",
  "clap",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-relay-server"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-rs"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "arc-swap",

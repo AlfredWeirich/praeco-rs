@@ -1,9 +1,10 @@
 [package]
 name = "praeco-reflection"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
-description = "gRPC reflection proxy logic for praeco-rs"
+description = "Dynamic gRPC Server Reflection HTTP/JSON-to-Protobuf transcoding router, reference Tonic backend, and static test client with payload/connection limits for the Praeco workspace"
+readme = "Readme.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

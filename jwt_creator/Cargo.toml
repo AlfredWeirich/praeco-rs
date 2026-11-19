@@ -1,9 +1,10 @@
 [package]
 name = "praeco-jwt-creator"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 rust-version.workspace = true
-description = "JWT generation utility for praeco-rs"
+description = "CLI developer utility for minting and verifying Ed25519 (EdDSA) JWT token pairs with configurable issuer, audience, subject, enterprise OID claims, and TTLs for Praeco auth testing"
+readme = "Readme.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

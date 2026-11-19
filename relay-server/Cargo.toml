@@ -1,9 +1,10 @@
 [package]
 name = "praeco-relay-server"
-version = "0.3.3"
+version = "0.3.4"
 edition.workspace = true
 rust-version.workspace = true
-description = "Zero-Trust Layer-4 SNI Relay and Reverse Tunnel Server with mTLS SAN routing, Yamux multiplexing, E2EE TLS passthrough, and PROXY Protocol v2"
+description = "Zero-Trust Layer-4 SNI Relay and Reverse Tunnel Server featuring mTLS SAN authentication, Yamux stream multiplexing, live CRL & certificate expiry enforcement, connection/rate limits, E2EE TLS passthrough, and PROXY Protocol v2"
+readme = "README.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

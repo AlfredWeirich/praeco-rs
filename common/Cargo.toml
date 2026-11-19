@@ -1,9 +1,10 @@
 [package]
 name = "praeco-common"
-version = "0.5.1"
+version = "0.5.2"
 edition.workspace = true
 rust-version.workspace = true
-description = "Shared HTTP/TLS client utilities for praeco-rs"
+description = "Shared TLS/mTLS root-store builders, Hyper HTTP/1.1+HTTP/2 client pools, EdDSA JWT verification, HAProxy PROXY Protocol v2 codecs, and IPv6/IPv4 canonicalization helpers for the Praeco workspace"
+readme = "Readme.md"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
