@@ -59,6 +59,18 @@ pub const DEFAULT_CONTROL_MAX_CONNECTIONS: usize = 256;
 /// Default maximum concurrent connections per IP (/64) on the Control Plane (Port `7001`).
 pub const DEFAULT_CONTROL_MAX_CONNECTIONS_PER_IP: usize = 16;
 
+/// Default timeout in milliseconds when probing an existing tunnel driver's liveness before
+/// permitting a same-certificate stale-tunnel takeover (`S-10`).
+pub const DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS: u64 = 1500;
+
+static SAME_CERT_TAKEOVER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the cumulative number of same-certificate stale-tunnel takeovers executed by the
+/// relay Control Plane (`S-10`).
+pub fn same_cert_takeover_count() -> u64 {
+    SAME_CERT_TAKEOVER_COUNT.load(Ordering::Relaxed)
+}
+
 const MIN_YAMUX_CONNECTION_WINDOW: usize = 4 * 1024 * 1024;
 
 pub(crate) fn build_yamux_config(max_streams: usize) -> YamuxConfig {
@@ -155,7 +167,8 @@ pub enum RelayError {
 pub struct Control {
     tx: mpsc::Sender<oneshot::Sender<Result<YamuxStream, yamux::ConnectionError>>>,
     cert_fingerprint: Option<[u8; 32]>,
-    probe_tx: Option<mpsc::Sender<oneshot::Sender<bool>>>,
+    probe_notify: Option<Arc<tokio::sync::Notify>>,
+    probe_ack_rx: Option<tokio::sync::watch::Receiver<u64>>,
     takeover_token: Option<CancellationToken>,
 }
 
@@ -167,7 +180,8 @@ impl Control {
         Self {
             tx,
             cert_fingerprint: None,
-            probe_tx: None,
+            probe_notify: None,
+            probe_ack_rx: None,
             takeover_token: None,
         }
     }
@@ -175,35 +189,39 @@ impl Control {
     fn with_identity(
         tx: mpsc::Sender<oneshot::Sender<Result<YamuxStream, yamux::ConnectionError>>>,
         cert_fingerprint: Option<[u8; 32]>,
-        probe_tx: mpsc::Sender<oneshot::Sender<bool>>,
+        probe_notify: Arc<tokio::sync::Notify>,
+        probe_ack_rx: tokio::sync::watch::Receiver<u64>,
         takeover_token: CancellationToken,
     ) -> Self {
         Self {
             tx,
             cert_fingerprint,
-            probe_tx: Some(probe_tx),
+            probe_notify: Some(probe_notify),
+            probe_ack_rx: Some(probe_ack_rx),
             takeover_token: Some(takeover_token),
         }
     }
 
     /// Probes whether the existing tunnel driver is still alive when a reconnect
-    /// with the same client certificate arrives.
-    async fn probe_liveness(&self) -> bool {
+    /// with the same client certificate arrives (`S-10`).
+    ///
+    /// Uses a lockless, coalesced `Notify` + monotonic `watch<u64>` sequence instead of
+    /// a fixed-capacity probe channel so concurrent reconnect bursts never stall behind
+    /// stale channel entries.
+    async fn probe_liveness(&self, timeout: Duration) -> bool {
         if self.is_closed() {
             return false;
         }
-        let Some(ref probe_tx) = self.probe_tx else {
+        let (Some(probe_notify), Some(ack_rx)) = (&self.probe_notify, &self.probe_ack_rx) else {
             return true;
         };
-        let (ack_tx, ack_rx) = oneshot::channel();
-        if probe_tx.send(ack_tx).await.is_err() {
-            return false;
-        }
-        tokio::time::timeout(Duration::from_millis(250), ack_rx)
-            .await
-            .ok()
-            .and_then(|res| res.ok())
-            .unwrap_or(false)
+        let mut ack_rx = ack_rx.clone();
+        let before_seq = *ack_rx.borrow_and_update();
+        probe_notify.notify_one();
+        matches!(
+            tokio::time::timeout(timeout, ack_rx.wait_for(|&seq| seq > before_seq)).await,
+            Ok(Ok(_))
+        )
     }
 
     fn trigger_takeover(&self) {
@@ -257,6 +275,8 @@ pub struct ControlPlaneOptions {
     pub connection_tracker: Arc<RelayConnectionTracker>,
     /// Optional watch receiver delivering reloaded [`TlsAcceptor`] and CRL serial sets.
     pub reload_rx: Option<tokio::sync::watch::Receiver<ControlPlaneReloadState>>,
+    /// Timeout for liveness probing before performing a same-certificate takeover (`S-10`).
+    pub liveness_probe_timeout: Duration,
 }
 
 impl Default for ControlPlaneOptions {
@@ -267,6 +287,9 @@ impl Default for ControlPlaneOptions {
                 DEFAULT_CONTROL_MAX_CONNECTIONS_PER_IP,
             )),
             reload_rx: None,
+            liveness_probe_timeout: Duration::from_millis(
+                DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS,
+            ),
         }
     }
 }
@@ -299,6 +322,7 @@ async fn try_register_tunnel_with_takeover(
     tunnels: &SessionMap,
     sni: String,
     route: TunnelRoute,
+    liveness_probe_timeout: Duration,
 ) -> bool {
     let probe_candidate = {
         match tunnels.entry(sni.clone()) {
@@ -323,12 +347,19 @@ async fn try_register_tunnel_with_takeover(
     };
 
     if let Some((stale_gen, stale_control)) = probe_candidate
-        && !stale_control.probe_liveness().await
-        && let dashmap::mapref::entry::Entry::Occupied(mut occupied) = tunnels.entry(sni)
+        && !stale_control.probe_liveness(liveness_probe_timeout).await
+        && let dashmap::mapref::entry::Entry::Occupied(mut occupied) = tunnels.entry(sni.clone())
         && occupied.get().generation == stale_gen
     {
         occupied.insert(route);
         stale_control.trigger_takeover();
+        let total_takeovers = SAME_CERT_TAKEOVER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        warn!(
+            target: "relay::control_plane",
+            sni = %sanitize_log_str(&sni),
+            total_takeovers,
+            "Replaced unresponsive tunnel via same-certificate takeover"
+        );
         return true;
     }
 
@@ -388,6 +419,7 @@ async fn handle_control_connection_with_cancel<S>(
         enable_proxy_protocol,
         cancel_token,
         None,
+        Duration::from_millis(DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS),
     )
     .await;
 }
@@ -403,7 +435,8 @@ async fn handle_control_connection_with_cancel<S>(
         max_yamux_streams,
         enable_proxy_protocol,
         cancel_token,
-        reload_rx
+        reload_rx,
+        liveness_probe_timeout
     ),
     fields(client_ip = %client_addr)
 )]
@@ -417,6 +450,7 @@ async fn handle_control_connection_with_reload<S>(
     enable_proxy_protocol: bool,
     cancel_token: CancellationToken,
     mut reload_rx: Option<tokio::sync::watch::Receiver<ControlPlaneReloadState>>,
+    liveness_probe_timeout: Duration,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -540,9 +574,17 @@ async fn handle_control_connection_with_reload<S>(
     }
 
     let (tx, mut rx) = mpsc::channel(32);
-    let (probe_tx, mut probe_rx) = mpsc::channel::<oneshot::Sender<bool>>(4);
+    let probe_notify = Arc::new(tokio::sync::Notify::new());
+    let (probe_ack_tx, probe_ack_rx) = tokio::sync::watch::channel(0u64);
+    let mut probe_seq = 0u64;
     let takeover_token = CancellationToken::new();
-    let control = Control::with_identity(tx, cert_fingerprint, probe_tx, takeover_token.clone());
+    let control = Control::with_identity(
+        tx,
+        cert_fingerprint,
+        probe_notify.clone(),
+        probe_ack_rx,
+        takeover_token.clone(),
+    );
 
     // --- Store with Generation ID (P0.5) & Atomic Overwrite Protection (P0.3 / S-27) ---
     static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -553,7 +595,9 @@ async fn handle_control_connection_with_reload<S>(
         generation: my_generation,
         supports_proxy_v2,
     };
-    if !try_register_tunnel_with_takeover(&tunnels, sni.clone(), route).await {
+    if !try_register_tunnel_with_takeover(&tunnels, sni.clone(), route, liveness_probe_timeout)
+        .await
+    {
         warn!(
             target: "relay::control_plane",
             sni = %sanitize_log_str(&sni),
@@ -624,19 +668,20 @@ async fn handle_control_connection_with_reload<S>(
 
                 std::task::Poll::Pending
             }) => break,
-            Some(ack_tx) = probe_rx.recv() => {
+            () = probe_notify.notified() => {
                 let mut noop_cx = std::task::Context::from_waker(std::task::Waker::noop());
                 match connection.poll_next_inbound(&mut noop_cx) {
                     std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
-                        let _ = ack_tx.send(false);
                         break;
                     }
                     std::task::Poll::Ready(Some(Ok(unexpected))) => {
                         drop(unexpected);
-                        let _ = ack_tx.send(true);
+                        probe_seq = probe_seq.wrapping_add(1);
+                        let _ = probe_ack_tx.send(probe_seq);
                     }
                     std::task::Poll::Pending => {
-                        let _ = ack_tx.send(true);
+                        probe_seq = probe_seq.wrapping_add(1);
+                        let _ = probe_ack_tx.send(probe_seq);
                     }
                 }
             }
@@ -810,6 +855,7 @@ pub async fn run_control_plane_with_options(
         let tunnels = tunnels.clone();
         let conn_cancel = cancel_token.child_token();
         let reload_rx = options.reload_rx.clone();
+        let probe_timeout = options.liveness_probe_timeout;
 
         conn_tasks.spawn(async move {
             let _guard = conn_guard;
@@ -823,6 +869,7 @@ pub async fn run_control_plane_with_options(
                 enable_proxy_protocol,
                 conn_cancel,
                 reload_rx,
+                probe_timeout,
             )
             .await;
         });

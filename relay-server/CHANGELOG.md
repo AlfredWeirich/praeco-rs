@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Removed the `PRAECO_STRICT_CRL` environment variable and made strict CRL validation the TOML-only default (`RelayConfig::strict_crl: Option<bool>`, default `Some(true)`), enabling `rustls`'s `enforce_revocation_expiration()` on `WebPkiClientVerifier`.
 * **O(1) Data-Plane Rate-Limit Saturation (`src/limits.rs`):**
   * Replaced unthrottled O(n) `sweep_expired` + `min_by_key` LRU eviction on `RateLimitTable` saturation with a 1-second throttled sweep and a shared O(1) `overflow_bucket` (`Mutex<Option<TokenBucket>>`), preventing O(n) CPU DoS and eviction of active IP buckets under IPv6 `/64` floods.
+* **Same-Cert Takeover Hardening & Metrics (`src/config.rs`, `src/lib.rs`, `src/main.rs`):**
+  * Replaced the bounded `mpsc::channel(4)` liveness probe mechanism in `Control` with lock-free/coalescing `tokio::sync::Notify` + `tokio::sync::watch::Receiver<u64>` signaling so concurrent probes never block on a full queue and driver shutdown fails fast.
+  * Made the takeover probe timeout configurable via `RelayConfig::same_cert_takeover_probe_timeout_ms` (`Option<u64>`, default `Some(1500)`) and `ControlPlaneOptions::liveness_probe_timeout` (default `1500 ms`), reducing tunnel flapping under load.
+  * Added a process-wide takeover metric counter (`same_cert_takeover_count() -> u64`) and warning logs whenever an unresponsive tunnel is displaced by a reconnecting same-certificate peer.
 
 ---
 

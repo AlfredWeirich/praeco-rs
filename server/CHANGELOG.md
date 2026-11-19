@@ -39,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Added `pub session_cache_size: Option<usize>` and `pub session_tickets: bool` to `ServerCertConfig` (TOML-compatible via `#[serde(default)]`).
   * Raised the default `ServerSessionMemoryCache` size from `1024` to `20_000` (`DEFAULT_TLS_SESSION_CACHE_SIZE`) for non-mTLS listeners, kept `1024` (`DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE`) for mTLS listeners without CRLs, and defaulted mTLS listeners with `ssl_client_crl` to `NoServerSessionStorage` (`0`) so revoked certificates are not bypassed by resumed sessions.
   * Added opt-in stateless `session_tickets` (`rustls::crypto::aws_lc_rs::Ticketer`, 12 h max lifetime), rejected at startup (`ServerConfig::finalize` and `tls_conf::tls_config`) when paired with `ssl_client_crl`.
+* **Substring Log Redaction (`src/middleware/logger.rs`, `S-09`):**
+  * Replaced exact header/query key matching in `sanitize_headers` and `sanitize_uri` with case-insensitive substring matching (`token`, `secret`, `session`, `jwt`, `key`, `pass`, `sig`, `auth`, `credential`) so variants such as `access_token`, `id_token`, `refresh_token`, `api_key`, `password`, `signature`, `x-api-key`, and `x-auth-token` are redacted consistently.
+  * Restricted unmasked `code` query parameter logging strictly to `/auth/confirm` (onboarding flow) while redacting `code` on all other paths (e.g., OAuth callbacks).
 
 ---
 

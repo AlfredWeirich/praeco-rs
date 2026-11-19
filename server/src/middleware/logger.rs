@@ -162,37 +162,59 @@ where
     }
 }
 
-/// Redacts sensitive response headers like Set-Cookie, Cookie, and Authorization from logs.
+/// Substrings identifying sensitive credential/session parameter and header names redacted from logs (`S-09`).
+const SENSITIVE_KEY_SUBSTRINGS: &[&str] = &[
+    "token",
+    "secret",
+    "session",
+    "jwt",
+    "key",
+    "pass",
+    "sig",
+    "auth",
+    "credential",
+];
+
+/// Returns `true` if a header or query-parameter name matches any sensitive credential substring.
+fn is_sensitive_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    SENSITIVE_KEY_SUBSTRINGS
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Redacts sensitive response headers (`Set-Cookie`, `Cookie`, `Authorization`, API keys, tokens) from logs.
 fn sanitize_headers(headers: &hyper::HeaderMap) -> hyper::HeaderMap {
     let mut sanitized = headers.clone();
-    let sensitive = [
-        hyper::header::SET_COOKIE,
-        hyper::header::COOKIE,
-        hyper::header::AUTHORIZATION,
-    ];
-    for name in &sensitive {
-        if sanitized.contains_key(name) {
-            sanitized.insert(
-                name.clone(),
-                hyper::header::HeaderValue::from_static("[REDACTED]"),
-            );
-        }
+    let sensitive_names: Vec<hyper::header::HeaderName> = sanitized
+        .keys()
+        .filter(|name| {
+            *name == hyper::header::SET_COOKIE
+                || *name == hyper::header::COOKIE
+                || is_sensitive_key(name.as_str())
+        })
+        .cloned()
+        .collect();
+    for name in sensitive_names {
+        sanitized.insert(name, hyper::header::HeaderValue::from_static("[REDACTED]"));
     }
     sanitized
 }
 
-/// Redacts sensitive query parameters like session, token, secret, jwt from logs.
-/// Note: 'code' (e.g. user_code / one-time pairing codes) is deliberately kept visible for device onboarding.
+/// Redacts sensitive query parameters from logs via case-insensitive substring matching (`S-09`).
+///
+/// Note: `code` is kept visible strictly on `/auth/confirm` for device onboarding pairing codes,
+/// and redacted on all other paths (e.g. OAuth authorization-code callbacks).
 fn sanitize_uri(uri: &hyper::Uri) -> String {
+    let path = uri.path();
     if let Some(query) = uri.query() {
         let sanitized_query: Vec<String> = query
             .split('&')
             .map(|pair| {
                 if let Some((k, _)) = pair.split_once('=') {
-                    if matches!(
-                        k.to_lowercase().as_str(),
-                        "session" | "token" | "jwt" | "secret" | "poll_secret"
-                    ) {
+                    let is_oauth_code =
+                        k.eq_ignore_ascii_case("code") && path != "/auth/confirm";
+                    if is_sensitive_key(k) || is_oauth_code {
                         format!("{}=[REDACTED]", k)
                     } else {
                         pair.to_string()
@@ -202,7 +224,7 @@ fn sanitize_uri(uri: &hyper::Uri) -> String {
                 }
             })
             .collect();
-        format!("{}?{}", uri.path(), sanitized_query.join("&"))
+        format!("{}?{}", path, sanitized_query.join("&"))
     } else {
         uri.to_string()
     }
@@ -292,12 +314,16 @@ mod tests {
         headers.insert(hyper::header::SET_COOKIE, "admin-jwt=secret123; Path=/; HttpOnly".parse().unwrap());
         headers.insert(hyper::header::AUTHORIZATION, "Bearer topsecret456".parse().unwrap());
         headers.insert(hyper::header::COOKIE, "session_id=789".parse().unwrap());
+        headers.insert("x-api-key", "secret-key-xyz".parse().unwrap());
+        headers.insert("x-auth-token", "tok-999".parse().unwrap());
 
         let sanitized = sanitize_headers(&headers);
         assert_eq!(sanitized.get(hyper::header::CONTENT_TYPE).unwrap(), "application/json");
         assert_eq!(sanitized.get(hyper::header::SET_COOKIE).unwrap(), "[REDACTED]");
         assert_eq!(sanitized.get(hyper::header::AUTHORIZATION).unwrap(), "[REDACTED]");
         assert_eq!(sanitized.get(hyper::header::COOKIE).unwrap(), "[REDACTED]");
+        assert_eq!(sanitized.get("x-api-key").unwrap(), "[REDACTED]");
+        assert_eq!(sanitized.get("x-auth-token").unwrap(), "[REDACTED]");
     }
 
     #[test]
@@ -311,5 +337,11 @@ mod tests {
 
         let code_uri: hyper::Uri = "/auth/confirm?session=abc123456&code=891023".parse().unwrap();
         assert_eq!(sanitize_uri(&code_uri), "/auth/confirm?session=[REDACTED]&code=891023");
+
+        let oauth_uri: hyper::Uri = "/oauth/callback?access_token=a1&id_token=b2&refresh_token=c3&API_Key=d4&apikey=e5&key=f6&password=g7&passwd=h8&sig=i9&signature=j0&credentials=k1&code=l2&state=ok".parse().unwrap();
+        assert_eq!(
+            sanitize_uri(&oauth_uri),
+            "/oauth/callback?access_token=[REDACTED]&id_token=[REDACTED]&refresh_token=[REDACTED]&API_Key=[REDACTED]&apikey=[REDACTED]&key=[REDACTED]&password=[REDACTED]&passwd=[REDACTED]&sig=[REDACTED]&signature=[REDACTED]&credentials=[REDACTED]&code=[REDACTED]&state=ok"
+        );
     }
 }

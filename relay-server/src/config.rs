@@ -78,6 +78,10 @@ pub struct RelayConfig {
     /// and enforce `nextUpdate` expiration at mTLS handshake time). Defaults to `true` (fail-closed).
     #[serde(default)]
     pub strict_crl: Option<bool>,
+    /// Timeout in milliseconds when probing an existing tunnel driver's liveness before
+    /// performing a same-certificate takeover (default: `1500`).
+    #[serde(default)]
+    pub same_cert_takeover_probe_timeout_ms: Option<u64>,
 }
 
 impl Default for RelayConfig {
@@ -110,6 +114,9 @@ impl Default for RelayConfig {
             control_plane_max_concurrent_connections_per_ip: Some(16),
             crl_reload_interval_secs: Some(60),
             strict_crl: Some(true),
+            same_cert_takeover_probe_timeout_ms: Some(
+                crate::DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS,
+            ),
         }
     }
 }
@@ -186,6 +193,7 @@ mod tests {
         assert_eq!(cfg.tunnel_stream_open_timeout_secs, Some(5));
         assert_eq!(cfg.max_yamux_streams, Some(4096));
         assert_eq!(cfg.enable_proxy_protocol, Some(true));
+        assert_eq!(cfg.same_cert_takeover_probe_timeout_ms, Some(1500));
     }
 
     #[test]
@@ -220,6 +228,7 @@ mod tests {
             server_cert_path = "cert.pem"
             server_key_path = "key.pem"
             enable_proxy_protocol = false
+            same_cert_takeover_probe_timeout_ms = 2500
         "#;
         fs::write(&ok_path, valid_toml).unwrap();
         let loaded = RelayConfig::load(&ok_path.to_string_lossy()).expect("valid config should load");
@@ -227,6 +236,7 @@ mod tests {
         assert_eq!(loaded.control_plane_addr, "127.0.0.1:7101");
         assert_eq!(loaded.data_plane_addr, "127.0.0.1:8443");
         assert_eq!(loaded.enable_proxy_protocol, Some(false));
+        assert_eq!(loaded.same_cert_takeover_probe_timeout_ms, Some(2500));
 
         // 4. Unknown fields (e.g. typo in crl_path) must be rejected
         let typo_path = std::env::temp_dir().join(format!(

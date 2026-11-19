@@ -1048,6 +1048,7 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `tunnel_stream_open_timeout_secs` | Integer | Optional | `5` | Timeout in seconds for opening a Yamux tunnel stream (`control.open_stream()`) and writing initial PROXY-v2 / `ClientHello` bytes. |
 | `max_yamux_streams` | Integer | Optional | `4096` | Maximum concurrent multiplexed Yamux streams per tunnel connection. |
 | `enable_proxy_protocol` | Boolean | Optional | `true` | When `true`, injects HAProxy PROXY-Protocol v2 headers into tunnel streams, propagating real client IPs to Praeco backend instances. |
+| `same_cert_takeover_probe_timeout_ms` | Integer | Optional | `1500` | Liveness probe timeout in milliseconds before a reconnecting backend presenting the same client certificate fingerprint can replace an existing tunnel route (values `0` are clamped to `1` ms). |
 
 > **Strict Schema Validation:** `RelayConfig` uses `#[serde(deny_unknown_fields)]`, so unrecognized keys in `RelayConfig.toml` cause startup to fail fast.
 

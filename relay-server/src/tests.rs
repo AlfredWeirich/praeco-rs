@@ -710,6 +710,7 @@ use std::net::IpAddr;
                 true,
                 CancellationToken::new(),
                 Some(reload_rx),
+                Duration::from_millis(DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS),
             )
             .await;
         });
@@ -830,17 +831,21 @@ use std::net::IpAddr;
         let tunnels = new_session_map();
         let fp_a = [0xAAu8; 32];
         let fp_b = [0xBBu8; 32];
+        let probe_timeout = Duration::from_millis(200);
+        let takeovers_before = same_cert_takeover_count();
 
-        // Simulated dead/unresponsive driver where probe channel returns false
+        // Simulated dead/unresponsive driver where probe ack receiver stays dropped/unacked
         let (tx1, _rx1) = mpsc::channel(4);
-        let (probe_tx1, mut probe_rx1) = mpsc::channel::<oneshot::Sender<bool>>(4);
+        let probe_notify1 = Arc::new(tokio::sync::Notify::new());
+        let (_probe_ack_tx1, probe_ack_rx1) = tokio::sync::watch::channel(0u64);
         let token1 = CancellationToken::new();
-        tokio::spawn(async move {
-            if let Some(ack) = probe_rx1.recv().await {
-                let _ = ack.send(false);
-            }
-        });
-        let ctrl1 = Control::with_identity(tx1, Some(fp_a), probe_tx1, token1.clone());
+        let ctrl1 = Control::with_identity(
+            tx1,
+            Some(fp_a),
+            probe_notify1,
+            probe_ack_rx1,
+            token1.clone(),
+        );
         tunnels.insert(
             "svc.example.com".to_string(),
             TunnelRoute {
@@ -852,11 +857,13 @@ use std::net::IpAddr;
 
         // Foreign certificate must be rejected even if old peer looks dead via probe
         let (tx_foreign, _rx_f) = mpsc::channel(4);
-        let (probe_f, _prx_f) = mpsc::channel(4);
+        let probe_notify_f = Arc::new(tokio::sync::Notify::new());
+        let (_probe_ack_tx_f, probe_ack_rx_f) = tokio::sync::watch::channel(0u64);
         let ctrl_foreign = Control::with_identity(
             tx_foreign,
             Some(fp_b),
-            probe_f,
+            probe_notify_f,
+            probe_ack_rx_f,
             CancellationToken::new(),
         );
         assert!(
@@ -867,16 +874,40 @@ use std::net::IpAddr;
                     control: ctrl_foreign,
                     generation: 2,
                     supports_proxy_v2: false,
-                }
+                },
+                probe_timeout,
             )
             .await
         );
         assert_eq!(tunnels.get("svc.example.com").unwrap().generation, 1);
+        assert_eq!(same_cert_takeover_count(), takeovers_before);
 
         // Same certificate takes over unresponsive route cleanly and cancels old driver
         let (tx2, _rx2) = mpsc::channel(4);
-        let (probe2, _prx2) = mpsc::channel(4);
-        let ctrl2 = Control::with_identity(tx2, Some(fp_a), probe2, CancellationToken::new());
+        let probe_notify2 = Arc::new(tokio::sync::Notify::new());
+        let (probe_ack_tx2, probe_ack_rx2) = tokio::sync::watch::channel(0u64);
+        let probe_notify2_task = Arc::clone(&probe_notify2);
+        let token2 = CancellationToken::new();
+        let token2_task = token2.clone();
+        tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                tokio::select! {
+                    _ = token2_task.cancelled() => break,
+                    _ = probe_notify2_task.notified() => {
+                        seq = seq.saturating_add(1);
+                        let _ = probe_ack_tx2.send(seq);
+                    }
+                }
+            }
+        });
+        let ctrl2 = Control::with_identity(
+            tx2,
+            Some(fp_a),
+            probe_notify2,
+            probe_ack_rx2,
+            token2.clone(),
+        );
         assert!(
             try_register_tunnel_with_takeover(
                 &tunnels,
@@ -885,12 +916,53 @@ use std::net::IpAddr;
                     control: ctrl2,
                     generation: 3,
                     supports_proxy_v2: false,
-                }
+                },
+                probe_timeout,
             )
             .await
         );
         assert_eq!(tunnels.get("svc.example.com").unwrap().generation, 3);
         assert!(token1.is_cancelled());
+        assert!(same_cert_takeover_count() > takeovers_before);
+
+        // Live responsive same-cert peer must NOT be displaced, even under concurrent probes
+        let takeovers_after_first = same_cert_takeover_count();
+        let route_live = tunnels.get("svc.example.com").unwrap().clone();
+        let (probe_res_1, probe_res_2, probe_res_3) = tokio::join!(
+            route_live.control.probe_liveness(probe_timeout),
+            route_live.control.probe_liveness(probe_timeout),
+            route_live.control.probe_liveness(probe_timeout),
+        );
+        assert!(probe_res_1 && probe_res_2 && probe_res_3);
+
+        let (tx3, _rx3) = mpsc::channel(4);
+        let probe_notify3 = Arc::new(tokio::sync::Notify::new());
+        let (_probe_ack_tx3, probe_ack_rx3) = tokio::sync::watch::channel(0u64);
+        let ctrl3 = Control::with_identity(
+            tx3,
+            Some(fp_a),
+            probe_notify3,
+            probe_ack_rx3,
+            CancellationToken::new(),
+        );
+        assert!(
+            !try_register_tunnel_with_takeover(
+                &tunnels,
+                "svc.example.com".to_string(),
+                TunnelRoute {
+                    control: ctrl3,
+                    generation: 4,
+                    supports_proxy_v2: false,
+                },
+                probe_timeout,
+            )
+            .await
+        );
+        assert_eq!(tunnels.get("svc.example.com").unwrap().generation, 3);
+        assert!(!token2.is_cancelled());
+        assert_eq!(same_cert_takeover_count(), takeovers_after_first);
+
+        token2.cancel();
     }
 
     #[test]

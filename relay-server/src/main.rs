@@ -227,6 +227,12 @@ async fn main() -> Result<()> {
     let control_options = ControlPlaneOptions {
         connection_tracker: control_tracker,
         reload_rx: Some(reload_rx),
+        liveness_probe_timeout: Duration::from_millis(
+            config
+                .same_cert_takeover_probe_timeout_ms
+                .unwrap_or(praeco_relay_server::DEFAULT_SAME_CERT_TAKEOVER_PROBE_TIMEOUT_MS)
+                .max(1),
+        ),
     };
 
     let mut control_handle = tokio::spawn(async move {
