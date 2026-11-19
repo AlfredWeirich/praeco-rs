@@ -42,6 +42,12 @@ const RELAY_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// PROXY-Protocol v2 / ClientHello bytes.
 pub const DEFAULT_TUNNEL_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default maximum concurrent connections on the Control Plane (Port `7001`).
+pub const DEFAULT_CONTROL_MAX_CONNECTIONS: usize = 256;
+
+/// Default maximum concurrent connections per IP (/64) on the Control Plane (Port `7001`).
+pub const DEFAULT_CONTROL_MAX_CONNECTIONS_PER_IP: usize = 16;
+
 /// Backoff after a transient `accept()` error (e.g. `EMFILE`) to avoid a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -456,6 +462,156 @@ pub fn setup_mtls_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Parses all revoked certificate serial numbers (raw DER integer bytes) from a PEM-encoded CRL file.
+pub fn parse_revoked_serials_from_crl_pem(
+    crl_path: &str,
+) -> Result<std::collections::HashSet<Vec<u8>>, RelayError> {
+    let mut serials = std::collections::HashSet::new();
+    let crls =
+        CertificateRevocationListDer::pem_file_iter(crl_path)?.collect::<Result<Vec<_>, _>>()?;
+    for crl_der in &crls {
+        if let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
+            for revoked in parsed_crl.iter_revoked_certificates() {
+                serials.insert(revoked.raw_serial().to_vec());
+            }
+        }
+    }
+    Ok(serials)
+}
+
+/// Extracts the leaf certificate's `notAfter` UNIX timestamp (seconds) and raw serial bytes.
+pub fn extract_cert_expiry_and_serial(cert_der: &[u8]) -> Option<(i64, Vec<u8>)> {
+    let (_, cert) = x509_parser::parse_x509_certificate(cert_der).ok()?;
+    let not_after = cert.validity().not_after.timestamp();
+    let serial = cert.raw_serial().to_vec();
+    Some((not_after, serial))
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Live-reloaded mTLS acceptor and revoked certificate serial set for the Control Plane.
+#[derive(Clone)]
+pub struct ControlPlaneReloadState {
+    /// Updated mTLS acceptor constructed with the latest CA/cert/key/CRL files.
+    pub acceptor: TlsAcceptor,
+    /// Set of raw certificate serial numbers present in the latest CRL.
+    pub revoked_serials: Arc<std::collections::HashSet<Vec<u8>>>,
+}
+
+/// Pre-handshake connection limits and live CRL reload state for [`run_control_plane_with_options`].
+#[derive(Clone)]
+pub struct ControlPlaneOptions {
+    /// Enforces global and per-IP connection limits before starting the mTLS handshake.
+    pub connection_tracker: Arc<RelayConnectionTracker>,
+    /// Optional watch receiver delivering reloaded [`TlsAcceptor`] and CRL serial sets.
+    pub reload_rx: Option<tokio::sync::watch::Receiver<ControlPlaneReloadState>>,
+}
+
+impl Default for ControlPlaneOptions {
+    fn default() -> Self {
+        Self {
+            connection_tracker: Arc::new(RelayConnectionTracker::new(
+                DEFAULT_CONTROL_MAX_CONNECTIONS,
+                DEFAULT_CONTROL_MAX_CONNECTIONS_PER_IP,
+            )),
+            reload_rx: None,
+        }
+    }
+}
+
+/// Spawns a background task that periodically reloads the mTLS [`TlsAcceptor`] and CRL serial
+/// denylist from disk (and on `SIGHUP` on Unix), broadcasting updates to the Control Plane
+/// and all active tunnel drivers.
+pub fn spawn_crl_reload_watcher(
+    ca_path: String,
+    cert_path: String,
+    key_path: String,
+    crl_path: Option<String>,
+    initial_acceptor: TlsAcceptor,
+    reload_interval: Duration,
+    cancel_token: CancellationToken,
+) -> tokio::sync::watch::Receiver<ControlPlaneReloadState> {
+    let initial_serials = crl_path
+        .as_deref()
+        .and_then(|p| parse_revoked_serials_from_crl_pem(p).ok())
+        .unwrap_or_default();
+    let (tx, rx) = tokio::sync::watch::channel(ControlPlaneReloadState {
+        acceptor: initial_acceptor,
+        revoked_serials: Arc::new(initial_serials),
+    });
+
+    if crl_path.is_none() || reload_interval.is_zero() {
+        // Keep sender alive in a lightweight task until shutdown so receivers don't see channel close.
+        tokio::spawn(async move {
+            let _tx = tx;
+            cancel_token.cancelled().await;
+        });
+        return rx;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(reload_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume immediate first tick
+        ticker.tick().await;
+
+        #[cfg(unix)]
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
+
+        loop {
+            #[cfg(unix)]
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = ticker.tick() => {}
+                Some(_) = async {
+                    match sighup.as_mut() {
+                        Some(sig) => sig.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    info!(target: "relay::control_plane", "Received SIGHUP, reloading mTLS acceptor and CRL");
+                }
+            }
+
+            #[cfg(not(unix))]
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = ticker.tick() => {}
+            }
+
+            let Some(ref path) = crl_path else {
+                continue;
+            };
+            match (
+                setup_mtls_acceptor(&ca_path, &cert_path, &key_path, Some(path)),
+                parse_revoked_serials_from_crl_pem(path),
+            ) {
+                (Ok(new_acceptor), Ok(serials)) => {
+                    let _ = tx.send(ControlPlaneReloadState {
+                        acceptor: new_acceptor,
+                        revoked_serials: Arc::new(serials),
+                    });
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    warn!(
+                        target: "relay::control_plane",
+                        crl_path = %path,
+                        error = %e,
+                        "Failed to reload CRL on control plane; keeping previous CRL state"
+                    );
+                }
+            }
+        }
+    });
+
+    rx
+}
+
 /// Extracts all DNS Subject Alternative Names (SANs) from a DER-encoded X.509 certificate.
 pub fn extract_allowed_snis(cert_der: &[u8]) -> Vec<String> {
     let mut allowed_snis = Vec::new();
@@ -539,19 +695,6 @@ pub async fn handle_control_connection<S>(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[tracing::instrument(
-    name = "control_connection",
-    skip(
-        stream,
-        acceptor,
-        tunnels,
-        handshake_timeout,
-        max_yamux_streams,
-        enable_proxy_protocol,
-        cancel_token
-    ),
-    fields(client_ip = %client_addr)
-)]
 async fn handle_control_connection_with_cancel<S>(
     stream: S,
     client_addr: SocketAddr,
@@ -561,6 +704,48 @@ async fn handle_control_connection_with_cancel<S>(
     max_yamux_streams: usize,
     enable_proxy_protocol: bool,
     cancel_token: CancellationToken,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_control_connection_with_reload(
+        stream,
+        client_addr,
+        acceptor,
+        tunnels,
+        handshake_timeout,
+        max_yamux_streams,
+        enable_proxy_protocol,
+        cancel_token,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "control_connection",
+    skip(
+        stream,
+        acceptor,
+        tunnels,
+        handshake_timeout,
+        max_yamux_streams,
+        enable_proxy_protocol,
+        cancel_token,
+        reload_rx
+    ),
+    fields(client_ip = %client_addr)
+)]
+async fn handle_control_connection_with_reload<S>(
+    stream: S,
+    client_addr: SocketAddr,
+    acceptor: TlsAcceptor,
+    tunnels: SessionMap,
+    handshake_timeout: Duration,
+    max_yamux_streams: usize,
+    enable_proxy_protocol: bool,
+    cancel_token: CancellationToken,
+    mut reload_rx: Option<tokio::sync::watch::Receiver<ControlPlaneReloadState>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -580,14 +765,45 @@ async fn handle_control_connection_with_cancel<S>(
         }
     };
 
-    // --- Extract Client Certificate SANs (P0.2) ---
-    let allowed_snis = tls_stream
+    // --- Extract Client Certificate SANs, Validity (notAfter), and Serial (P0.2 & R-05) ---
+    let leaf_cert = tls_stream
         .get_ref()
         .1
         .peer_certificates()
-        .and_then(|certs| certs.first())
+        .and_then(|certs| certs.first());
+
+    let allowed_snis = leaf_cert
         .map(|cert_der| extract_allowed_snis(cert_der))
         .unwrap_or_default();
+
+    let Some((cert_not_after_ts, cert_serial)) =
+        leaf_cert.and_then(|cert_der| extract_cert_expiry_and_serial(cert_der))
+    else {
+        warn!(target: "relay::control_plane", client_ip = %client_addr, "Failed to parse client certificate validity/serial");
+        return;
+    };
+
+    let now_ts = current_unix_timestamp();
+    if cert_not_after_ts <= now_ts {
+        warn!(
+            target: "relay::control_plane",
+            client_ip = %client_addr,
+            not_after = cert_not_after_ts,
+            "Rejecting control connection: client certificate has expired"
+        );
+        return;
+    }
+
+    if let Some(ref rx) = reload_rx
+        && rx.borrow().revoked_serials.contains(&cert_serial)
+    {
+        warn!(
+            target: "relay::control_plane",
+            client_ip = %client_addr,
+            "Rejecting control connection: client certificate serial is revoked by latest CRL"
+        );
+        return;
+    }
 
     if allowed_snis.is_empty() {
         warn!(target: "relay::control_plane", client_ip = %client_addr, "No DNS SANs found in client certificate");
@@ -690,52 +906,108 @@ async fn handle_control_connection_with_cancel<S>(
         oneshot::Sender<Result<yamux::Stream, yamux::ConnectionError>>,
     > = None;
 
-    let driver = std::future::poll_fn(|cx| {
-        // 1. Check for new outbound requests (from Data Plane) if we don't have one pending
-        if pending_outbound.is_none()
-            && let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx)
-        {
-            pending_outbound = Some(resp_tx);
-        }
+    let remaining_lifetime_secs = (cert_not_after_ts - current_unix_timestamp()).max(0) as u64;
+    let expiry_wait = Duration::from_secs(remaining_lifetime_secs.min(30 * 24 * 3600));
+    let expiry_timer = tokio::time::sleep(expiry_wait);
+    tokio::pin!(expiry_timer);
 
-        // 2. Drive outbound stream opening if pending
-        if pending_outbound.is_some()
-            && let std::task::Poll::Ready(stream_res) = connection.poll_new_outbound(cx)
-            && let Some(resp_tx) = pending_outbound.take()
-        {
-            let _ = resp_tx.send(stream_res);
-        }
+    loop {
+        tokio::select! {
+            () = std::future::poll_fn(|cx| {
+                // 1. Check for new outbound requests (from Data Plane) if we don't have one pending
+                if pending_outbound.is_none()
+                    && let std::task::Poll::Ready(Some(resp_tx)) = rx.poll_recv(cx)
+                {
+                    pending_outbound = Some(resp_tx);
+                }
 
-        // 3. Drive inbound streams and connection progress (keeping multiplexing alive)
-        match connection.poll_next_inbound(cx) {
-            std::task::Poll::Ready(Some(Ok(unexpected_stream))) => {
-                warn!(target: "relay::control_plane", sni = %sni, "Unexpected inbound stream from client");
-                drop(unexpected_stream);
-                cx.waker().wake_by_ref();
+                // 2. Drive outbound stream opening if pending
+                if pending_outbound.is_some()
+                    && let std::task::Poll::Ready(stream_res) = connection.poll_new_outbound(cx)
+                    && let Some(resp_tx) = pending_outbound.take()
+                {
+                    let _ = resp_tx.send(stream_res);
+                }
+
+                // 3. Drive inbound streams and connection progress (keeping multiplexing alive)
+                match connection.poll_next_inbound(cx) {
+                    std::task::Poll::Ready(Some(Ok(unexpected_stream))) => {
+                        warn!(target: "relay::control_plane", sni = %sni, "Unexpected inbound stream from client");
+                        drop(unexpected_stream);
+                        cx.waker().wake_by_ref();
+                    }
+                    std::task::Poll::Ready(Some(Err(e))) => {
+                        warn!(target: "relay::control_plane", sni = %sni, error = ?e, "Tunnel connection failed");
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Ready(None) => {
+                        info!(target: "relay::control_plane", sni = %sni, "Tunnel closed cleanly");
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Pending => {}
+                }
+
+                std::task::Poll::Pending
+            }) => break,
+            () = &mut expiry_timer => {
+                if current_unix_timestamp() >= cert_not_after_ts {
+                    warn!(
+                        target: "relay::control_plane",
+                        sni = %sni,
+                        not_after = cert_not_after_ts,
+                        "Closing active tunnel: client certificate reached notAfter expiration"
+                    );
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        std::future::poll_fn(|cx| connection.poll_close(cx)),
+                    )
+                    .await;
+                    break;
+                }
+                let next_rem = (cert_not_after_ts - current_unix_timestamp()).max(0) as u64;
+                expiry_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(next_rem.min(30 * 24 * 3600)));
             }
-            std::task::Poll::Ready(Some(Err(e))) => {
-                warn!(target: "relay::control_plane", sni = %sni, error = ?e, "Tunnel connection failed");
-                return std::task::Poll::Ready(());
+            changed = async {
+                match reload_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    reload_rx = None;
+                    continue;
+                }
+                let revoked = reload_rx
+                    .as_mut()
+                    .is_some_and(|rx| rx.borrow_and_update().revoked_serials.contains(&cert_serial));
+                let expired = current_unix_timestamp() >= cert_not_after_ts;
+                if revoked || expired {
+                    warn!(
+                        target: "relay::control_plane",
+                        sni = %sni,
+                        revoked,
+                        expired,
+                        "Closing active tunnel: client certificate revoked by updated CRL or expired"
+                    );
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        std::future::poll_fn(|cx| connection.poll_close(cx)),
+                    )
+                    .await;
+                    break;
+                }
             }
-            std::task::Poll::Ready(None) => {
-                info!(target: "relay::control_plane", sni = %sni, "Tunnel closed cleanly");
-                return std::task::Poll::Ready(());
+            () = cancel_token.cancelled() => {
+                info!(target: "relay::control_plane", sni = %sni, "Closing control tunnel on shutdown");
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    std::future::poll_fn(|cx| connection.poll_close(cx)),
+                )
+                .await;
+                break;
             }
-            std::task::Poll::Pending => {}
-        }
-
-        std::task::Poll::Pending
-    });
-
-    tokio::select! {
-        () = driver => {}
-        () = cancel_token.cancelled() => {
-            info!(target: "relay::control_plane", sni = %sni, "Closing control tunnel on shutdown");
-            let _ = tokio::time::timeout(
-                Duration::from_secs(1),
-                std::future::poll_fn(|cx| connection.poll_close(cx)),
-            )
-            .await;
         }
     }
 
@@ -754,6 +1026,33 @@ pub async fn run_control_plane(
     max_yamux_streams: usize,
     enable_proxy_protocol: bool,
     cancel_token: CancellationToken,
+) -> Result<(), RelayError> {
+    run_control_plane_with_options(
+        listener,
+        tls_acceptor,
+        tunnels,
+        handshake_timeout,
+        max_yamux_streams,
+        enable_proxy_protocol,
+        cancel_token,
+        ControlPlaneOptions::default(),
+    )
+    .await
+}
+
+/// Like [`run_control_plane`], but accepts explicit [`ControlPlaneOptions`] for pre-mTLS
+/// connection limiting and live CRL reload notifications.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(listener, tls_acceptor, tunnels, cancel_token, options), err)]
+pub async fn run_control_plane_with_options(
+    listener: TcpListener,
+    tls_acceptor: TlsAcceptor,
+    tunnels: SessionMap,
+    handshake_timeout: Duration,
+    max_yamux_streams: usize,
+    enable_proxy_protocol: bool,
+    cancel_token: CancellationToken,
+    options: ControlPlaneOptions,
 ) -> Result<(), RelayError> {
     if let Ok(local_addr) = listener.local_addr() {
         info!("Control plane listening on mTLS {}", local_addr);
@@ -786,6 +1085,20 @@ pub async fn run_control_plane(
             }
         };
 
+        let conn_guard = match options.connection_tracker.acquire(client_addr.ip()) {
+            Ok(guard) => guard,
+            Err(reason) => {
+                warn!(
+                    target: "relay::control_plane",
+                    client_ip = %client_addr,
+                    reason = %reason,
+                    "Control-plane connection rejected before mTLS handshake"
+                );
+                drop(stream);
+                continue;
+            }
+        };
+
         // Socket-level TCP Keepalive on Control Plane to detect dead connections without dummy streams
         let sock_ref = socket2::SockRef::from(&stream);
         let keepalive = socket2::TcpKeepalive::new()
@@ -794,20 +1107,30 @@ pub async fn run_control_plane(
         let _ = sock_ref.set_tcp_keepalive(&keepalive);
         let _ = sock_ref.set_nodelay(true);
 
-        let acceptor = tls_acceptor.clone();
+        let acceptor = options
+            .reload_rx
+            .as_ref()
+            .map(|rx| rx.borrow().acceptor.clone())
+            .unwrap_or_else(|| tls_acceptor.clone());
         let tunnels = tunnels.clone();
         let conn_cancel = cancel_token.child_token();
+        let reload_rx = options.reload_rx.clone();
 
-        conn_tasks.spawn(handle_control_connection_with_cancel(
-            stream,
-            client_addr,
-            acceptor,
-            tunnels,
-            handshake_timeout,
-            max_yamux_streams,
-            enable_proxy_protocol,
-            conn_cancel,
-        ));
+        conn_tasks.spawn(async move {
+            let _guard = conn_guard;
+            handle_control_connection_with_reload(
+                stream,
+                client_addr,
+                acceptor,
+                tunnels,
+                handshake_timeout,
+                max_yamux_streams,
+                enable_proxy_protocol,
+                conn_cancel,
+                reload_rx,
+            )
+            .await;
+        });
     }
 
     drop(listener);
@@ -1983,5 +2306,144 @@ mod tests {
         )
         .await;
         assert!(res.is_ok(), "handle_data_connection must time out when open_stream stalls");
+    }
+
+    #[test]
+    fn test_parse_revoked_serials_and_extract_cert_expiry() {
+        let pki = common::test_pki::TestPki::new();
+        let client_certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(&pki.praeco_client_pem)
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+        let (not_after, client_serial) =
+            extract_cert_expiry_and_serial(client_certs[0].as_ref()).expect("valid leaf cert");
+        assert!(not_after > current_unix_timestamp());
+        assert!(!client_serial.is_empty());
+
+        let non_revoking = parse_revoked_serials_from_crl_pem(
+            &pki.relay_crl_pem.to_string_lossy(),
+        )
+        .expect("parse non-revoking CRL");
+        assert!(!non_revoking.contains(&client_serial));
+
+        let revoking = parse_revoked_serials_from_crl_pem(
+            &pki.relay_crl_revoking_client_pem.to_string_lossy(),
+        )
+        .expect("parse revoking CRL");
+        assert!(revoking.contains(&client_serial));
+    }
+
+    #[tokio::test]
+    async fn test_active_control_tunnel_terminated_on_live_crl_revocation() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+
+        let ca_str = pki.relay_ca_pem.to_string_lossy().to_string();
+        let srv_cert_str = pki.relay_server_pem.to_string_lossy().to_string();
+        let srv_key_str = pki.relay_server_key.to_string_lossy().to_string();
+        let non_revoking_crl = pki.relay_crl_pem.to_string_lossy().to_string();
+        let revoking_crl = pki.relay_crl_revoking_client_pem.to_string_lossy().to_string();
+
+        let initial_acceptor = setup_mtls_acceptor(
+            &ca_str,
+            &srv_cert_str,
+            &srv_key_str,
+            Some(&non_revoking_crl),
+        )
+        .expect("initial acceptor");
+        let initial_serials =
+            parse_revoked_serials_from_crl_pem(&non_revoking_crl).expect("initial serials");
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(ControlPlaneReloadState {
+            acceptor: initial_acceptor.clone(),
+            revoked_serials: Arc::new(initial_serials),
+        });
+
+        let tunnels: SessionMap = new_session_map();
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let peer_addr: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        let tunnels_srv = tunnels.clone();
+        let server_task = tokio::spawn(async move {
+            handle_control_connection_with_reload(
+                server_io,
+                peer_addr,
+                initial_acceptor,
+                tunnels_srv,
+                Duration::from_secs(5),
+                128,
+                true,
+                CancellationToken::new(),
+                Some(reload_rx),
+            )
+            .await;
+        });
+
+        // Build mTLS client connector using praeco_client_pem
+        let mut root_store = RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(&pki.relay_ca_pem).unwrap() {
+            root_store.add(cert.unwrap()).unwrap();
+        }
+        let client_certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(&pki.praeco_client_pem)
+                .unwrap()
+                .map(|c| c.unwrap())
+                .collect();
+        let client_key = PrivateKeyDer::from_pem_file(&pki.praeco_client_key).unwrap();
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(client_certs, client_key)
+            .unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+        let domain = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_client = connector.connect(domain, client_io).await.unwrap();
+
+        // Register SNI allowed by praeco_client_pem
+        tls_client
+            .write_all(b"REGISTER wurzelwerk.api.aweirich.eu PROXY_V2\n")
+            .await
+            .unwrap();
+        tls_client.flush().await.unwrap();
+
+        let mut client_yamux =
+            Connection::new(tls_client.compat(), YamuxConfig::default(), Mode::Client);
+        let _client_driver = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| client_yamux.poll_next_inbound(cx)).await;
+        });
+
+        // Wait until the tunnel is registered in SessionMap
+        for _ in 0..50 {
+            if tunnels.contains_key("wurzelwerk.api.aweirich.eu") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            tunnels.contains_key("wurzelwerk.api.aweirich.eu"),
+            "Tunnel must be registered before CRL update"
+        );
+
+        // Broadcast CRL reload that revokes praeco_client_pem
+        let revoked_acceptor =
+            setup_mtls_acceptor(&ca_str, &srv_cert_str, &srv_key_str, Some(&revoking_crl))
+                .expect("revoked acceptor");
+        let revoked_serials =
+            parse_revoked_serials_from_crl_pem(&revoking_crl).expect("revoked serials");
+        reload_tx
+            .send(ControlPlaneReloadState {
+                acceptor: revoked_acceptor,
+                revoked_serials: Arc::new(revoked_serials),
+            })
+            .unwrap();
+
+        // Active control tunnel task must exit promptly and evict the route from SessionMap
+        tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("active tunnel must close promptly upon CRL revocation")
+            .unwrap();
+        assert!(
+            !tunnels.contains_key("wurzelwerk.api.aweirich.eu"),
+            "Revoked tunnel must be removed from SessionMap"
+        );
     }
 }

@@ -65,6 +65,15 @@ pub struct RelayConfig {
     pub max_yamux_streams: Option<usize>,
     /// Whether to enable PROXY-Protocol v2 for tunnels that negotiate it (default: true).
     pub enable_proxy_protocol: Option<bool>,
+    /// Optional limit on the total number of concurrent control plane (Port 7001) connections (default: 256).
+    #[serde(default)]
+    pub control_plane_max_concurrent_connections: Option<usize>,
+    /// Optional limit on the number of concurrent control plane (Port 7001) connections per IP /64 (default: 16).
+    #[serde(default)]
+    pub control_plane_max_concurrent_connections_per_ip: Option<usize>,
+    /// Optional interval in seconds for reloading `crl_path` and re-verifying active tunnels (default: 60, 0 = disabled).
+    #[serde(default)]
+    pub crl_reload_interval_secs: Option<u64>,
 }
 
 impl Default for RelayConfig {
@@ -93,6 +102,9 @@ impl Default for RelayConfig {
             tunnel_stream_open_timeout_secs: Some(5),
             max_yamux_streams: Some(4096),
             enable_proxy_protocol: Some(true),
+            control_plane_max_concurrent_connections: Some(256),
+            control_plane_max_concurrent_connections_per_ip: Some(16),
+            crl_reload_interval_secs: Some(60),
         }
     }
 }

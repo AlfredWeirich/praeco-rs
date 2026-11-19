@@ -13,8 +13,9 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::Resource;
 use praeco_relay_server::{
-    RelayConfig, RelayConnectionTracker, SessionMap, new_session_map, run_control_plane,
-    run_data_plane_with_stream_timeout, setup_mtls_acceptor,
+    ControlPlaneOptions, RelayConfig, RelayConnectionTracker, SessionMap, new_session_map,
+    run_control_plane_with_options, run_data_plane_with_stream_timeout, setup_mtls_acceptor,
+    spawn_crl_reload_watcher,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,9 +198,34 @@ async fn main() -> Result<()> {
     let max_yamux_streams = config.max_yamux_streams.unwrap_or(4096);
     let enable_proxy_protocol = config.enable_proxy_protocol.unwrap_or(true);
     let control_cancel = cancel_token.clone();
+    let control_max_global = config
+        .control_plane_max_concurrent_connections
+        .unwrap_or(praeco_relay_server::DEFAULT_CONTROL_MAX_CONNECTIONS);
+    let control_max_per_ip = config
+        .control_plane_max_concurrent_connections_per_ip
+        .unwrap_or(praeco_relay_server::DEFAULT_CONTROL_MAX_CONNECTIONS_PER_IP);
+    let control_tracker = Arc::new(RelayConnectionTracker::new(
+        control_max_global,
+        control_max_per_ip,
+    ));
+    let crl_reload_interval =
+        Duration::from_secs(config.crl_reload_interval_secs.unwrap_or(60));
+    let reload_rx = spawn_crl_reload_watcher(
+        config.ca_cert_path.clone(),
+        config.server_cert_path.clone(),
+        config.server_key_path.clone(),
+        config.crl_path.clone(),
+        tls_acceptor.clone(),
+        crl_reload_interval,
+        cancel_token.clone(),
+    );
+    let control_options = ControlPlaneOptions {
+        connection_tracker: control_tracker,
+        reload_rx: Some(reload_rx),
+    };
 
     let mut control_handle = tokio::spawn(async move {
-        if let Err(e) = run_control_plane(
+        if let Err(e) = run_control_plane_with_options(
             control_listener,
             tls_acceptor,
             control_tunnels,
@@ -207,6 +233,7 @@ async fn main() -> Result<()> {
             max_yamux_streams,
             enable_proxy_protocol,
             control_cancel,
+            control_options,
         )
         .await
         {
