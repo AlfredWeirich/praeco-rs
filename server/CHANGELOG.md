@@ -60,6 +60,7 @@ SemVer-compatible security, resilience, hot-reload, runtime, modularization, and
   * Added `ConnectionTracker::update_limits`, `ServerReloadUpdate`, and `start_single_server_reloadable` so `SIGHUP` hot-reloads live TLS/mTLS/CRL configurations (`TlsAcceptor` + `quinn::Endpoint::set_server_config`), `oid_mapping`, `pki_base_oid`, `connection_limits`, and restarts active router health-check loops against the newly built `UpstreamNode` instances without dropping listening sockets.
 * **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**
   * Handled `SIGTERM` (`SignalKind::terminate`) alongside `Ctrl-C` for graceful connection draining and OTLP flush.
+  * Fixed a shutdown deadlock in `supervise_reloadable_health_checks` (`src/runner.rs`) where closing `reload_rx` during `server.rs` shutdown awaited `std::future::pending()` inside a `tokio::select!` arm body instead of disabling the branch.
   * Migrated all unit, integration, and relay E2E tests (plus `examples/https_web_server`) from gitignored `server_certs/` / `client_certs/` files to ephemeral `common::test_pki::TestPki` (`praeco-common` `test-pki` feature).
 
 ---

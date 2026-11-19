@@ -312,15 +312,18 @@ async fn supervise_reloadable_health_checks(
         spawn_router_health_checks_in(&initial_config, health_token.clone(), &mut background_tasks);
     }
 
+    let mut reload_closed = false;
+
     loop {
         tokio::select! {
             _ = server_token.cancelled() => break,
             Some(res) = background_tasks.join_next(), if !background_tasks.is_empty() => {
                 log_task_result(&server_name, "background", res);
             }
-            changed = reload_rx.changed() => {
+            changed = reload_rx.changed(), if !reload_closed => {
                 if changed.is_err() {
-                    std::future::pending::<()>().await;
+                    reload_closed = true;
+                    continue;
                 }
                 let next_cfg = reload_rx.borrow_and_update().config.clone();
                 health_token.cancel();
@@ -2438,5 +2441,52 @@ mod tests {
             .await
             .expect("run_servers must not idle when all listeners fail to start");
         drop(occupied);
+    }
+
+    #[tokio::test]
+    async fn test_start_single_server_reloadable_shuts_down_when_reload_tx_dropped() {
+        ensure_crypto_provider();
+        let toml_cfg = r#"
+            name = "reload_drop_shutdown"
+            enabled = true
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 0
+            [Layers]
+            enabled = []
+        "#;
+        let mut srv_cfg: ServerConfig = toml::from_str(toml_cfg).unwrap();
+        srv_cfg.finalize().unwrap();
+        let srv_cfg = Arc::new(srv_cfg);
+        let stack = Arc::new(ArcSwap::from_pointee(build_service_stack(&srv_cfg).unwrap()));
+        let cancel_token = CancellationToken::new();
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(ServerReloadUpdate {
+            config: srv_cfg.clone(),
+            tls_config: None,
+        });
+        let (released_tx, released_rx) = oneshot::channel();
+
+        let handle = tokio::spawn(start_single_server_reloadable(
+            srv_cfg,
+            cancel_token.clone(),
+            stack,
+            Some(released_tx),
+            reload_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Simulate server.rs shutdown: drop `reload_tx` together with cancelling `cancel_token`.
+        drop(reload_tx);
+        cancel_token.cancel();
+
+        tokio::time::timeout(Duration::from_secs(2), released_rx)
+            .await
+            .expect("socket release signal must fire promptly")
+            .expect("socket release channel must succeed");
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("start_single_server_reloadable must not deadlock when reload_tx is dropped")
+            .expect("server task must not panic");
     }
 }
