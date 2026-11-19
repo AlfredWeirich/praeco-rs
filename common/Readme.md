@@ -7,7 +7,7 @@ It is designed to be a central repository for reusable components such as:
 - **Client IP Canonicalization & XFF Parsing (`canonical_client_ip`, `client_ip_from_xff`)**: Normalizes client IP addresses across all rate limiters, connection trackers, and session stores by unwrapping IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d` $\to$ `a.b.c.d`), preserving loopback (`::1`) and unspecified (`::`) addresses, and masking standard IPv6 unicast addresses to their `/64` subnet prefix (`segments[0..4]`) to prevent IPv6 `/64` rotation bypasses; `client_ip_from_xff` resolves `X-Forwarded-For` strictly from right to left using `trusted_hops`.
 - **Shared CRL Validation (`crl` Feature)**: Centralizes fail-closed X.509 CRL expiration validation (`check_crl_not_expired`) and revoked serial extraction (`extract_revoked_serials_from_crls`) for both `praeco-rs` and `praeco-relay-server`.
 - **HAProxy PROXY-Protocol v2 (`proxy_protocol`)**: Binary encoder (`encode_proxy_v2`), strict fail-closed parser (`read_proxy_v2` with full 16-byte `InvalidMagic` header preservation and 512-byte payload bounds), and `PrefixedStream` for propagating real client IPs across Yamux Layer-4 tunnels.
-- **JWT Validation (`verify_jwt`)**: Shared token claims (`Claims`) and Ed25519/RSA validation helpers failing closed on empty/whitespace-only `expected_issuer` or `expected_audience`.
+- **JWT Validation (`verify_jwt`, `verify_jwt_with_options`)**: Shared token claims (`Claims`), policy options (`JwtVerifyOptions`), and Ed25519 validation helpers enforcing a 4 KiB token length cap (`MAX_JWT_TOKEN_LEN`), 3-segment compact JWS structure, O(1) `kid` key routing (`"praeco-key-<1-based-index>"`), `nbf` validation, mandatory `jti` (`require_jti = true`), and a 30-day maximum remaining token lifetime (`DEFAULT_MAX_JWT_LIFETIME_SECS`), failing closed on empty/whitespace-only `expected_issuer` or `expected_audience`.
 - **Security Primitives**: Core structures used for authentication, OID role mapping (`UserRole`, `MtlsClaims`), and authorization.
 - **Ephemeral Test PKI (`test-pki` Feature)**: Feature-gated `common::test_pki::TestPki` (`rcgen`, `tempfile`, `time`) generating isolated CAs, server/client certificates (including custom RBAC OIDs), no-SAN client certs, and non-revoking/revoking CRLs in temporary directories so workspace tests run without checked-in key material.
 
@@ -22,7 +22,7 @@ This crate is primarily intended to be consumed by other `praeco-*` crates (like
 - **`proxy_protocol`, `canonical_client_ip` & `client_ip_from_xff`** are always available (even with `default-features = false`).
 - **`crl`**: `crl::{CrlValidationError, check_crl_not_expired, extract_revoked_serials_from_crls}`.
 - **`tls`**: `load_certs`, `load_single_key`, `build_root_store`, `build_tls_client_config`.
-- **`jwt`**: `Claims`, `load_decoding_keys`, `load_encoding_key`, `verify_jwt`, `sign_jwt`.
+- **`jwt`**: `Claims`, `JwtVerifyOptions`, `MAX_JWT_TOKEN_LEN`, `DEFAULT_MAX_JWT_LIFETIME_SECS`, `load_decoding_keys`, `load_encoding_key`, `verify_jwt`, `verify_jwt_with_options`, `sign_jwt`, `sign_jwt_with_kid`.
 - **`client`** *(implies `tls`)*: `client::{ClientPoolConfig, HttpsConnector, build_hyper_client}`.
 - **`test-pki`**: Ephemeral runtime `TestPki` via `rcgen` for self-contained tests.
 

@@ -43,6 +43,174 @@ pub enum RequestBody {
     Buffered(bytes::Bytes),
 }
 
+/// Process-wide byte budget cap for buffered upstream responses across all concurrent
+/// `grpc_transcoding` and `aggregate` requests (256 MiB, [P-03]).
+pub const DEFAULT_GLOBAL_RESPONSE_BUFFER_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Lock-free atomic byte budget bounding total concurrent buffered response memory ([P-03]).
+pub(crate) struct BufferBudget {
+    remaining: std::sync::atomic::AtomicUsize,
+}
+
+impl BufferBudget {
+    /// Creates a new [`BufferBudget`] with the given capacity in bytes.
+    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: std::sync::atomic::AtomicUsize::new(capacity),
+        })
+    }
+
+    /// Returns the number of unreserved bytes currently available in this budget.
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Returns the global process-wide [`BufferBudget`] singleton.
+pub(crate) fn global_response_buffer_budget() -> &'static Arc<BufferBudget> {
+    static GLOBAL_BUDGET: std::sync::OnceLock<Arc<BufferBudget>> = std::sync::OnceLock::new();
+    GLOBAL_BUDGET.get_or_init(|| BufferBudget::new(DEFAULT_GLOBAL_RESPONSE_BUFFER_BUDGET_BYTES))
+}
+
+/// RAII reservation of bytes from a [`BufferBudget`].
+///
+/// Tracks the exact byte count currently reserved by an in-flight buffered response
+/// and automatically releases all remaining reserved bytes on `Drop`.
+pub(crate) struct BufferReservation {
+    budget: Arc<BufferBudget>,
+    reserved: usize,
+}
+
+impl BufferReservation {
+    /// Creates an initially empty (`0` bytes) reservation against `budget`.
+    pub(crate) fn new(budget: Arc<BufferBudget>) -> Self {
+        Self {
+            budget,
+            reserved: 0,
+        }
+    }
+
+    /// Attempts to reserve `bytes` additional bytes from the underlying [`BufferBudget`].
+    ///
+    /// Returns `true` if the reservation succeeded, or `false` if fewer than `bytes`
+    /// were available.
+    pub(crate) fn try_reserve(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut rem = self
+            .budget
+            .remaining
+            .load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let Some(next) = rem.checked_sub(bytes) else {
+                return false;
+            };
+            match self.budget.remaining.compare_exchange_weak(
+                rem,
+                next,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.reserved = self.reserved.saturating_add(bytes);
+                    return true;
+                }
+                Err(actual) => rem = actual,
+            }
+        }
+    }
+
+    /// Releases up to `bytes` previously reserved bytes back to the underlying [`BufferBudget`].
+    pub(crate) fn release(&mut self, bytes: usize) {
+        let to_release = bytes.min(self.reserved);
+        if to_release > 0 {
+            self.reserved -= to_release;
+            self.budget
+                .remaining
+                .fetch_add(to_release, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Adjusts this reservation to hold `target_bytes` in total, either releasing excess
+    /// bytes or attempting to reserve the difference.
+    pub(crate) fn adjust_to(&mut self, target_bytes: usize) -> bool {
+        if target_bytes <= self.reserved {
+            let diff = self.reserved - target_bytes;
+            self.release(diff);
+            true
+        } else {
+            self.try_reserve(target_bytes - self.reserved)
+        }
+    }
+
+    /// Merges `other`'s reserved byte count into `self` without touching the atomic counter.
+    pub(crate) fn absorb(&mut self, mut other: Self) {
+        debug_assert!(Arc::ptr_eq(&self.budget, &other.budget));
+        self.reserved = self.reserved.saturating_add(other.reserved);
+        other.reserved = 0;
+    }
+
+    /// Returns the number of bytes currently held by this reservation.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> usize {
+        self.reserved
+    }
+}
+
+impl Drop for BufferReservation {
+    fn drop(&mut self) {
+        self.release(self.reserved);
+    }
+}
+
+/// Single-frame [`http_body::Body`] holding a buffered [`Bytes`] payload and its
+/// [`BufferReservation`], releasing the reserved bytes as soon as the frame is
+/// yielded to Hyper (or when the body is dropped).
+pub(crate) struct BudgetedBytesBody {
+    data: Option<Bytes>,
+    reservation: BufferReservation,
+}
+
+impl BudgetedBytesBody {
+    pub(crate) fn new(data: Bytes, reservation: BufferReservation) -> Self {
+        Self {
+            data: Some(data),
+            reservation,
+        }
+    }
+}
+
+impl http_body::Body for BudgetedBytesBody {
+    type Data = Bytes;
+    type Error = SrvError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        if let Some(chunk) = this.data.take() {
+            this.reservation.release(chunk.len());
+            if chunk.is_empty() {
+                return Poll::Ready(None);
+            }
+            return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+        }
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().is_none_or(Bytes::is_empty)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        let len = self.data.as_ref().map_or(0, Bytes::len);
+        http_body::SizeHint::with_exact(len as u64)
+    }
+}
+
 /// Builds a minimal synthetic HTTP error response.
 pub(crate) fn build_error_response(msg: &str, status: StatusCode) -> Response<ServiceRespBody> {
     let body = Full::new(Bytes::from(msg.to_string()))
@@ -485,7 +653,7 @@ impl Service<Request<SrvBody>> for RouterService {
             // Dispatch to the proper specialized terminal service
             match route_info.backend_type {
                 RouteBackendType::GrpcTranscoding => {
-                    grpc_web::handle_grpc_web(
+                    grpc_web::handle_grpc_web_with_limit(
                         &route_info.target,
                         request_body,
                         original_method,
@@ -496,6 +664,7 @@ impl Service<Request<SrvBody>> for RouterService {
                         &grpc_client,
                         &self_clone.config,
                         request_timeout,
+                        route_info.max_response_bytes,
                     )
                     .await
                 }
@@ -777,5 +946,42 @@ mod tests {
             http_proxy::classify_error_chain(dec_err.as_ref()),
             http_proxy::ProxyErrorKind::DecompressionLimitExceeded
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_budget_reservation_adjust_absorb_and_drop_release() {
+        let budget = BufferBudget::new(100);
+        assert_eq!(budget.remaining(), 100);
+
+        let mut res1 = BufferReservation::new(Arc::clone(&budget));
+        assert!(res1.try_reserve(60));
+        assert_eq!(res1.reserved(), 60);
+        assert_eq!(budget.remaining(), 40);
+
+        // Exceeding remaining capacity fails without partial reservation
+        let mut res2 = BufferReservation::new(Arc::clone(&budget));
+        assert!(!res2.try_reserve(50));
+        assert_eq!(res2.reserved(), 0);
+        assert_eq!(budget.remaining(), 40);
+
+        // Exact remaining reservation succeeds
+        assert!(res2.try_reserve(40));
+        assert_eq!(budget.remaining(), 0);
+
+        // Shrink res1 via adjust_to frees 20 bytes
+        assert!(res1.adjust_to(40));
+        assert_eq!(res1.reserved(), 40);
+        assert_eq!(budget.remaining(), 20);
+
+        // Absorb res2 into res1 consolidates ownership without altering budget.remaining()
+        res1.absorb(res2);
+        assert_eq!(res1.reserved(), 80);
+        assert_eq!(budget.remaining(), 20);
+
+        // Wrapping res1 into BudgetedBytesBody releases bytes as soon as the frame is polled
+        let body = BudgetedBytesBody::new(Bytes::from(vec![b'x'; 80]), res1);
+        let collected = body.collect().await.unwrap().to_bytes();
+        assert_eq!(collected.len(), 80);
+        assert_eq!(budget.remaining(), 100);
     }
 }

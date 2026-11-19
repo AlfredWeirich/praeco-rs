@@ -102,6 +102,66 @@ fn build_grpc_status_error(code: u32, message: Option<String>) -> Response<Servi
     resp
 }
 
+/// Fallback upper bound on a single gRPC response body when `handle_grpc_web` is called
+/// in unit tests without an explicit per-route `max_response_bytes` limit (16 MiB).
+#[cfg(test)]
+pub const MAX_GRPC_WEB_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Body wrapper enforcing both a per-route response size cap (`max_response_bytes`)
+/// and the process-wide [`super::BufferBudget`] as HTTP/2 `DATA` frames arrive.
+struct GrpcWebResponseBody<'a, B> {
+    inner: &'a mut B,
+    max_response_bytes: usize,
+    read_bytes: usize,
+    reservation: &'a mut super::BufferReservation,
+    global_exhausted: &'a mut bool,
+}
+
+impl<B> http_body::Body for GrpcWebResponseBody<'_, B>
+where
+    B: http_body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut *this.inner).poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    let len = data.len();
+                    let next_total = this.read_bytes.saturating_add(len);
+                    if next_total > this.max_response_bytes {
+                        return std::task::Poll::Ready(Some(Err(Box::new(
+                            SrvError::PayloadTooLarge {
+                                current: next_total,
+                                max: this.max_response_bytes,
+                            },
+                        ))));
+                    }
+                    if !this.reservation.try_reserve(len) {
+                        *this.global_exhausted = true;
+                        return std::task::Poll::Ready(Some(Err(Box::new(SrvError::Other(
+                            "Global response buffer budget exhausted".to_string(),
+                        )))));
+                    }
+                    this.read_bytes = next_total;
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => {
+                std::task::Poll::Ready(Some(Err(e.into())))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
 /// Handles a single JSON-to-gRPC transcoded request (`backend_type = "grpc_transcoding"`).
 ///
 /// # Arguments
@@ -121,9 +181,81 @@ fn build_grpc_status_error(code: u32, message: Option<String>) -> Response<Servi
 ///
 /// Returns an HTTP [`Response<ServiceRespBody>`] with `content-type: application/json` on success,
 /// or an appropriate synthetic HTTP error status (`400`, `401`, `403`, `404`, `409`, `429`, `501`, `502`, `503`, `504`) on failure.
+#[cfg(test)]
 #[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_grpc_web(
+    target: &Arc<RouteTarget>,
+    request_body: RequestBody,
+    original_method: Method,
+    prepared_headers: hyper::HeaderMap,
+    original_uri: &Uri,
+    client_addr: Option<std::net::SocketAddr>,
+    server_name: &str,
+    grpc_client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    config: &ServerConfig,
+    timeout_override: Option<std::time::Duration>,
+) -> Result<Response<ServiceRespBody>, SrvError> {
+    handle_grpc_web_with_limit(
+        target,
+        request_body,
+        original_method,
+        prepared_headers,
+        original_uri,
+        client_addr,
+        server_name,
+        grpc_client,
+        config,
+        timeout_override,
+        MAX_GRPC_WEB_RESPONSE_BYTES,
+    )
+    .await
+}
+
+/// Handles a single JSON-to-gRPC transcoded request with an explicit per-route
+/// `max_response_bytes` cap and the global [`super::BufferBudget`].
+#[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_grpc_web_with_limit(
+    target: &Arc<RouteTarget>,
+    request_body: RequestBody,
+    original_method: Method,
+    prepared_headers: hyper::HeaderMap,
+    original_uri: &Uri,
+    client_addr: Option<std::net::SocketAddr>,
+    server_name: &str,
+    grpc_client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    config: &ServerConfig,
+    timeout_override: Option<std::time::Duration>,
+    max_response_bytes: usize,
+) -> Result<Response<ServiceRespBody>, SrvError> {
+    handle_grpc_web_with_budget(
+        target,
+        request_body,
+        original_method,
+        prepared_headers,
+        original_uri,
+        client_addr,
+        server_name,
+        grpc_client,
+        config,
+        timeout_override,
+        max_response_bytes,
+        super::global_response_buffer_budget(),
+    )
+    .await
+}
+
+/// Handles a single JSON-to-gRPC transcoded request with an explicit per-route
+/// `max_response_bytes` cap and an explicit [`super::BufferBudget`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_grpc_web_with_budget(
     target: &Arc<RouteTarget>,
     request_body: RequestBody, // not mut since GrpcWeb buffers only
     original_method: Method,
@@ -137,6 +269,8 @@ pub async fn handle_grpc_web(
     >,
     config: &ServerConfig,
     timeout_override: Option<std::time::Duration>,
+    max_response_bytes: usize,
+    global_budget: &Arc<super::BufferBudget>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
     let max_retries = target.max_retries;
@@ -499,17 +633,34 @@ pub async fn handle_grpc_web(
                     return Ok(build_grpc_status_error(grpc_code, grpc_msg));
                 }
 
-                const MAX_GRPC_WEB_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+                let mut reservation = super::BufferReservation::new(Arc::clone(global_budget));
+                let mut global_exhausted = false;
                 let remaining_timeout = req_timeout.saturating_sub(req_start.elapsed());
                 let collect_res = tokio::time::timeout(
                     remaining_timeout,
-                    http_body_util::Limited::new(res.body_mut(), MAX_GRPC_WEB_RESPONSE_BYTES)
-                        .collect(),
+                    GrpcWebResponseBody {
+                        inner: res.body_mut(),
+                        max_response_bytes,
+                        read_bytes: 0,
+                        reservation: &mut reservation,
+                        global_exhausted: &mut global_exhausted,
+                    }
+                    .collect(),
                 )
                 .await;
 
                 let collected = match collect_res {
                     Ok(Ok(c)) => c,
+                    Ok(Err(_)) if global_exhausted => {
+                        warn!(
+                            "{}: Global response buffer budget exhausted while reading gRPC response from {}",
+                            server_name, backend_base_uri
+                        );
+                        return Ok(build_error_response(
+                            "Service Unavailable",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        ));
+                    }
                     Ok(Err(e)) => {
                         warn!(
                             "{}: Failed to read gRPC response body from {}: {}",
@@ -620,14 +771,27 @@ pub async fn handle_grpc_web(
                     }
                 };
 
+                // Release raw protobuf buffer and adjust global buffer reservation to the JSON size
+                drop(res_body_bytes);
+                if !reservation.adjust_to(response_json.len()) {
+                    warn!(
+                        "{}: Global response buffer budget exhausted after JSON transcoding ({} bytes)",
+                        server_name,
+                        response_json.len()
+                    );
+                    return Ok(build_error_response(
+                        "Service Unavailable",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    ));
+                }
+
                 upstream_node.record_success_with_epoch(request_epoch);
 
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(
-                        Full::new(Bytes::from(response_json))
-                            .map_err(SrvError::from)
+                        super::BudgetedBytesBody::new(Bytes::from(response_json), reservation)
                             .boxed(),
                     )
                     .unwrap());
@@ -1275,5 +1439,46 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(held_lock);
+    }
+
+    #[tokio::test]
+    async fn test_grpc_web_response_body_distinguishes_route_cap_and_global_budget() {
+        // 1. Per-route cap exceeded -> fails with global_exhausted == false
+        let budget = super::super::BufferBudget::new(1024);
+        let mut reservation = super::super::BufferReservation::new(Arc::clone(&budget));
+        let mut global_exhausted = false;
+        let mut inner_route_exceeded = Full::new(Bytes::from(vec![b'a'; 100]));
+        let res_route = GrpcWebResponseBody {
+            inner: &mut inner_route_exceeded,
+            max_response_bytes: 50,
+            read_bytes: 0,
+            reservation: &mut reservation,
+            global_exhausted: &mut global_exhausted,
+        }
+        .collect()
+        .await;
+        assert!(res_route.is_err());
+        assert!(!global_exhausted);
+        assert_eq!(budget.remaining(), 1024);
+
+        // 2. Global budget exhausted -> fails with global_exhausted == true and restores on Drop
+        let small_global = super::super::BufferBudget::new(40);
+        {
+            let mut res_global = super::super::BufferReservation::new(Arc::clone(&small_global));
+            let mut global_flag = false;
+            let mut inner_global_exceeded = Full::new(Bytes::from(vec![b'b'; 60]));
+            let res = GrpcWebResponseBody {
+                inner: &mut inner_global_exceeded,
+                max_response_bytes: 1024,
+                read_bytes: 0,
+                reservation: &mut res_global,
+                global_exhausted: &mut global_flag,
+            }
+            .collect()
+            .await;
+            assert!(res.is_err());
+            assert!(global_flag);
+        }
+        assert_eq!(small_global.remaining(), 40);
     }
 }

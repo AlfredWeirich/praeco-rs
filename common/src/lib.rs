@@ -22,7 +22,6 @@ use anyhow::{Context, Error};
 #[cfg(feature = "tls")]
 use anyhow::anyhow;
 #[cfg(feature = "jwt")]
-#[allow(unused_imports)]
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
 #[cfg(feature = "tls")]
 use rustls::{
@@ -171,22 +170,64 @@ pub fn load_encoding_key(path: &str) -> Result<EncodingKey, Error> {
     Ok(key)
 }
 
-/// Verifies a JWT token against a set of decoding keys.
+/// Maximum allowed serialized JWT length in bytes (4 KiB) to reject oversized
+/// payloads before base64 decoding or Ed25519 signature verification ([P-01]).
+#[cfg(feature = "jwt")]
+pub const MAX_JWT_TOKEN_LEN: usize = 4096;
+
+/// Default maximum allowed remaining JWT lifetime (`exp - now`) in seconds (30 days, [S-06]).
+#[cfg(feature = "jwt")]
+pub const DEFAULT_MAX_JWT_LIFETIME_SECS: u64 = 30 * 24 * 3600;
+
+/// Maximum allowed `jti` claim length in bytes.
+#[cfg(feature = "jwt")]
+const MAX_JTI_CLAIM_LEN: usize = 256;
+
+/// Clock-skew leeway in seconds applied to the upper token lifetime bound check.
+#[cfg(feature = "jwt")]
+const JWT_LIFETIME_LEEWAY_SECS: u64 = 60;
+
+/// Policy options for JWT verification ([`verify_jwt_with_options`]).
+#[cfg(feature = "jwt")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JwtVerifyOptions {
+    /// Whether a non-empty `jti` claim is mandatory (default: `true`).
+    ///
+    /// Enforcing `jti` ensures issued tokens can be revoked via the `jti` denylist.
+    pub require_jti: bool,
+    /// Maximum allowed remaining token lifetime (`exp - now`) in seconds.
+    ///
+    /// Defaults to `Some(DEFAULT_MAX_JWT_LIFETIME_SECS)` (30 days).
+    /// Set to `None` to disable the upper lifetime bound.
+    pub max_token_lifetime_secs: Option<u64>,
+}
+
+#[cfg(feature = "jwt")]
+impl Default for JwtVerifyOptions {
+    fn default() -> Self {
+        Self {
+            require_jti: true,
+            max_token_lifetime_secs: Some(DEFAULT_MAX_JWT_LIFETIME_SECS),
+        }
+    }
+}
+
+/// Verifies a JWT token against a set of decoding keys using default policy options
+/// ([`JwtVerifyOptions::default()`]: mandatory `jti` and a 30-day maximum lifetime).
 ///
-/// Tries each key in order; the **first** successful verification wins.
-/// This enables seamless key rotation: both the old and new keys can be
-/// active simultaneously during a rollover window.
+/// Tries the key selected by the JWS header `kid` (`"praeco-key-<1-based-index>"`)
+/// when present, or each key in order when no `kid` is set.
 ///
 /// # Algorithm
 ///
-/// Currently hard-coded to **EdDSA** (Ed25519). If algorithm negotiation
-/// is needed in the future, the commented-out `decode_header` block can be
-/// re-enabled.
+/// Strictly enforces **EdDSA** (Ed25519).
 ///
 /// # Errors
 ///
-/// Returns an error if `expected_issuer` or `expected_audience` is empty,
-/// or if **none** of the provided keys can verify the token.
+/// Returns an error if the token exceeds [`MAX_JWT_TOKEN_LEN`], has a malformed
+/// compact JWS structure, specifies an unknown `kid`, misses required claims
+/// (`exp`, `iss`, `aud`, `sub`, and `jti`), exceeds the maximum lifetime policy,
+/// or fails signature verification.
 #[cfg(feature = "jwt")]
 pub fn verify_jwt(
     token: &str,
@@ -194,13 +235,60 @@ pub fn verify_jwt(
     expected_issuer: &str,
     expected_audience: &str,
 ) -> Result<Claims, Error> {
+    verify_jwt_with_options(
+        token,
+        decoding_keys,
+        expected_issuer,
+        expected_audience,
+        JwtVerifyOptions::default(),
+    )
+}
+
+/// Verifies a JWT token against a set of decoding keys with explicit [`JwtVerifyOptions`].
+#[cfg(feature = "jwt")]
+pub fn verify_jwt_with_options(
+    token: &str,
+    decoding_keys: &[DecodingKey],
+    expected_issuer: &str,
+    expected_audience: &str,
+    options: JwtVerifyOptions,
+) -> Result<Claims, Error> {
+    if token.is_empty() || token.len() > MAX_JWT_TOKEN_LEN {
+        return Err(Error::msg(
+            "JWT verification failed: token length out of bounds",
+        ));
+    }
+
+    let mut segments = token.split('.');
+    let (Some(h), Some(p), Some(s), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return Err(Error::msg(
+            "JWT verification failed: malformed compact JWS structure",
+        ));
+    };
+    if h.is_empty() || p.is_empty() || s.is_empty() {
+        return Err(Error::msg("JWT verification failed: empty JWS segment"));
+    }
+
+    if decoding_keys.is_empty() {
+        return Err(Error::msg(
+            "JWT verification failed: no decoding keys configured",
+        ));
+    }
+
     let iss_list: Vec<&str> = expected_issuer
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
     if iss_list.is_empty() {
-        return Err(Error::msg("JWT verification failed: expected_issuer must not be empty"));
+        return Err(Error::msg(
+            "JWT verification failed: expected_issuer must not be empty",
+        ));
     }
 
     let aud_list: Vec<&str> = expected_audience
@@ -209,20 +297,93 @@ pub fn verify_jwt(
         .filter(|s| !s.is_empty())
         .collect();
     if aud_list.is_empty() {
-        return Err(Error::msg("JWT verification failed: expected_audience must not be empty"));
+        return Err(Error::msg(
+            "JWT verification failed: expected_audience must not be empty",
+        ));
     }
+
+    let header = decode_header(token)
+        .map_err(|_| Error::msg("JWT verification failed: invalid JWS header"))?;
+    if header.alg != jsonwebtoken::Algorithm::EdDSA {
+        return Err(Error::msg(
+            "JWT verification failed: unsupported algorithm",
+        ));
+    }
+
+    // If the token header specifies a `kid` of the form `"praeco-key-<N>"`,
+    // route directly to the 1-based key slot (O(1) single-key verification).
+    // Fail fast if `<N>` is out of range or malformed.
+    let candidate_keys: &[DecodingKey] = match header.kid.as_deref() {
+        Some(kid) => {
+            if let Some(idx_str) = kid.strip_prefix("praeco-key-") {
+                let idx = idx_str
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|&i| i >= 1 && i <= decoding_keys.len())
+                    .ok_or_else(|| {
+                        Error::msg("JWT verification failed: unknown key ID (kid)")
+                    })?;
+                &decoding_keys[idx - 1..idx]
+            } else {
+                decoding_keys
+            }
+        }
+        None => decoding_keys,
+    };
 
     let mut validation = Validation::new(jsonwebtoken::Algorithm::EdDSA);
     validation.set_issuer(&iss_list);
     validation.set_audience(&aud_list);
+    validation.validate_nbf = true;
+    if options.require_jti {
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub", "jti"]);
+    } else {
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    }
 
-    // Try verifying the JWT with each decoding key
-    for key in decoding_keys {
+    let mut verified_claims: Option<Claims> = None;
+    for key in candidate_keys {
         if let Ok(data) = decode::<Claims>(token, key, &validation) {
-            return Ok(data.claims);
+            verified_claims = Some(data.claims);
+            break;
         }
     }
-    Err(Error::msg("JWT verification failed with all keys"))
+
+    let claims =
+        verified_claims.ok_or_else(|| Error::msg("JWT verification failed with all keys"))?;
+
+    if claims.sub.trim().is_empty() {
+        return Err(Error::msg(
+            "JWT verification failed: subject (sub) must not be empty",
+        ));
+    }
+
+    if options.require_jti {
+        let valid_jti = claims
+            .jti
+            .as_deref()
+            .is_some_and(|jti| !jti.trim().is_empty() && jti.len() <= MAX_JTI_CLAIM_LEN);
+        if !valid_jti {
+            return Err(Error::msg(
+                "JWT verification failed: missing or invalid jti claim",
+            ));
+        }
+    }
+
+    if let Some(max_lifetime_secs) = options.max_token_lifetime_secs {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let remaining = (claims.exp as u64).saturating_sub(now);
+        if remaining > max_lifetime_secs.saturating_add(JWT_LIFETIME_LEEWAY_SECS) {
+            return Err(Error::msg(
+                "JWT verification failed: token lifetime exceeds maximum policy",
+            ));
+        }
+    }
+
+    Ok(claims)
 }
 
 /// Signs a JWT token with the given `Claims` and `EncodingKey`.
@@ -428,12 +589,16 @@ mod tests {
 
         let enc_key = EncodingKey::from_ed_pem(priv_pem.as_bytes()).unwrap();
         let dec_key = DecodingKey::from_ed_pem(pub_pem.as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
 
         let claims = Claims {
             sub: "user-1".to_string(),
             iss: "praeco-idp".to_string(),
             aud: Some("admin-dashboard".to_string()),
-            exp: 9999999999,
+            exp: now + 3600,
             oids: vec!["1".to_string()],
             jti: Some("jti-123".to_string()),
         };
@@ -458,14 +623,18 @@ mod tests {
 
         let enc_key = EncodingKey::from_ed_pem(priv_pem.as_bytes()).unwrap();
         let dec_key = DecodingKey::from_ed_pem(pub_pem.as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
 
         let claims = Claims {
             sub: "test-user".to_string(),
             iss: "praeco-idp".to_string(),
             aud: Some("admin-dashboard".to_string()),
-            exp: 9999999999,
+            exp: now + 3600,
             oids: vec!["1".to_string()],
-            jti: None,
+            jti: Some("jti-valid".to_string()),
         };
 
         let token = sign_jwt(&claims, &enc_key).unwrap();
@@ -474,6 +643,153 @@ mod tests {
         assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), " , ", "admin-dashboard").is_err());
         assert!(verify_jwt(&token, std::slice::from_ref(&dec_key), "praeco-idp", "").is_err());
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", " , ").is_err());
+    }
+
+    #[cfg(feature = "jwt")]
+    #[test]
+    fn test_verify_jwt_enforces_jti_max_lifetime_kid_and_size_bounds() {
+        let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+        let pub_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+        let other_pub_pem = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA1111111111111111111111111111111111111111110=\n-----END PUBLIC KEY-----\n";
+
+        let enc_key = EncodingKey::from_ed_pem(priv_pem.as_bytes()).unwrap();
+        let dec_key = DecodingKey::from_ed_pem(pub_pem.as_bytes()).unwrap();
+        let other_dec_key = DecodingKey::from_ed_pem(other_pub_pem.as_bytes()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as usize;
+
+        // 1. Missing jti rejected by default, accepted when require_jti = false
+        let claims_no_jti = Claims {
+            sub: "user-1".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("admin-dashboard".to_string()),
+            exp: now + 3600,
+            oids: vec!["1".to_string()],
+            jti: None,
+        };
+        let token_no_jti = sign_jwt(&claims_no_jti, &enc_key).unwrap();
+        assert!(verify_jwt(&token_no_jti, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+        assert!(
+            verify_jwt_with_options(
+                &token_no_jti,
+                std::slice::from_ref(&dec_key),
+                "praeco-idp",
+                "admin-dashboard",
+                JwtVerifyOptions {
+                    require_jti: false,
+                    max_token_lifetime_secs: Some(DEFAULT_MAX_JWT_LIFETIME_SECS),
+                },
+            )
+            .is_ok()
+        );
+
+        // 2. Excessive lifetime (year 2286) rejected by default, accepted when max_token_lifetime_secs = None
+        let claims_far_exp = Claims {
+            sub: "user-1".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("admin-dashboard".to_string()),
+            exp: 9_999_999_999,
+            oids: vec!["1".to_string()],
+            jti: Some("jti-far".to_string()),
+        };
+        let token_far_exp = sign_jwt(&claims_far_exp, &enc_key).unwrap();
+        assert!(verify_jwt(&token_far_exp, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+        assert!(
+            verify_jwt_with_options(
+                &token_far_exp,
+                std::slice::from_ref(&dec_key),
+                "praeco-idp",
+                "admin-dashboard",
+                JwtVerifyOptions {
+                    require_jti: true,
+                    max_token_lifetime_secs: None,
+                },
+            )
+            .is_ok()
+        );
+
+        // 3. kid routing: "praeco-key-2" routes to index 1; out-of-range "praeco-key-99" fails fast
+        let valid_claims = Claims {
+            sub: "user-1".to_string(),
+            iss: "praeco-idp".to_string(),
+            aud: Some("admin-dashboard".to_string()),
+            exp: now + 3600,
+            oids: vec!["1".to_string()],
+            jti: Some("jti-kid".to_string()),
+        };
+        let token_kid_2 = sign_jwt_with_kid(&valid_claims, &enc_key, Some("praeco-key-2")).unwrap();
+        let keys = vec![other_dec_key, dec_key.clone()];
+        assert!(verify_jwt(&token_kid_2, &keys, "praeco-idp", "admin-dashboard").is_ok());
+
+        let token_kid_oob = sign_jwt_with_kid(&valid_claims, &enc_key, Some("praeco-key-99")).unwrap();
+        assert!(verify_jwt(&token_kid_oob, &keys, "praeco-idp", "admin-dashboard").is_err());
+
+        // 4. Oversized token (> MAX_JWT_TOKEN_LEN) and malformed structure rejected before crypto
+        let oversized = format!("a.{}.c", "b".repeat(MAX_JWT_TOKEN_LEN));
+        assert!(verify_jwt(&oversized, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+        assert!(verify_jwt("not-a-jwt", std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+
+        // 5. Empty/whitespace subject or whitespace/oversized jti (> 256 bytes) rejected
+        let empty_sub_token = sign_jwt(
+            &Claims {
+                sub: "   ".to_string(),
+                ..valid_claims.clone()
+            },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(verify_jwt(&empty_sub_token, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+
+        let blank_jti_token = sign_jwt(
+            &Claims {
+                jti: Some("   ".to_string()),
+                ..valid_claims.clone()
+            },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(verify_jwt(&blank_jti_token, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+
+        let huge_jti_token = sign_jwt(
+            &Claims {
+                jti: Some("j".repeat(257)),
+                ..valid_claims.clone()
+            },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(verify_jwt(&huge_jti_token, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
+
+        // 6. Future `nbf` (Not Before) claim is enforced (`validate_nbf = true`)
+        #[derive(Serialize)]
+        struct ClaimsWithNbf {
+            sub: String,
+            iss: String,
+            aud: String,
+            exp: usize,
+            nbf: usize,
+            oids: Vec<String>,
+            jti: String,
+        }
+        let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some("praeco-key-1".to_string());
+        let future_nbf_token = encode(
+            &header,
+            &ClaimsWithNbf {
+                sub: "user-1".to_string(),
+                iss: "praeco-idp".to_string(),
+                aud: "admin-dashboard".to_string(),
+                exp: now + 7200,
+                nbf: now + 3600,
+                oids: vec!["1".to_string()],
+                jti: "jti-future-nbf".to_string(),
+            },
+            &enc_key,
+        )
+        .unwrap();
+        assert!(verify_jwt(&future_nbf_token, &[dec_key], "praeco-idp", "admin-dashboard").is_err());
     }
 
     #[cfg(feature = "tls")]

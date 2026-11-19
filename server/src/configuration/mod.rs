@@ -585,15 +585,15 @@ pub struct RouteConfig {
     /// Maximum incoming request body size in bytes buffered in RAM for buffered-only routes
     /// (`grpc_transcoding` and `aggregate`). Defaults to 4 MiB.
     pub max_request_bytes: Option<usize>,
-    /// Maximum cumulative response bytes buffered across all sub-targets of an `aggregate` route.
-    /// Defaults to 16 MiB.
+    /// Maximum response bytes buffered in RAM for `grpc_transcoding` routes or cumulatively
+    /// across all sub-targets of an `aggregate` route. Defaults to 4 MiB.
     pub max_response_bytes: Option<usize>,
 }
 
 /// Default maximum request body size buffered in RAM for `grpc_transcoding` and `aggregate` routes (4 MiB).
 pub const DEFAULT_MAX_BUFFERED_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-/// Default maximum cumulative response size buffered across all targets of an `aggregate` route (16 MiB).
-pub const DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Default maximum response size buffered in RAM for `grpc_transcoding` and `aggregate` routes (4 MiB).
+pub const DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Controls how incoming `POST` request bodies are distributed across fan-out targets
 /// on an `aggregate` route.
@@ -1142,6 +1142,14 @@ pub struct DelayConfig {
     pub delay_micros: u64,
 }
 
+fn default_require_jti() -> bool {
+    true
+}
+
+fn default_max_token_lifetime_seconds() -> u64 {
+    common::DEFAULT_MAX_JWT_LIFETIME_SECS
+}
+
 /// Configuration for the JWT authentication layer.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1161,6 +1169,14 @@ pub struct JwtAuthConfig {
     /// while still forwarding the request to the upstream backend.
     #[serde(default)]
     pub revoke_on_paths: Vec<String>,
+    /// Whether incoming JWTs must contain a non-empty `jti` claim (default: `true`).
+    /// Enforcing `jti` ensures tokens can be revoked via the `jti` denylist.
+    #[serde(default = "default_require_jti")]
+    pub require_jti: bool,
+    /// Maximum allowed remaining token lifetime (`exp - now`) in seconds (default: `2_592_000` / 30 days).
+    /// Set to `0` to disable the upper lifetime bound.
+    #[serde(default = "default_max_token_lifetime_seconds")]
+    pub max_token_lifetime_seconds: u64,
 }
 
 fn default_max_connections() -> usize {

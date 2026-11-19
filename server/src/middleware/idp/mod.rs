@@ -670,8 +670,13 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                 let token_from_header = req.headers()
                     .get(hyper::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.strip_prefix("Bearer "))
-                    .map(|s| s.trim().to_string());
+                    .and_then(|s| {
+                        s.get(..7)
+                            .filter(|p| p.eq_ignore_ascii_case("bearer "))
+                            .and_then(|_| s.get(7..))
+                    })
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
 
                 let token_from_cookie = if token_from_header.is_none() {
                     let prefix = format!("{}=", self.params.cookie_name);
@@ -699,6 +704,14 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                             response: Some(Self::response_err(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 "JWT revocation unavailable: no decoding keys configured",
+                            )),
+                        };
+                    }
+                    if token_str.is_empty() || token_str.len() > common::MAX_JWT_TOKEN_LEN {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::UNAUTHORIZED,
+                                "Unauthorized: invalid token for revocation",
                             )),
                         };
                     }
@@ -1002,6 +1015,36 @@ mod tests {
 
         // Check JTI is now revoked in store
         assert!(crate::middleware::jwt::get_jwt_revocation_store().is_revoked(&jti));
+
+        // 2. Lowercase "bearer " prefix works and oversized token (> MAX_JWT_TOKEN_LEN) is rejected with 401
+        let jti_lower = "revoke-test-jti-lowercase-bearer".to_string();
+        let token_lower = common::sign_jwt(
+            &Claims {
+                jti: Some(jti_lower.clone()),
+                ..claims
+            },
+            &enc_key,
+        )
+        .unwrap();
+        let req_lower = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header("Authorization", format!("bearer {token_lower}"))
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp_lower = idp.ready().await.unwrap().call(req_lower).await.unwrap();
+        assert_eq!(resp_lower.status(), StatusCode::OK);
+        assert!(crate::middleware::jwt::get_jwt_revocation_store().is_revoked(&jti_lower));
+
+        let oversized_token = "a".repeat(common::MAX_JWT_TOKEN_LEN + 10);
+        let req_oversized = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/revoke")
+            .header("Authorization", format!("Bearer {oversized_token}"))
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp_oversized = idp.ready().await.unwrap().call(req_oversized).await.unwrap();
+        assert_eq!(resp_oversized.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

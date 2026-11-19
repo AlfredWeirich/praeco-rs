@@ -522,13 +522,15 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 | :--- | :--- | :--- | :--- | :--- |
 | `upstreams` | Array of Strings | **Mandatory** (except `admin`, `aggregate`) | `[]` | List of target backend URLs (e.g. `["https://10.0.0.1:8080", "https://10.0.0.2:8080"]`). Must be omitted or `[]` when `backend_type = "admin"` or `"aggregate"`. |
 | `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
-| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; 16 MiB response body cap), `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint), or `"aggregate"` / `"fanout"` (parallel fan-out aggregator across REST and gRPC-transcoding sub-targets). |
+| `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; bounded by `max_response_bytes` and the 256 MiB global response buffer budget), `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint), or `"aggregate"` / `"fanout"` (parallel fan-out aggregator across REST and gRPC-transcoding sub-targets). |
 | `targets` | Array of Tables | **Mandatory** for `aggregate` | `[]` | Sub-target definitions (`[[Server.ReverseRoutes."/path".targets]]`) when `backend_type = "aggregate"`. Each target specifies `key`, `backend_type` (`"rest"` or `"grpc_transcoding"`), `upstreams`, `path`, optional `method`, and `required` (default `true`). |
 | `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
 | `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead (`CircuitState::Open`) upstream is benched before a single probe request is allowed in `HalfOpen` state. |
 | `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes (on TCP/timeout errors or `502`/`503`/`504` outlier responses) before returning to client. |
 | `failure_threshold` | Integer | Optional | `3` | Consecutive upstream `502`/`503`/`504` (or gRPC `14 UNAVAILABLE`) responses before the 3-State Circuit Breaker trips to `Open`. Hard TCP/timeout failures trip immediately; a single failure in `HalfOpen` re-opens immediately. |
 | `max_retry_buffer_bytes` | Integer | Optional | `65536` (64 KiB) | Maximum request body size buffered in RAM for automatic retries on idempotent requests. Payloads exceeding this cap seamlessly stream (`PrefixedStreamBody`) without buffering the full upload in memory. |
+| `max_request_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum incoming request body size buffered in RAM for buffered-only routes (`grpc_transcoding` and `aggregate`). Must be `> 0`. Exceeding payloads are rejected with `413 Payload Too Large`. |
+| `max_response_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum response body size buffered in RAM for `grpc_transcoding` routes or cumulatively across all fan-out sub-targets of an `aggregate` route (additionally bounded by the 256 MiB process-wide response buffer budget). Must be `> 0`. |
 | `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Polling interval in seconds. Proactively pings `/health` (REST) or gRPC `health` method. Expected score payload: `{"score": 100}` (REST) or field tag 1 integer (gRPC). Score 0 quarantines node. |
 
 #### Upstream Connection Parameters (`[Server.RouterParams]`)
@@ -578,7 +580,7 @@ REST / Web Browser Client      │                                              
 | **Target Client** | Real gRPC client SDKs, mobile apps, backend microservices | Web browsers, Single Page Apps (SPAs), cURL, third-party REST consumers |
 | **Schema Requirement** | **None.** Operates at wire speed without inspecting message fields. | **Automatic Reflection.** Fetches protobuf definitions at runtime via gRPC Reflection v1. |
 | **Recompilation on Schema Change**| **Never.** Fully schema-agnostic. | **Never.** Automatically re-syncs schema based on `grpc_reflection_ttl_seconds`. |
-| **Streaming Support** | **Full:** Unary, Client-Streaming, Server-Streaming, Bidirectional | **Unary:** Request-Response (buffers request body and responses up to 16 MiB). |
+| **Streaming Support** | **Full:** Unary, Client-Streaming, Server-Streaming, Bidirectional | **Unary:** Request-Response (buffers request and response bodies up to `max_request_bytes` / `max_response_bytes`, default 4 MiB, within the 256 MiB global response buffer budget). |
 | **CPU & Memory Overhead** | **Zero-Copy / Wire-Speed.** Passes raw HTTP/2 frames directly. | **Minimal.** Performs dynamic JSON-to-Protobuf serialization via `prost-reflect`. |
 | **HTTP/2 Trailers (`grpc-status`)** | Preserved end-to-end to the client in trailing HEADERS frames. | Translated into HTTP status codes and JSON error responses. |
 
@@ -652,7 +654,7 @@ Client (Browser)                      Praeco Router                      Backend
        │                                    │    [0x00][4-byte len][res_protobuf]  │
        │                                    │    trailers: grpc-status: 0          │
        │                                    │                                      │
-       │                                    │── [Step 5: Enforce 16 MB Cap]        │
+       │                                    │── [Step 5: Enforce Route/Global Cap] │
        │                                    │── [Step 6: Decode Protobuf to JSON]  │
        │                                    │                                      │
        │◄─ HTTP 200 OK (application/json) ──│                                      │
@@ -665,9 +667,9 @@ Client (Browser)                      Praeco Router                      Backend
    - **Byte 0:** Compression flag (`0` = uncompressed, `1` = compressed).
    - **Bytes 1–4:** Big-endian 32-bit unsigned integer representing the exact payload byte length (`u32::to_be_bytes`).
 4. **Header Injection:** Dispatches an HTTP/2 request with `content-type: application/grpc`, `te: trailers`, and propagated W3C `traceparent` headers.
-5. **Response Translation & 16 MiB Protection:**
-   - Praeco bounds response body collection to **16 MiB** (`http_body_util::Limited::new(res.body_mut(), 16 * 1024 * 1024)`). This prevents malfunctioning or malicious upstream services from causing out-of-memory (OOM) crashes in the gateway.
-   - Extracts the 5-byte gRPC frame, decodes the Protobuf response payload using `DynamicMessage::merge`, serializes it into a JSON string, and responds to the client with `200 OK` and `content-type: application/json`.
+5. **Response Translation, Per-Route `max_response_bytes` & 256 MiB Global Buffer Budget:**
+   - Praeco bounds each transcoded response body to `max_response_bytes` (default **4 MiB**) and simultaneously reserves bytes from the process-wide **256 MiB** response buffer budget (`DEFAULT_GLOBAL_RESPONSE_BUFFER_BUDGET_BYTES`). If the per-route limit is exceeded, Praeco returns `502 Bad Gateway`; if the global 256 MiB memory budget is saturated across concurrent requests, Praeco sheds load with `503 Service Unavailable` **without** tripping the upstream node's circuit breaker. For larger payloads, prefer native Server-Streaming gRPC (`backend_type = "grpc_passthrough"`).
+   - Extracts the 5-byte gRPC frame, decodes the Protobuf response payload using `DynamicMessage::merge`, serializes it into a JSON string, adjusts the RAII `BufferReservation` to the transcoded JSON size, and releases the reservation as soon as Hyper drains the response frame.
 
 ```toml
 # Example Dynamic JSON-to-gRPC Route
@@ -687,7 +689,7 @@ An `aggregate` route accepts a single client `GET` or `POST` request, fans it ou
 - **Headers & credentials (`forward_headers`):** Conditional/range headers (`If-None-Match`, `If-Modified-Since`, `Range`, …) are always stripped so no single sub-request turns the aggregate into `304`/`206`. Client `Authorization` and `Cookie` headers are stripped by default unless explicitly listed in a target's `forward_headers` (gateway-injected `[Server.RouterParams].jwt` tokens are preserved).
 - **Partial failures (`expose_upstream_errors`):** Targets with `required = true` (default) abort remaining sub-requests immediately on failure and return `502`/`504`. Targets with `required = false` degrade gracefully with `"<key>": null` and an `"_errors": { "<key>": { "status": ..., "message": ... } }` entry. Raw upstream error texts are logged on the server and replaced with canonical HTTP reason phrases by default (`expose_upstream_errors = false`).
 
-- **Deadlines & Memory Limits (`timeout_ms`, `deadline_ms`, `max_request_bytes`, `max_response_bytes`):** Set `timeout_ms` per target and/or `deadline_ms` on the route so slow optional targets degrade to `504` instead of holding back the whole response. Incoming buffered request bodies are capped by `max_request_bytes` (default: 4 MiB, returning `413 Payload Too Large`), and cumulative sub-responses across all targets are capped by `max_response_bytes` (default: 16 MiB).
+- **Deadlines & Memory Limits (`timeout_ms`, `deadline_ms`, `max_request_bytes`, `max_response_bytes`):** Set `timeout_ms` per target and/or `deadline_ms` on the route so slow optional targets degrade to `504` instead of holding back the whole response. Incoming buffered request bodies are capped by `max_request_bytes` (default: 4 MiB, returning `413 Payload Too Large`), and cumulative sub-responses across all targets are capped by `max_response_bytes` (default: 4 MiB, returning `502 Bad Gateway`) as well as the process-wide 256 MiB `BufferBudget` (returning `503 Service Unavailable` when exhausted, with incremental RAII release as `ChunkedBytesBody` yields chunks to Hyper).
 - **gRPC Status Mapping:** For `grpc_transcoding` targets, non-zero `grpc-status` headers/trailers (both Trailers-Only and trailing error frames after data) are mapped to HTTP statuses (`NOT_FOUND` $\rightarrow$ `404`, `UNAVAILABLE` $\rightarrow$ `503`, `DEADLINE_EXCEEDED` $\rightarrow$ `504`, `PERMISSION_DENIED` $\rightarrow$ `403`, `UNAUTHENTICATED` $\rightarrow$ `401`, etc.) and reported with `"grpc_status"` inside `"_errors"`.
 
 ```toml
@@ -840,7 +842,8 @@ When errors occur during gRPC proxying, Praeco maps them consistently to standar
 | **Payload Limit Exceeded** | `413 Payload Too Large` | Client payload exceeds `max_bytes` in `[Server.Layers.MaxPayload]`. Upstream node remains healthy. |
 | **Backend Unreachable** | `502 Bad Gateway` | TCP connection refused or backend closed connection before sending headers. Retries alternative nodes if configured. |
 | **Backend Timeout** | `504 Gateway Timeout` | Upstream backend accepted connection but failed to respond within `request_timeout_seconds`. |
-| **Upstream Response > 16 MB** | `502 Bad Gateway` | Transcoding response body exceeds the 16 MiB safety limit. Prevents memory exhaustion. |
+| **Upstream Response > `max_response_bytes`** | `502 Bad Gateway` | Transcoding response body exceeds the per-route `max_response_bytes` limit (default 4 MiB). |
+| **Global Response Buffer Budget Exhausted** | `503 Service Unavailable` | Concurrent buffered `grpc_transcoding` / `aggregate` responses exceed the 256 MiB process-wide budget. Upstream circuit breaker is not penalized. |
 
 ---
 
@@ -955,12 +958,14 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 #### `[Server.Layers.JWT]`
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `jwt_public_keys` | Array of Strings | **Mandatory** | *None* | Non-empty list of file paths to PEM-encoded Ed25519 or RSA public keys used to verify token signatures. |
-| `expected_issuer` | String | **Mandatory** | *None* | Expected `iss` claim (must be non-empty / non-whitespace; fails closed otherwise). |
-| `expected_audience` | String | **Mandatory** | *None* | Expected `aud` claim (must be non-empty / non-whitespace; fails closed otherwise). |
-| `cookie_fallback` | String | Optional | `None` | Cookie name to extract JWT if `Authorization` header is missing. |
-| `redirect_on_failure` | String | Optional | `None` | Target URL (HTTP 302/307) to redirect unauthenticated browser requests. |
+| `jwt_public_keys` | Array of Strings | **Mandatory** | *None* | Non-empty list of file paths to PEM-encoded Ed25519 public keys used to verify token signatures. Supports O(1) `kid` routing (`"praeco-key-<1-based-index>"`) during key rotation. |
+| `expected_issuer` | String | **Mandatory** | *None* | Expected `iss` claim (comma-separated list supported; must be non-empty / non-whitespace; fails closed otherwise). |
+| `expected_audience` | String | **Mandatory** | *None* | Expected `aud` claim (comma-separated list supported; must be non-empty / non-whitespace; fails closed otherwise). |
+| `cookie_fallback` | String | Optional | `None` | Cookie name to extract JWT if `Authorization` header (matched case-insensitively for `"Bearer "` per RFC 7235) is missing. |
+| `redirect_on_failure` | String | Optional | `None` | Target URL (HTTP 302) to redirect unauthenticated browser requests. |
 | `revoke_on_paths` | Array of Strings | Optional | `[]` | Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` is automatically added to the global `JwtRevocationStore`. |
+| `require_jti` | Boolean | Optional | `true` | Requires every incoming JWT to carry a non-empty `jti` claim (`<= 256` bytes) so tokens cannot bypass `JwtRevocationStore` revocation. |
+| `max_token_lifetime_seconds` | Integer (`u64`) | Optional | `2592000` (30 days) | Maximum allowed remaining token lifetime (`exp - now`) in seconds. Rejects tokens with excessively far-future `exp` timestamps. Set to `0` to disable the upper bound. |
 
 #### `[Server.Layers.RateLimiter]` (Simple Fixed-Window)
 | Parameter | Data Type | Requirement | Default Value | Description |

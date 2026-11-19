@@ -15,7 +15,10 @@ use std::task::{Context, Poll};
 use tokio::task::JoinSet;
 use tracing::{Instrument, error, info_span, warn};
 
-use super::{RequestBody, build_error_response, grpc_web, http_proxy};
+use super::{
+    BufferBudget, BufferReservation, RequestBody, build_error_response,
+    global_response_buffer_budget, grpc_web, http_proxy,
+};
 use crate::{
     ServiceRespBody, SrvError,
     configuration::{
@@ -49,7 +52,7 @@ struct AggregateErrorEntry {
 }
 
 enum SubOutcome {
-    Success(Bytes),
+    Success(Bytes, BufferReservation),
     Failed {
         status: StatusCode,
         grpc_status: Option<u32>,
@@ -305,16 +308,19 @@ fn prepare_rest_sub_headers(
     headers
 }
 
-/// Body adapter that enforces a shared cumulative byte budget atomically *while frames arrive*
-/// across all concurrent fan-out sub-requests, aborting upstream reads immediately before peak
-/// buffered memory can grow to `N * max_sub_bytes`.
-struct SharedBudgetBody<B> {
+/// Body adapter that enforces both the per-route cumulative byte budget and the
+/// process-wide [`BufferBudget`] atomically *while frames arrive* across all concurrent
+/// fan-out sub-requests, aborting upstream reads immediately before peak buffered memory
+/// can grow unboundedly.
+struct SharedBudgetBody<'a, B> {
     inner: B,
     remaining_budget: Arc<AtomicUsize>,
     exceeded: Arc<std::sync::atomic::AtomicBool>,
+    reservation: &'a mut BufferReservation,
+    global_exceeded: &'a mut bool,
 }
 
-impl<B> http_body::Body for SharedBudgetBody<B>
+impl<B> http_body::Body for SharedBudgetBody<'_, B>
 where
     B: http_body::Body<Data = Bytes, Error = SrvError> + Unpin,
 {
@@ -325,16 +331,17 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        match Pin::new(&mut self.inner).poll_frame(cx) {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     let len = data.len();
-                    let mut rem = self.remaining_budget.load(Ordering::Relaxed);
+                    let mut rem = this.remaining_budget.load(Ordering::Relaxed);
                     let within_budget = loop {
                         let Some(next) = rem.checked_sub(len) else {
                             break false;
                         };
-                        match self.remaining_budget.compare_exchange_weak(
+                        match this.remaining_budget.compare_exchange_weak(
                             rem,
                             next,
                             Ordering::Relaxed,
@@ -345,11 +352,17 @@ where
                         }
                     };
                     if !within_budget {
-                        self.exceeded.store(true, Ordering::Relaxed);
+                        this.exceeded.store(true, Ordering::Relaxed);
                         return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
                             current: len,
                             max: 0,
                         })));
+                    }
+                    if !this.reservation.try_reserve(len) {
+                        *this.global_exceeded = true;
+                        return Poll::Ready(Some(Err(SrvError::Other(
+                            "Global response buffer budget exhausted".to_string(),
+                        ))));
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -403,6 +416,7 @@ async fn collect_sub_outcome(
     body_timeout: Option<std::time::Duration>,
     max_sub_bytes: usize,
     shared_budget: Arc<AtomicUsize>,
+    global_budget: Arc<BufferBudget>,
     expose_upstream_errors: bool,
 ) -> SubOutcome {
     let status = resp.status();
@@ -437,11 +451,15 @@ async fn collect_sub_outcome(
         };
     }
 
+    let mut reservation = BufferReservation::new(global_budget);
+    let mut global_exceeded = false;
     let budget_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let budgeted_body = SharedBudgetBody {
         inner: resp.into_body(),
         remaining_budget: shared_budget,
         exceeded: budget_exceeded.clone(),
+        reservation: &mut reservation,
+        global_exceeded: &mut global_exceeded,
     };
     let collect_fut = Limited::new(budgeted_body, max_sub_bytes).collect();
     let collected = match body_timeout {
@@ -461,6 +479,17 @@ async fn collect_sub_outcome(
 
     let bytes = match collected {
         Ok(c) => c.to_bytes(),
+        Err(_) if global_exceeded => {
+            return SubOutcome::Failed {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                grpc_status: None,
+                client_message: "Service Unavailable".to_string(),
+                internal_detail: format!(
+                    "Global response buffer budget exhausted while reading target '{}'",
+                    sub_target.key
+                ),
+            };
+        }
         Err(e) => {
             let detail = if budget_exceeded.load(Ordering::Relaxed) {
                 format!(
@@ -480,7 +509,7 @@ async fn collect_sub_outcome(
     };
 
     if bytes.is_empty() {
-        return SubOutcome::Success(Bytes::from_static(b"null"));
+        return SubOutcome::Success(Bytes::from_static(b"null"), reservation);
     }
 
     // Validate REST upstream payloads are syntactically valid JSON without allocating a DOM tree.
@@ -499,7 +528,7 @@ async fn collect_sub_outcome(
         };
     }
 
-    SubOutcome::Success(bytes)
+    SubOutcome::Success(bytes, reservation)
 }
 
 /// Executes a single fan-out sub-request against either `grpc_web` or `http_proxy`.
@@ -525,6 +554,7 @@ async fn execute_sub_target(
     sub_timeout: Option<std::time::Duration>,
     max_sub_bytes: usize,
     shared_budget: Arc<AtomicUsize>,
+    global_budget: Arc<BufferBudget>,
     expose_upstream_errors: bool,
 ) -> SubOutcome {
     let start = std::time::Instant::now();
@@ -538,7 +568,7 @@ async fn execute_sub_target(
 
     let result = match sub_target.backend_type {
         RouteBackendType::GrpcTranscoding => {
-            grpc_web::handle_grpc_web(
+            grpc_web::handle_grpc_web_with_budget(
                 &sub_target.target,
                 RequestBody::Buffered(sub_body),
                 Method::POST,
@@ -549,6 +579,8 @@ async fn execute_sub_target(
                 &grpc_client,
                 &config,
                 sub_timeout,
+                max_sub_bytes,
+                &global_budget,
             )
             .await
         }
@@ -601,6 +633,7 @@ async fn execute_sub_target(
                 remaining_timeout,
                 max_sub_bytes,
                 shared_budget,
+                global_budget,
                 expose_upstream_errors,
             )
             .await
@@ -617,9 +650,13 @@ async fn execute_sub_target(
 /// Zero-copy multi-chunk [`http_body::Body`] backed by a queue of reference-counted [`Bytes`]
 /// frames so aggregated upstream JSON payloads are streamed directly to Hyper without copying
 /// sub-response buffers into a single contiguous heap allocation.
+///
+/// Holds the consolidated [`BufferReservation`] and releases reserved bytes incrementally
+/// as each chunk is yielded to Hyper (or all remaining bytes on `Drop`).
 struct ChunkedBytesBody {
     chunks: VecDeque<Bytes>,
     remaining_bytes: usize,
+    reservation: BufferReservation,
 }
 
 impl http_body::Body for ChunkedBytesBody {
@@ -630,11 +667,13 @@ impl http_body::Body for ChunkedBytesBody {
         mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        while let Some(chunk) = self.chunks.pop_front() {
+        let this = &mut *self;
+        while let Some(chunk) = this.chunks.pop_front() {
             if chunk.is_empty() {
                 continue;
             }
-            self.remaining_bytes = self.remaining_bytes.saturating_sub(chunk.len());
+            this.remaining_bytes = this.remaining_bytes.saturating_sub(chunk.len());
+            this.reservation.release(chunk.len());
             return Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
         }
         Poll::Ready(None)
@@ -654,9 +693,11 @@ impl http_body::Body for ChunkedBytesBody {
 fn assemble_aggregated_body(
     targets: &[Arc<ParsedAggregateTarget>],
     outcomes: Vec<Option<SubOutcome>>,
+    global_budget: &Arc<BufferBudget>,
 ) -> Result<ChunkedBytesBody, SrvError> {
     let mut chunks = VecDeque::with_capacity(targets.len() * 3 + 3);
     let mut total_bytes = 0usize;
+    let mut consolidated_reservation = BufferReservation::new(Arc::clone(global_budget));
 
     let mut push_chunk = |b: Bytes| {
         if !b.is_empty() {
@@ -676,8 +717,9 @@ fn assemble_aggregated_body(
         push_chunk(target.json_key_prefix.clone());
 
         match outcome_opt {
-            Some(SubOutcome::Success(raw_json)) => {
-                // Zero-copy move of the validated upstream JSON buffer directly into the frame queue
+            Some(SubOutcome::Success(raw_json, sub_reservation)) => {
+                // Zero-copy move of the validated upstream JSON buffer and its reservation
+                consolidated_reservation.absorb(sub_reservation);
                 push_chunk(raw_json);
             }
             Some(SubOutcome::Failed {
@@ -713,6 +755,7 @@ fn assemble_aggregated_body(
     Ok(ChunkedBytesBody {
         chunks,
         remaining_bytes: total_bytes,
+        reservation: consolidated_reservation,
     })
 }
 
@@ -726,6 +769,45 @@ fn assemble_aggregated_body(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(server = %server_name, route = %route_info.prefix, method = %original_method))]
 pub async fn handle_aggregate(
+    route_info: &ParsedRoute,
+    request_body: RequestBody,
+    original_method: Method,
+    original_version: Version,
+    prepared_headers: hyper::HeaderMap,
+    original_uri: &Uri,
+    client_addr: Option<std::net::SocketAddr>,
+    server_name: &'static str,
+    client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    grpc_client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    config: &Arc<ServerConfig>,
+    request_timeout: Option<std::time::Duration>,
+) -> Result<Response<ServiceRespBody>, SrvError> {
+    handle_aggregate_with_budget(
+        route_info,
+        request_body,
+        original_method,
+        original_version,
+        prepared_headers,
+        original_uri,
+        client_addr,
+        server_name,
+        client,
+        grpc_client,
+        config,
+        request_timeout,
+        global_response_buffer_budget(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_aggregate_with_budget(
     route_info: &ParsedRoute,
     request_body: RequestBody,
     original_method: Method,
@@ -744,6 +826,7 @@ pub async fn handle_aggregate(
     >,
     config: &Arc<ServerConfig>,
     request_timeout: Option<std::time::Duration>,
+    global_budget: &Arc<BufferBudget>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     if !matches!(original_method, Method::GET | Method::POST) {
         return Ok(build_error_response(
@@ -832,6 +915,7 @@ pub async fn handle_aggregate(
         let sub_grpc_client = grpc_client.clone();
         let sub_config = Arc::clone(config);
         let sub_budget = Arc::clone(&shared_budget);
+        let sub_global_budget = Arc::clone(global_budget);
         let span = info_span!(
             "aggregate_subrequest",
             target_key = %sub_target.key,
@@ -855,6 +939,7 @@ pub async fn handle_aggregate(
                     effective_timeout,
                     per_sub_max_bytes,
                     sub_budget,
+                    sub_global_budget,
                     expose_upstream_errors,
                 );
                 let outcome = match effective_timeout {
@@ -926,7 +1011,7 @@ pub async fn handle_aggregate(
                 let target = &route_info.aggregate_targets[idx];
 
                 // Enforce cumulative response memory cap across all sub-targets (M1)
-                if let SubOutcome::Success(ref bytes) = outcome {
+                if let SubOutcome::Success(ref bytes, _) = outcome {
                     if cumulative_response_bytes.saturating_add(bytes.len()) > max_response_bytes {
                         let detail = format!(
                             "Cumulative aggregate response exceeded {} bytes on target '{}'",
@@ -979,7 +1064,8 @@ pub async fn handle_aggregate(
         }
     }
 
-    let chunked_body = assemble_aggregated_body(&route_info.aggregate_targets, outcomes)?;
+    let chunked_body =
+        assemble_aggregated_body(&route_info.aggregate_targets, outcomes, global_budget)?;
     let content_len = chunked_body.remaining_bytes;
 
     Response::builder()

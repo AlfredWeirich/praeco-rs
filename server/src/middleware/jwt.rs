@@ -43,7 +43,7 @@ use tracing::error;
 
 // === Internal Modules ===
 use crate::{ServiceRespBody, SrvError};
-use common::{Claims, load_decoding_keys, verify_jwt};
+use common::{Claims, JwtVerifyOptions, load_decoding_keys, verify_jwt_with_options};
 
 const MAX_REVOKED_ENTRIES: usize = 50_000;
 const REVOCATION_CLEANUP_INTERVAL_SECS: u64 = 30;
@@ -287,6 +287,8 @@ pub struct JwtAuthLayer {
     expected_audience: String,
     /// Request paths on which a valid JWT's `jti` is automatically revoked upon forwarding.
     revoke_on_paths: Arc<Vec<String>>,
+    /// Verification policy options (`require_jti`, `max_token_lifetime_secs`).
+    verify_options: JwtVerifyOptions,
 }
 
 impl JwtAuthLayer {
@@ -327,6 +329,7 @@ impl JwtAuthLayer {
             expected_issuer,
             expected_audience,
             revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions::default(),
         })
     }
 
@@ -334,6 +337,19 @@ impl JwtAuthLayer {
     /// a verified token's `jti` to the global [`JwtRevocationStore`].
     pub fn with_revoke_on_paths(mut self, paths: Vec<String>) -> Self {
         self.revoke_on_paths = Arc::new(paths);
+        self
+    }
+
+    /// Configures whether incoming JWTs must carry a non-empty `jti` claim (default: `true`).
+    pub fn with_require_jti(mut self, require_jti: bool) -> Self {
+        self.verify_options.require_jti = require_jti;
+        self
+    }
+
+    /// Configures the maximum allowed remaining lifetime (`exp - now`) for incoming JWTs.
+    /// Pass `None` to disable the upper lifetime bound.
+    pub fn with_max_token_lifetime_seconds(mut self, max_lifetime_secs: Option<u64>) -> Self {
+        self.verify_options.max_token_lifetime_secs = max_lifetime_secs;
         self
     }
 }
@@ -352,6 +368,7 @@ impl<S> Layer<S> for JwtAuthLayer {
             expected_issuer: self.expected_issuer.clone(),
             expected_audience: self.expected_audience.clone(),
             revoke_on_paths: Arc::clone(&self.revoke_on_paths),
+            verify_options: self.verify_options,
         }
     }
 }
@@ -383,6 +400,19 @@ pub struct JwtAuthService<S> {
     expected_audience: String,
     /// Request paths on which a valid JWT's `jti` is automatically revoked upon forwarding.
     revoke_on_paths: Arc<Vec<String>>,
+    /// Verification policy options (`require_jti`, `max_token_lifetime_secs`).
+    verify_options: JwtVerifyOptions,
+}
+
+/// Case-insensitively strips the RFC 7235 `"Bearer "` authorization scheme prefix.
+#[inline]
+fn strip_bearer_prefix(header_val: &str) -> Option<&str> {
+    let prefix = header_val.get(..7)?;
+    if prefix.eq_ignore_ascii_case("bearer ") {
+        header_val.get(7..)
+    } else {
+        None
+    }
 }
 
 #[pin_project(project = JwtAuthFutureProj)]
@@ -393,16 +423,6 @@ where
     /// Short-circuit response if token is missing or invalid.
     Unauthorized {
         response: Option<Response<ServiceRespBody>>,
-    },
-    /// The token is currently being verified asynchronously in a blocking thread.
-    Verifying {
-        verify_task: tokio::task::JoinHandle<Result<Claims, anyhow::Error>>,
-        req: Option<Request<ReqBody>>,
-        inner: S,
-        server_name: &'static str,
-        oid_mapping: Arc<Vec<(String, crate::configuration::UserRole)>>,
-        redirect: Option<String>,
-        revoke_on_paths: Arc<Vec<String>>,
     },
     /// Verification succeeded, the request was forwarded to the inner service.
     Inner {
@@ -418,113 +438,12 @@ where
     type Output = Result<Response<ServiceRespBody>, S::Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            match self.as_mut().project() {
-                JwtAuthFutureProj::Unauthorized { response } => {
-                    let res = response.take().expect("polled after complete");
-                    return Poll::Ready(Ok(res));
-                }
-                JwtAuthFutureProj::Inner { inner_fut } => {
-                    return inner_fut.poll(cx);
-                }
-                JwtAuthFutureProj::Verifying {
-                    verify_task,
-                    req,
-                    inner,
-                    server_name,
-                    oid_mapping,
-                    redirect,
-                    revoke_on_paths,
-                } => {
-                    // Wait for the blocking task to finish decoding the JWT
-                    let claims_result = std::task::ready!(Pin::new(verify_task).poll(cx));
-
-                    let claims_res = match claims_result {
-                        Ok(Ok(c)) => Ok(c),
-                        Ok(Err(e)) => Err(format!("{:?}", e)),
-                        Err(e) => Err(format!("Task error: {}", e)),
-                    };
-
-                    match claims_res {
-                        Ok(claims) => {
-                            // --- Revocation Check (jti Denylist) ---
-                            if let Some(ref jti) = claims.jti
-                                && get_jwt_revocation_store().is_revoked(jti) {
-                                    crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
-                                    tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
-                                    let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
-                                    self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
-                                    continue;
-                                }
-
-                            // --- Role Mapping Logic ---
-                            let mut roles: crate::configuration::RoleVec<6> = claims
-                                .oids
-                                .iter()
-                                .map(|suffix| {
-                                    oid_mapping
-                                        .iter()
-                                        .find(|(k, _)| k == suffix)
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or_else(crate::configuration::UserRole::guest)
-                                })
-                                .filter(|role| *role != crate::configuration::UserRole::guest())
-                                .collect();
-
-                            if roles.is_empty() {
-                                roles.push(crate::configuration::UserRole::guest());
-                            }
-
-                            tracing::trace!("{}: JWT Roles mapped: {:?}", server_name, roles);
-
-                            let mut request = req.take().unwrap();
-
-                            // --- Auto-Revoke JTI on Configured Logout Paths ([F-11]) ---
-                            if !revoke_on_paths.is_empty()
-                                && revoke_on_paths.iter().any(|p| p == request.uri().path())
-                                && let Some(ref jti) = claims.jti {
-                                    let exp = if claims.exp > 0 {
-                                        claims.exp as u64
-                                    } else {
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs()
-                                            + 3600
-                                    };
-                                    get_jwt_revocation_store().revoke(
-                                        jti.clone(),
-                                        exp.saturating_add(JWT_EXP_LEEWAY_SECS),
-                                    );
-                                    tracing::info!(
-                                        "{}: Auto-revoked JWT jti '{}' on logout path '{}'",
-                                        server_name,
-                                        jti,
-                                        request.uri().path()
-                                    );
-                                }
-
-                            request.extensions_mut().insert::<Claims>(claims);
-                            request
-                                .extensions_mut()
-                                .insert::<Arc<crate::configuration::RoleVec<6>>>(Arc::new(
-                                    roles,
-                                ));
-
-                            let fut = inner.call(request);
-                            self.set(JwtAuthFuture::Inner { inner_fut: fut });
-                            // Loop around to poll the newly created Inner future
-                        }
-                        Err(e) => {
-                            crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
-                            tracing::warn!("{}: Invalid JWT: {}", server_name, e);
-                            let resp = unauthorized_response::<()>(redirect.as_deref()).unwrap();
-                            self.set(JwtAuthFuture::Unauthorized { response: Some(resp) });
-                            // Loop around to return the Unauthorized response
-                        }
-                    }
-                }
+        match self.as_mut().project() {
+            JwtAuthFutureProj::Unauthorized { response } => {
+                let res = response.take().expect("polled after complete");
+                Poll::Ready(Ok(res))
             }
+            JwtAuthFutureProj::Inner { inner_fut } => inner_fut.poll(cx),
         }
     }
 }
@@ -545,91 +464,158 @@ where
         self.inner.poll_ready(cx)
     }
 
-    /// Extracts, validates, and processes the JWT from the `Authorization` header.
+    /// Extracts, validates, and processes the JWT from the `Authorization` header
+    /// or configured fallback cookie.
     ///
     /// ## Happy Path
     ///
-    /// 1. Strips the `Bearer ` prefix from the `Authorization` header.
-    /// 2. Calls [`verify_jwt`] , which tries every decoding key until one
-    ///    succeeds (supporting key rotation).
-    /// 3. Maps each OID in the claims to a [`UserRole`](crate::configuration::UserRole)
-    ///    via the global config. If no specific roles are matched, defaults to
-    ///    `UserRole::Guest`.
-    /// 4. Inserts the raw `Claims` and the `Vec<UserRole>` into the request
-    ///    extensions.
-    /// 5. Forwards the enriched request to the inner service.
-    ///
-    /// ## Error Path
-    ///
-    /// Returns **401 Unauthorized** if:
-    /// * The `Authorization` header is missing.
-    /// * The token cannot be verified by any of the configured keys.
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let decoding_keys = Arc::clone(&self.decoding_keys);
+    /// 1. Strips the `Bearer ` prefix (case-insensitively per RFC 7235) from the
+    ///    `Authorization` header, falling back to `cookie_fallback` if configured.
+    /// 2. Calls [`verify_jwt_with_options`] inline (~50–100 µs for Ed25519 after a fast
+    ///    4 KiB length and 3-segment structure pre-check, avoiding `spawn_blocking`
+    ///    thread-pool exhaustion under unauthenticated token floods).
+    /// 3. Checks the global [`JwtRevocationStore`] denylist for the token's `jti`.
+    /// 4. Maps each OID in the claims to a [`UserRole`](crate::configuration::UserRole)
+    ///    via the server's OID mapping table (defaulting to `UserRole::Guest`).
+    /// 5. Inserts the raw `Claims` and `Arc<RoleVec<6>>` into request extensions and
+    ///    forwards the enriched request to the inner service.
+    fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         let server_name = self.server_name;
-        let oid_mapping = Arc::clone(&self.oid_mapping);
 
-        tracing::trace!("{}: Processing JWT Authentication for path: {}", server_name, req.uri().path());
+        tracing::trace!(
+            "{}: Processing JWT Authentication for path: {}",
+            server_name,
+            req.uri().path()
+        );
 
-        // Extract the token from the "Authorization: Bearer <token>" header.
-        let mut token = req
+        // Extract the token from the "Authorization: Bearer <token>" header (borrowed, zero-alloc).
+        let mut token: Option<&str> = req
             .headers()
-            .get("Authorization")
+            .get(hyper::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .map(|s| s.trim().to_string());
+            .and_then(strip_bearer_prefix)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         // If not found in header, check the cookie fallback (if configured).
         if token.is_none()
-            && let Some(cookie_name) = &self.cookie_fallback {
-                let cookie_prefix = format!("{}=", cookie_name);
-                for cookie_header in req.headers().get_all("Cookie").iter() {
-                    if let Ok(v) = cookie_header.to_str() {
-                        for cookie in v.split(';') {
-                            let cookie = cookie.trim();
-                            if let Some(val) = cookie.strip_prefix(&cookie_prefix) {
-                                token = Some(val.trim().to_string());
+            && let Some(cookie_name) = &self.cookie_fallback
+        {
+            for cookie_header in req.headers().get_all(hyper::header::COOKIE) {
+                if let Ok(v) = cookie_header.to_str() {
+                    for cookie in v.split(';') {
+                        let cookie = cookie.trim();
+                        if let Some(rest) = cookie.strip_prefix(cookie_name.as_str())
+                            && let Some(val) = rest.strip_prefix('=')
+                        {
+                            let trimmed = val.trim();
+                            if !trimmed.is_empty() {
+                                token = Some(trimmed);
                                 break;
                             }
                         }
                     }
-                    if token.is_some() {
-                        break;
-                    }
                 }
-            }
-
-        let inner = self.inner.clone();
-        let redirect = self.redirect_on_failure.clone();
-        let revoke_on_paths = Arc::clone(&self.revoke_on_paths);
-
-        let expected_iss = self.expected_issuer.clone();
-        let expected_aud = self.expected_audience.clone();
-
-        match token {
-            Some(token_str) => {
-                let verify_task = tokio::task::spawn_blocking(move || {
-                    verify_jwt(&token_str, &decoding_keys, expected_iss.as_str(), expected_aud.as_str())
-                });
-
-                JwtAuthFuture::Verifying {
-                    verify_task,
-                    req: Some(req),
-                    inner,
-                    server_name,
-                    oid_mapping,
-                    redirect,
-                    revoke_on_paths,
-                }
-            }
-            None => {
-                crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
-                tracing::debug!("{}: Missing Authorization header or cookie", server_name);
-                JwtAuthFuture::Unauthorized {
-                    response: Some(unauthorized_response::<()>(redirect.as_deref()).unwrap()),
+                if token.is_some() {
+                    break;
                 }
             }
         }
+
+        let Some(token_str) = token else {
+            crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
+            tracing::debug!("{}: Missing Authorization header or cookie", server_name);
+            return JwtAuthFuture::Unauthorized {
+                response: Some(
+                    unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
+                ),
+            };
+        };
+
+        let claims = match verify_jwt_with_options(
+            token_str,
+            &self.decoding_keys,
+            self.expected_issuer.as_str(),
+            self.expected_audience.as_str(),
+            self.verify_options,
+        ) {
+            Ok(claims) => claims,
+            Err(e) => {
+                crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
+                tracing::warn!("{}: Invalid JWT: {:#}", server_name, e);
+                return JwtAuthFuture::Unauthorized {
+                    response: Some(
+                        unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
+                    ),
+                };
+            }
+        };
+
+        // --- Revocation Check (jti Denylist) ---
+        if let Some(ref jti) = claims.jti
+            && get_jwt_revocation_store().is_revoked(jti)
+        {
+            crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
+            tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
+            return JwtAuthFuture::Unauthorized {
+                response: Some(
+                    unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
+                ),
+            };
+        }
+
+        // --- Role Mapping Logic ---
+        let mut roles: crate::configuration::RoleVec<6> = claims
+            .oids
+            .iter()
+            .map(|suffix| {
+                self.oid_mapping
+                    .iter()
+                    .find(|(k, _)| k == suffix)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(crate::configuration::UserRole::guest)
+            })
+            .filter(|role| *role != crate::configuration::UserRole::guest())
+            .collect();
+
+        if roles.is_empty() {
+            roles.push(crate::configuration::UserRole::guest());
+        }
+
+        tracing::trace!("{}: JWT Roles mapped: {:?}", server_name, roles);
+
+        // --- Auto-Revoke JTI on Configured Logout Paths ([F-11]) ---
+        if !self.revoke_on_paths.is_empty()
+            && self.revoke_on_paths.iter().any(|p| p == req.uri().path())
+            && let Some(ref jti) = claims.jti
+        {
+            let exp = if claims.exp > 0 {
+                claims.exp as u64
+            } else {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    + 3600
+            };
+            get_jwt_revocation_store().revoke(
+                jti.clone(),
+                exp.saturating_add(JWT_EXP_LEEWAY_SECS),
+            );
+            tracing::info!(
+                "{}: Auto-revoked JWT jti '{}' on logout path '{}'",
+                server_name,
+                jti,
+                req.uri().path()
+            );
+        }
+
+        req.extensions_mut().insert::<Claims>(claims);
+        req.extensions_mut()
+            .insert::<Arc<crate::configuration::RoleVec<6>>>(Arc::new(roles));
+
+        let fut = self.inner.call(req);
+        JwtAuthFuture::Inner { inner_fut: fut }
     }
 }
 
@@ -871,6 +857,7 @@ mod tests {
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions::default(),
         };
 
         // First request: token is NOT revoked -> should succeed (200 OK)
@@ -939,6 +926,7 @@ mod tests {
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(vec!["/api/Logout".to_string()]),
+            verify_options: JwtVerifyOptions::default(),
         };
 
         // 1. Regular API call (/api/WhoAmI) succeeds and does NOT revoke the JTI
@@ -1038,6 +1026,7 @@ mod tests {
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions::default(),
         };
 
         // 1. Unauthenticated attacker sends 10 requests without token
@@ -1138,6 +1127,7 @@ mod tests {
             expected_issuer: "test-issuer".to_string(),
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(vec!["/logout".to_string()]),
+            verify_options: JwtVerifyOptions::default(),
         };
 
         // First call to /logout succeeds and revokes the jti until exp + JWT_EXP_LEEWAY_SECS.
@@ -1158,6 +1148,92 @@ mod tests {
             .unwrap();
         let replay_resp = svc.ready().await.unwrap().call(replay_req).await.unwrap();
         assert_eq!(replay_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_jwtauth_service_case_insensitive_bearer_and_policy_enforcement() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let valid_claims = Claims {
+            sub: "policy-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: (now + 300) as usize,
+            oids: vec!["1".to_string()],
+            jti: Some("policy-jti-1".to_string()),
+        };
+        let valid_token = common::sign_jwt(&valid_claims, &enc_key).unwrap();
+
+        let no_jti_claims = Claims {
+            jti: None,
+            ..valid_claims.clone()
+        };
+        let no_jti_token = common::sign_jwt(&no_jti_claims, &enc_key).unwrap();
+
+        let long_lived_claims = Claims {
+            exp: (now + 7200) as usize,
+            jti: Some("policy-jti-2".to_string()),
+            ..valid_claims.clone()
+        };
+        let long_lived_token = common::sign_jwt(&long_lived_claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|_req: Request<Full<Bytes>>| async {
+            let body: ServiceRespBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-policy-server",
+            oid_mapping: Arc::new(vec![("1".to_string(), crate::configuration::UserRole("Admin".to_string()))]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions {
+                require_jti: true,
+                max_token_lifetime_secs: Some(600),
+            },
+        };
+
+        // 1. Lowercase "bearer " and uppercase "BEARER " schemes are accepted (RFC 7235)
+        for prefix in ["bearer", "BEARER", "BeArEr"] {
+            let req = Request::builder()
+                .uri("/api/data")
+                .header("Authorization", format!("{prefix} {valid_token}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = svc.ready().await.unwrap().call(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // 2. Missing jti is rejected with 401 when require_jti = true
+        let req_no_jti = Request::builder()
+            .uri("/api/data")
+            .header("Authorization", format!("Bearer {no_jti_token}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_no_jti = svc.ready().await.unwrap().call(req_no_jti).await.unwrap();
+        assert_eq!(resp_no_jti.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Token exceeding max_token_lifetime_secs (7200 > 600) is rejected with 401
+        let req_long = Request::builder()
+            .uri("/api/data")
+            .header("Authorization", format!("Bearer {long_lived_token}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_long = svc.ready().await.unwrap().call(req_long).await.unwrap();
+        assert_eq!(resp_long.status(), StatusCode::UNAUTHORIZED);
     }
 }
 

@@ -1718,12 +1718,20 @@
         let ptr_alpha = up_alpha.as_ptr();
         let ptr_beta = up_beta.as_ptr();
 
+        let global_budget = BufferBudget::new(1024);
         let body = assemble_aggregated_body(
             &route.aggregate_targets,
             vec![
-                Some(SubOutcome::Success(up_alpha)),
-                Some(SubOutcome::Success(up_beta)),
+                Some(SubOutcome::Success(
+                    up_alpha,
+                    BufferReservation::new(Arc::clone(&global_budget)),
+                )),
+                Some(SubOutcome::Success(
+                    up_beta,
+                    BufferReservation::new(Arc::clone(&global_budget)),
+                )),
             ],
+            &global_budget,
         )
         .expect("assemble_aggregated_body");
 
@@ -1804,15 +1812,25 @@
         let exceeded_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exceeded_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let global_budget = BufferBudget::new(1024);
+        let mut res_guard_a = BufferReservation::new(Arc::clone(&global_budget));
+        let mut res_guard_b = BufferReservation::new(Arc::clone(&global_budget));
+        let mut global_exc_a = false;
+        let mut global_exc_b = false;
+
         let body_a = SharedBudgetBody {
             inner: make_stream(Arc::clone(&chunks_pulled_a)),
             remaining_budget: Arc::clone(&budget),
             exceeded: Arc::clone(&exceeded_a),
+            reservation: &mut res_guard_a,
+            global_exceeded: &mut global_exc_a,
         };
         let body_b = SharedBudgetBody {
             inner: make_stream(Arc::clone(&chunks_pulled_b)),
             remaining_budget: Arc::clone(&budget),
             exceeded: Arc::clone(&exceeded_b),
+            reservation: &mut res_guard_b,
+            global_exceeded: &mut global_exc_b,
         };
 
         let (res_a, res_b) = tokio::join!(body_a.collect(), body_b.collect());
@@ -1831,4 +1849,81 @@
             total_pulled <= 3,
             "SharedBudgetBody must stop pulling before buffering remaining chunks (pulled {total_pulled}/20)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_shared_budget_body_enforces_global_buffer_budget_and_releases_on_drop() {
+        let route_budget = Arc::new(AtomicUsize::new(10_000));
+        let global_budget = BufferBudget::new(30);
+
+        let sub_target = make_sub_target(
+            "orders",
+            RouteBackendType::Rest,
+            8080,
+            "/orders",
+            Some(Method::GET),
+            true,
+            None,
+        );
+
+        // 40-byte JSON response fits easily in route_budget (10_000), but exceeds global_budget (30).
+        let payload = Bytes::from_static(br#"{"orders":[1,2,3,4,5,6,7,8,9,10,11,12]}"#);
+        let resp = Response::builder()
+            .status(StatusCode::OK)
+            .body(Full::new(payload).map_err(SrvError::from).boxed())
+            .unwrap();
+
+        let outcome = collect_sub_outcome(
+            &sub_target,
+            resp,
+            Some(Duration::from_secs(1)),
+            10_000,
+            route_budget,
+            Arc::clone(&global_budget),
+            false,
+        )
+        .await;
+
+        match outcome {
+            SubOutcome::Failed { status, .. } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            }
+            SubOutcome::Success(_, _) => panic!("Expected 503 when global buffer budget is exhausted"),
+        }
+
+        // RAII drop of the failed sub-target's BufferReservation must restore the full global budget.
+        assert_eq!(global_budget.remaining(), 30);
+    }
+
+    #[tokio::test]
+    async fn test_chunked_bytes_body_releases_global_budget_incrementally_and_on_early_drop() {
+        let route = make_aggregate_route(vec![
+            make_sub_target("alpha", RouteBackendType::Rest, 8081, "/a", Some(Method::GET), true, None),
+            make_sub_target("beta", RouteBackendType::Rest, 8082, "/b", Some(Method::GET), true, None),
+        ]);
+        let global_budget = BufferBudget::new(200);
+
+        let mut res_a = BufferReservation::new(Arc::clone(&global_budget));
+        assert!(res_a.try_reserve(40));
+        let mut res_b = BufferReservation::new(Arc::clone(&global_budget));
+        assert!(res_b.try_reserve(60));
+        assert_eq!(global_budget.remaining(), 100);
+
+        let mut body = assemble_aggregated_body(
+            &route.aggregate_targets,
+            vec![
+                Some(SubOutcome::Success(Bytes::from(vec![b'1'; 40]), res_a)),
+                Some(SubOutcome::Success(Bytes::from(vec![b'2'; 60]), res_b)),
+            ],
+            &global_budget,
+        )
+        .expect("assemble_aggregated_body");
+
+        // Poll only the first two framing chunks ("{" and "\"alpha\":"), then drop the body early
+        // (simulating a client disconnecting mid-stream) and verify 100% of the budget is restored.
+        let _ = body.frame().await;
+        let _ = body.frame().await;
+        assert!(global_budget.remaining() > 100);
+        drop(body);
+        assert_eq!(global_budget.remaining(), 200);
     }

@@ -861,6 +861,8 @@ enabled = []
                 expected_issuer: "   ".into(),
                 expected_audience: "api".into(),
                 revoke_on_paths: vec![],
+                require_jti: true,
+                max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
             }),
             ..Default::default()
         };
@@ -877,12 +879,42 @@ enabled = []
                 expected_issuer: "idp".into(),
                 expected_audience: "".into(),
                 revoke_on_paths: vec![],
+                require_jti: true,
+                max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
             }),
             ..Default::default()
         };
         assert!(layers_empty_aud
             .build_middleware_layers("jwt_aud_test")
             .is_err());
+
+        // Verify TOML defaults and explicit overrides for require_jti and max_token_lifetime_seconds
+        let default_jwt_cfg: JwtAuthConfig = toml::from_str(
+            r#"
+            jwt_public_keys = ["k.pem"]
+            expected_issuer = "idp"
+            expected_audience = "api"
+            "#,
+        )
+        .expect("default JwtAuthConfig TOML must parse");
+        assert!(default_jwt_cfg.require_jti);
+        assert_eq!(
+            default_jwt_cfg.max_token_lifetime_seconds,
+            common::DEFAULT_MAX_JWT_LIFETIME_SECS
+        );
+
+        let custom_jwt_cfg: JwtAuthConfig = toml::from_str(
+            r#"
+            jwt_public_keys = ["k.pem"]
+            expected_issuer = "idp"
+            expected_audience = "api"
+            require_jti = false
+            max_token_lifetime_seconds = 0
+            "#,
+        )
+        .expect("custom JwtAuthConfig TOML must parse");
+        assert!(!custom_jwt_cfg.require_jti);
+        assert_eq!(custom_jwt_cfg.max_token_lifetime_seconds, 0);
     }
 
     #[test]

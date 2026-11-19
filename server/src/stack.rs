@@ -415,7 +415,11 @@ pub fn apply_layers(
                     cfg.expected_audience.clone(),
                 )
                 .map_err(|e| SrvError::Other(e.to_string()))?
-                .with_revoke_on_paths(cfg.revoke_on_paths.clone());
+                .with_revoke_on_paths(cfg.revoke_on_paths.clone())
+                .with_require_jti(cfg.require_jti)
+                .with_max_token_lifetime_seconds(
+                    (cfg.max_token_lifetime_seconds > 0).then_some(cfg.max_token_lifetime_seconds),
+                );
                 layer.layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(RateLimiter::Simple(cfg)) => {
@@ -1330,6 +1334,8 @@ mod tunnel_peer_tests {
                 expected_issuer: "iss".to_string(),
                 expected_audience: "aud".to_string(),
                 revoke_on_paths: vec![],
+                require_jti: true,
+                max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
             }),
             MiddlewareLayer::PathSanitizer,
         ]));

@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **IdP Webhook Validation & O(log n) `JwtRevocationStore` Index (`src/middleware/idp/webhook.rs`, `src/middleware/jwt.rs`):**
   * Replaced prefix-based `claims_webhook_url` validation with strict `url::Url` host/scheme checking (rejecting embedded userinfo and spoofed prefixes like `http://localhost.evil.example`) and bounded returned `oids` (`<= 64` entries, `<= 64` chars each, numeric dot-arc format only).
   * Added an `ExpiryMinHeap` (`BinaryHeap<Reverse<(u64, String)>>` with lazy deletion) to `JwtRevocationStore` so capacity-saturation sweeps and earliest-expiry eviction run in O(log n) instead of scanning all `50,000` entries via `min_by_key`.
+* **JWT Verification Hardening & Inline Execution (`common/src/lib.rs`, `src/middleware/jwt.rs`, `src/middleware/idp/mod.rs`, `src/configuration/mod.rs`, `src/stack.rs`):**
+  * Added `JwtVerifyOptions`, `verify_jwt_with_options`, `MAX_JWT_TOKEN_LEN` (4 KiB), and `DEFAULT_MAX_JWT_LIFETIME_SECS` (30 days) in `praeco-common`: enforces a 4 KiB length bound and 3-segment JWS check before base64/cryptographic work, validates `nbf`, routes `"praeco-key-<N>"` `kid` headers in O(1) to the matching decoding key (rejecting unknown indices immediately), requires a non-empty `jti` claim (`require_jti = true` by default), and bounds remaining token lifetime (`max_token_lifetime_seconds = 2_592_000` by default).
+  * Added `pub require_jti: bool` and `pub max_token_lifetime_seconds: u64` to `JwtAuthConfig` (TOML-compatible via `#[serde(default)]`) plus `.with_require_jti(...)` and `.with_max_token_lifetime_seconds(...)` builders on `JwtAuthLayer`.
+  * Eliminated `tokio::task::spawn_blocking` and per-request `String`/`Service` clones in `JwtAuthService::call`, performing Ed25519 verification inline after length/structure pre-filtering and matching `"Bearer "` case-insensitively per RFC 7235.
+* **Global 256 MiB Response Buffer Budget & 4 MiB Per-Route Default (`src/configuration/mod.rs`, `src/middleware/router/mod.rs`, `src/middleware/router/grpc_web.rs`, `src/middleware/router/aggregator/mod.rs`):**
+  * Lowered `DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES` from 16 MiB to 4 MiB (`4 * 1024 * 1024`) and wired `route_info.max_response_bytes` into `grpc_transcoding` routes (`handle_grpc_web_with_limit`).
+  * Added a lock-free process-wide 256 MiB `BufferBudget` (`DEFAULT_GLOBAL_RESPONSE_BUFFER_BUDGET_BYTES`) with RAII `BufferReservation` and `BudgetedBytesBody` / `ChunkedBytesBody` incremental release across `grpc_web` and `aggregator`, shedding excess buffered memory load with `503 Service Unavailable` without penalizing upstream circuit breakers.
 
 ---
 
