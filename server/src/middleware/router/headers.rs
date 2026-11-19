@@ -151,7 +151,9 @@ pub fn inject_real_ip(parts: &mut hyper::http::request::Parts) {
 /// Cleans and prepares HTTP headers for upstream forwarding according to the route's [`RouteHeaderPolicy`].
 ///
 /// Security operations performed:
-/// 1. Loop detection via `Max-Forwards`.
+/// 1. Loop detection via `Max-Forwards` across all HTTP methods (stricter than RFC 9110 §7.6.2,
+///    which limits `Max-Forwards` to `TRACE`/`OPTIONS`, in order to protect any routed backend against
+///    forwarding loops). Rejects unparseable or duplicate `Max-Forwards` values with `400 Bad Request`.
 /// 2. Strips hop-by-hop headers per RFC 7230 §6.1 (including custom headers listed in `Connection`).
 /// 3. Strips all client-identity and proxy-forwarding headers via prefix/exact matching (`S-05`).
 /// 4. Enforces per-route credential isolation (`Authorization` / `Cookie` / `strip_cookie_names`)
@@ -167,12 +169,35 @@ pub fn prepare_proxy_headers(
     config: &ServerConfig,
     policy: &RouteHeaderPolicy,
 ) -> Result<(), Box<Response<ServiceRespBody>>> {
-    // 1. Loop Detection (evaluate before allowlist filtering; insert decremented value afterwards)
+    // 1. Loop Detection across all HTTP methods (gateway policy; RFC 9110 §7.6.2 covers TRACE/OPTIONS).
+    //    Reject malformed/duplicate Max-Forwards values with 400 Bad Request instead of resetting to 10.
     let mut max_forwards = 10u8;
-    if let Some(mf_val) = original_headers.get(header::MAX_FORWARDS)
-        && let Ok(mf_str) = mf_val.to_str()
-        && let Ok(mut mf) = mf_str.parse::<u8>()
-    {
+    let mut mf_iter = original_headers.get_all(header::MAX_FORWARDS).iter();
+    if let Some(mf_val) = mf_iter.next() {
+        if mf_iter.next().is_some() {
+            warn!("{}: Duplicate Max-Forwards header rejected", server_name);
+            return Err(Box::new(build_error_response(
+                "Bad Request: Duplicate Max-Forwards header",
+                StatusCode::BAD_REQUEST,
+            )));
+        }
+        let Ok(mf_str) = mf_val.to_str() else {
+            warn!("{}: Non-UTF-8 Max-Forwards header rejected", server_name);
+            return Err(Box::new(build_error_response(
+                "Bad Request: Invalid Max-Forwards header",
+                StatusCode::BAD_REQUEST,
+            )));
+        };
+        let Ok(mut mf) = mf_str.trim().parse::<u8>() else {
+            warn!(
+                "{}: Invalid Max-Forwards header value rejected",
+                server_name
+            );
+            return Err(Box::new(build_error_response(
+                "Bad Request: Invalid Max-Forwards header",
+                StatusCode::BAD_REQUEST,
+            )));
+        };
         if mf == 0 {
             warn!("{}: Max-Forwards reached 0, Loop Detected!", server_name);
             return Err(Box::new(build_error_response(
@@ -241,7 +266,7 @@ pub fn prepare_proxy_headers(
     // 4. Authoritatively set Max-Forwards and Client IP / Forwarded headers
     original_headers.insert(
         header::MAX_FORWARDS,
-        header::HeaderValue::from(max_forwards as u16),
+        header::HeaderValue::from(u16::from(max_forwards)),
     );
 
     if let Some(addr) = extensions.get::<std::net::SocketAddr>()
@@ -794,5 +819,52 @@ mod tests {
         assert!(!headers.contains_key(header::CONNECTION));
         assert!(!headers.contains_key("x-upstream-metric"));
         assert!(!headers.contains_key(header::TRANSFER_ENCODING));
+    }
+
+    #[test]
+    fn test_max_forwards_validation_decrement_and_loop_detection() {
+        let config = make_test_config(None);
+        let extensions = hyper::http::Extensions::new();
+        let policy = RouteHeaderPolicy::default();
+
+        // Valid Max-Forwards is decremented
+        let mut h_ok = hyper::HeaderMap::new();
+        h_ok.insert(header::MAX_FORWARDS, header::HeaderValue::from_static("3"));
+        prepare_proxy_headers(&mut h_ok, "test_server", None, &extensions, &config, &policy)
+            .unwrap();
+        assert_eq!(h_ok.get(header::MAX_FORWARDS).unwrap(), "2");
+
+        // Zero returns 508 Loop Detected
+        let mut h_zero = hyper::HeaderMap::new();
+        h_zero.insert(header::MAX_FORWARDS, header::HeaderValue::from_static("0"));
+        let err_zero =
+            prepare_proxy_headers(&mut h_zero, "test_server", None, &extensions, &config, &policy)
+                .unwrap_err();
+        assert_eq!(err_zero.status(), StatusCode::LOOP_DETECTED);
+
+        // Out-of-range ("300") and non-numeric ("abc") return 400 Bad Request
+        for invalid in ["300", "abc"] {
+            let mut h_bad = hyper::HeaderMap::new();
+            h_bad.insert(header::MAX_FORWARDS, header::HeaderValue::from_static(invalid));
+            let err_bad = prepare_proxy_headers(
+                &mut h_bad,
+                "test_server",
+                None,
+                &extensions,
+                &config,
+                &policy,
+            )
+            .unwrap_err();
+            assert_eq!(err_bad.status(), StatusCode::BAD_REQUEST);
+        }
+
+        // Duplicate Max-Forwards headers return 400 Bad Request
+        let mut h_dup = hyper::HeaderMap::new();
+        h_dup.append(header::MAX_FORWARDS, header::HeaderValue::from_static("5"));
+        h_dup.append(header::MAX_FORWARDS, header::HeaderValue::from_static("4"));
+        let err_dup =
+            prepare_proxy_headers(&mut h_dup, "test_server", None, &extensions, &config, &policy)
+                .unwrap_err();
+        assert_eq!(err_dup.status(), StatusCode::BAD_REQUEST);
     }
 }

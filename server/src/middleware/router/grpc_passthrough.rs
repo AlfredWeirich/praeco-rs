@@ -38,6 +38,7 @@ pub async fn handle_grpc_passthrough(
         server_name,
         grpc_client,
         request_timeout,
+        false,
     )
     .await
 }

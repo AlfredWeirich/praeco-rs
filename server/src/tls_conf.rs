@@ -109,12 +109,12 @@ impl ResolvesServerCert for DynamicCertResolver {
 /// - `server_name`: Identifier for tracing/logging context (usually the hostname).
 /// - `server_cert_config`: Contains file paths to the server certificate and private key.
 /// - `client_ca_configs`: Optional list of client CA configs. Required if client authentication is enabled.
-/// - `require_client_auth`: Whether to enforce mTLS (client certificate verification).
+/// - `authentication_method`: Client authentication mode (`None`, `ClientCert`, `OptionalClientCert`, or `Jwt`).
 ///
 /// # Returns
 ///
-/// Returns a fully configured [`RustlsServerConfig`] that can be used to run
-/// a secure TLS server with (optional) client certificate verification.
+/// Returns a fully configured [`RustlsServerConfig`] supporting TLS 1.3 and TLS 1.2
+/// with (optional) client certificate verification.
 ///
 /// # ALPN Protocols
 ///

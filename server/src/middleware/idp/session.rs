@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::RngExt;
 
 const MAX_LOGIN_REQUESTS_PER_MINUTE: u32 = 15;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
@@ -34,29 +34,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Generates a high-entropy 256-bit poll secret (URL-safe base64).
 fn generate_poll_secret() -> String {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Generates a high-entropy 192-bit session ID (URL-safe base64).
 fn generate_session_id() -> String {
     let mut bytes = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::fill(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// Generates a human-readable 6-character user verification code formatted as `XXX-YYY`.
 /// Omits easily confused characters (0/O, 1/I).
 fn generate_user_code() -> String {
-    use rand::Rng;
-    let mut rng = rand::rngs::OsRng;
+    let mut rng = rand::rng();
     const CHARSET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
     let mut code = String::with_capacity(7);
     for i in 0..6 {
         if i == 3 {
             code.push('-');
         }
-        let ch = CHARSET[rng.gen_range(0..CHARSET.len())] as char;
+        let ch = CHARSET[rng.random_range(0..CHARSET.len())] as char;
         code.push(ch);
     }
     code

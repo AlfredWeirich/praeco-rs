@@ -506,13 +506,9 @@ impl Service<Request<SrvBody>> for RouterService {
             );
             let is_passthrough = route_info.backend_type == RouteBackendType::GrpcPassthrough;
             let has_failover_nodes = route_info.target.upstreams.len() > 1;
-            let is_idempotent = matches!(
-                original_method,
-                hyper::Method::GET
-                    | hyper::Method::HEAD
-                    | hyper::Method::PUT
-                    | hyper::Method::DELETE
-                    | hyper::Method::OPTIONS
+            let is_idempotent = http_proxy::is_method_idempotent_for_retry(
+                &original_method,
+                route_info.retry_put_delete,
             );
 
             let parsed_content_length = prepared_headers
@@ -682,7 +678,7 @@ impl Service<Request<SrvBody>> for RouterService {
                     .await
                 }
                 RouteBackendType::Rest => {
-                    http_proxy::handle_http_proxy(
+                    http_proxy::handle_http_proxy_with_retry_policy(
                         &route_info.target,
                         request_body,
                         original_method,
@@ -694,6 +690,7 @@ impl Service<Request<SrvBody>> for RouterService {
                         server_name,
                         &client,
                         request_timeout,
+                        route_info.retry_put_delete,
                     )
                     .await
                 }

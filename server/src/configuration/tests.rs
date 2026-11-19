@@ -1345,5 +1345,35 @@ enabled = []
             Some(4096)
         );
 
+        // Q-08: Per-route retry_put_delete defaults to true and can be disabled per route
+        let route_retry_toml = r#"
+            name = "route_retry_opt_out"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            service = "Router"
+            [Layers]
+            enabled = []
+            [ReverseRoutes."/default-idempotent"]
+            upstreams = ["http://127.0.0.1:9001"]
+            [ReverseRoutes."/non-idempotent"]
+            upstreams = ["http://127.0.0.1:9002"]
+            retry_put_delete = false
+        "#;
+        let mut retry_srv: ServerConfig = toml::from_str(route_retry_toml).unwrap();
+        assert!(retry_srv.finalize().is_ok());
+        let non_idem = retry_srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/non-idempotent")
+            .unwrap();
+        let default_idem = retry_srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/default-idempotent")
+            .unwrap();
+        assert!(!non_idem.retry_put_delete);
+        assert!(default_idem.retry_put_delete);
+
         let _ = std::fs::remove_dir_all(&dir);
     }

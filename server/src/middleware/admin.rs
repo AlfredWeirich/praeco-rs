@@ -1016,6 +1016,7 @@ mod tests {
             max_request_bytes: crate::configuration::DEFAULT_MAX_BUFFERED_REQUEST_BYTES,
             max_response_bytes: crate::configuration::DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES,
             header_policy: crate::configuration::RouteHeaderPolicy::default(),
+            retry_put_delete: true,
         };
 
         let toml_str = r#"

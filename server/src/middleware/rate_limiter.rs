@@ -13,23 +13,14 @@
 //! - **Keyed rate limiting**: Requests can be partitioned by Client IP (`RateLimitKeyStrategy::Ip`),
 //!   authenticated identity (JWT `sub` or mTLS SAN, falling back to IP, `RateLimitKeyStrategy::Identity`),
 //!   or server-wide (`RateLimitKeyStrategy::Global`).
-//! - **Bounded state & TTL pruning**: Keyed states are tracked in thread-safe [`DashMap`] with a maximum
-//!   entry cap and idle TTL cleanup to prevent unbounded memory consumption from IP spoofing / scanning.
+//! - **Bounded state & fail-closed capacity**: Keyed states are tracked in thread-safe [`DashMap`] with
+//!   a maximum entry cap and idle TTL cleanup to prevent unbounded memory consumption from IP spoofing /
+//!   scanning. Unlike the L4 `praeco-relay-server` limiter (which routes excess unknown IPs into a shared
+//!   `overflow_bucket` on saturation), this L7 middleware operates **strictly fail-closed** once `max_entries`
+//!   is reached (unknown keys receive `429 Too Many Requests` without evicting existing entries).
 //! - **Floating-point token precision**: Refills track fractional tokens without truncating elapsed intervals,
 //!   preventing token drift.
 //! - **RFC 6585 compliance**: All 429 Too Many Requests responses include a standardized `Retry-After` header.
-//! 
-//! TEST:
-//! 
-//! ```bash
-//! fredi@AlfredsMacBookM4 260225_Tower_Hyper_Rustls_refactor_client_gprc % for i in {1..70}; do
-//!  printf "A-%02d: " "$i" && sleep 0.05
-//!  curl -s -o /dev/null -w "%{http_code}\n" -k --resolve "wurzelwerk.onboarding.aweirich.eu:443:127.0.0.1" -H "X-Forwarded-For: 198.51.100.10" -X POST "https://wurzelwerk.onboarding.aweirich.eu/chat.OnboardingService/RequestOnboarding"
-//! done
-//! echo -n "Client B (andere IP): "
-//! curl -s -o /dev/null -w "%{http_code}\n" -k --resolve "wurzelwerk.onboarding.aweirich.eu:443:127.0.0.1" -H "X-Forwarded-For: 203.0.113.50" -X POST "https://wurzelwerk.onboarding.aweirich.eu/chat.OnboardingService/RequestOnboarding"
-//! ```
-//! 
 
 // === Standard Library ===
 use std::{

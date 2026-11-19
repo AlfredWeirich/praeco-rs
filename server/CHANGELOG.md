@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Substring Log Redaction (`src/middleware/logger.rs`, `S-09`):**
   * Replaced exact header/query key matching in `sanitize_headers` and `sanitize_uri` with case-insensitive substring matching (`token`, `secret`, `session`, `jwt`, `key`, `pass`, `sig`, `auth`, `credential`) so variants such as `access_token`, `id_token`, `refresh_token`, `api_key`, `password`, `signature`, `x-api-key`, and `x-auth-token` are redacted consistently.
   * Restricted unmasked `code` query parameter logging strictly to `/auth/confirm` (onboarding flow) while redacting `code` on all other paths (e.g., OAuth callbacks).
+* **Workspace Dependency Deduplication (`Cargo.toml`, `deny.toml`, `src/middleware/idp/session.rs`, `src/configuration/resilience.rs`, `src/runner.rs`, `Q-03`):**
+  * Upgraded workspace `rand` (`0.8` → `0.10`), `socket2` (`0.5` → `0.6`), and aligned `pem` (`4.0` → `3.0` matching `jsonwebtoken`/`rcgen`), eliminating duplicate `pem 4.0`, `socket2 0.5`, `rand 0.8`, `rand_core 0.6`, `rand_chacha 0.3`, and `getrandom 0.2` from `Cargo.lock`.
+  * Added root `deny.toml` with `[bans] multiple-versions = "warn"`.
+* **Doc Comment Alignment & Logic Edge-Case Hardening (`Q-07`, `Q-08`):**
+  * Moved the misplaced `sanitize_and_normalize_path_cow` doc comment off `contains_ascii_ignore_case` (`src/middleware/path_sanitizer.rs`), aligned `tls_config` parameter/protocol docs (`src/tls_conf.rs`), and documented the intentional difference between the fail-closed L7 middleware limiter (`src/middleware/rate_limiter.rs`) and L4 relay `overflow_bucket` (`relay-server/src/limits.rs`).
+  * Rejected malformed, non-UTF-8, or duplicate `Max-Forwards` headers with `400 Bad Request` instead of silently resetting to `10` (`src/middleware/router/headers.rs`), replaced `as u16` with `u16::from(max_forwards)`, and documented gateway-wide method loop detection.
+  * Fixed `normalize_segment` to preserve multi-byte UTF-8 via byte accumulation and bounds-check truncated `%` escapes with `bytes.get(...)` (`src/middleware/path_sanitizer.rs`).
+  * Added `checked_add` length arithmetic in `parse_grpc_health_score` (`src/runner.rs`), penalized upstream circuit breakers (`record_failure_with_epoch`) on corrupt/short `< 5` byte or truncated gRPC-Web responses (`src/middleware/router/grpc_web.rs`), and added per-route `RouteConfig::retry_put_delete: Option<bool>` / `ParsedRoute::retry_put_delete: bool` (`true` by default) to opt out of `PUT`/`DELETE` retries (`src/configuration/mod.rs`, `src/middleware/router/{mod,http_proxy}.rs`).
 
 ---
 

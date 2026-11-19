@@ -480,8 +480,7 @@ impl RouteTarget {
                 candidates[count % candidates.len()]
             }
             LbStrategy::Random => {
-                use rand::Rng;
-                let index = rand::thread_rng().gen_range(0..candidates.len());
+                let index = rand::random_range(0..candidates.len());
                 candidates[index]
             }
             LbStrategy::LeastConnections => candidates
@@ -500,7 +499,7 @@ impl RouteTarget {
                     hasher.finish() as usize
                 } else {
                     // Fallback to random if no IP is provided
-                    rand::random::<usize>()
+                    rand::random_range(0..candidates.len())
                 };
                 candidates[hash % candidates.len()]
             }

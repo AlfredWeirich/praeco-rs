@@ -606,6 +606,10 @@ pub struct RouteConfig {
     /// framing headers and Praeco-injected headers remain preserved.
     #[serde(default)]
     pub forward_headers: Option<Vec<String>>,
+    /// Whether `PUT` and `DELETE` requests are treated as idempotent for automatic failover retries
+    /// on REST routes (per RFC 9110). Defaults to `true`. Set to `false` for non-idempotent upstreams.
+    #[serde(default)]
+    pub retry_put_delete: Option<bool>,
 }
 
 /// Default maximum request body size buffered in RAM for `grpc_transcoding` and `aggregate` routes (4 MiB).
@@ -784,6 +788,8 @@ pub struct ParsedRoute {
     pub max_response_bytes: usize,
     /// Compiled header & credential sanitization policy for upstream forwarding (`S-05`).
     pub header_policy: RouteHeaderPolicy,
+    /// Whether `PUT` and `DELETE` requests are retried as idempotent on REST routes (default: `true`).
+    pub retry_put_delete: bool,
 }
 
 impl ParsedRoute {
@@ -2430,6 +2436,7 @@ impl ServerConfig {
                         max_request_bytes,
                         max_response_bytes,
                         header_policy,
+                        retry_put_delete: cfg.retry_put_delete.unwrap_or(true),
                     });
                     continue;
                 }
@@ -2473,6 +2480,7 @@ impl ServerConfig {
                     max_request_bytes,
                     max_response_bytes,
                     header_policy,
+                    retry_put_delete: cfg.retry_put_delete.unwrap_or(true),
                 });
             }
         }

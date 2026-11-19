@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Replaced the bounded `mpsc::channel(4)` liveness probe mechanism in `Control` with lock-free/coalescing `tokio::sync::Notify` + `tokio::sync::watch::Receiver<u64>` signaling so concurrent probes never block on a full queue and driver shutdown fails fast.
   * Made the takeover probe timeout configurable via `RelayConfig::same_cert_takeover_probe_timeout_ms` (`Option<u64>`, default `Some(1500)`) and `ControlPlaneOptions::liveness_probe_timeout` (default `1500 ms`), reducing tunnel flapping under load.
   * Added a process-wide takeover metric counter (`same_cert_takeover_count() -> u64`) and warning logs whenever an unresponsive tunnel is displaced by a reconnecting same-certificate peer.
+* **Dependency Alignment (`Cargo.toml`, `src/lib.rs`, `Q-03`):**
+  * Updated `socket2` to `0.6` (`set_tcp_nodelay`) to match `tokio`/`hyper-util`/`quinn`/`tonic` and remove duplicate `socket2 0.5`.
 
 ---
 

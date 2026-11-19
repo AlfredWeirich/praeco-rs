@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Maximum entries retained in the data-plane per-IP rate-limit table before
-/// sweeping expired entries and evicting the least-recently-used bucket.
+/// throttled expiry sweeps and shared `overflow_bucket` saturation fallback.
 pub(crate) const MAX_RATE_LIMIT_ENTRIES: usize = 100_000;
 
 /// Minimum interval between expiry sweeps when the rate-limit table is at capacity.

@@ -539,6 +539,7 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 | `strip_cookies` | Boolean | Optional | `true` | Strips the entire client `Cookie` header before forwarding to upstream (automatically `false` if `strip_cookie_names` is non-empty or `"cookie"` is in `forward_headers`). |
 | `strip_cookie_names` | Array of Strings | Optional | `[]` | Specific cookie names to strip from `Cookie` headers while forwarding remaining cookies (automatically includes `[Server.Layers.JWT].cookie_fallback` when configured). Contradicting `strip_cookies = true` is rejected. |
 | `forward_headers` | Array of Strings | Optional | `None` (All non-identity) | Optional strict allowlist of client header names (case-insensitive) for sensitive upstreams (e.g. `["accept", "x-request-id"]`). When set, all unlisted headers except essential HTTP/gRPC wire-framing headers (`host`, `content-type`, `content-length`, `content-encoding`, `accept-encoding`, `te`, `grpc-*`) and Praeco-injected headers (`X-Forwarded-*`, `X-Real-IP`, `Max-Forwards`, `client_cert_forwarding`) are stripped. Hop-by-hop and identity-spoofing headers (`x-forwarded-*`, `x-auth-*`, `x-authenticated-*`, `x-remote-*`, `x-user*`, `x-client-*`, `x-ssl-*`, `ssl-client-*`, `x-original-*`, `x-rewrite-*`, `remote-*`, `true-client-ip`, `cf-connecting-ip`) are always stripped. |
+| `retry_put_delete` | Boolean | Optional | `true` | Controls whether `PUT` and `DELETE` requests are treated as idempotent for automatic failover retries (and retry buffering) on REST routes per RFC 9110. Set to `false` for non-idempotent upstreams so only `GET`, `HEAD`, and `OPTIONS` are retried. |
 
 #### Upstream Connection Parameters (`[Server.RouterParams]`)
 
@@ -1037,7 +1038,7 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `otel_log_level` | String | Optional | `"info"` | Log level filter for exported Relay telemetry spans. |
 | `otel_sample_ratio` | Float (`f64`) | Optional | `1.0` | Sampling ratio for Relay traces (`0.0` to `1.0`). |
 | `log_dir` | String | Optional | `None` (Stdout only) | Directory path for asynchronous, non-blocking daily rolling log files (`relay.YYYY-MM-DD.log`). |
-| `rate_limit_connections_per_sec` | Integer | Optional | `50` | Maximum new TCP connections permitted per second per client IP / IPv6 `/64` subnet on the data plane (bounded to 100,000 active buckets). |
+| `rate_limit_connections_per_sec` | Integer | Optional | `50` | Maximum new TCP connections permitted per second per client IP / IPv6 `/64` subnet on the data plane (bounded to 100,000 active buckets, falling back to a shared O(1) overflow bucket on saturation). |
 | `rate_limit_burst` | Integer | Optional | `100` | Maximum burst of new TCP connections permitted per client IP / IPv6 `/64` subnet. |
 | `data_plane_idle_timeout_secs` | Integer | Optional | `1800` (30 mins) | Inactivity timeout in seconds for established data-plane connections (`0` disables). |
 | `tcp_keepalive_secs` | Integer | Optional | `60` | TCP keepalive probe interval on data-plane sockets. |

@@ -1086,10 +1086,11 @@ fn parse_grpc_health_score(bytes: &[u8]) -> Option<usize> {
     }
     let len_bytes: [u8; 4] = [bytes[1], bytes[2], bytes[3], bytes[4]];
     let payload_len = u32::from_be_bytes(len_bytes) as usize;
-    if bytes.len() < 5 + payload_len {
+    let frame_end = 5usize.checked_add(payload_len)?;
+    if bytes.len() < frame_end {
         return None;
     }
-    let raw_payload = &bytes[5..5 + payload_len];
+    let raw_payload = &bytes[5..frame_end];
     if raw_payload.len() < 2 || raw_payload[0] != 0x08 {
         return None;
     }
@@ -1891,7 +1892,7 @@ async fn run_tunnel_with_dynamic_state(
         .with_time(Duration::from_secs(30))
         .with_interval(Duration::from_secs(10));
     let _ = sock_ref.set_tcp_keepalive(&keepalive);
-    let _ = sock_ref.set_nodelay(true);
+    let _ = sock_ref.set_tcp_nodelay(true);
 
     let domain = rustls::pki_types::ServerName::try_from(relay_host.to_string())
         .map_err(|e| SrvError::Other(format!("Invalid relay server hostname '{relay_host}': {e}")))?;

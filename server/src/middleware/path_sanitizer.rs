@@ -72,11 +72,6 @@ pub enum PathSanitizeError {
     UriFormatError(String),
 }
 
-/// Sanitizes and canonicalizes a raw URI path according to RFC 3986 and strict gateway rules.
-///
-/// # Errors
-///
-/// Returns a [`PathSanitizeError`] if traversal, illegal characters, or invalid encodings are detected.
 /// Searches `haystack` for an ASCII slice matching `needle_lower` case-insensitively
 /// without allocating a lowercased `String`.
 #[inline]
@@ -89,8 +84,12 @@ fn contains_ascii_ignore_case(haystack: &[u8], needle_lower: &[u8]) -> bool {
         .any(|w| w.eq_ignore_ascii_case(needle_lower))
 }
 
-/// Validates and canonicalizes a raw URL path, returning `Cow::Borrowed` without
-/// any heap allocation on clean normalized paths.
+/// Sanitizes and canonicalizes a raw URI path according to RFC 3986 and strict gateway rules,
+/// returning `Cow::Borrowed` without any heap allocation on clean normalized paths.
+///
+/// # Errors
+///
+/// Returns a [`PathSanitizeError`] if traversal, illegal characters, or invalid encodings are detected.
 pub fn sanitize_and_normalize_path_cow(
     raw_path: &str,
 ) -> Result<std::borrow::Cow<'_, str>, PathSanitizeError> {
@@ -217,34 +216,38 @@ pub fn sanitize_and_normalize_path(raw_path: &str) -> Result<String, PathSanitiz
 
 /// Normalizes a single path segment by decoding unreserved ASCII characters
 /// per RFC 3986 §2.3 and normalizing uppercase hex escapes for remaining percent-encodings.
+///
+/// Operates on UTF-8 bytes to preserve multi-byte characters without Latin-1 mojibake
+/// and checks bounds safely when called directly on truncated `%`-escapes.
 fn normalize_segment(seg: &str) -> Result<String, PathSanitizeError> {
     let bytes = seg.as_bytes();
-    let mut res = String::with_capacity(seg.len());
+    let mut out: Vec<u8> = Vec::with_capacity(seg.len());
     let mut i = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let h1 = bytes[i + 1];
-            let h2 = bytes[i + 2];
+            let (Some(&h1), Some(&h2)) = (bytes.get(i + 1), bytes.get(i + 2)) else {
+                return Err(PathSanitizeError::InvalidEncoding);
+            };
             let hex_val = (hex_digit_to_val(h1)? << 4) | hex_digit_to_val(h2)?;
 
             // Decode unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
             if is_unreserved(hex_val) {
-                res.push(hex_val as char);
+                out.push(hex_val);
             } else {
                 // Keep reserved or non-ASCII characters percent-encoded with uppercase hex
-                res.push('%');
-                res.push((h1 as char).to_ascii_uppercase());
-                res.push((h2 as char).to_ascii_uppercase());
+                out.push(b'%');
+                out.push(h1.to_ascii_uppercase());
+                out.push(h2.to_ascii_uppercase());
             }
             i += 3;
         } else {
-            res.push(bytes[i] as char);
+            out.push(bytes[i]);
             i += 1;
         }
     }
 
-    Ok(res)
+    String::from_utf8(out).map_err(|_| PathSanitizeError::InvalidEncoding)
 }
 
 #[inline]
@@ -644,6 +647,24 @@ mod tests {
                 .blocked_inspection
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
+        );
+    }
+
+    #[test]
+    fn test_normalize_segment_preserves_utf8_and_bounds_truncated_percent() {
+        assert_eq!(
+            normalize_segment("café-%7e"),
+            Ok("café-~".to_string()),
+            "multi-byte UTF-8 characters must be preserved without Latin-1 mojibake"
+        );
+        assert_eq!(
+            normalize_segment("%"),
+            Err(PathSanitizeError::InvalidEncoding),
+            "truncated '%' escape must return InvalidEncoding instead of panicking"
+        );
+        assert_eq!(
+            normalize_segment("abc%2"),
+            Err(PathSanitizeError::InvalidEncoding)
         );
     }
 }

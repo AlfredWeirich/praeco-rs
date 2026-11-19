@@ -128,6 +128,20 @@ fn build_grpc_error_response(
     res
 }
 
+/// Returns `true` when `method` is eligible for automatic failover retries.
+///
+/// Safe methods (`GET`, `HEAD`, `OPTIONS`) are always idempotent; `PUT` and `DELETE` are
+/// idempotent under RFC 9110 unless the operator disables `retry_put_delete` for non-idempotent
+/// upstreams (`Q-08`).
+#[inline]
+pub(super) fn is_method_idempotent_for_retry(method: &Method, retry_put_delete: bool) -> bool {
+    match *method {
+        Method::GET | Method::HEAD | Method::OPTIONS => true,
+        Method::PUT | Method::DELETE => retry_put_delete,
+        _ => false,
+    }
+}
+
 /// Forwards an HTTP/REST request to a load-balanced upstream pool with 3-state circuit breaking,
 /// passive outlier detection, idempotent failover retries, and client-error isolation.
 #[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
@@ -148,6 +162,43 @@ pub async fn handle_http_proxy(
     >,
     request_timeout: Option<std::time::Duration>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
+    handle_http_proxy_with_retry_policy(
+        target,
+        request_body,
+        original_method,
+        original_version,
+        prepared_headers,
+        original_uri,
+        matched_params,
+        client_addr,
+        server_name,
+        client,
+        request_timeout,
+        true,
+    )
+    .await
+}
+
+/// Variant of [`handle_http_proxy`] honoring the per-route `retry_put_delete` policy (`Q-08`).
+#[tracing::instrument(skip_all, fields(server = %server_name, method = %original_method), err)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_http_proxy_with_retry_policy(
+    target: &Arc<RouteTarget>,
+    request_body: RequestBody,
+    original_method: Method,
+    original_version: Version,
+    prepared_headers: hyper::HeaderMap,
+    original_uri: &Uri,
+    matched_params: &matchit::Params<'_, '_>,
+    client_addr: Option<std::net::SocketAddr>,
+    server_name: &str,
+    client: &Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        ServiceRespBody,
+    >,
+    request_timeout: Option<std::time::Duration>,
+    retry_put_delete: bool,
+) -> Result<Response<ServiceRespBody>, SrvError> {
     forward_with_failover(
         ProxyMode::Http(original_version),
         target,
@@ -160,6 +211,7 @@ pub async fn handle_http_proxy(
         server_name,
         client,
         request_timeout,
+        retry_put_delete,
     )
     .await
 }
@@ -182,6 +234,7 @@ pub(super) async fn forward_with_failover(
         ServiceRespBody,
     >,
     request_timeout: Option<std::time::Duration>,
+    retry_put_delete: bool,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
     let is_multi_node = target.upstreams.len() > 1;
@@ -193,10 +246,7 @@ pub(super) async fn forward_with_failover(
     };
     let mut attempts = 0;
     let is_stream = matches!(request_body, RequestBody::Stream(_));
-    let is_idempotent = matches!(
-        original_method,
-        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
-    );
+    let is_idempotent = is_method_idempotent_for_retry(&original_method, retry_put_delete);
     let proto_label = mode.label();
 
     loop {
@@ -1264,6 +1314,20 @@ mod tests {
         let grpc_err = ProxyMode::GrpcPassthrough.build_error("Bad Gateway", StatusCode::BAD_GATEWAY, "14");
         assert_eq!(grpc_err.headers().get("grpc-status").unwrap(), "14");
         assert_eq!(grpc_err.headers().get(header::CONTENT_TYPE).unwrap(), "application/grpc");
+    }
+
+    #[test]
+    fn test_is_method_idempotent_for_retry_respects_put_delete_opt_out() {
+        assert!(is_method_idempotent_for_retry(&Method::GET, false));
+        assert!(is_method_idempotent_for_retry(&Method::HEAD, false));
+        assert!(is_method_idempotent_for_retry(&Method::OPTIONS, false));
+        assert!(!is_method_idempotent_for_retry(&Method::POST, true));
+        assert!(!is_method_idempotent_for_retry(&Method::PATCH, true));
+
+        assert!(is_method_idempotent_for_retry(&Method::PUT, true));
+        assert!(is_method_idempotent_for_retry(&Method::DELETE, true));
+        assert!(!is_method_idempotent_for_retry(&Method::PUT, false));
+        assert!(!is_method_idempotent_for_retry(&Method::DELETE, false));
     }
 }
 

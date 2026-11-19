@@ -711,7 +711,8 @@ pub(crate) async fn handle_grpc_web_with_budget(
                 let res_body_bytes = collected.to_bytes();
 
                 if res_body_bytes.len() < 5 {
-                    upstream_node.record_success_with_epoch(request_epoch);
+                    upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     return Ok(build_error_response(
                         "Invalid gRPC Response",
                         StatusCode::BAD_GATEWAY,
@@ -723,7 +724,8 @@ pub(crate) async fn handle_grpc_web_with_budget(
                         "{}: Upstream gRPC response used unsupported compression flag ({})",
                         server_name, res_body_bytes[0]
                     );
-                    upstream_node.record_success_with_epoch(request_epoch);
+                    upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     return Ok(build_error_response(
                         "Unsupported gRPC Response Compression",
                         StatusCode::BAD_GATEWAY,
@@ -737,13 +739,16 @@ pub(crate) async fn handle_grpc_web_with_budget(
                     res_body_bytes[4],
                 ]) as usize;
                 let Some(frame_end) = 5usize.checked_add(payload_len) else {
+                    upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     return Ok(build_error_response(
                         "Invalid gRPC Response",
                         StatusCode::BAD_GATEWAY,
                     ));
                 };
                 if res_body_bytes.len() < frame_end {
-                    upstream_node.record_success_with_epoch(request_epoch);
+                    upstream_node
+                        .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     return Ok(build_error_response(
                         "Truncated gRPC Response",
                         StatusCode::BAD_GATEWAY,
@@ -1408,6 +1413,27 @@ mod tests {
                 .consecutive_failures
                 .load(std::sync::atomic::Ordering::Acquire)
                 >= 1
+        );
+
+        // 3. Short/corrupt gRPC frame (< 5 bytes) records failure instead of success
+        let short_port = spawn_h2_upstream(|req| async move {
+            let _ = req.into_body().collect().await;
+            Ok(hyper::Response::builder()
+                .status(200)
+                .body(Full::new(Bytes::from_static(&[0x00, 0x01])))
+                .unwrap())
+        })
+        .await;
+        let short_target = test_target(short_port);
+        let cfg = test_server_config(5);
+        let resp = call_grpc_web(&short_target, &cfg, hyper::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            short_target.upstreams[0]
+                .consecutive_failures
+                .load(std::sync::atomic::Ordering::Acquire)
+                >= 1,
+            "corrupt <5-byte gRPC upstream body must penalize circuit breaker"
         );
     }
 

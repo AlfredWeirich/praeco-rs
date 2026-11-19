@@ -1,0 +1,28 @@
+# cargo-deny configuration for the Praeco workspace (Q-03).
+# Run manually or in CI via: `cargo deny check bans`
+
+[graph]
+all-features = false
+
+[bans]
+# Warn on multiple major/minor versions of the same crate in the dependency graph.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+# Remaining transitive duplicates (e.g. `base64` 0.22/0.23 between `tonic`/`jsonwebtoken`
+# and `hyper-util`/`reqwest`; `tower-http` 0.6/0.7 via `reqwest`; `matchit` 0.8/0.9 via `axum`;
+# `rand` 0.9/0.10 & `getrandom` 0.3/0.4 between `opentelemetry_sdk` and `quinn-proto`/`uuid`)
+# stem from external upstream crate bounds and are reported as warnings until upstream aligns.
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "OpenSSL",
+]

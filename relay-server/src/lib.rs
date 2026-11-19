@@ -845,7 +845,7 @@ pub async fn run_control_plane_with_options(
             .with_time(Duration::from_secs(30))
             .with_interval(Duration::from_secs(10));
         let _ = sock_ref.set_tcp_keepalive(&keepalive);
-        let _ = sock_ref.set_nodelay(true);
+        let _ = sock_ref.set_tcp_nodelay(true);
 
         let acceptor = options
             .reload_rx
@@ -1157,7 +1157,7 @@ pub async fn run_data_plane_with_stream_timeout(
                 .with_time(keepalive_dur)
                 .with_interval(Duration::from_secs(10));
             let _ = sock_ref.set_tcp_keepalive(&keepalive);
-            let _ = sock_ref.set_nodelay(true);
+            let _ = sock_ref.set_tcp_nodelay(true);
         }
 
         // --- Rate Limiting Check (Aggregated IPv6 on /64, bounded with LRU eviction) ---
