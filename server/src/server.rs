@@ -71,8 +71,8 @@ fn main() -> Result<(), Error> {
         .nth(1)
         .unwrap_or_else(|| "Config.toml".to_string());
 
-    // Install 'ring' as the default crypto provider for the process.
-    rustls::crypto::ring::default_provider()
+    // Install 'aws-lc-rs' as the default crypto provider for the process.
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
 

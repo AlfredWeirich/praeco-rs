@@ -656,7 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_proxy_request_timeout_returns_504() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -898,7 +898,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_proxy_real_connect_failure_marks_node_dead_and_returns_502() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // Pick an unused port without starting a server
         let port = {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1029,7 +1029,7 @@ mod tests {
     /// not as a client abort (400).
     #[tokio::test]
     async fn test_http_proxy_upstream_tcp_reset_returns_502_and_marks_node_dead() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_proxy_outlier_503_retries_on_healthy_node_and_trips_circuit_breaker() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // Node 1 returns 503 Service Unavailable
         let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

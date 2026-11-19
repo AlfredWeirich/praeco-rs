@@ -147,7 +147,7 @@ mod tests {
     use super::*;
 
     fn dummy_idp_params(url: Option<String>) -> IdpParams {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         IdpParams {
             jwt_private_key: "".to_string(),
             jwt_public_key: None,

@@ -847,7 +847,7 @@ fn cert_fingerprint_subject(pem_str: &str) -> Option<String> {
     let pem = pem::parse(pem_str).ok()?;
     use x509_parser::prelude::FromDer;
     let _ = x509_parser::prelude::X509Certificate::from_der(pem.contents()).ok()?;
-    let sha256 = rustls::crypto::ring::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
+    let sha256 = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256
         .tls13()?
         .common
         .hash_provider;

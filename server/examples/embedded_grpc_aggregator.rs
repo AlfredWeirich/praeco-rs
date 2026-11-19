@@ -384,7 +384,7 @@ where
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cancel = CancellationToken::new();
 
     // 1. Start two typed gRPC backend services

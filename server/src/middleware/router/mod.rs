@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_router_service_rejects_invalid_upstream_jwt_header() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let toml_cfg = r#"
             name = "bad_jwt_router"
             enabled = true
@@ -701,7 +701,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use tower::Service;
 
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let toml_cfg = r#"
             name = "early_cl_router"
             enabled = true

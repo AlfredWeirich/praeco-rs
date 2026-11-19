@@ -190,7 +190,7 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
     // Use Config::init (instead of Config::load) to also populate the global config
     // singleton used by mTLS OID extraction and the Admin telemetry service.
     let config = praeco_rs::configuration::Config::init("Config.toml")?;

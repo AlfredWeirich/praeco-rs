@@ -1684,7 +1684,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_full_control_plane_registration() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pki = common::test_pki::TestPki::new();
         // 1. Setup Acceptor
         let acceptor = setup_mtls_acceptor(
@@ -2018,7 +2018,7 @@ mod tests {
 
     #[test]
     fn test_setup_mtls_acceptor_errors_and_crl_loading() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pki = common::test_pki::TestPki::new();
         let ca = common::test_pki::TestPki::s(&pki.relay_ca_pem);
         let srv_cert = common::test_pki::TestPki::s(&pki.relay_server_pem);
@@ -2043,7 +2043,7 @@ mod tests {
     }
 
     fn build_client_hello_bytes(server_name: rustls::pki_types::ServerName<'static>) -> Vec<u8> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cfg = Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(RootCertStore::empty())
@@ -2259,7 +2259,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_data_connection_times_out_when_open_stream_stalls() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
         // Build a real TLS ClientHello with SNI "stalled.example.com"
         let root_store = rustls::RootCertStore::empty();
@@ -2336,7 +2336,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_control_tunnel_terminated_on_live_crl_revocation() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pki = common::test_pki::TestPki::new();
 
         let ca_str = pki.relay_ca_pem.to_string_lossy().to_string();

@@ -98,9 +98,9 @@ async fn main() -> Result<(), Error> {
     //console_subscriber::init();
     tracing_subscriber::fmt::init();
 
-    // Install the `ring` crypto provider as the process-wide default.
+    // Install the `aws-lc-rs` crypto provider as the process-wide default.
     // This is required by both `rustls` (TCP+TLS path) and `quinn` (QUIC path).
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("Failed to install rustls crypto provider"))?;
 

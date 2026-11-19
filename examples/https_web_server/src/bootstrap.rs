@@ -135,9 +135,9 @@ pub async fn run_https_server(router: WebRouter) -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Required once per process for rustls / Quinn TLS 1.3.
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .map_err(|_| anyhow::anyhow!("Failed to install rustls ring crypto provider"))?;
+        .map_err(|_| anyhow::anyhow!("Failed to install rustls aws-lc-rs crypto provider"))?;
 
     let port: u16 = std::env::var("PORT")
         .ok()

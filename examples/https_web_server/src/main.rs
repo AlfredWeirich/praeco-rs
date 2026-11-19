@@ -69,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_hardened_https_stack_and_endpoints() -> anyhow::Result<()> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let pki = TestPki::new();
         let router = build_app_router()?;
         let cfg = bootstrap::build_server_config_with_certs(

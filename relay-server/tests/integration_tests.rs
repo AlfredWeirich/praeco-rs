@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use yamux::{Config as YamuxConfig, Connection, Mode};
 
 fn ensure_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
 /// Builds the Relay Control Plane `TlsAcceptor` using the ephemeral `TestPki`.
@@ -1386,11 +1386,25 @@ async fn test_data_plane_case_insensitive_sni_routing() {
         });
 
         // Verify the forwarded ClientHello contains our patched uppercase SNI
+        // (post-quantum ClientHellos with ML-KEM768 exceed 512 bytes, so read the full record).
         let mut compat = inbound.compat();
-        let mut buf = vec![0u8; 512];
-        let n = compat.read(&mut buf).await.unwrap();
+        let mut received = Vec::with_capacity(2048);
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = compat.read(&mut chunk).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..n]);
+            if received
+                .windows(upper_sni.len())
+                .any(|w| w == upper_sni.as_bytes())
+            {
+                break;
+            }
+        }
         assert!(
-            buf[..n]
+            received
                 .windows(upper_sni.len())
                 .any(|w| w == upper_sni.as_bytes()),
             "Forwarded ClientHello must arrive at the matching lowercase tunnel"

@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_build_hyper_client_with_custom_keepalive_and_timeouts() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let root_store = rustls::RootCertStore::empty();
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)

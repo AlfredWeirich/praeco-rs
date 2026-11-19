@@ -168,7 +168,7 @@ async fn main() -> Result<()> {
     let (_tracing_guard, tracer_provider) = setup_tracing(&config)?;
 
     // Install default crypto provider for rustls
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     info!("Starting Praeco Relay Server...");
 

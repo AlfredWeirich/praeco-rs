@@ -52,7 +52,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_passthrough_request_timeout_returns_504() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -159,7 +159,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_passthrough_failover_from_dead_node_to_healthy_node() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         // Node 1: Dead port (bind and immediately drop so TCP connect refuses)
@@ -249,7 +249,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_passthrough_streaming_payload_too_large_returns_413_and_node_remains_alive() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -334,7 +334,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grpc_passthrough_timeout_does_not_retry_second_upstream() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
         // Node 1: Accepts connection and stalls past request timeout
