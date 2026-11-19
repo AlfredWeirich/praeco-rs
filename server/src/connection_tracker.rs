@@ -24,9 +24,9 @@ pub enum AcquireError {
 #[derive(Debug, Clone)]
 pub struct ConnectionTracker {
     current_connections: Arc<AtomicUsize>,
-    max_connections: usize,
+    max_connections: Arc<AtomicUsize>,
     ip_counts: Arc<DashMap<IpAddr, u32>>,
-    max_connections_per_ip: usize,
+    max_connections_per_ip: Arc<AtomicUsize>,
     metrics: Option<Arc<crate::configuration::ServerMetrics>>,
 }
 
@@ -35,9 +35,9 @@ impl ConnectionTracker {
     pub fn new(max_connections: usize, max_connections_per_ip: usize) -> Self {
         Self {
             current_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections,
+            max_connections: Arc::new(AtomicUsize::new(max_connections)),
             ip_counts: Arc::new(DashMap::new()),
-            max_connections_per_ip,
+            max_connections_per_ip: Arc::new(AtomicUsize::new(max_connections_per_ip)),
             metrics: None,
         }
     }
@@ -51,11 +51,19 @@ impl ConnectionTracker {
     ) -> Self {
         Self {
             current_connections: Arc::new(AtomicUsize::new(0)),
-            max_connections,
+            max_connections: Arc::new(AtomicUsize::new(max_connections)),
             ip_counts: Arc::new(DashMap::new()),
-            max_connections_per_ip,
+            max_connections_per_ip: Arc::new(AtomicUsize::new(max_connections_per_ip)),
             metrics: Some(crate::configuration::ServerMetrics::for_server(server_name)),
         }
+    }
+
+    /// Dynamically updates the global and per-IP connection limits in place (e.g. on `SIGHUP`)
+    /// without losing active connection counters.
+    pub fn update_limits(&self, max_connections: usize, max_connections_per_ip: usize) {
+        self.max_connections.store(max_connections, Ordering::SeqCst);
+        self.max_connections_per_ip
+            .store(max_connections_per_ip, Ordering::SeqCst);
     }
 
     /// Attempts to acquire a permit for an incoming connection.
@@ -64,10 +72,12 @@ impl ConnectionTracker {
     /// the permits when dropped.
     pub fn acquire(&self, ip: Option<IpAddr>) -> Result<ConnectionGuard, AcquireError> {
         let ip = ip.map(common::canonical_client_ip);
+        let max_connections = self.max_connections();
+        let max_connections_per_ip = self.max_connections_per_ip();
 
         // 1. Check and increment global counter
         let current = self.current_connections.fetch_add(1, Ordering::SeqCst);
-        if current >= self.max_connections {
+        if current >= max_connections {
             self.current_connections.fetch_sub(1, Ordering::SeqCst);
             if let Some(m) = &self.metrics {
                 m.connections_rejected_global
@@ -75,7 +85,7 @@ impl ConnectionTracker {
             }
             return Err(AcquireError::GlobalLimitReached {
                 current,
-                max: self.max_connections,
+                max: max_connections,
             });
         }
 
@@ -83,7 +93,7 @@ impl ConnectionTracker {
         if let Some(ip_addr) = ip
             && !ip_addr.is_unspecified() {
                 let mut entry = self.ip_counts.entry(ip_addr).or_insert(0);
-                if *entry as usize >= self.max_connections_per_ip {
+                if *entry as usize >= max_connections_per_ip {
                     let cur_ip = *entry;
                     drop(entry);
                     self.current_connections.fetch_sub(1, Ordering::SeqCst);
@@ -93,7 +103,7 @@ impl ConnectionTracker {
                     return Err(AcquireError::IpLimitReached {
                         ip: ip_addr,
                         current: cur_ip,
-                        max: self.max_connections_per_ip,
+                        max: max_connections_per_ip,
                     });
                 }
                 *entry += 1;
@@ -140,12 +150,12 @@ impl ConnectionTracker {
 
     /// Returns the configured global maximum number of connections.
     pub fn max_connections(&self) -> usize {
-        self.max_connections
+        self.max_connections.load(Ordering::SeqCst)
     }
 
     /// Returns the configured maximum number of connections per IP address.
     pub fn max_connections_per_ip(&self) -> usize {
-        self.max_connections_per_ip
+        self.max_connections_per_ip.load(Ordering::SeqCst)
     }
 }
 
@@ -164,8 +174,9 @@ impl ConnectionGuard {
         if ip.is_unspecified() || self.ip.is_some() {
             return Ok(());
         }
+        let max_per_ip = self.tracker.max_connections_per_ip();
         let mut entry = self.tracker.ip_counts.entry(ip).or_insert(0);
-        if *entry as usize >= self.tracker.max_connections_per_ip {
+        if *entry as usize >= max_per_ip {
             let cur_ip = *entry;
             if let Some(m) = &self.tracker.metrics {
                 m.connections_rejected_ip.fetch_add(1, Ordering::Relaxed);
@@ -173,7 +184,7 @@ impl ConnectionGuard {
             return Err(AcquireError::IpLimitReached {
                 ip,
                 current: cur_ip,
-                max: self.tracker.max_connections_per_ip,
+                max: max_per_ip,
             });
         }
         *entry += 1;
@@ -221,6 +232,30 @@ mod tests {
         assert_eq!(tracker.current_connections(), 2);
 
         drop(g2);
+    }
+
+    #[test]
+    fn test_update_limits_dynamically() {
+        let tracker = ConnectionTracker::new(1, 1);
+        let ip: IpAddr = Ipv4Addr::new(192, 168, 10, 1).into();
+
+        let _g1 = tracker.acquire(Some(ip)).expect("conn 1 ok");
+        assert!(tracker.acquire(Some(ip)).is_err());
+
+        // Hot-reload increases both global and per-IP limits
+        tracker.update_limits(3, 2);
+        assert_eq!(tracker.max_connections(), 3);
+        assert_eq!(tracker.max_connections_per_ip(), 2);
+
+        let _g2 = tracker.acquire(Some(ip)).expect("conn 2 ok after limit increase");
+        assert_eq!(
+            tracker.acquire(Some(ip)).unwrap_err(),
+            AcquireError::IpLimitReached {
+                ip,
+                current: 2,
+                max: 2,
+            }
+        );
     }
 
     #[test]

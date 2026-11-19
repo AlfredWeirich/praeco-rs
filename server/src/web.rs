@@ -341,11 +341,15 @@ where
 /// Combine with Rust struct destructuring in the handler signature to inject
 /// fields directly as typed local variables without procedural macros:
 ///
-/// ```ignore
+/// ```rust
+/// # use praeco_rs::web::Query;
+/// # use serde::Deserialize;
 /// #[derive(Deserialize)]
 /// struct GreetQuery { user_name: String, age: Option<u8> }
 ///
-/// async fn greet(Query(GreetQuery { user_name, age }): Query<GreetQuery>) -> ...
+/// async fn greet(Query(GreetQuery { user_name, age }): Query<GreetQuery>) -> String {
+///     format!("Hello {user_name} ({age:?})")
+/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct Query<T>(pub T);

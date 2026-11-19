@@ -61,10 +61,10 @@ pub mod web;
 pub use common::Claims;
 pub use error::SrvError;
 pub use runner::{
-    CONNECTION_DRAIN_TIMEOUT, DualStackHandles, run_dual_stack, run_servers, run_tunnel,
-    run_tunnel_with_timeout, run_tunnel_with_timeout_and_base_oid, spawn_dual_stack,
+    CONNECTION_DRAIN_TIMEOUT, DualStackHandles, ServerReloadUpdate, run_dual_stack, run_servers,
+    run_tunnel, run_tunnel_with_timeout, run_tunnel_with_timeout_and_base_oid, spawn_dual_stack,
     spawn_router_health_checks, spawn_router_health_checks_in, start_single_server,
-    start_single_server_with_socket_signal,
+    start_single_server_reloadable, start_single_server_with_socket_signal,
 };
 pub use stack::{
     apply_layers, build_rustls_config, build_service_stack, build_service_stack_with_base,
@@ -304,10 +304,46 @@ pub struct SanCertExtension(pub String);
 #[derive(Clone, Debug)]
 pub struct OidCertExtension(pub Vec<String>);
 
+#[derive(Clone)]
+enum ServiceSource {
+    Static(BoxedCloneService),
+    Dynamic(Arc<arc_swap::ArcSwap<BoxedCloneService>>),
+}
+
+#[derive(Clone)]
+struct DynamicOidMapping {
+    live: Arc<arc_swap::ArcSwap<std::collections::HashMap<String, UserRole>>>,
+    cached_map: Arc<std::collections::HashMap<String, UserRole>>,
+}
+
+fn resolve_roles_from_oids(
+    oids: &[String],
+    oid_mapping: &std::collections::HashMap<String, UserRole>,
+) -> crate::configuration::RoleVec<6> {
+    let roles: crate::configuration::RoleVec<6> = oids
+        .iter()
+        .map(|oid| {
+            oid_mapping
+                .get(oid)
+                .cloned()
+                .unwrap_or_else(UserRole::guest)
+        })
+        .filter(|role| *role != UserRole::guest())
+        .collect();
+
+    if roles.is_empty() {
+        let mut r = crate::configuration::RoleVec::new();
+        r.push(UserRole::guest());
+        r
+    } else {
+        roles
+    }
+}
+
 pub struct ConnectionHandler {
-    /// The fully assembled middleware + routing pipeline, type-erased and
-    /// cloneable so it can be shared across all requests on this connection.
-    inner_service: BoxedCloneService,
+    /// The fully assembled middleware + routing pipeline (either a fixed
+    /// [`BoxedCloneService`] or a live [`arc_swap::ArcSwap`] loaded per request).
+    service_source: ServiceSource,
 
     /// The remote peer's socket address (IP + port), used to populate
     /// `X-Real-IP` and for logging/diagnostics.
@@ -319,6 +355,10 @@ pub struct ConnectionHandler {
     /// the same connection is a cheap pointer bump instead of a `Vec` copy.
     /// Defaults to `[UserRole::Guest]` when no recognized OID is found.
     client_roles: Arc<crate::configuration::RoleVec<6>>,
+
+    /// Optional live `oid_mapping` reference used to detect `SIGHUP` role-table
+    /// updates via a single `Arc::ptr_eq` check per request.
+    dynamic_oid_mapping: Option<DynamicOidMapping>,
 
     /// The client's full certificate in PEM format, URL-encoded.
     client_cert_pem: Option<String>,
@@ -360,31 +400,68 @@ impl ConnectionHandler {
         client_cert_san: Option<String>,
         oid_mapping: Arc<std::collections::HashMap<String, UserRole>>,
     ) -> Self {
-        // 1. Perform the expensive mapping ONCE per connection
-        let roles: crate::configuration::RoleVec<6> = oids
-            .iter()
-            .map(|oid| {
-                oid_mapping
-                    .get(oid)
-                    .cloned()
-                    .unwrap_or_else(UserRole::guest)
-            })
-            .filter(|role| *role != UserRole::guest())
-            .collect();
-
-        // If you need Guest as fallback, handle it here
-        let final_roles = if roles.is_empty() {
-            let mut r = crate::configuration::RoleVec::new();
-            r.push(UserRole::guest());
-            r
-        } else {
-            roles
-        };
+        let final_roles = resolve_roles_from_oids(&oids, &oid_mapping);
 
         Self {
-            inner_service: service,
+            service_source: ServiceSource::Static(service),
             client_addr: addr,
             client_roles: Arc::new(final_roles),
+            dynamic_oid_mapping: None,
+            client_cert_pem,
+            client_cert_san,
+            client_oids: Arc::new(oids),
+        }
+    }
+
+    /// Creates a `ConnectionHandler` backed by a live [`arc_swap::ArcSwap`] service
+    /// stack so long-lived HTTP/1.1, HTTP/2, and tunneled connections automatically
+    /// pick up hot-reloaded middleware and routing pipelines on every request.
+    pub fn with_dynamic_stack(
+        dynamic_stack: Arc<arc_swap::ArcSwap<BoxedCloneService>>,
+        addr: SocketAddr,
+        oids: Vec<String>,
+        client_cert_pem: Option<String>,
+        client_cert_san: Option<String>,
+        oid_mapping: Arc<std::collections::HashMap<String, UserRole>>,
+    ) -> Self {
+        let final_roles = resolve_roles_from_oids(&oids, &oid_mapping);
+
+        Self {
+            service_source: ServiceSource::Dynamic(dynamic_stack),
+            client_addr: addr,
+            client_roles: Arc::new(final_roles),
+            dynamic_oid_mapping: None,
+            client_cert_pem,
+            client_cert_san,
+            client_oids: Arc::new(oids),
+        }
+    }
+
+    /// Like [`ConnectionHandler::with_dynamic_stack`], but also tracks a live
+    /// [`arc_swap::ArcSwap`] OID-to-role map.
+    ///
+    /// On the hot path, each request performs a single `Arc::ptr_eq` check against
+    /// the connection's cached map and only recomputes roles if a `SIGHUP` reload
+    /// replaced the OID mapping table.
+    pub fn with_dynamic_stack_and_oids(
+        dynamic_stack: Arc<arc_swap::ArcSwap<BoxedCloneService>>,
+        addr: SocketAddr,
+        oids: Vec<String>,
+        client_cert_pem: Option<String>,
+        client_cert_san: Option<String>,
+        oid_mapping: Arc<arc_swap::ArcSwap<std::collections::HashMap<String, UserRole>>>,
+    ) -> Self {
+        let cached_map = oid_mapping.load_full();
+        let final_roles = resolve_roles_from_oids(&oids, &cached_map);
+
+        Self {
+            service_source: ServiceSource::Dynamic(dynamic_stack),
+            client_addr: addr,
+            client_roles: Arc::new(final_roles),
+            dynamic_oid_mapping: Some(DynamicOidMapping {
+                live: oid_mapping,
+                cached_map,
+            }),
             client_cert_pem,
             client_cert_san,
             client_oids: Arc::new(oids),
@@ -412,9 +489,31 @@ impl ConnectionHandler {
         client_oids: Arc<Vec<String>>,
     ) -> Self {
         Self {
-            inner_service: service,
+            service_source: ServiceSource::Static(service),
             client_addr: addr,
             client_roles: roles,
+            dynamic_oid_mapping: None,
+            client_cert_pem,
+            client_cert_san,
+            client_oids,
+        }
+    }
+
+    /// Like [`ConnectionHandler::new_shared`], but loads the current service stack
+    /// from `dynamic_stack` on execution.
+    pub fn with_dynamic_stack_shared(
+        dynamic_stack: Arc<arc_swap::ArcSwap<BoxedCloneService>>,
+        addr: SocketAddr,
+        roles: Arc<crate::configuration::RoleVec<6>>,
+        client_cert_pem: Option<String>,
+        client_cert_san: Option<String>,
+        client_oids: Arc<Vec<String>>,
+    ) -> Self {
+        Self {
+            service_source: ServiceSource::Dynamic(dynamic_stack),
+            client_addr: addr,
+            client_roles: roles,
+            dynamic_oid_mapping: None,
             client_cert_pem,
             client_cert_san,
             client_oids,
@@ -449,13 +548,23 @@ impl ConnectionHandler {
     ///
     /// Returns `Err(SrvError)` if the inner service stack returns an error.
     pub async fn handle(
-        mut self,
+        self,
         mut req: Request<SrvBody>,
     ) -> Result<Response<ServiceRespBody>, SrvError> {
         req.extensions_mut().insert(self.client_addr);
 
-        // 2. Zero-cost injection. Just cloning the Arc pointer.
-        req.extensions_mut().insert(self.client_roles.clone());
+        // 2. Zero-cost injection on the hot path (`Arc::ptr_eq` check when dynamic OIDs are used).
+        let roles_to_inject = if let Some(ref dyn_oid) = self.dynamic_oid_mapping {
+            let current_map = dyn_oid.live.load();
+            if Arc::ptr_eq(&current_map, &dyn_oid.cached_map) {
+                self.client_roles.clone()
+            } else {
+                Arc::new(resolve_roles_from_oids(&self.client_oids, &current_map))
+            }
+        } else {
+            self.client_roles.clone()
+        };
+        req.extensions_mut().insert(roles_to_inject);
 
         // 3. Inject cert information if present
         if let Some(pem) = self.client_cert_pem.clone() {
@@ -479,13 +588,18 @@ impl ConnectionHandler {
             .and_then(|v| v.to_str().ok())
             .is_some_and(is_grpc_content_type);
 
+        let mut inner_service = match self.service_source {
+            ServiceSource::Static(svc) => svc,
+            ServiceSource::Dynamic(stack) => (**stack.load()).clone(),
+        };
+
         // Tower service contract: poll_ready() MUST be called before call().
         // This is critical for layers like ConcurrencyLimit that acquire a
         // semaphore permit during poll_ready() and assert it exists in call().
         // Most layers silently accept skipping this, but ConcurrencyLimit panics.
-        futures::future::poll_fn(|cx| self.inner_service.poll_ready(cx)).await?;
+        futures::future::poll_fn(|cx| inner_service.poll_ready(cx)).await?;
 
-        let mut resp = self.inner_service.call(req).await?;
+        let mut resp = inner_service.call(req).await?;
 
         if is_grpc_request && !resp.status().is_success() {
             let already_grpc = resp.headers().contains_key("grpc-status")
@@ -633,9 +747,10 @@ impl hyper::service::Service<Request<Incoming>> for ConnectionHandler {
 impl Clone for ConnectionHandler {
     fn clone(&self) -> Self {
         Self {
-            inner_service: self.inner_service.clone(),
+            service_source: self.service_source.clone(),
             client_addr: self.client_addr,
             client_roles: self.client_roles.clone(),
+            dynamic_oid_mapping: self.dynamic_oid_mapping.clone(),
             client_cert_pem: self.client_cert_pem.clone(),
             client_cert_san: self.client_cert_san.clone(),
             client_oids: self.client_oids.clone(),
@@ -645,6 +760,13 @@ impl Clone for ConnectionHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::configuration::{RoleVec, UserRole};
+    use arc_swap::ArcSwap;
+    use http_body_util::Full;
+    use std::collections::HashMap;
+    use tower::service_fn;
+
     #[test]
     fn test_reexported_claims_matches_common_claims() {
         let claims: super::Claims = common::Claims {
@@ -656,5 +778,65 @@ mod tests {
             jti: None,
         };
         assert_eq!(claims.sub, "embedder");
+    }
+
+    #[tokio::test]
+    async fn test_connection_handler_dynamic_stack_and_oids_updates_per_request() {
+        let echo_role_svc = |tag: &'static str| {
+            service_fn(move |req: Request<SrvBody>| async move {
+                let roles = req
+                    .extensions()
+                    .get::<Arc<RoleVec<6>>>()
+                    .expect("roles extension present");
+                let role_name = roles
+                    .first()
+                    .map(|r| r.0.as_str())
+                    .unwrap_or("none")
+                    .to_string();
+                let payload = format!("{tag}:{role_name}");
+                let body = Full::new(Bytes::from(payload)).map_err(SrvError::from).boxed();
+                Ok::<Response<ServiceRespBody>, SrvError>(Response::new(body))
+            })
+            .boxed_clone_sync()
+        };
+
+        let dynamic_stack = Arc::new(ArcSwap::from_pointee(echo_role_svc("v1")));
+        let mut initial_oids = HashMap::new();
+        initial_oids.insert("1".to_string(), UserRole("User".to_string()));
+        let live_oid_map = Arc::new(ArcSwap::from_pointee(initial_oids));
+
+        let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let handler = ConnectionHandler::with_dynamic_stack_and_oids(
+            dynamic_stack.clone(),
+            peer,
+            vec!["1".to_string()],
+            None,
+            None,
+            live_oid_map.clone(),
+        );
+
+        // Request 1 on long-lived connection sees stack v1 and role "User"
+        let req1 = Request::builder()
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp1 = handler.clone().handle(req1).await.unwrap();
+        let body1 = resp1.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body1[..], b"v1:User");
+
+        // Simulate SIGHUP hot-reload of both service stack and oid_mapping
+        dynamic_stack.store(Arc::new(echo_role_svc("v2")));
+        let mut updated_oids = HashMap::new();
+        updated_oids.insert("1".to_string(), UserRole("Admin".to_string()));
+        live_oid_map.store(Arc::new(updated_oids));
+
+        // Request 2 on the SAME ConnectionHandler sees stack v2 and updated role "Admin"
+        let req2 = Request::builder()
+            .uri("/test")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp2 = handler.clone().handle(req2).await.unwrap();
+        let body2 = resp2.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body2[..], b"v2:Admin");
     }
 }

@@ -33,9 +33,7 @@ use crate::{
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::router::build_grpc_pool,
     stack::{
-        build_rustls_config, build_service_stack, build_tunnel_tls_connector,
-        run_tunnel_over_stream_with_drain_timeout_and_base_oid, serve_http_connection,
-        serve_tls_connection_with_base_oid,
+        build_rustls_config, build_service_stack, build_tunnel_tls_connector, serve_http_connection,
     },
     tls_conf::extract_client_metadata_with_base,
 };
@@ -175,17 +173,6 @@ async fn drain_tasks(tasks: &mut JoinSet<()>, server_name: &str, what: &str, tim
     }
 }
 
-/// Reaps finished background tasks (logging panics) for as long as it is polled.
-///
-/// Never completes, so it can be used as a `select!` branch next to the actual
-/// server future.
-async fn watch_background_tasks(tasks: &mut JoinSet<()>, server_name: &str) {
-    while let Some(res) = tasks.join_next().await {
-        log_task_result(server_name, "background", res);
-    }
-    std::future::pending::<()>().await;
-}
-
 /// Starts a single server instance (HTTP, HTTPS/H3 dual-stack, or outbound Relay tunnel)
 /// based on the provided configuration and returns once it has fully stopped.
 ///
@@ -212,6 +199,17 @@ pub async fn start_single_server(
     start_single_server_with_socket_signal(server_config, cancel_token, dynamic_stack, None).await;
 }
 
+/// Hot-reload payload delivered on `SIGHUP` to a running server instance
+/// whose listening socket or tunnel target did not change.
+#[derive(Clone)]
+pub struct ServerReloadUpdate {
+    /// Updated server configuration (contains new `parsed_routes` / `UpstreamNode`s,
+    /// `oid_mapping`, `parsed_pki_base_oid`, and `connection_limits`).
+    pub config: Arc<ServerConfig>,
+    /// Pre-validated TLS configuration (when `protocol == Https` or `tunnel.is_some()`).
+    pub tls_config: Option<Arc<RustlsServerConfig>>,
+}
+
 /// Like [`start_single_server`], but notifies `sockets_released` as soon as the
 /// server's listening sockets are closed (before waiting for slow HTTP connection
 /// draining to finish), allowing hot-reload restarts on the same port to bind promptly.
@@ -221,18 +219,47 @@ pub async fn start_single_server_with_socket_signal(
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     sockets_released: Option<oneshot::Sender<()>>,
 ) {
+    let (_reload_tx, reload_rx) = tokio::sync::watch::channel(ServerReloadUpdate {
+        config: server_config.clone(),
+        tls_config: None,
+    });
+    start_single_server_reloadable(
+        server_config,
+        cancel_token,
+        dynamic_stack,
+        sockets_released,
+        reload_rx,
+    )
+    .await;
+}
+
+/// Like [`start_single_server_with_socket_signal`], but also listens on `reload_rx`
+/// to hot-reload TLS/mTLS/CRL configurations, OID mappings, connection limits, and
+/// active router health-check loops in place on `SIGHUP`.
+pub async fn start_single_server_reloadable(
+    server_config: Arc<ServerConfig>,
+    cancel_token: CancellationToken,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    sockets_released: Option<oneshot::Sender<()>>,
+    reload_rx: tokio::sync::watch::Receiver<ServerReloadUpdate>,
+) {
     // Per-server token: cancelled by the caller or if a listener dies unexpectedly.
     let server_token = cancel_token.child_token();
-    let mut background_tasks: JoinSet<()> = JoinSet::new();
+    let health_shutdown_token = CancellationToken::new();
+    let health_handle = tokio::spawn(supervise_reloadable_health_checks(
+        server_config.clone(),
+        health_shutdown_token.clone(),
+        reload_rx.clone(),
+    ));
 
-    if server_config.service == ServiceType::Router {
-        spawn_router_health_checks_in(&server_config, server_token.clone(), &mut background_tasks);
-    }
-
-    tokio::select! {
-        () = serve_listeners(&server_config, &server_token, dynamic_stack, sockets_released) => {}
-        () = watch_background_tasks(&mut background_tasks, &server_config.name) => {}
-    }
+    serve_listeners(
+        &server_config,
+        &server_token,
+        dynamic_stack,
+        sockets_released,
+        reload_rx,
+    )
+    .await;
 
     if !cancel_token.is_cancelled() {
         error!(
@@ -242,9 +269,62 @@ pub async fn start_single_server_with_socket_signal(
     }
 
     server_token.cancel();
+    health_shutdown_token.cancel();
+    let _ = health_handle.await;
+}
+
+/// Supervises active router health-check tasks and restarts them against the new
+/// [`UpstreamNode`] instances whenever a `SIGHUP` reload arrives on `reload_rx`.
+async fn supervise_reloadable_health_checks(
+    initial_config: Arc<ServerConfig>,
+    server_token: CancellationToken,
+    mut reload_rx: tokio::sync::watch::Receiver<ServerReloadUpdate>,
+) {
+    let server_name = initial_config.name.clone();
+    let mut health_token = server_token.child_token();
+    let mut background_tasks: JoinSet<()> = JoinSet::new();
+
+    if initial_config.service == ServiceType::Router {
+        spawn_router_health_checks_in(&initial_config, health_token.clone(), &mut background_tasks);
+    }
+
+    loop {
+        tokio::select! {
+            _ = server_token.cancelled() => break,
+            Some(res) = background_tasks.join_next(), if !background_tasks.is_empty() => {
+                log_task_result(&server_name, "background", res);
+            }
+            changed = reload_rx.changed() => {
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                }
+                let next_cfg = reload_rx.borrow_and_update().config.clone();
+                health_token.cancel();
+                drain_tasks(
+                    &mut background_tasks,
+                    &server_name,
+                    "background",
+                    BACKGROUND_STOP_TIMEOUT,
+                )
+                .await;
+
+                health_token = server_token.child_token();
+                if next_cfg.service == ServiceType::Router {
+                    spawn_router_health_checks_in(
+                        &next_cfg,
+                        health_token.clone(),
+                        &mut background_tasks,
+                    );
+                    info!("{}: Reloaded active health checks for updated upstream targets", server_name);
+                }
+            }
+        }
+    }
+
+    health_token.cancel();
     drain_tasks(
         &mut background_tasks,
-        &server_config.name,
+        &server_name,
         "background",
         BACKGROUND_STOP_TIMEOUT,
     )
@@ -258,6 +338,7 @@ async fn serve_listeners(
     server_token: &CancellationToken,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     sockets_released: Option<oneshot::Sender<()>>,
+    mut reload_rx: tokio::sync::watch::Receiver<ServerReloadUpdate>,
 ) {
     let drain_timeout = server_config.drain_timeout();
     let Some(static_name) = server_config.static_name else {
@@ -268,9 +349,10 @@ async fn serve_listeners(
         return;
     };
 
-    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
-    let pki_base_oid: Option<Arc<[u64]>> =
-        server_config.parsed_pki_base_oid.as_deref().map(Arc::from);
+    let live_oid_mapping = Arc::new(ArcSwap::from_pointee(server_config.oid_mapping.clone()));
+    let live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>> = Arc::new(ArcSwap::from_pointee(
+        server_config.parsed_pki_base_oid.as_deref().map(Arc::from),
+    ));
     let connection_tracker = Arc::new(ConnectionTracker::with_server_name(
         server_config.connection_limits.max_connections,
         server_config.connection_limits.max_connections_per_ip,
@@ -283,13 +365,53 @@ async fn serve_listeners(
             "{}: Connecting to Zero-Trust Tunnel at {}",
             server_config.name, tunnel.target_url
         );
-        let tls_config: Arc<RustlsServerConfig> = match build_rustls_config(server_config.as_ref()) {
-            Ok(cfg) => Arc::new(cfg),
-            Err(e) => {
-                error!("{}: TLS Setup Error: {:?}", server_config.name, e);
-                return;
-            }
+        let initial_tls = reload_rx.borrow().tls_config.clone();
+        let tls_config: Arc<RustlsServerConfig> = match initial_tls {
+            Some(cfg) => cfg,
+            None => match build_rustls_config(server_config.as_ref()) {
+                Ok(cfg) => Arc::new(cfg),
+                Err(e) => {
+                    error!("{}: TLS Setup Error: {:?}", server_config.name, e);
+                    return;
+                }
+            },
         };
+        let live_acceptor = Arc::new(ArcSwap::from_pointee(tokio_rustls::TlsAcceptor::from(
+            tls_config,
+        )));
+
+        let watcher_token = server_token.child_token();
+        let watcher_tracker = connection_tracker.clone();
+        let watcher_oids = live_oid_mapping.clone();
+        let watcher_base_oid = live_pki_base_oid.clone();
+        let watcher_acceptor = live_acceptor.clone();
+        let _reload_watcher = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watcher_token.cancelled() => break,
+                    res = reload_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                        let snap = reload_rx.borrow_and_update().clone();
+                        watcher_tracker.update_limits(
+                            snap.config.connection_limits.max_connections,
+                            snap.config.connection_limits.max_connections_per_ip,
+                        );
+                        watcher_oids.store(Arc::new(snap.config.oid_mapping.clone()));
+                        watcher_base_oid.store(Arc::new(
+                            snap.config.parsed_pki_base_oid.as_deref().map(Arc::from),
+                        ));
+                        let new_tls = snap.tls_config.or_else(|| {
+                            build_rustls_config(snap.config.as_ref()).ok().map(Arc::new)
+                        });
+                        if let Some(tls_cfg) = new_tls {
+                            watcher_acceptor.store(Arc::new(tokio_rustls::TlsAcceptor::from(tls_cfg)));
+                        }
+                    }
+                }
+            }
+        });
 
         let mut retry_count = 0;
         let initial_delay = Duration::from_secs(1);
@@ -300,16 +422,16 @@ async fn serve_listeners(
             }
 
             let start_time = std::time::Instant::now();
-            if let Err(e) = run_tunnel_with_timeout_and_base_oid(
+            if let Err(e) = run_tunnel_with_dynamic_state(
                 tunnel.clone(),
-                tls_config.clone(),
+                live_acceptor.clone(),
                 dynamic_stack.clone(),
                 server_token.clone(),
                 static_name,
-                oid_mapping.clone(),
+                live_oid_mapping.clone(),
                 connection_tracker.clone(),
                 drain_timeout,
-                pki_base_oid.clone(),
+                live_pki_base_oid.clone(),
             )
             .await
             {
@@ -353,26 +475,31 @@ async fn serve_listeners(
 
     // === HTTPS / DUAL STACK PATH ===
     if server_config.protocol == Protocol::Https {
-        let tls_config: RustlsServerConfig = match build_rustls_config(server_config.as_ref()) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                error!("{}: TLS Setup Error: {:?}", server_config.name, e);
-                return;
-            }
+        let initial_tls = reload_rx.borrow().tls_config.clone();
+        let tls_config: Arc<RustlsServerConfig> = match initial_tls {
+            Some(cfg) => cfg,
+            None => match build_rustls_config(server_config.as_ref()) {
+                Ok(cfg) => Arc::new(cfg),
+                Err(e) => {
+                    error!("{}: TLS Setup Error: {:?}", server_config.name, e);
+                    return;
+                }
+            },
         };
 
         let barrier = SocketReleaseBarrier::new(2, sockets_released);
-        match spawn_dual_stack_inner(
+        match spawn_dual_stack_reloadable(
             server_addr,
             tls_config,
             dynamic_stack,
             server_token.clone(),
             static_name,
-            oid_mapping,
+            live_oid_mapping,
             connection_tracker.clone(),
             drain_timeout,
             Some(barrier),
-            pki_base_oid,
+            live_pki_base_oid,
+            Some(reload_rx),
         )
         .await
         {
@@ -391,6 +518,28 @@ async fn serve_listeners(
                 return;
             }
         };
+
+        let watcher_token = server_token.child_token();
+        let watcher_tracker = connection_tracker.clone();
+        let watcher_oids = live_oid_mapping.clone();
+        let _reload_watcher = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watcher_token.cancelled() => break,
+                    res = reload_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                        let snap = reload_rx.borrow_and_update().clone();
+                        watcher_tracker.update_limits(
+                            snap.config.connection_limits.max_connections,
+                            snap.config.connection_limits.max_connections_per_ip,
+                        );
+                        watcher_oids.store(Arc::new(snap.config.oid_mapping.clone()));
+                    }
+                }
+            }
+        });
 
         let barrier = SocketReleaseBarrier::new(1, sockets_released);
         let mut conn_tasks: JoinSet<()> = JoinSet::new();
@@ -423,13 +572,13 @@ async fn serve_listeners(
                                     continue;
                                 }
                             };
-                            let svc = (**dynamic_stack.load()).clone();
+                            let dynamic_stack = dynamic_stack.clone();
                             let conn_token = server_token.clone();
-                            let oid_mapping = oid_mapping.clone();
+                            let oid_mapping = live_oid_mapping.clone();
                             conn_tasks.spawn(async move {
                                 let _guard = conn_guard;
-                                let handler = ConnectionHandler::new(
-                                    svc,
+                                let handler = ConnectionHandler::with_dynamic_stack_and_oids(
+                                    dynamic_stack,
                                     peer_addr,
                                     Vec::new(),
                                     None,
@@ -993,37 +1142,108 @@ async fn spawn_dual_stack_inner(
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
     pki_base_oid: Option<Arc<[u64]>>,
 ) -> Result<DualStackHandles, SrvError> {
-    let arc_tls_config = Arc::new(tls_config);
+    spawn_dual_stack_reloadable(
+        server_addr,
+        Arc::new(tls_config),
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        Arc::new(ArcSwap::new(oid_mapping)),
+        connection_tracker,
+        drain_timeout,
+        release_barrier,
+        Arc::new(ArcSwap::from_pointee(pki_base_oid)),
+        None,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn spawn_dual_stack_reloadable(
+    server_addr: SocketAddr,
+    arc_tls_config: Arc<RustlsServerConfig>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    release_barrier: Option<Arc<SocketReleaseBarrier>>,
+    live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
+    reload_rx: Option<tokio::sync::watch::Receiver<ServerReloadUpdate>>,
+) -> Result<DualStackHandles, SrvError> {
     // Bind everything first: on failure the already-bound socket is simply dropped.
     let tcp_listener = TcpListener::bind(server_addr)
         .await
         .map_err(|e| SrvError::Other(format!("TCP bind failed on {server_addr}: {e}")))?;
     let quic_endpoint = build_quic_endpoint(server_addr, &arc_tls_config)?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(arc_tls_config);
+    let live_acceptor = Arc::new(ArcSwap::from_pointee(tokio_rustls::TlsAcceptor::from(
+        arc_tls_config,
+    )));
+
+    if let Some(mut rx) = reload_rx {
+        let watcher_token = cancel_token.child_token();
+        let watcher_tracker = connection_tracker.clone();
+        let watcher_oids = live_oid_mapping.clone();
+        let watcher_base_oid = live_pki_base_oid.clone();
+        let watcher_acceptor = live_acceptor.clone();
+        let watcher_endpoint = quic_endpoint.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watcher_token.cancelled() => break,
+                    res = rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                        let snap = rx.borrow_and_update().clone();
+                        watcher_tracker.update_limits(
+                            snap.config.connection_limits.max_connections,
+                            snap.config.connection_limits.max_connections_per_ip,
+                        );
+                        watcher_oids.store(Arc::new(snap.config.oid_mapping.clone()));
+                        watcher_base_oid.store(Arc::new(
+                            snap.config.parsed_pki_base_oid.as_deref().map(Arc::from),
+                        ));
+                        let new_tls = snap.tls_config.or_else(|| {
+                            build_rustls_config(snap.config.as_ref()).ok().map(Arc::new)
+                        });
+                        if let Some(tls_cfg) = new_tls {
+                            watcher_acceptor.store(Arc::new(tokio_rustls::TlsAcceptor::from(
+                                tls_cfg.clone(),
+                            )));
+                            if let Ok(quinn_cfg) = build_quinn_server_config(&tls_cfg) {
+                                watcher_endpoint.set_server_config(Some(quinn_cfg));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let tcp_task = tokio::spawn(run_tcp_accept_loop(
         tcp_listener,
-        acceptor,
+        live_acceptor,
         dynamic_stack.clone(),
         cancel_token.clone(),
         server_name,
-        oid_mapping.clone(),
+        live_oid_mapping.clone(),
         connection_tracker.clone(),
         drain_timeout,
         release_barrier.clone(),
-        pki_base_oid.clone(),
+        live_pki_base_oid.clone(),
     ));
     let udp_task = tokio::spawn(run_udp_accept_loop(
         quic_endpoint,
         dynamic_stack,
         cancel_token,
         server_name,
-        oid_mapping,
+        live_oid_mapping,
         connection_tracker,
         drain_timeout,
         release_barrier,
-        pki_base_oid,
+        live_pki_base_oid,
     ));
 
     Ok(DualStackHandles { tcp_task, udp_task })
@@ -1036,15 +1256,15 @@ async fn spawn_dual_stack_inner(
 #[allow(clippy::too_many_arguments)]
 async fn run_tcp_accept_loop(
     tcp_listener: TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    live_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
-    oid_mapping: Arc<HashMap<String, UserRole>>,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
-    pki_base_oid: Option<Arc<[u64]>>,
+    live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
 ) {
     let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1072,15 +1292,15 @@ async fn run_tcp_accept_loop(
                             }
                         };
                         let _ = stream.set_nodelay(true);
-                        let acceptor = acceptor.clone();
+                        let acceptor = (**live_acceptor.load()).clone();
                         let dynamic_stack = dynamic_stack.clone();
-                        let oid_mapping = oid_mapping.clone();
+                        let oid_mapping = live_oid_mapping.clone();
                         let conn_token = cancel_token.clone();
-                        let pki_base_oid = pki_base_oid.clone();
+                        let pki_base_oid = (**live_pki_base_oid.load()).clone();
                         conn_tasks.spawn(async move {
                             let _guard = conn_guard;
                             trace!("{}: TCP Connection accepted", server_name);
-                            let _ = serve_tls_connection_with_base_oid(
+                            let _ = crate::stack::serve_tls_connection_with_dynamic_oids(
                                 stream,
                                 peer_addr,
                                 &acceptor,
@@ -1113,11 +1333,10 @@ async fn run_tcp_accept_loop(
     drain_tasks(&mut conn_tasks, server_name, "connection", drain_timeout).await;
 }
 
-/// Builds the QUIC server endpoint (and binds its UDP socket) for HTTP/3.
-fn build_quic_endpoint(
-    server_addr: SocketAddr,
+/// Builds a `quinn::ServerConfig` from a `RustlsServerConfig` with Praeco's HTTP/3 transport parameters.
+fn build_quinn_server_config(
     tls_config: &Arc<RustlsServerConfig>,
-) -> Result<quinn::Endpoint, SrvError> {
+) -> Result<quinn::ServerConfig, SrvError> {
     let mut quic_tls_models = rustls::ServerConfig::clone(tls_config);
     quic_tls_models.alpn_protocols = vec![b"h3".to_vec()];
 
@@ -1138,6 +1357,15 @@ fn build_quic_endpoint(
     transport.keep_alive_interval(Some(Duration::from_secs(10)));
     quinn_server_config.transport_config(Arc::new(transport));
 
+    Ok(quinn_server_config)
+}
+
+/// Builds the QUIC server endpoint (and binds its UDP socket) for HTTP/3.
+fn build_quic_endpoint(
+    server_addr: SocketAddr,
+    tls_config: &Arc<RustlsServerConfig>,
+) -> Result<quinn::Endpoint, SrvError> {
+    let quinn_server_config = build_quinn_server_config(tls_config)?;
     quinn::Endpoint::server(quinn_server_config, server_addr)
         .map_err(|e| SrvError::Other(format!("QUIC UDP bind failed on {server_addr}: {e}")))
 }
@@ -1152,11 +1380,11 @@ async fn run_udp_accept_loop(
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     cancel_token: CancellationToken,
     server_name: &'static str,
-    oid_mapping: Arc<HashMap<String, UserRole>>,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
     connection_tracker: Arc<ConnectionTracker>,
     drain_timeout: Duration,
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
-    pki_base_oid: Option<Arc<[u64]>>,
+    live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
 ) {
     let mut conn_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1192,9 +1420,9 @@ async fn run_udp_accept_loop(
                 };
                 trace!("{}: UDP Connection accepted", server_name);
                 let dynamic_stack = dynamic_stack.clone();
-                let oid_mapping = oid_mapping.clone();
+                let oid_mapping = live_oid_mapping.clone();
                 let conn_token = cancel_token.clone();
-                let pki_base_oid = pki_base_oid.clone();
+                let pki_base_oid = (**live_pki_base_oid.load()).clone();
 
                 conn_tasks.spawn(async move {
                     let _guard = conn_guard;
@@ -1241,6 +1469,27 @@ async fn run_udp_accept_loop(
     }
 }
 
+fn map_h3_oids_to_roles(
+    oids: &[String],
+    oid_mapping: &HashMap<String, UserRole>,
+) -> RoleVec<6> {
+    let mut roles: RoleVec<6> = oids
+        .iter()
+        .map(|oid| {
+            oid_mapping
+                .get(oid)
+                .cloned()
+                .unwrap_or_else(UserRole::guest)
+        })
+        .filter(|role| *role != UserRole::guest())
+        .collect();
+
+    if roles.is_empty() {
+        roles.push(UserRole::guest());
+    }
+    roles
+}
+
 /// Handles a single HTTP/3 (QUIC) connection and dispatches its request streams through [`ConnectionHandler`].
 ///
 /// When `cancel_token` fires, an HTTP/3 `GOAWAY` is sent, no new requests are accepted and the
@@ -1250,7 +1499,7 @@ async fn handle_h3_connection(
     connecting: quinn::Incoming,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
     server_name: &str,
-    oid_mapping: Arc<HashMap<String, UserRole>>,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
     cancel_token: CancellationToken,
     drain_timeout: Duration,
     pki_base_oid: Option<Arc<[u64]>>,
@@ -1271,29 +1520,14 @@ async fn handle_h3_connection(
     let client_cert_pem = client_meta.pem;
     let client_cert_san = client_meta.san;
 
-    let mut roles: RoleVec<6> = oids
-        .iter()
-        .map(|oid| {
-            oid_mapping
-                .get(oid)
-                .cloned()
-                .unwrap_or_else(UserRole::guest)
-        })
-        .filter(|role| *role != UserRole::guest())
-        .collect();
-
-    if roles.is_empty() {
-        roles.push(UserRole::guest());
-    }
-
-    let shared_roles = Arc::new(roles);
+    let mut cached_oid_map = live_oid_mapping.load_full();
+    let mut shared_roles = Arc::new(map_h3_oids_to_roles(&oids, &cached_oid_map));
     let shared_oids = Arc::new(oids);
 
     let h3_conn = h3_quinn::Connection::new(connection);
     let mut h3_server: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         h3::server::Connection::new(h3_conn).await?;
 
-    let base_svc = (**dynamic_stack.load()).clone();
     let stream_semaphore = Arc::new(tokio::sync::Semaphore::new(128));
     let mut stream_tasks: JoinSet<()> = JoinSet::new();
 
@@ -1318,7 +1552,13 @@ async fn handle_h3_connection(
                             continue;
                         }
                     };
-                    let svc = base_svc.clone();
+                    let current_oid_map = live_oid_mapping.load();
+                    if !Arc::ptr_eq(&current_oid_map, &cached_oid_map) {
+                        cached_oid_map = Arc::clone(&current_oid_map);
+                        shared_roles = Arc::new(map_h3_oids_to_roles(&shared_oids, &cached_oid_map));
+                    }
+
+                    let dynamic_stack_for_req = dynamic_stack.clone();
                     let roles_for_req = shared_roles.clone();
                     let shared_oids_for_req = shared_oids.clone();
                     let req_cert_pem = client_cert_pem.clone();
@@ -1330,8 +1570,8 @@ async fn handle_h3_connection(
                             Ok((req, stream)) => {
                                 let (mut sender, receiver) = stream.split();
 
-                                let handler = ConnectionHandler::new_shared(
-                                    svc,
+                                let handler = ConnectionHandler::with_dynamic_stack_shared(
+                                    dynamic_stack_for_req,
                                     peer_addr,
                                     roles_for_req,
                                     req_cert_pem,
@@ -1466,6 +1706,38 @@ pub async fn run_tunnel_with_timeout_and_base_oid(
     drain_timeout: Duration,
     pki_base_oid: Option<Arc<[u64]>>,
 ) -> Result<(), SrvError> {
+    let live_acceptor = Arc::new(ArcSwap::from_pointee(tokio_rustls::TlsAcceptor::from(
+        tls_config,
+    )));
+    let live_oid_mapping = Arc::new(ArcSwap::new(oid_mapping));
+    let live_pki_base_oid = Arc::new(ArcSwap::from_pointee(pki_base_oid));
+    run_tunnel_with_dynamic_state(
+        tunnel,
+        live_acceptor,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        live_oid_mapping,
+        connection_tracker,
+        drain_timeout,
+        live_pki_base_oid,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+async fn run_tunnel_with_dynamic_state(
+    tunnel: TunnelConfig,
+    live_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
+) -> Result<(), SrvError> {
     let connector = build_tunnel_tls_connector(&tunnel)?;
 
     let parsed_url = url::Url::parse(&tunnel.target_url)
@@ -1517,17 +1789,17 @@ pub async fn run_tunnel_with_timeout_and_base_oid(
         }
     };
 
-    run_tunnel_over_stream_with_drain_timeout_and_base_oid(
+    crate::stack::run_tunnel_over_stream_dynamic(
         tls_stream,
         &tunnel,
-        tls_config,
+        live_acceptor,
         dynamic_stack,
         cancel_token,
         server_name,
-        oid_mapping,
+        live_oid_mapping,
         connection_tracker,
         drain_timeout,
-        pki_base_oid,
+        live_pki_base_oid,
     )
     .await?;
 

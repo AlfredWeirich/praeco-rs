@@ -811,9 +811,56 @@ where
             let client_meta =
                 extract_client_metadata_with_base(session.peer_certificates(), pki_base_oid);
 
-            let svc = (**dynamic_stack.load()).clone();
-            let handler = ConnectionHandler::new(
-                svc,
+            let handler = ConnectionHandler::with_dynamic_stack(
+                dynamic_stack.clone(),
+                peer_addr,
+                client_meta.oids,
+                client_meta.pem,
+                client_meta.san,
+                oid_mapping.clone(),
+            );
+
+            serve_http_connection(tls_stream, handler, cancel_token).await;
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            warn!("{}: TLS handshake failed: {}", server_name, e);
+            Err(SrvError::Other(format!("TLS handshake failed: {e}")))
+        }
+        Err(_) => {
+            trace!("{}: TLS handshake timed out for {}", server_name, peer_addr);
+            Err(SrvError::Other("TLS handshake timed out".to_string()))
+        }
+    }
+}
+
+/// Like [`serve_tls_connection_with_base_oid`], but accepts a live [`ArcSwap`]
+/// OID-to-role map so long-lived HTTP/1.1, HTTP/2, and tunneled TLS connections
+/// automatically pick up both service-stack and `oid_mapping` updates per request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_tls_connection_with_dynamic_oids<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    acceptor: &tokio_rustls::TlsAcceptor,
+    dynamic_stack: &Arc<ArcSwap<BoxedCloneService>>,
+    oid_mapping: &Arc<ArcSwap<HashMap<String, UserRole>>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    pki_base_oid: Option<&[u64]>,
+) -> Result<(), SrvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let tls_result = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(stream)).await;
+
+    match tls_result {
+        Ok(Ok(tls_stream)) => {
+            let (_, session) = tls_stream.get_ref();
+            let client_meta =
+                extract_client_metadata_with_base(session.peer_certificates(), pki_base_oid);
+
+            let handler = ConnectionHandler::with_dynamic_stack_and_oids(
+                dynamic_stack.clone(),
                 peer_addr,
                 client_meta.oids,
                 client_meta.pem,
@@ -918,7 +965,7 @@ where
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
 pub async fn run_tunnel_over_stream_with_drain_timeout_and_base_oid<S>(
-    mut control_stream: S,
+    control_stream: S,
     tunnel: &TunnelConfig,
     tls_config: Arc<RustlsServerConfig>,
     dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
@@ -932,8 +979,46 @@ pub async fn run_tunnel_over_stream_with_drain_timeout_and_base_oid<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let live_acceptor = Arc::new(ArcSwap::from_pointee(tokio_rustls::TlsAcceptor::from(
+        tls_config,
+    )));
+    let live_oid_mapping = Arc::new(ArcSwap::new(oid_mapping));
+    let live_pki_base_oid = Arc::new(ArcSwap::from_pointee(pki_base_oid));
+    run_tunnel_over_stream_dynamic(
+        control_stream,
+        tunnel,
+        live_acceptor,
+        dynamic_stack,
+        cancel_token,
+        server_name,
+        live_oid_mapping,
+        connection_tracker,
+        drain_timeout,
+        live_pki_base_oid,
+    )
+    .await
+}
 
+/// Internal reload-aware tunnel loop using live [`ArcSwap`] handles for the TLS acceptor,
+/// OID role table, and PKI base OID so `SIGHUP` updates apply to new streams on an existing
+/// Yamux tunnel without dropping the control connection.
+#[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip_all, fields(server = %server_name, sni = %tunnel.sni_domain), err)]
+pub(crate) async fn run_tunnel_over_stream_dynamic<S>(
+    mut control_stream: S,
+    tunnel: &TunnelConfig,
+    live_acceptor: Arc<ArcSwap<tokio_rustls::TlsAcceptor>>,
+    dynamic_stack: Arc<ArcSwap<BoxedCloneService>>,
+    cancel_token: CancellationToken,
+    server_name: &'static str,
+    live_oid_mapping: Arc<ArcSwap<HashMap<String, UserRole>>>,
+    connection_tracker: Arc<ConnectionTracker>,
+    drain_timeout: Duration,
+    live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
+) -> Result<(), SrvError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // 1. Register SNI with capability negotiation (Phase 4)
     let reg_cmd = if tunnel.proxy_protocol {
         format!("REGISTER {} PROXY_V2\n", tunnel.sni_domain)
@@ -995,12 +1080,12 @@ where
                                 continue;
                             }
                         };
-                        let acceptor = acceptor.clone();
+                        let acceptor = (**live_acceptor.load()).clone();
                         let dynamic_stack = dynamic_stack.clone();
-                        let oid_mapping = oid_mapping.clone();
+                        let oid_mapping = live_oid_mapping.clone();
                         let conn_token = stream_token.clone();
                         let span_sni = sni_domain.clone();
-                        let pki_base_oid = pki_base_oid.clone();
+                        let pki_base_oid = (**live_pki_base_oid.load()).clone();
 
                         conn_tasks.spawn(async move {
                             let mut connection_guard = connection_guard;
@@ -1027,7 +1112,7 @@ where
                                 return;
                             }
 
-                            let _ = serve_tls_connection_with_base_oid(
+                            let _ = serve_tls_connection_with_dynamic_oids(
                                 stream,
                                 peer_addr,
                                 &acceptor,

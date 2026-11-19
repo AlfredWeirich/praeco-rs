@@ -54,7 +54,7 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 use praeco_rs::{
     BoxedCloneService,
     configuration::{Config, Protocol, ServerConfig},
-    runner::start_single_server_with_socket_signal,
+    runner::{ServerReloadUpdate, start_single_server_reloadable},
     stack::{build_rustls_config, build_service_stack},
 };
 
@@ -111,12 +111,14 @@ struct ActiveServer {
     config: Arc<ServerConfig>,
     /// Hot-swappable service stack.
     stack: Arc<ArcSwap<BoxedCloneService>>,
+    /// Broadcasts live configuration and TLS/CRL updates to the running server on `SIGHUP`.
+    reload_tx: tokio::sync::watch::Sender<ServerReloadUpdate>,
     /// Resolves as soon as the server's listening sockets (or tunnel session)
     /// are released, even while slow connections are still draining.
     sockets_released: oneshot::Receiver<()>,
 }
 
-/// Spawns `start_single_server_with_socket_signal` into `join_set` and returns a
+/// Spawns `start_single_server_reloadable` into `join_set` and returns a
 /// receiver that resolves as soon as the server releases its listening sockets.
 ///
 /// If `wait_for` is given (a predecessor that still holds the same socket address or
@@ -127,6 +129,7 @@ fn spawn_server(
     config: Arc<ServerConfig>,
     cancel_token: CancellationToken,
     stack: Arc<ArcSwap<BoxedCloneService>>,
+    reload_rx: tokio::sync::watch::Receiver<ServerReloadUpdate>,
     wait_for: Option<oneshot::Receiver<()>>,
 ) -> oneshot::Receiver<()> {
     let (released_tx, released_rx) = oneshot::channel();
@@ -135,7 +138,7 @@ fn spawn_server(
             // An `Err` only means the predecessor task dropped the sender on exit.
             let _ = previous.await;
         }
-        start_single_server_with_socket_signal(config, cancel_token, stack, Some(released_tx))
+        start_single_server_reloadable(config, cancel_token, stack, Some(released_tx), reload_rx)
             .await;
     });
     released_rx
@@ -168,12 +171,17 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
             }
         };
         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
+        let (reload_tx, reload_rx) = tokio::sync::watch::channel(ServerReloadUpdate {
+            config: server_config_arc.clone(),
+            tls_config: None,
+        });
 
         let sockets_released = spawn_server(
             &mut server_join_set,
             server_config_arc.clone(),
             cancel_token.clone(),
             dynamic_stack.clone(),
+            reload_rx,
             None,
         );
         active_servers.insert(
@@ -182,6 +190,7 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                 cancel_token,
                 config: server_config_arc,
                 stack: dynamic_stack,
+                reload_tx,
                 sockets_released,
             },
         );
@@ -224,17 +233,33 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                     }
                     let server_config_arc = Arc::new(new_server.clone());
 
-                    if (new_server.protocol == Protocol::Https || new_server.tunnel.is_some())
-                        && let Err(e) = build_rustls_config(new_server)
+                    let built_tls = if new_server.protocol == Protocol::Https
+                        || new_server.tunnel.is_some()
                     {
-                        error!("{}: FAILED to build TLS config (dry-run): {:?}", new_server.name, e);
-                        reload_errors.push((new_server.name.clone(), format!("TLS config error: {e}")));
-                        continue;
-                    }
+                        match build_rustls_config(new_server) {
+                            Ok(tls_cfg) => Some(Arc::new(tls_cfg)),
+                            Err(e) => {
+                                error!(
+                                    "{}: FAILED to build TLS config (dry-run): {:?}",
+                                    new_server.name, e
+                                );
+                                reload_errors.push((
+                                    new_server.name.clone(),
+                                    format!("TLS config error: {e}"),
+                                ));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
 
                     match build_service_stack(&server_config_arc) {
                         Ok(svc) => {
-                            built_stacks.insert(new_server.name.clone(), (server_config_arc, svc));
+                            built_stacks.insert(
+                                new_server.name.clone(),
+                                (server_config_arc, svc, built_tls),
+                            );
                         }
                         Err(e) => {
                             error!("{}: FAILED to build service stack (dry-run): {:?}", new_server.name, e);
@@ -260,7 +285,7 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                 Config::update_global(new_config.clone());
                 let mut next_active_servers = HashMap::new();
 
-                for (name, (server_config_arc, service_stack)) in built_stacks {
+                for (name, (server_config_arc, service_stack, built_tls)) in built_stacks {
                     let new_server = &server_config_arc;
                     let needs_restart = match active_servers.get(&name) {
                         None => true,
@@ -288,12 +313,18 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                         info!("Starting server '{}'...", new_server.name);
                         let cancel_token = CancellationToken::new();
                         let dynamic_stack = Arc::new(ArcSwap::from_pointee(service_stack));
+                        let (reload_tx, reload_rx) =
+                            tokio::sync::watch::channel(ServerReloadUpdate {
+                                config: server_config_arc.clone(),
+                                tls_config: built_tls,
+                            });
 
                         let sockets_released = spawn_server(
                             &mut server_join_set,
                             server_config_arc.clone(),
                             cancel_token.clone(),
                             dynamic_stack.clone(),
+                            reload_rx,
                             wait_for,
                         );
                         next_active_servers.insert(
@@ -302,12 +333,20 @@ async fn main_async(config: Arc<Config>, config_path: String) -> Result<(), Erro
                                 cancel_token,
                                 config: server_config_arc.clone(),
                                 stack: dynamic_stack,
+                                reload_tx,
                                 sockets_released,
                             },
                         );
                     } else if let Some(mut active) = active_servers.remove(&name) {
                         active.stack.store(Arc::new(service_stack));
-                        info!("Hot-swapped service stack for '{}'", new_server.name);
+                        let _ = active.reload_tx.send(ServerReloadUpdate {
+                            config: server_config_arc.clone(),
+                            tls_config: built_tls,
+                        });
+                        info!(
+                            "Hot-swapped service stack, TLS/CRL, limits, and health checks for '{}'",
+                            new_server.name
+                        );
 
                         active.config = server_config_arc.clone();
                         next_active_servers.insert(name, active);
