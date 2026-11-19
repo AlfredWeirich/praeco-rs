@@ -15,7 +15,7 @@ categories = ["network-programming", "cryptography", "authentication"]
 anyhow = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
-common = { workspace = true }
+common = { workspace = true, default-features = false, features = ["client"] }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
