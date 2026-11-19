@@ -78,7 +78,10 @@ fn main() -> Result<(), Error> {
 
     let config = Config::init(&arg)?;
 
-    let tokio_threads = config.tokio_threads.unwrap_or_else(num_cpus::get);
+    let tokio_threads = config
+        .tokio_threads
+        .filter(|&n| n > 0)
+        .unwrap_or_else(num_cpus::get);
 
     let runtime = Builder::new_multi_thread()
         .worker_threads(tokio_threads)

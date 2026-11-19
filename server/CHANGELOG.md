@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **RBAC & gRPC Passthrough Fixes (`src/middleware/path_sanitizer.rs`, `src/middleware/router/rbac.rs`, `src/middleware/router/http_proxy.rs`):**
   * Rejected semicolon matrix parameters (`;` / `%3b`) in `PathSanitizerLayer` (`400`) and `enforce_rbac` (`403`), and normalized trailing slashes on exact RBAC rules in `CompiledRbac`.
   * Added `buffer_grpc_first_frame_or_stream` (preserving initial frames via `PrefixedStreamBody` with a `408` read timeout) so bidirectional/client-streaming gRPC passthrough streams immediately without hanging while unary/server-streaming calls stay retryable strictly on `RetryReason::ConnectError`.
+* **Contradiction Validation, Router Init, Compression & W3C Trace Hygiene (`src/configuration.rs`, `src/server.rs`, `src/middleware/router/mod.rs`, `src/middleware/compression.rs`, `src/middleware/trace_id.rs`, `.cargo/config.toml`, `Cargo.toml`):**
+  * Rejected `ClientCert` / `OptionalClientCert` with `protocol != "https"`, `__Host-` cookies paired with `cookie_domain`, and `tokio_threads = 0` at config load / `finalize()` time.
+  * Propagated route insertion errors (`router.insert(prefix, ...)`) and invalid `[Server.RouterParams].jwt` header values during `RouterService::new` instead of discarding them.
+  * Fixed off-by-one EOF rejection in `LimitedReader::poll_read`, normalized `Content-Encoding` case-insensitively during request decompression, and added `Vary: Accept-Encoding` to compressed responses.
+  * Validated `x-trace-id` against W3C `traceparent` syntax in `TraceIdLayer` before populating `traceparent` (preserving non-W3C `x-trace-id` headers while synthesizing a valid `traceparent`).
+  * Enabled `overflow-checks = true` in `[profile.release]` and commented out host-specific `-C target-cpu=native` in `.cargo/config.toml` for portable builds.
 
 ### Changed & Fixed
 * **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**

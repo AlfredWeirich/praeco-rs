@@ -79,7 +79,9 @@ impl RouterService {
         let mut router = Router::new();
         for route_data in &config.parsed_routes {
             let prefix = &route_data.prefix;
-            let _ = router.insert(prefix, route_data.clone());
+            router.insert(prefix, route_data.clone()).map_err(|e| {
+                anyhow::anyhow!("{}: Failed to insert route '{}': {}", config.name, prefix, e)
+            })?;
 
             let wildcard_path = if prefix.ends_with('/') {
                 format!("{}{{*rest}}", prefix)
@@ -140,10 +142,18 @@ impl RouterService {
             common::client::build_hyper_client(tls_client_config.clone(), pool_config)
         };
 
-        let jwt_token = router_params
-            .jwt
-            .as_ref()
-            .and_then(|t| header::HeaderValue::from_str(&format!("Bearer {}", t)).ok());
+        let jwt_token = match router_params.jwt.as_ref() {
+            Some(t) => Some(
+                header::HeaderValue::from_str(&format!("Bearer {}", t)).map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: Invalid [Server.RouterParams].jwt header value: {}",
+                        config.name,
+                        e
+                    )
+                })?,
+            ),
+            None => None,
+        };
 
         Ok(RouterService {
             client,
@@ -648,5 +658,31 @@ mod tests {
             !is_route_healthy(route),
             "Optional-only aggregate route is unhealthy when every target is dead"
         );
+    }
+
+    #[test]
+    fn test_router_service_rejects_invalid_upstream_jwt_header() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let toml_cfg = r#"
+            name = "bad_jwt_router"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+            jwt = "invalid\ntoken"
+
+            [Layers]
+            enabled = []
+        "#;
+        let mut cfg: ServerConfig = toml::from_str(toml_cfg).unwrap();
+        cfg.finalize().unwrap();
+        let err = RouterService::new(Arc::new(cfg))
+            .err()
+            .expect("invalid HeaderValue in RouterParams.jwt must return Err");
+        assert!(err.to_string().contains("Invalid [Server.RouterParams].jwt"));
     }
 }

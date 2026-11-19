@@ -1817,6 +1817,12 @@ impl Config {
         let mut config: Config =
             toml::from_str(&toml_str).context("Failed to parse TOML configuration")?;
 
+        if config.tokio_threads == Some(0) {
+            return Err(Error::msg(
+                "Configuration error: 'tokio_threads' must be >= 1.",
+            ));
+        }
+
         // 2.5 Process Includes
         let base_dir = std::path::Path::new(config_file)
             .parent()
@@ -2075,11 +2081,17 @@ impl ServerConfig {
         }
         // 4. Validate Authentication Requirements
         match self.authentication {
-            AuthenticationMethod::ClientCert => {
-                if self.client_certs.is_none() {
+            AuthenticationMethod::ClientCert | AuthenticationMethod::OptionalClientCert => {
+                if self.protocol != Protocol::Https {
                     return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Authentication is 'ClientCert' (mTLS), but [[Server.client_certs]] is missing.",
-                        self.name
+                        "Configuration error in Server '{}': Authentication is '{:?}' (mTLS), but protocol is not 'https'.",
+                        self.name, self.authentication
+                    )));
+                }
+                if self.client_certs.as_ref().is_none_or(|c| c.is_empty()) {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Authentication is '{:?}' (mTLS), but [[Server.client_certs]] is missing.",
+                        self.name, self.authentication
                     )));
                 }
             }
@@ -2115,14 +2127,6 @@ impl ServerConfig {
                 }
             }
 
-            AuthenticationMethod::OptionalClientCert => {
-                if self.client_certs.is_none() {
-                    return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Authentication is 'OptionalClientCert' (mTLS), but [[Server.client_certs]] is missing.",
-                        self.name
-                    )));
-                }
-            }
             AuthenticationMethod::None => {
                 // No specific config required for None
             }
@@ -2141,11 +2145,23 @@ impl ServerConfig {
             common::load_encoding_key(&idp_params.jwt_private_key)
                 .with_context(|| format!("{}: Failed to load IdP private key", self.name))?;
 
-            if idp_params.cookie_name.starts_with("__Host-") && self.protocol != Protocol::Https {
-                return Err(Error::msg(format!(
-                    "Configuration error in Server '{}': Service is 'Idp' using '__Host-' cookie, but Protocol is not 'Https'. This will be rejected by browsers.",
-                    self.name
-                )));
+            if idp_params.cookie_name.starts_with("__Host-") {
+                if self.protocol != Protocol::Https {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Service is 'Idp' using '__Host-' cookie, but Protocol is not 'Https'. This will be rejected by browsers.",
+                        self.name
+                    )));
+                }
+                if idp_params
+                    .cookie_domain
+                    .as_deref()
+                    .is_some_and(|d| !d.trim().is_empty())
+                {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': Service is 'Idp' using '__Host-' cookie, which forbids setting 'cookie_domain' per RFC 6265bis.",
+                        self.name
+                    )));
+                }
             }
         } else if self.service == ServiceType::StaticFiles {
             let params = self.static_files_params.as_ref().ok_or_else(|| {
@@ -3919,6 +3935,94 @@ enabled = []
         assert!(
             bad_router.finalize().is_err(),
             "Route backend_type='admin' without auth/roles/rbac must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_contradictions_and_zero_tokio_threads() {
+        let dir = std::env::temp_dir().join(format!(
+            "praeco_cfg_contradictions_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("zero_threads.toml");
+        std::fs::write(&cfg_path, "tokio_threads = 0\n").unwrap();
+        let zero_res = Config::load(cfg_path.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            zero_res.is_err(),
+            "tokio_threads = 0 must be rejected before Tokio Runtime::worker_threads(0) panics"
+        );
+
+        let pki = common::test_pki::TestPki::new();
+        let ca_pem = common::test_pki::TestPki::s(&pki.relay_ca_pem);
+
+        let http_mtls_toml = format!(
+            r#"
+            name = "http_mtls"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            authentication = "ClientCert"
+            service = "Echo"
+            [Layers]
+            enabled = []
+            [[client_certs]]
+            ssl_client_ca = "{ca_pem}"
+        "#
+        );
+        let mut http_mtls: ServerConfig = toml::from_str(&http_mtls_toml).unwrap();
+        assert!(
+            http_mtls.finalize().is_err(),
+            "ClientCert on plain HTTP must be rejected"
+        );
+
+        let mut opt_http_mtls: ServerConfig =
+            toml::from_str(&http_mtls_toml.replace("ClientCert", "OptionalClientCert")).unwrap();
+        assert!(
+            opt_http_mtls.finalize().is_err(),
+            "OptionalClientCert on plain HTTP must be rejected"
+        );
+
+        let pub_pem = common::test_pki::TestPki::s(&pki.praeco_public_pem);
+        let pub_key = common::test_pki::TestPki::s(&pki.praeco_public_key);
+        let priv_key_dir = std::env::temp_dir().join(format!(
+            "praeco_idp_host_domain_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&priv_key_dir).unwrap();
+        let jwt_priv_path = priv_key_dir.join("jwt_priv.pem");
+        std::fs::write(
+            &jwt_priv_path,
+            "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let host_domain_toml = format!(
+            r#"
+            name = "idp_host_domain"
+            ip = "127.0.0.1"
+            port = 1339
+            protocol = "https"
+            service = "Idp"
+            [Layers]
+            enabled = []
+            [server_certs]
+            ssl_certificate = "{pub_pem}"
+            ssl_certificate_key = "{pub_key}"
+            [IdpParams]
+            jwt_private_key = "{}"
+            cookie_name = "__Host-jwt"
+            cookie_domain = "example.test"
+        "#,
+            jwt_priv_path.display()
+        );
+        let mut bad_idp: ServerConfig = toml::from_str(&host_domain_toml).unwrap();
+        let host_res = bad_idp.finalize();
+        let _ = std::fs::remove_dir_all(&priv_key_dir);
+        assert!(
+            host_res.is_err(),
+            "__Host- cookie paired with cookie_domain must be rejected in finalize()"
         );
     }
 }

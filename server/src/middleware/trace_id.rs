@@ -74,6 +74,36 @@ pub struct TraceIdMiddleware<S> {
     inner: S,
 }
 
+/// Checks whether `value` matches the W3C TraceContext `traceparent` wire format:
+/// `00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>` with non-zero trace/span IDs.
+fn is_valid_w3c_traceparent(value: &str) -> bool {
+    let mut parts = value.split('-');
+    let (Some(version), Some(trace_id), Some(span_id), Some(flags), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return false;
+    };
+
+    let is_lower_hex = |s: &str| s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let all_zero = |s: &str| s.bytes().all(|b| b == b'0');
+
+    version.len() == 2
+        && is_lower_hex(version)
+        && version != "ff"
+        && trace_id.len() == 32
+        && is_lower_hex(trace_id)
+        && !all_zero(trace_id)
+        && span_id.len() == 16
+        && is_lower_hex(span_id)
+        && !all_zero(span_id)
+        && flags.len() == 2
+        && is_lower_hex(flags)
+}
+
 impl<S> Service<Request<SrvBody>> for TraceIdMiddleware<S>
 where
     S: Service<Request<SrvBody>, Response = Response<ServiceRespBody>> + Clone + Send + 'static,
@@ -101,18 +131,20 @@ where
         let current_otel_cx = tracing::Span::current().context();
         let current_sc = current_otel_cx.span().span_context().clone();
 
-        // 1. Extract an existing trace identifier (`traceparent` or `x-trace-id`),
-        //    reuse the active OpenTelemetry root span context if valid, or synthesize
-        //    a fresh W3C TraceContext `traceparent` header via UUID v4 fallback.
+        // 1. Extract an existing valid W3C `traceparent` (from `traceparent` or from a
+        //    W3C-formatted `x-trace-id`), reuse the active OpenTelemetry root span context if
+        //    valid, or synthesize a fresh W3C TraceContext `traceparent` via UUID v4 fallback.
         let trace_id = req
             .headers()
             .get("traceparent")
             .and_then(|h| h.to_str().ok())
+            .filter(|s| is_valid_w3c_traceparent(s))
             .map(|s| s.to_string())
             .or_else(|| {
                 req.headers()
                     .get("x-trace-id")
                     .and_then(|h| h.to_str().ok())
+                    .filter(|s| is_valid_w3c_traceparent(s))
                     .map(|s| s.to_string())
             })
             .unwrap_or_else(|| {
@@ -330,5 +362,42 @@ mod tests {
             propagated_tp,
             incoming_trace_id
         );
+    }
+
+    #[tokio::test]
+    async fn test_non_w3c_x_trace_id_synthesizes_valid_traceparent() {
+        let svc = TraceIdLayer::new().layer(tower::service_fn(|req: Request<SrvBody>| async move {
+            let tp = req
+                .headers()
+                .get("traceparent")
+                .and_then(|h| h.to_str().ok())
+                .expect("traceparent must be synthesized")
+                .to_string();
+            let x_tid = req
+                .headers()
+                .get("x-trace-id")
+                .and_then(|h| h.to_str().ok())
+                .expect("client x-trace-id must be preserved")
+                .to_string();
+            assert!(
+                is_valid_w3c_traceparent(&tp),
+                "synthesized traceparent '{tp}' must match W3C format"
+            );
+            assert_eq!(x_tid, "custom-client-correlation-id");
+            Ok::<_, crate::SrvError>(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(req.into_body())
+                    .unwrap(),
+            )
+        }));
+
+        let req = Request::builder()
+            .uri("/test")
+            .header("x-trace-id", "custom-client-correlation-id")
+            .body(empty_body())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

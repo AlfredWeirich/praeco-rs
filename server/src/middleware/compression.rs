@@ -56,7 +56,7 @@ use http_body::Frame;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
 use hyper::{
     Request, Response,
-    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH},
+    header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, VARY},
 };
 use pin_project::pin_project;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -171,6 +171,7 @@ where
                     "br"
                 }),
             );
+            append_vary_accept_encoding(resp.headers_mut());
 
             let (parts, body) = resp.into_parts();
 
@@ -380,8 +381,8 @@ where
             .headers()
             .get(CONTENT_ENCODING)
             .and_then(|h| h.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
 
         if encoding == "gzip" || encoding == "br" {
             let (parts, body) = req.into_parts();
@@ -420,6 +421,17 @@ where
 
         let fut = self.inner.call(req);
         SrvDecompressionFuture { inner: fut }
+    }
+}
+
+/// Ensures `Vary` includes `Accept-Encoding` so caches do not serve compressed responses to plain clients.
+fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
+    let already_has_accept_encoding = headers.get_all(VARY).iter().any(|val| {
+        val.to_str()
+            .is_ok_and(|s| s.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding")))
+    });
+    if !already_has_accept_encoding {
+        headers.append(VARY, hyper::header::HeaderValue::from_static("Accept-Encoding"));
     }
 }
 
@@ -485,13 +497,6 @@ impl<R: AsyncRead> AsyncRead for LimitedReader<R> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // If the limit has already been reached, reject immediately.
-        if self.remaining == 0 {
-            return Poll::Ready(Err(io::Error::other(
-                "Decompressed payload exceeds maximum allowed size",
-            )));
-        }
-
         let this = self.project();
         let before = buf.filled().len();
 
@@ -653,5 +658,51 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn test_compressed_response_sets_vary_accept_encoding() {
+        let resp = run(Some("application/json"), None, "gzip", full_body(PAYLOAD)).await;
+        assert_eq!(resp.headers().get(CONTENT_ENCODING).unwrap(), "gzip");
+        let has_vary = resp
+            .headers()
+            .get_all(VARY)
+            .iter()
+            .any(|v| v.to_str().is_ok_and(|s| s.eq_ignore_ascii_case("Accept-Encoding")));
+        assert!(has_vary, "compressed response must carry Vary: Accept-Encoding");
+    }
+
+    #[tokio::test]
+    async fn test_decompression_exact_limit_succeeds_and_uppercase_header() {
+        use async_compression::tokio::write::GzipEncoder;
+        use tokio::io::AsyncWriteExt;
+
+        let exact_payload = vec![b'X'; 64];
+        let mut encoder = GzipEncoder::new(Vec::new());
+        encoder.write_all(&exact_payload).await.unwrap();
+        encoder.shutdown().await.unwrap();
+        let compressed = encoder.into_inner();
+
+        let inner = service_fn(|mut req: Request<SrvBody>| async move {
+            let collected = req.body_mut().collect().await?.to_bytes();
+            assert_eq!(collected.len(), 64);
+            Ok::<Response<SrvBody>, SrvError>(Response::new(full_body(b"OK")))
+        });
+
+        let svc = SrvDecompressionLayer::new("test_exact_limit", 64).layer(inner);
+        let req = Request::builder()
+            .header(CONTENT_ENCODING, "GZIP")
+            .body(
+                Full::new(Bytes::from(compressed))
+                    .map_err(|never| match never {})
+                    .boxed(),
+            )
+            .unwrap();
+
+        let resp = svc
+            .oneshot(req)
+            .await
+            .expect("payload of exact max_bytes must succeed without off-by-one 413");
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
     }
 }
