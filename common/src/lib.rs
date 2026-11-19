@@ -17,13 +17,19 @@
 //! | [`build_root_store`] | Build a `RootCertStore` from system + custom CAs. |
 
 // === External Crates ===
-use anyhow::{Context, Error, anyhow};
+#[cfg(any(feature = "tls", feature = "jwt"))]
+use anyhow::{Context, Error};
+#[cfg(feature = "tls")]
+use anyhow::anyhow;
+#[cfg(feature = "jwt")]
 #[allow(unused_imports)]
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode};
+#[cfg(feature = "tls")]
 use rustls::{
     ClientConfig, RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
 };
+#[cfg(feature = "jwt")]
 use serde::{Deserialize, Serialize};
 
 // Note: tracing 'info' was unused, so it was removed.
@@ -45,6 +51,7 @@ pub mod test_pki;
 ///
 /// Returns an error if the file cannot be read, contains invalid PEM data,
 /// or contains no certificates.
+#[cfg(feature = "tls")]
 pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'static>>, Error> {
     let data = std::fs::read(path)
         .with_context(|| format!("{server_name}: Failed to read certificate file '{path}'"))?;
@@ -74,6 +81,7 @@ pub fn load_certs(path: &str, server_name: &str) -> Result<Vec<CertificateDer<'s
 ///
 /// Returns an error if the file cannot be opened, contains no recognised key, or
 /// has a PEM parse error.
+#[cfg(feature = "tls")]
 pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'static>, Error> {
     match PrivateKeyDer::from_pem_file(path) {
         Ok(key) => Ok(key),
@@ -95,6 +103,7 @@ pub fn load_single_key(path: &str, server_name: &str) -> Result<PrivateKeyDer<'s
 /// The `oids` field carries custom OID suffixes extracted from the
 /// signing identity, which are later mapped to [`UserRole`](crate)
 /// values by the server.
+#[cfg(feature = "jwt")]
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Claims {
     /// Subject identifier (usually user ID or account ID).
@@ -127,6 +136,7 @@ pub struct Claims {
 /// # Errors
 ///
 /// Returns an error if any file cannot be read or is not a valid Ed25519 PEM.
+#[cfg(feature = "jwt")]
 pub fn load_decoding_keys(key_paths: &[String]) -> Result<Vec<DecodingKey>, Error> {
     let mut keys = Vec::with_capacity(key_paths.len());
     for path in key_paths {
@@ -150,6 +160,7 @@ pub fn load_decoding_keys(key_paths: &[String]) -> Result<Vec<DecodingKey>, Erro
 /// # Errors
 ///
 /// Returns an error if the file cannot be read or is not a valid Ed25519 PEM.
+#[cfg(feature = "jwt")]
 pub fn load_encoding_key(path: &str) -> Result<EncodingKey, Error> {
     let pem = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read private key file: '{path}'"))?;
@@ -174,6 +185,7 @@ pub fn load_encoding_key(path: &str) -> Result<EncodingKey, Error> {
 ///
 /// Returns an error if `expected_issuer` or `expected_audience` is empty,
 /// or if **none** of the provided keys can verify the token.
+#[cfg(feature = "jwt")]
 pub fn verify_jwt(
     token: &str,
     decoding_keys: &[DecodingKey],
@@ -221,11 +233,13 @@ pub fn verify_jwt(
 /// # Errors
 ///
 /// Returns an error if token signing fails.
+#[cfg(feature = "jwt")]
 pub fn sign_jwt(claims: &Claims, encoding_key: &EncodingKey) -> Result<String, Error> {
     sign_jwt_with_kid(claims, encoding_key, Some("praeco-key-1"))
 }
 
 /// Signs a JWT token with the given `Claims`, `EncodingKey`, and optional Key ID (`kid`).
+#[cfg(feature = "jwt")]
 pub fn sign_jwt_with_kid(
     claims: &Claims,
     encoding_key: &EncodingKey,
@@ -252,6 +266,7 @@ pub fn sign_jwt_with_kid(
 /// # Errors
 ///
 /// Returns an error if client certificates or private keys cannot be loaded or parsed.
+#[cfg(feature = "tls")]
 pub fn build_tls_client_config(
     root_store: RootCertStore,
     cert: Option<&str>,
@@ -296,6 +311,7 @@ pub fn build_tls_client_config(
 /// # Errors
 ///
 /// Returns an error if the custom CA certificate file cannot be read or parsed.
+#[cfg(feature = "tls")]
 pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
     if let Some(path) = ca_path {
@@ -310,6 +326,7 @@ pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error
 }
 
 /// Builds a `RootCertStore` containing both public WebPKI roots and an optional custom CA.
+#[cfg(feature = "tls")]
 pub fn build_root_store_with_webpki(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -343,6 +360,7 @@ pub fn canonical_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+#[cfg(feature = "client")]
 pub mod client;
 pub mod proxy_protocol;
 
@@ -350,30 +368,35 @@ pub mod proxy_protocol;
 mod tests {
     use super::*;
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_load_certs_nonexistent_file_returns_err() {
         let res = load_certs("nonexistent_cert_path_12345.pem", "test_server");
         assert!(res.is_err());
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_load_single_key_nonexistent_file_returns_err() {
         let res = load_single_key("nonexistent_key_path_12345.pem", "test_server");
         assert!(res.is_err());
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
     fn test_load_decoding_keys_nonexistent_file_returns_err() {
         let res = load_decoding_keys(&["nonexistent_jwt_key_12345.pem".to_string()]);
         assert!(res.is_err());
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
     fn test_load_encoding_key_nonexistent_file_returns_err() {
         let res = load_encoding_key("nonexistent_jwt_priv_12345.pem");
         assert!(res.is_err());
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
     fn test_verify_jwt_multiple_audiences() {
         let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
@@ -403,6 +426,7 @@ mod tests {
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", "wrong-aud").is_err());
     }
 
+    #[cfg(feature = "jwt")]
     #[test]
     fn test_verify_jwt_rejects_empty_issuer_or_audience() {
         let priv_pem = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
@@ -428,6 +452,7 @@ mod tests {
         assert!(verify_jwt(&token, &[dec_key], "praeco-idp", " , ").is_err());
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_build_root_store_none_uses_webpki() {
         let store = build_root_store(&None).expect("build_root_store should succeed with None");
@@ -435,6 +460,7 @@ mod tests {
         assert!(store.len() > 100);
     }
 
+    #[cfg(feature = "tls")]
     #[test]
     fn test_build_root_store_custom_ca_isolates_and_excludes_webpki() {
         let pki = crate::test_pki::TestPki::new();

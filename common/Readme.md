@@ -16,11 +16,20 @@ It is designed to be a central repository for reusable components such as:
 
 ## Usage
 
-This crate is primarily intended to be consumed by other `praeco-*` crates (like `praeco-rs` and `praeco-client`), but can be used standalone if you need a highly optimized HTTP/2 or HTTP/3 compatible Hyper client.
+This crate is primarily intended to be consumed by other `praeco-*` crates (like `praeco-rs`, `praeco-relay-server`, and `praeco-client`), but can be used standalone with granular Cargo features (`default = ["client", "jwt", "tls"]`):
+
+- **`proxy_protocol` & `canonical_client_ip`** are always available (even with `default-features = false`).
+- **`tls`**: `load_certs`, `load_single_key`, `build_root_store`, `build_tls_client_config`.
+- **`jwt`**: `Claims`, `load_decoding_keys`, `load_encoding_key`, `verify_jwt`, `sign_jwt`.
+- **`client`** *(implies `tls`)*: `client::{ClientPoolConfig, HttpsConnector, build_hyper_client}`.
+- **`test-pki`**: Ephemeral runtime `TestPki` via `rcgen` for self-contained tests.
 
 ```toml
 [dependencies]
 praeco-common = "0.5.1"
+
+# Minimal usage (e.g., Layer-4 relay needing only `proxy_protocol` + `canonical_client_ip`):
+# praeco-common = { version = "0.5.1", default-features = false }
 
 # For self-contained integration tests using ephemeral `TestPki`:
 # [dev-dependencies]
