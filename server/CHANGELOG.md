@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Added `JWT_EXP_LEEWAY_SECS` (`60` s, matching `jsonwebtoken::Validation` default `leeway`) to `JwtRevocationStore` revocation expiry timestamps in both `POST /auth/revoke` and `JwtAuthService::revoke_on_paths` so tokens revoked near `exp` cannot be replayed during the leeway grace window.
   * Replaced the shared `"device"` mTLS `sub` fallback in `IdpService` with a deterministic `"sha256:<hex>"` leaf-certificate DER fingerprint (`cert_fingerprint_subject`) whenever SAN and CN are both absent (falling back to `"device"` only for non-PEM synthetic inputs).
   * Removed plaintext `user_code` from `SessionStore::create_session` `trace!` logs and truncated `session_id` values in `session.rs` / `idp/mod.rs` logs via `redact_session_id` (first 8 characters + `"…"`).
+  * Added anti-CSRF `Sec-Fetch-Site` / `Origin` checks on `POST /auth/confirm` and `GET /auth/session_info`, and required mTLS client certificate or valid `poll_secret` authentication (`verify_poll_secret`) to read `user_code` via `GET /auth/session_info`.
 
 ### Changed & Fixed
 * **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**

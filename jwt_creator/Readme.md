@@ -22,11 +22,19 @@ To generate a fresh Ed25519 key pair (`jwt_private.pem` / `jwt_public.pem`) safe
 
 ## Usage
 
-Run the utility from the workspace root to generate a new token (backed directly by `praeco-common`'s shared `Claims`, `sign_jwt`, and `verify_jwt` helpers with the `jwt` feature):
+Run the utility from the workspace root to generate a new token pair (backed directly by `praeco-common`'s shared `Claims`, `sign_jwt`, and `verify_jwt` helpers with the `jwt` feature):
 
 ```bash
-cargo run -p praeco-jwt-creator --release
+cargo run -p praeco-jwt-creator --release -- \
+  --iss praeco-auth \
+  --aud praeco-gateway \
+  --sub 1234567890 \
+  --oids 1,2 \
+  --ttl1 2592000 \
+  --ttl2 3600
 ```
+
+All CLI flags (`--private-key`, `--public-key`, `--out1`, `--out2`, `--iss`, `--aud`, `--sub`, `--oids`, `--ttl1`, `--ttl2`) are optional and fall back to the development defaults above.
 
 ## Example (Rust Claims)
 

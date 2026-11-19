@@ -16,14 +16,14 @@ This crate enables the unique **JSON Transcoding** feature of the gateway. It al
 
 By using this crate, `praeco-rs` can proxy gRPC services without requiring any pre-compiled `.proto` files at runtime.
 
-## Example (CLI Router)
+## Example (CLI Router & Hardening Controls)
 
-You can launch the standalone reflection router to test dynamic transcoding against a backend gRPC service (e.g. running on port 50051):
+The standalone demo router binds `127.0.0.1:8080` by default (loopback-only unless `--allow-non-loopback` + `--auth-token` / `PRAECO_ROUTER_AUTH_TOKEN` are supplied), enforces a `1 MiB` payload limit, `128` concurrent connections, `10 s` header read timeout, `15 s` request timeout, and non-fatal `accept()` error handling. Demo backend login credentials are disabled until configured via `PRAECO_DEMO_PASSWORD` or `--demo-password`.
 
 ```bash
 # Start the dynamic gRPC reflection router
-$ cargo run -p praeco-reflection --bin grpc_router
-Listening on http://127.0.0.1:3000
+$ cargo run -p praeco-reflection --bin grpc_router -- --listen 127.0.0.1:3000
+Gateway JSON Endpoint listening on http://127.0.0.1:3000
 
 # Now you can send a standard JSON POST request:
 $ curl -X POST http://127.0.0.1:3000/helloworld.Greeter/SayHello \

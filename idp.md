@@ -61,9 +61,9 @@ This flow allows a user on an untrusted device (like a desktop web browser) to s
 2. **Display & Polling:** 
    The browser displays the QR Code and the visual `user_code`. It continuously polls the IdP via `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>` (or `X-Poll-Secret` header). Without this secret, polling is rejected with `401 Unauthorized`. While unconfirmed, the IdP returns `{"status":"pending"}`.
    
-3. **Session Confirmation (Mandatory Quishing Protection & Brute-Force Lockout):** 
-   The user scans the QR code with their trusted mobile app. The mobile app can query `GET /auth/session_info?session=<session_id>` (without mTLS) to retrieve and display the 6-character `user_code` so the user can compare it with the desktop screen, and then makes a `POST` request to `/auth/confirm?session=<session_id>&code=<user_code>`. 
-   Crucially, the mobile app performs this confirmation over an **mTLS connection** using its client certificate. The `code` parameter is **mandatory**: the IdP verifies in constant time (`constant_time_eq`) that `code` matches the session's `user_code` **before** invoking any external Claims Webhook. After `3` failed confirmation attempts (`MAX_CONFIRM_ATTEMPTS = 3`), the session is permanently invalidated and evicted to prevent brute-force guessing. Upon matching, the IdP extracts the identity claims (Subject and OIDs) from the mobile certificate (or resolves them via the Claims Webhook) and marks the session as "confirmed".
+3. **Session Confirmation (Mandatory Quishing Protection, Anti-CSRF & Brute-Force Lockout):** 
+   The user scans the QR code with their trusted mobile app. The mobile app can query `GET /auth/session_info?session=<session_id>` (**authenticated via mTLS client certificate or valid `poll_secret`**) to retrieve and display the 6-character `user_code` so the user can compare it with the desktop screen, and then makes a `POST` request to `/auth/confirm?session=<session_id>&code=<user_code>`. 
+   Crucially, the mobile app performs this confirmation over an **mTLS connection** using its client certificate; browser cross-site / cross-origin requests (`Sec-Fetch-Site` other than `same-origin`/`none` or mismatched `Origin` vs `Host`) are rejected with `403 Forbidden` on both `/auth/confirm` and `/auth/session_info`. The `code` parameter is **mandatory**: the IdP verifies in constant time (`constant_time_eq`) that `code` matches the session's `user_code` **before** invoking any external Claims Webhook. After `3` failed confirmation attempts (`MAX_CONFIRM_ATTEMPTS = 3`), the session is permanently invalidated and evicted to prevent brute-force guessing. Upon matching, the IdP extracts the identity claims (Subject and OIDs) from the mobile certificate (or resolves them via the Claims Webhook) and marks the session as "confirmed".
    
 4. **Token Issuance & Single Use Consumption:** 
    On the browser's next polling request to `GET /auth/status?session=<session_id>&poll_secret=<poll_secret>`, the IdP sees the session is confirmed. It generates a signed JWT and atomically consumes (removes) the session to prevent replay.
@@ -125,8 +125,11 @@ curl -s "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK...
 
 **Step 3: Confirm Session via mTLS (Trusted Device)**
 ```bash
-# Optional: Mobile app fetches the 6-char user_code to display for visual verification
-curl -s "https://localhost:1339/auth/session_info?session=abc123xyz"
+# Optional: Mobile app fetches the 6-char user_code to display for visual verification (mTLS or poll_secret)
+curl -s "https://localhost:1339/auth/session_info?session=abc123xyz" \
+  --cert client_certs/device.crt \
+  --key client_certs/device.key \
+  --cacert server_certs/ca.crt
 # Example Response: {"user_code":"K7X-9P2"}
 
 # The trusted device uses its mTLS certificate and the MANDATORY user_code to confirm
