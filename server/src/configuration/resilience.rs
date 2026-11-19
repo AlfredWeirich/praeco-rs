@@ -491,7 +491,7 @@ impl RouteTarget {
                     node.active_connections
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
-                .expect("candidates is non-empty"),
+                .unwrap_or_else(|| candidates[0]),
             LbStrategy::Sticky => {
                 let hash = if let Some(addr) = client_ip {
                     use std::hash::{Hash, Hasher};
@@ -511,7 +511,7 @@ impl RouteTarget {
                     node.current_score
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
-                .expect("candidates is non-empty"),
+                .unwrap_or_else(|| candidates[0]),
         }
     }
 }

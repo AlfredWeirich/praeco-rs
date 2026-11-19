@@ -108,10 +108,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             InspectionFutureProj::Allowed { inner } => inner.poll(cx),
-            InspectionFutureProj::Blocked { response } => {
-                let res = response.take().expect("InspectionFuture polled after completion");
-                Poll::Ready(Ok(res))
-            }
+            InspectionFutureProj::Blocked { response } => crate::poll_ready_response(response),
         }
     }
 }
@@ -192,9 +189,6 @@ impl<S> InspectionService<S> {
         .map_err(SrvError::from)
         .boxed();
 
-        Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(body)
-            .expect("Builder is infallible with these inputs")
+        crate::build_infallible_response(StatusCode::FORBIDDEN, None, body)
     }
 }

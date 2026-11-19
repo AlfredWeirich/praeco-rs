@@ -216,10 +216,7 @@ pub(crate) fn build_error_response(msg: &str, status: StatusCode) -> Response<Se
     let body = Full::new(Bytes::from(msg.to_string()))
         .map_err(SrvError::from)
         .boxed();
-    Response::builder()
-        .status(status)
-        .body(body)
-        .expect("Response builder failed")
+    crate::build_infallible_response(status, None, body)
 }
 
 #[derive(Clone)]

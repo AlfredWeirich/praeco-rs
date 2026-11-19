@@ -135,8 +135,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             MaxPayloadFutureProj::HeaderRejected { response } => {
-                let res = response.take().expect("MaxPayloadFuture polled after completion");
-                Poll::Ready(Ok(res))
+                crate::poll_ready_response(response)
             }
             MaxPayloadFutureProj::Streaming {
                 inner,
@@ -357,10 +356,7 @@ fn build_413_response(msg: &'static str) -> Response<SrvBody> {
         .map_err(|e| match e {})
         .boxed();
 
-    Response::builder()
-        .status(StatusCode::PAYLOAD_TOO_LARGE)
-        .body(body)
-        .unwrap()
+    crate::build_infallible_response(StatusCode::PAYLOAD_TOO_LARGE, None, body)
 }
 
 // ============================================================================
@@ -628,8 +624,7 @@ where
             let this = self.as_mut().project();
             match this {
                 ConcurrencyLimitFutureProj::Immediate { response } => {
-                    let res = response.take().expect("polled after completion");
-                    return Poll::Ready(Ok(res));
+                    return crate::poll_ready_response(response);
                 }
                 ConcurrencyLimitFutureProj::Waiting {
                     acquire_task,
@@ -638,7 +633,11 @@ where
                     server_name,
                 } => match acquire_task.poll(cx) {
                     Poll::Ready(Ok(permit)) => {
-                        let request = req.take().expect("polled after completion");
+                        let Some(request) = req.take() else {
+                            return Poll::Ready(Err(SrvError::from(
+                                "ConcurrencyLimitFuture polled after completion".to_string(),
+                            )));
+                        };
                         let fut = inner.call(request);
                         self.set(ConcurrencyLimitFuture::Processing {
                             inner: fut,
@@ -655,7 +654,11 @@ where
                 ConcurrencyLimitFutureProj::Processing { inner, permit } => {
                     match inner.poll(cx) {
                         Poll::Ready(Ok(resp)) => {
-                            let p = permit.take().expect("permit missing in Processing");
+                            let Some(p) = permit.take() else {
+                                return Poll::Ready(Err(SrvError::from(
+                                    "ConcurrencyLimitFuture permit missing in Processing".to_string(),
+                                )));
+                            };
                             let (parts, body) = resp.into_parts();
                             let permitted = PermittedBody {
                                 inner: body,
@@ -680,11 +683,12 @@ pub fn build_503_response() -> Response<SrvBody> {
         .map_err(|e| match e {})
         .boxed();
 
-    Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header(hyper::header::RETRY_AFTER, "1")
-        .body(body)
-        .unwrap()
+    let mut resp = crate::build_infallible_response(StatusCode::SERVICE_UNAVAILABLE, None, body);
+    resp.headers_mut().insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    resp
 }
 
 // ============================================================================

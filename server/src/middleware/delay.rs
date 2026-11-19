@@ -108,17 +108,18 @@ where
     ///    service's `poll_ready`.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // If we haven't started sleeping yet, create a new Sleep.
-        if self.sleep.is_none() {
+        let delay = self.delay;
+        let server_name = self.server_name;
+        let sleep = self.sleep.get_or_insert_with(|| {
             tracing::info!(
                 "{}: Injecting a delay of {:?} before readiness",
-                self.server_name,
-                self.delay
+                server_name,
+                delay
             );
-            self.sleep = Some(Box::pin(time::sleep(self.delay)));
-        }
+            Box::pin(time::sleep(delay))
+        });
 
         // Now, poll the Sleep future.
-        let sleep = self.sleep.as_mut().unwrap();
         if Pin::new(sleep).poll(cx).is_pending() {
             return Poll::Pending;
         }

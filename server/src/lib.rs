@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! # Server Library Crate Root
 //!
 //! This module defines the **core types** and the [`ConnectionHandler`] that
@@ -88,6 +89,34 @@ pub type SrvBody = BoxBody<Bytes, SrvError>;
 /// Having a separate alias makes it easy to diverge later (e.g. if response
 /// bodies need different constraints) without touching every signature.
 pub type ServiceRespBody = SrvBody;
+
+/// Constructs an HTTP [`Response`] infallibly without falling back to `Response::builder().unwrap()`.
+pub(crate) fn build_infallible_response<B>(
+    status: hyper::StatusCode,
+    content_type: Option<hyper::header::HeaderValue>,
+    body: B,
+) -> Response<B> {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+    if let Some(ct) = content_type {
+        resp.headers_mut().insert(hyper::header::CONTENT_TYPE, ct);
+    }
+    resp
+}
+
+/// Consumes a pre-built short-circuit response from a middleware `Future`, returning
+/// a `500 Internal Server Error` fallback instead of panicking if polled after completion.
+pub(crate) fn poll_ready_response<E>(
+    slot: &mut Option<Response<ServiceRespBody>>,
+) -> Poll<Result<Response<ServiceRespBody>, E>> {
+    let resp = slot.take().unwrap_or_else(|| {
+        let body = http_body_util::Full::new(Bytes::from_static(b"Internal Server Error"))
+            .map_err(SrvError::from)
+            .boxed();
+        build_infallible_response(hyper::StatusCode::INTERNAL_SERVER_ERROR, None, body)
+    });
+    Poll::Ready(Ok(resp))
+}
 
 pub trait CloneSyncService<R, U, E>: Send + Sync {
     fn clone_box(&self) -> Box<dyn CloneSyncService<R, U, E>>;
@@ -981,5 +1010,33 @@ mod tests {
         let err = timed.frame().await.unwrap().unwrap_err();
         assert!(matches!(err, SrvError::ClientAborted(_)));
         drop(tx);
+    }
+
+    #[test]
+    fn test_infallible_response_and_poll_ready_response_fallback() {
+        let body = Full::new(Bytes::from_static(b"ok"))
+            .map_err(SrvError::from)
+            .boxed();
+        let resp = build_infallible_response(
+            hyper::StatusCode::CREATED,
+            Some(hyper::header::HeaderValue::from_static("text/plain")),
+            body,
+        );
+        assert_eq!(resp.status(), hyper::StatusCode::CREATED);
+        assert_eq!(
+            resp.headers().get(hyper::header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+
+        let mut slot = Some(resp);
+        match poll_ready_response::<SrvError>(&mut slot) {
+            Poll::Ready(Ok(r)) => assert_eq!(r.status(), hyper::StatusCode::CREATED),
+            _ => panic!("expected Poll::Ready(Ok)"),
+        }
+        // Second poll on empty slot yields 500 Internal Server Error instead of panicking
+        match poll_ready_response::<SrvError>(&mut slot) {
+            Poll::Ready(Ok(r)) => assert_eq!(r.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            _ => panic!("expected Poll::Ready(Ok(500))"),
+        }
     }
 }

@@ -391,10 +391,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             SimpleRateLimitFutureProj::Allowed { inner } => inner.poll(cx),
-            SimpleRateLimitFutureProj::Blocked { response } => {
-                let res = response.take().expect("polled after completion");
-                Poll::Ready(Ok(res))
-            }
+            SimpleRateLimitFutureProj::Blocked { response } => crate::poll_ready_response(response),
         }
     }
 }
@@ -743,8 +740,7 @@ where
         match self.project() {
             TokenBucketRateLimitFutureProj::Allowed { inner } => inner.poll(cx),
             TokenBucketRateLimitFutureProj::Blocked { response } => {
-                let res = response.take().expect("polled after completion");
-                Poll::Ready(Ok(res))
+                crate::poll_ready_response(response)
             }
         }
     }

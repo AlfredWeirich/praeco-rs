@@ -1675,9 +1675,12 @@ impl Config {
 
     /// Returns a cloned `Arc<Config>` from the global configuration singleton.
     ///
+    /// Prefer [`Config::try_global`] in new code.
+    ///
     /// # Panics
     ///
     /// Panics if [`Config::init`] has not been called yet.
+    #[allow(clippy::expect_used)]
     pub fn global() -> Arc<Config> {
         CONFIG
             .get()
@@ -1733,7 +1736,8 @@ impl ServerConfig {
                 "Configuration error: Server 'name' must not be empty.",
             ));
         }
-        self.static_name = Some(Box::leak(self.name.clone().into_boxed_str()));
+        let static_name: &'static str = Box::leak(self.name.clone().into_boxed_str());
+        self.static_name = Some(static_name);
         let server_name = self.name.clone();
         self.metrics = ServerMetrics::for_server(&server_name);
 
@@ -1749,7 +1753,6 @@ impl ServerConfig {
         // Eagerly pre-load TLS CertifiedKey if HTTPS is enabled
         if self.protocol == Protocol::Https {
             if let Some(cert_config) = &self.server_certs {
-                let static_name = self.static_name.expect("static_name initialized");
                 let loaded_key = crate::tls_conf::load_certified_key(static_name, cert_config)?;
                 if let Some(leaf_der) = loaded_key.cert.first()
                     && let Ok((_, parsed_cert)) =

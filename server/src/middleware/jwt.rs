@@ -439,10 +439,7 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.as_mut().project() {
-            JwtAuthFutureProj::Unauthorized { response } => {
-                let res = response.take().expect("polled after complete");
-                Poll::Ready(Ok(res))
-            }
+            JwtAuthFutureProj::Unauthorized { response } => crate::poll_ready_response(response),
             JwtAuthFutureProj::Inner { inner_fut } => inner_fut.poll(cx),
         }
     }
@@ -526,9 +523,7 @@ where
             crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
             tracing::debug!("{}: Missing Authorization header or cookie", server_name);
             return JwtAuthFuture::Unauthorized {
-                response: Some(
-                    unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
-                ),
+                response: Some(unauthorized_response(self.redirect_on_failure.as_deref())),
             };
         };
 
@@ -544,9 +539,7 @@ where
                 crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
                 tracing::warn!("{}: Invalid JWT: {:#}", server_name, e);
                 return JwtAuthFuture::Unauthorized {
-                    response: Some(
-                        unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
-                    ),
+                    response: Some(unauthorized_response(self.redirect_on_failure.as_deref())),
                 };
             }
         };
@@ -558,9 +551,7 @@ where
             crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
             tracing::warn!("{}: Rejected revoked JWT (jti: {})", server_name, jti);
             return JwtAuthFuture::Unauthorized {
-                response: Some(
-                    unauthorized_response::<()>(self.redirect_on_failure.as_deref()).unwrap(),
-                ),
+                response: Some(unauthorized_response(self.redirect_on_failure.as_deref())),
             };
         }
 
@@ -619,11 +610,8 @@ where
     }
 }
 
-/// Helper function to create a standardized **401 Unauthorized** response.
-///
-/// Generic over the error type `T` so it can be used in any `Result<Response, T>`
-/// context — the `Ok` variant is always returned, making the error type irrelevant.
-fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRespBody>, T> {
+/// Helper function to create a standardized **401 Unauthorized** (or **302 Found** redirect) response.
+fn unauthorized_response(redirect: Option<&str>) -> Response<ServiceRespBody> {
     if let Some(url) = redirect
         && let Ok(loc_val) = hyper::header::HeaderValue::from_str(url) {
             let body: ServiceRespBody = Full::new(Bytes::new())
@@ -632,16 +620,14 @@ fn unauthorized_response<T>(redirect: Option<&str>) -> Result<Response<ServiceRe
             let mut resp = Response::new(body);
             *resp.status_mut() = StatusCode::FOUND;
             resp.headers_mut().insert(hyper::header::LOCATION, loc_val);
-            return Ok(resp);
+            return resp;
         }
 
     let body: ServiceRespBody = Full::new(Bytes::from("Unauthorized"))
         .map_err(SrvError::from)
         .boxed();
 
-    let mut resp: Response<ServiceRespBody> = Response::new(body);
-    *resp.status_mut() = StatusCode::UNAUTHORIZED;
-    Ok(resp)
+    crate::build_infallible_response(StatusCode::UNAUTHORIZED, None, body)
 }
 
 #[cfg(test)]

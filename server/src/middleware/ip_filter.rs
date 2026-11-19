@@ -542,11 +542,11 @@ impl<S> IpFilterService<S> {
             .map_err(SrvError::from)
             .boxed();
 
-        Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(body)
-            .unwrap()
+        crate::build_infallible_response(
+            StatusCode::FORBIDDEN,
+            Some(hyper::header::HeaderValue::from_static("text/plain; charset=utf-8")),
+            body,
+        )
     }
 }
 
@@ -576,12 +576,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             IpFilterFutureProj::Allowed { inner } => inner.poll(cx),
-            IpFilterFutureProj::Blocked { response } => {
-                let res = response
-                    .take()
-                    .expect("IpFilterFuture polled after completion");
-                Poll::Ready(Ok(res))
-            }
+            IpFilterFutureProj::Blocked { response } => crate::poll_ready_response(response),
         }
     }
 }

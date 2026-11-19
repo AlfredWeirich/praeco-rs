@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Extracted `execute_health_probe` in `src/runner.rs` so both `client.request(req)` and the bounded (`64 KiB`) health-check response body read run inside the shared 5-second timeout (`ACTIVE_HEALTH_CHECK_TIMEOUT`).
 * **IdP JSON/Cookie Validation & Panic Removal (`src/middleware/idp/mod.rs`, `src/configuration/mod.rs`):**
   * Replaced all manual `format!` JSON string construction in `IdpService` with `serde_json::json!`, eliminated all `.unwrap()` calls across production IdP paths (`Response::new`, `unwrap_or_default`, and typed `WebhookEndpoint` state enum), and validated `cookie_name`, `cookie_domain`, and `redirect_after_login` at startup in both `ServerConfig::finalize` and `IdpService::new`.
+* **Workspace-Wide `.unwrap()` / `.expect()` Elimination & Crate Lints (`Q-01`):**
+  * Enabled `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]` in `server` (`lib.rs`, `server.rs`), `relay-server` (`lib.rs`, `main.rs`), and `common` (`lib.rs`, exempting `test-pki`).
+  * Replaced all remaining production `Response::builder()...unwrap()`/`expect(...)`, `unauthorized_response::<T>(...).unwrap()` (`jwt.rs`), `pool_opt.expect(...)` (`grpc_web.rs` returning `502 Bad Gateway`), `DelayService::poll_ready` `as_mut().unwrap()` (`get_or_insert_with`), `LbStrategy::{LeastConnections,HighestScore}` `expect(...)`, `rustls::crypto::default_provider().install_default().expect(...)` (`server.rs`), and future `take().expect("polled after completion")` calls across middleware with shared infallible helpers (`build_infallible_response`, `poll_ready_response`) and explicit error returns.
 
 ---
 

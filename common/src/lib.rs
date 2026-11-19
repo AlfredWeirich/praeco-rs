@@ -1,3 +1,4 @@
+#![cfg_attr(all(not(test), not(feature = "test-pki")), deny(clippy::unwrap_used, clippy::expect_used))]
 //! # Common Utilities Crate
 //!
 //! Shared types and helper functions used by both the server and client

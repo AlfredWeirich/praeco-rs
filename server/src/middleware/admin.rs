@@ -809,12 +809,14 @@ fn build_admin_response(
     payload: Bytes,
 ) -> Response<ServiceRespBody> {
     let body = Full::new(payload).map_err(SrvError::from).boxed();
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(body)
-        .expect("Response builder failed")
+    let mut resp = crate::build_infallible_response(
+        status,
+        Some(header::HeaderValue::from_static(content_type)),
+        body,
+    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    resp
 }
 
 /// Handles an incoming Admin / Telemetry HTTP request for a standalone `ServiceType::Admin`

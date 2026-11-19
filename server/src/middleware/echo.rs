@@ -80,13 +80,11 @@ impl Service<Request<SrvBody>> for EchoService {
                     let body: ServiceRespBody =
                         Full::new(msg_bytes).map_err(SrvError::from).boxed();
 
-                    let response = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "text/plain")
-                        .body(body)
-                        .unwrap();
-
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::OK,
+                        Some(header::HeaderValue::from_static("text/plain")),
+                        body,
+                    ))
                 }
 
                 // ── GET /name ────────────────────────────────────────────
@@ -103,13 +101,11 @@ impl Service<Request<SrvBody>> for EchoService {
                     let body: ServiceRespBody =
                         Full::new(msg_bytes).map_err(SrvError::from).boxed();
 
-                    let response = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "text/plain")
-                        .body(body)
-                        .unwrap();
-
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::OK,
+                        Some(header::HeaderValue::from_static("text/plain")),
+                        body,
+                    ))
                 }
 
                 // ── GET /health ──────────────────────────────────────
@@ -118,12 +114,11 @@ impl Service<Request<SrvBody>> for EchoService {
                     let body = Full::new(Bytes::from_static(msg.as_bytes()))
                         .map_err(SrvError::from)
                         .boxed();
-                    let response = Response::builder()
-                        .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(body)
-                        .unwrap();
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::OK,
+                        Some(header::HeaderValue::from_static("application/json")),
+                        body,
+                    ))
                 }
 
                 // ── GET /help ────────────────────────────────────────
@@ -135,19 +130,18 @@ impl Service<Request<SrvBody>> for EchoService {
 
                 // ── POST / ──────────────────────────────────────────
                 (&hyper::Method::POST, "/") => {
-                    let content_type =
-                        req.headers().get(header::CONTENT_TYPE).cloned().unwrap_or(
-                            header::HeaderValue::from_static("application/octet-stream"),
-                        );
+                    let content_type = req.headers().get(header::CONTENT_TYPE).cloned().unwrap_or(
+                        header::HeaderValue::from_static("application/octet-stream"),
+                    );
 
                     let body_bytes = req.collect().await?.to_bytes();
                     let body = Full::new(body_bytes).map_err(SrvError::from).boxed();
 
-                    let response = Response::builder()
-                        .header(header::CONTENT_TYPE, content_type)
-                        .body(body)
-                        .unwrap();
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::OK,
+                        Some(content_type),
+                        body,
+                    ))
                 }
 
                 // ── PUT / ───────────────────────────────────────────
@@ -165,12 +159,11 @@ impl Service<Request<SrvBody>> for EchoService {
                         body_bytes
                     };
 
-                    let response = Response::builder()
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Full::new(final_bytes).map_err(SrvError::from).boxed())
-                        .unwrap();
-
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::OK,
+                        Some(header::HeaderValue::from_static("application/json")),
+                        Full::new(final_bytes).map_err(SrvError::from).boxed(),
+                    ))
                 }
 
                 // ── Catch-all ───────────────────────────────────────
@@ -180,11 +173,11 @@ impl Service<Request<SrvBody>> for EchoService {
                         .map_err(SrvError::from)
                         .boxed();
 
-                    let response = Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(body)
-                        .unwrap();
-                    Ok(response)
+                    Ok(crate::build_infallible_response(
+                        StatusCode::NOT_FOUND,
+                        None,
+                        body,
+                    ))
                 }
             }
         })

@@ -342,12 +342,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             PathSanitizerFutureProj::Allowed { inner } => inner.poll(cx),
-            PathSanitizerFutureProj::Blocked { response } => {
-                let res = response
-                    .take()
-                    .expect("PathSanitizerFuture polled after completion");
-                Poll::Ready(Ok(res))
-            }
+            PathSanitizerFutureProj::Blocked { response } => crate::poll_ready_response(response),
         }
     }
 }
@@ -397,11 +392,11 @@ impl<S> PathSanitizerService<S> {
             .map_err(SrvError::from)
             .boxed();
 
-        Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(body)
-            .unwrap()
+        crate::build_infallible_response(
+            StatusCode::BAD_REQUEST,
+            Some(hyper::header::HeaderValue::from_static("text/plain; charset=utf-8")),
+            body,
+        )
     }
 }
 

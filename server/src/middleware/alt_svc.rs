@@ -46,11 +46,11 @@ impl AltSvcLayer {
         // "h3" advertises HTTP/3 support on the given port.
         // "ma" (max-age) indicates how long the client should remember this advertisement (86400s = 24h).
         let val = format!("h3=\":{}\" ; ma=86400", port);
+        // `port` is a u16, so `val` contains strictly valid ASCII characters; fallback is unreachable.
+        let header_value = HeaderValue::from_str(&val)
+            .unwrap_or_else(|_| HeaderValue::from_static("h3=\":443\" ; ma=86400"));
 
-        Self {
-            header_value: HeaderValue::from_str(&val)
-                .expect("Failed to create valid Alt-Svc header value"),
-        }
+        Self { header_value }
     }
 }
 

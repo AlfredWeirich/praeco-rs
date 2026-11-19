@@ -394,7 +394,14 @@ pub(crate) async fn handle_grpc_web_with_budget(
             }
         }
 
-        let pool = pool_opt.expect("pool must be present");
+        let Some(pool) = pool_opt else {
+            error!(
+                "{}: gRPC descriptor pool unavailable for '{}'",
+                server_name,
+                original_uri.path()
+            );
+            return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));
+        };
 
         let uri_path = original_uri.path().trim_start_matches('/');
         let uri_parts: Vec<&str> = uri_path.split('/').collect();
@@ -787,14 +794,11 @@ pub(crate) async fn handle_grpc_web_with_budget(
 
                 upstream_node.record_success_with_epoch(request_epoch);
 
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(
-                        super::BudgetedBytesBody::new(Bytes::from(response_json), reservation)
-                            .boxed(),
-                    )
-                    .unwrap());
+                return Ok(crate::build_infallible_response(
+                    StatusCode::OK,
+                    Some(header::HeaderValue::from_static("application/json")),
+                    super::BudgetedBytesBody::new(Bytes::from(response_json), reservation).boxed(),
+                ));
             }
             Err(e) => {
                 if let Some(ref mut pg) = probe_guard {

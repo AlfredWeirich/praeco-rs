@@ -1,3 +1,4 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 //! # Server Binary — Entry Point & Lifecycle
 //!
 //! This is the main executable for the server application. It orchestrates:
@@ -74,7 +75,7 @@ fn main() -> Result<(), Error> {
     // Install 'aws-lc-rs' as the default crypto provider for the process.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
-        .expect("Failed to install rustls crypto provider");
+        .map_err(|_| Error::msg("Failed to install rustls crypto provider"))?;
 
     let config = Config::init(&arg)?;
 
