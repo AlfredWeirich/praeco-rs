@@ -1155,14 +1155,28 @@ pub(crate) fn validate_idp_cookie_and_redirect(
 }
 
 
-/// Server TLS certificate and key paths.
-#[derive(Debug, Deserialize, Clone)]
+/// Default TLS stateful session resumption cache size for non-mTLS HTTPS listeners (`20,000`).
+pub const DEFAULT_TLS_SESSION_CACHE_SIZE: usize = 20_000;
+/// Default TLS stateful session resumption cache size for mTLS listeners without CRLs (`1,024`).
+pub const DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE: usize = 1024;
+
+/// Server TLS certificate, key, and session resumption configuration (`[Server.server_certs]`).
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ServerCertConfig {
     /// Path to the PEM-encoded server certificate chain.
     pub ssl_certificate: String,
     /// Path to the PEM-encoded server private key.
     pub ssl_certificate_key: String,
+    /// Maximum entries in `rustls::server::ServerSessionMemoryCache` (`0` disables session
+    /// resumption via `NoServerSessionStorage`). Defaults to `20000` for non-mTLS listeners,
+    /// `1024` for mTLS listeners without CRLs, and `0` when `ssl_client_crl` is configured.
+    #[serde(default)]
+    pub session_cache_size: Option<usize>,
+    /// Enable stateless TLS session tickets (`rustls::crypto::aws_lc_rs::Ticketer`, 12 h max
+    /// lifetime). Defaults to `false`. Rejected at startup when paired with `ssl_client_crl`.
+    #[serde(default)]
+    pub session_tickets: bool,
 }
 
 fn default_strict_crl() -> bool {
@@ -1854,6 +1868,16 @@ impl ServerConfig {
                     return Err(Error::msg(format!(
                         "Configuration error in Server '{}': Authentication is '{:?}' (mTLS), but [[Server.client_certs]] is missing.",
                         self.name, self.authentication
+                    )));
+                }
+                let has_crl = self
+                    .client_certs
+                    .as_deref()
+                    .is_some_and(|cas| cas.iter().any(|c| c.ssl_client_crl.is_some()));
+                if has_crl && self.server_certs.as_ref().is_some_and(|sc| sc.session_tickets) {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{}': 'server_certs.session_tickets = true' cannot be combined with 'ssl_client_crl' because stateless 12h tickets bypass CRL checks during session resumption.",
+                        self.name
                     )));
                 }
             }

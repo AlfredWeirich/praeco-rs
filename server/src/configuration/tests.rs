@@ -1311,5 +1311,39 @@ enabled = []
             toml::from_str(&make_idp_toml(r#"redirect_after_login = "javascript:alert(1)""#)).unwrap();
         assert!(bad_redirect_srv.finalize().is_err());
 
+        // P-07: mTLS with CRL rejects session_tickets = true in finalize()
+        let ca_pem = common::test_pki::TestPki::s(&pki.relay_ca_pem);
+        let crl_pem = common::test_pki::TestPki::s(&pki.relay_crl_pem);
+        let mtls_ticket_toml = format!(
+            r#"
+            name = "mtls_crl_ticket_reject"
+            ip = "127.0.0.1"
+            port = 8443
+            protocol = "https"
+            authentication = "ClientCert"
+            service = "Echo"
+            [Layers]
+            enabled = []
+            [server_certs]
+            ssl_certificate = "{pub_pem}"
+            ssl_certificate_key = "{pub_key}"
+            session_cache_size = 4096
+            session_tickets = true
+            [[client_certs]]
+            ssl_client_ca = "{ca_pem}"
+            ssl_client_crl = "{crl_pem}"
+        "#
+        );
+        let mut bad_ticket_srv: ServerConfig = toml::from_str(&mtls_ticket_toml).unwrap();
+        assert!(bad_ticket_srv.finalize().is_err());
+
+        let mut ok_cache_srv: ServerConfig =
+            toml::from_str(&mtls_ticket_toml.replace("session_tickets = true", "session_tickets = false")).unwrap();
+        assert!(ok_cache_srv.finalize().is_ok());
+        assert_eq!(
+            ok_cache_srv.server_certs.as_ref().unwrap().session_cache_size,
+            Some(4096)
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }

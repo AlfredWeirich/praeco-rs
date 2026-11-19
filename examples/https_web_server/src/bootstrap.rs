@@ -73,6 +73,7 @@ pub fn build_server_config_with_certs(
         server_certs: Some(ServerCertConfig {
             ssl_certificate: cert_path,
             ssl_certificate_key: key_path,
+            ..Default::default()
         }),
         connection_limits: ConnectionLimitsConfig {
             max_connections: 1024,

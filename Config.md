@@ -309,7 +309,7 @@ When `protocol = "https"`, Praeco automatically:
 1. Binds a standard non-blocking **TCP socket** on `ip:port` for HTTP/1.1 and HTTP/2.
 2. Simultaneously binds a **UDP socket** on the exact same `ip:port` for **HTTP/3 (QUIC)**.
 3. Configures ALPN on the TLS stack to advertise `h3`, `h2`, and `http/1.1` in preference order.
-4. Enables session resumption (`ServerSessionMemoryCache` with 1024 slots) to reduce TLS handshake overhead.
+4. Configures TLS session resumption (`ServerSessionMemoryCache`, defaulting to `20000` slots for non-mTLS listeners, `1024` for mTLS without CRLs, and `0`/disabled via `NoServerSessionStorage` when `ssl_client_crl` is configured; configurable per server via `[Server.server_certs].session_cache_size` and optional stateless `session_tickets`).
 
 ---
 
@@ -408,6 +408,8 @@ Maps OID suffix numbers extracted from certificates or JWT claims to internal `U
 | :--- | :--- | :--- | :--- | :--- |
 | `ssl_certificate` | String | **Mandatory** | *None* | Path to PEM-encoded certificate chain (leaf certificate followed by any intermediate CAs). |
 | `ssl_certificate_key` | String | **Mandatory** | *None* | Path to unencrypted PEM private key (PKCS#8, RSA, or SEC1). |
+| `session_cache_size` | Integer | Optional | `20000` (non-mTLS) / `1024` (mTLS without CRL) / `0` (mTLS with CRL) | Maximum stateful TLS session resumption cache entries (`ServerSessionMemoryCache`). Set to `0` to disable resumption (`NoServerSessionStorage`). Defaults to `0` when `[[Server.client_certs]].ssl_client_crl` is set because resumed TLS sessions skip per-handshake client certificate and CRL re-verification. |
+| `session_tickets` | Boolean | Optional | `false` | Enables stateless TLS session tickets via `rustls::crypto::aws_lc_rs::Ticketer` (6 h key rotation / 12 h max lifetime) for multi-instance or high-concurrency deployments. Rejected at startup when combined with mTLS CRL verification (`ssl_client_crl`). |
 
 #### Client CA Certificates (`[[Server.client_certs]]`)
 **Mandatory** when `authentication = "ClientCert"` or `"OptionalClientCert"`. Multiple blocks can be defined to trust multiple independent CAs.

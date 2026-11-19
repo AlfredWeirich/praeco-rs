@@ -35,6 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Workspace-Wide `.unwrap()` / `.expect()` Elimination & Crate Lints (`Q-01`):**
   * Enabled `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]` in `server` (`lib.rs`, `server.rs`), `relay-server` (`lib.rs`, `main.rs`), and `common` (`lib.rs`, exempting `test-pki`).
   * Replaced all remaining production `Response::builder()...unwrap()`/`expect(...)`, `unauthorized_response::<T>(...).unwrap()` (`jwt.rs`), `pool_opt.expect(...)` (`grpc_web.rs` returning `502 Bad Gateway`), `DelayService::poll_ready` `as_mut().unwrap()` (`get_or_insert_with`), `LbStrategy::{LeastConnections,HighestScore}` `expect(...)`, `rustls::crypto::default_provider().install_default().expect(...)` (`server.rs`), and future `take().expect("polled after completion")` calls across middleware with shared infallible helpers (`build_infallible_response`, `poll_ready_response`) and explicit error returns.
+* **Configurable TLS Session Cache & CRL-Safe Resumption Policy (`src/configuration/mod.rs`, `src/tls_conf.rs`):**
+  * Added `pub session_cache_size: Option<usize>` and `pub session_tickets: bool` to `ServerCertConfig` (TOML-compatible via `#[serde(default)]`).
+  * Raised the default `ServerSessionMemoryCache` size from `1024` to `20_000` (`DEFAULT_TLS_SESSION_CACHE_SIZE`) for non-mTLS listeners, kept `1024` (`DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE`) for mTLS listeners without CRLs, and defaulted mTLS listeners with `ssl_client_crl` to `NoServerSessionStorage` (`0`) so revoked certificates are not bypassed by resumed sessions.
+  * Added opt-in stateless `session_tickets` (`rustls::crypto::aws_lc_rs::Ticketer`, 12 h max lifetime), rejected at startup (`ServerConfig::finalize` and `tls_conf::tls_config`) when paired with `ssl_client_crl`.
 
 ---
 

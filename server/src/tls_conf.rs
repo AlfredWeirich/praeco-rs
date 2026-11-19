@@ -123,13 +123,8 @@ impl ResolvesServerCert for DynamicCertResolver {
 ///
 /// # Errors
 ///
-/// Returns an error if any certificate or private key file fails to load, is malformed, or if
-/// configuration cannot be completed.
-///
-/// # Panics
-///
-/// This function will panic only if a `.expect()` is triggered inside a utility function
-/// (not expected if `load_certs`/`load_single_key` are implemented with Result).
+/// Returns an error if any certificate, CRL, or private key file fails to load, is malformed,
+/// if CRL validation rejects an expired/corrupt CRL, or if `session_tickets` is paired with CRLs.
 pub fn tls_config(
     server_name: &'static str,
     server_cert_config: &ServerCertConfig,
@@ -142,7 +137,7 @@ pub fn tls_config(
         fallback_key,
     ));
 
-    // Create a fresh Rustls config builder (TLS 1.3 by default)
+    // Create a fresh Rustls config builder (supports TLS 1.3 and TLS 1.2)
     let config_builder = rustls::ServerConfig::builder();
 
     let require_client_auth = authentication_method == crate::configuration::AuthenticationMethod::ClientCert
@@ -243,10 +238,51 @@ pub fn tls_config(
     };
 
     let mut config = config;
-    // Optimization 7
-    // Enable TLS session resumption — reconnecting clients skip the full
-    // handshake, saving a round-trip. 1024 entries covers high-concurrency.
-    config.session_storage = rustls::server::ServerSessionMemoryCache::new(1024);
+    let has_crl =
+        client_ca_configs.is_some_and(|cas| cas.iter().any(|c| c.ssl_client_crl.is_some()));
+    let effective_cache_size = server_cert_config.session_cache_size.unwrap_or({
+        if !require_client_auth {
+            crate::configuration::DEFAULT_TLS_SESSION_CACHE_SIZE
+        } else if has_crl {
+            0
+        } else {
+            crate::configuration::DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE
+        }
+    });
+
+    if effective_cache_size == 0 {
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    } else {
+        if require_client_auth && has_crl {
+            tracing::warn!(
+                "{}: Stateful TLS session cache ({} slots) enabled alongside mTLS CRLs; resumed sessions skip client certificate & CRL re-verification.",
+                server_name,
+                effective_cache_size
+            );
+        }
+        config.session_storage =
+            rustls::server::ServerSessionMemoryCache::new(effective_cache_size);
+    }
+
+    if server_cert_config.session_tickets {
+        if has_crl {
+            return Err(Error::msg(format!(
+                "{server_name}: 'session_tickets = true' cannot be combined with mTLS CRL verification ('ssl_client_crl')"
+            )));
+        }
+        if require_client_auth {
+            tracing::warn!(
+                "{}: Stateless TLS session tickets enabled on mTLS server; resumed sessions skip client certificate checks for up to 12h.",
+                server_name
+            );
+        }
+        config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new().map_err(|e| {
+            Error::msg(format!(
+                "{server_name}: Failed to initialize TLS session ticketer: {e}"
+            ))
+        })?;
+    }
+
     // Enable ALPN for HTTP/3, HTTP/2, and HTTP/1.1 negotiation.
     // The order indicates server preference (H3 > H2 > H1.1).
     config.alpn_protocols = vec![b"h3".to_vec(), b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -550,6 +586,7 @@ mod tests {
         let srv_cert = ServerCertConfig {
             ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
             ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            ..Default::default()
         };
         let client_ca = vec![ClientCertConfig {
             ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
@@ -565,5 +602,83 @@ mod tests {
         );
         let _ = std::fs::remove_file(&empty_crl);
         assert!(res.is_err(), "empty CRL file must be rejected");
+    }
+
+    #[test]
+    fn test_tls_session_cache_and_tickets_policy() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let base_cert = || ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            ..Default::default()
+        };
+
+        // 1. Non-mTLS: session cache enabled by default (20k), ticketer off unless enabled
+        let cfg_public = tls_config(
+            "pub",
+            &base_cert(),
+            None,
+            crate::configuration::AuthenticationMethod::None,
+        )
+        .unwrap();
+        assert!(cfg_public.session_storage.can_cache());
+        assert!(!cfg_public.ticketer.enabled());
+
+        // Non-mTLS with session_cache_size = 0 and session_tickets = true
+        let mut ticket_cert = base_cert();
+        ticket_cert.session_cache_size = Some(0);
+        ticket_cert.session_tickets = true;
+        let cfg_tickets = tls_config(
+            "pub_tickets",
+            &ticket_cert,
+            None,
+            crate::configuration::AuthenticationMethod::Jwt,
+        )
+        .unwrap();
+        assert!(!cfg_tickets.session_storage.can_cache());
+        assert!(cfg_tickets.ticketer.enabled());
+
+        // 2. mTLS without CRL keeps session cache enabled by default
+        let ca_no_crl = vec![ClientCertConfig {
+            ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+            ssl_client_crl: None,
+            strict_crl: true,
+        }];
+        let cfg_mtls_no_crl = tls_config(
+            "mtls_no_crl",
+            &base_cert(),
+            Some(&ca_no_crl),
+            crate::configuration::AuthenticationMethod::ClientCert,
+        )
+        .unwrap();
+        assert!(cfg_mtls_no_crl.session_storage.can_cache());
+
+        // 3. mTLS with CRL defaults to NoServerSessionStorage (0) and rejects session_tickets = true
+        let ca_with_crl = vec![ClientCertConfig {
+            ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+            ssl_client_crl: Some(common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string()),
+            strict_crl: true,
+        }];
+        let cfg_mtls_crl = tls_config(
+            "mtls_crl",
+            &base_cert(),
+            Some(&ca_with_crl),
+            crate::configuration::AuthenticationMethod::ClientCert,
+        )
+        .unwrap();
+        assert!(!cfg_mtls_crl.session_storage.can_cache());
+
+        let mut crl_with_tickets = base_cert();
+        crl_with_tickets.session_tickets = true;
+        assert!(
+            tls_config(
+                "mtls_crl_tickets",
+                &crl_with_tickets,
+                Some(&ca_with_crl),
+                crate::configuration::AuthenticationMethod::ClientCert,
+            )
+            .is_err()
+        );
     }
 }
