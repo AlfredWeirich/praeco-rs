@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use hyper::{Response, StatusCode, header};
 use smallvec::SmallVec;
 use tracing::warn;
@@ -5,7 +7,7 @@ use tracing::warn;
 use super::build_error_response;
 use crate::{
     ServiceRespBody,
-    configuration::{RoleVec, ServerConfig, UserRole},
+    configuration::{RoleVec, RouteHeaderPolicy, ServerConfig, UserRole},
 };
 
 /// Stack-allocated header vector: holds up to `N` (default 6) headers on the stack without heap allocation.
@@ -24,43 +26,116 @@ static HOP_BY_HOP_HEADERS: [header::HeaderName; 9] = [
     header::HeaderName::from_static("proxy-connection"),
 ];
 
-/// Global deny-list of identity and client-cert headers that MUST ALWAYS be stripped
-/// from incoming client requests to prevent Identity Spoofing (pre-parsed `HeaderName::from_static`).
-static IDENTITY_HEADER_NAMES: [header::HeaderName; 28] = [
-    // Client certificates
-    header::HeaderName::from_static("x-client-cert"),
-    header::HeaderName::from_static("x-client-certificate"),
-    header::HeaderName::from_static("x-ssl-client-cert"),
-    header::HeaderName::from_static("x-ssl-certificate"),
-    header::HeaderName::from_static("ssl-client-cert"),
-    header::HeaderName::from_static("x-forwarded-tls-client-cert"),
-    header::HeaderName::from_static("x-forwarded-client-cert"),
-    // Subject Alternative Name (SAN)
-    header::HeaderName::from_static("x-client-san"),
-    header::HeaderName::from_static("x-ssl-client-san"),
-    header::HeaderName::from_static("ssl-client-san"),
-    header::HeaderName::from_static("x-client-cert-san"),
-    // User Roles / OIDs
-    header::HeaderName::from_static("x-client-roles"),
-    header::HeaderName::from_static("x-client-role"),
-    header::HeaderName::from_static("x-user-roles"),
-    header::HeaderName::from_static("x-user-role"),
-    header::HeaderName::from_static("x-auth-roles"),
-    header::HeaderName::from_static("x-auth-role"),
-    header::HeaderName::from_static("x-user-role-oid"),
-    header::HeaderName::from_static("x-authenticated-user"),
-    // Certificate metadata & DNs
-    header::HeaderName::from_static("x-client-dn"),
-    header::HeaderName::from_static("x-client-subject-dn"),
-    header::HeaderName::from_static("x-client-issuer-dn"),
-    header::HeaderName::from_static("x-client-serial"),
-    header::HeaderName::from_static("x-ssl-client-subject-dn"),
-    header::HeaderName::from_static("x-ssl-client-issuer-dn"),
-    header::HeaderName::from_static("x-ssl-client-serial"),
-    header::HeaderName::from_static("x-ssl-client-verify"),
-    // Client IP header if forwarded via client-cert config
-    header::HeaderName::from_static("x-client-ip"),
-];
+/// Returns `true` if `name` is an untrusted client-identity, certificate-forwarding,
+/// or proxy-forwarding header that must be stripped before Praeco injects authoritative values (`S-05`).
+fn is_identity_like(name: &header::HeaderName) -> bool {
+    let n = name.as_str();
+    const PREFIXES: &[&str] = &[
+        "x-forwarded-",
+        "x-auth-",
+        "x-authenticated-",
+        "x-remote-",
+        "x-user",
+        "x-client-",
+        "x-ssl-",
+        "ssl-client-",
+        "x-original-",
+        "x-rewrite-",
+    ];
+    PREFIXES.iter().any(|p| n.starts_with(p))
+        || matches!(
+            n,
+            "forwarded"
+                | "x-real-ip"
+                | "remote-user"
+                | "remote-groups"
+                | "remote-email"
+                | "true-client-ip"
+                | "cf-connecting-ip"
+                | "x-cluster-client-ip"
+                | "x-auth"
+        )
+}
+
+/// Returns `true` if `name` matches any custom header name configured in `client_cert_forwarding`.
+fn is_configured_cert_forwarding_header(name: &header::HeaderName, config: &ServerConfig) -> bool {
+    let Some(fwd) = &config.client_cert_forwarding else {
+        return false;
+    };
+    let n = name.as_str();
+    fwd.header_cert.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(n))
+        || fwd.header_san.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(n))
+        || fwd.header_roles.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(n))
+        || fwd.header_client_ip.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(n))
+}
+
+/// Returns `true` for HTTP/gRPC wire-framing headers that remain preserved in strict `forward_headers` allowlist mode.
+fn is_essential_wire_header(name: &header::HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "content-type"
+            | "content-length"
+            | "content-encoding"
+            | "accept-encoding"
+            | "te"
+            | "grpc-timeout"
+            | "grpc-encoding"
+            | "grpc-accept-encoding"
+    )
+}
+
+/// Filters named cookies out of all `Cookie` headers without disturbing remaining application cookies.
+fn filter_cookie_header(headers: &mut hyper::HeaderMap, strip_cookie_names: &HashSet<String>) {
+    if strip_cookie_names.is_empty() || !headers.contains_key(header::COOKIE) {
+        return;
+    }
+
+    let (changed, rebuilt) = {
+        let mut kept_parts: SmallVec<[&str; 8]> = SmallVec::new();
+        let mut changed = false;
+
+        for val in headers.get_all(header::COOKIE) {
+            let Ok(raw) = val.to_str() else {
+                changed = true;
+                continue;
+            };
+            for part in raw.split(';') {
+                let trimmed = part.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let cookie_name = trimmed
+                    .split_once('=')
+                    .map(|(name, _)| name.trim())
+                    .unwrap_or(trimmed);
+                if strip_cookie_names.contains(cookie_name) {
+                    changed = true;
+                } else {
+                    kept_parts.push(trimmed);
+                }
+            }
+        }
+
+        let rebuilt = if changed && !kept_parts.is_empty() {
+            Some(kept_parts.join("; "))
+        } else {
+            None
+        };
+        (changed, rebuilt)
+    };
+
+    if !changed {
+        return;
+    }
+
+    headers.remove(header::COOKIE);
+    if let Some(joined) = rebuilt
+        && let Ok(hv) = header::HeaderValue::from_str(&joined)
+    {
+        headers.insert(header::COOKIE, hv);
+    }
+}
 
 /// Extracts the client's IP from request extensions and injects it as the `X-Real-IP` header.
 pub fn inject_real_ip(parts: &mut hyper::http::request::Parts) {
@@ -73,41 +148,41 @@ pub fn inject_real_ip(parts: &mut hyper::http::request::Parts) {
     }
 }
 
-/// Cleans and prepares HTTP headers for upstream forwarding.
+/// Cleans and prepares HTTP headers for upstream forwarding according to the route's [`RouteHeaderPolicy`].
 ///
 /// Security operations performed:
 /// 1. Loop detection via `Max-Forwards`.
 /// 2. Strips hop-by-hop headers per RFC 7230 §6.1 (including custom headers listed in `Connection`).
-/// 3. Unconditionally strips all known client-identity headers (anti-spoofing).
-/// 4. Sanitizes and manages `Forwarded` / `X-Forwarded-*` headers.
-/// 5. Injects JWT authorization tokens if configured for the upstream route.
-/// 6. Injects verified mTLS identity headers if (and only if) `client_cert_forwarding` is enabled.
+/// 3. Strips all client-identity and proxy-forwarding headers via prefix/exact matching (`S-05`).
+/// 4. Enforces per-route credential isolation (`Authorization` / `Cookie` / `strip_cookie_names`)
+///    and optional strict header allowlisting (`forward_headers`).
+/// 5. Authoritatively sets `Max-Forwards`, `X-Real-IP`, and `X-Forwarded-*` headers.
+/// 6. Injects upstream JWT authorization tokens if configured via `[Server.RouterParams].jwt`.
+/// 7. Injects verified mTLS identity headers if (and only if) `client_cert_forwarding` is enabled.
 pub fn prepare_proxy_headers(
     original_headers: &mut hyper::HeaderMap,
     server_name: &str,
     jwt_token: Option<&hyper::header::HeaderValue>,
     extensions: &hyper::http::Extensions,
     config: &ServerConfig,
+    policy: &RouteHeaderPolicy,
 ) -> Result<(), Box<Response<ServiceRespBody>>> {
-    // 1. Loop Detection
-    let mut max_forwards = 10;
+    // 1. Loop Detection (evaluate before allowlist filtering; insert decremented value afterwards)
+    let mut max_forwards = 10u8;
     if let Some(mf_val) = original_headers.get(header::MAX_FORWARDS)
         && let Ok(mf_str) = mf_val.to_str()
-            && let Ok(mut mf) = mf_str.parse::<u8>() {
-                if mf == 0 {
-                    warn!("{}: Max-Forwards reached 0, Loop Detected!", server_name);
-                    return Err(Box::new(build_error_response(
-                        "Loop Detected",
-                        StatusCode::LOOP_DETECTED,
-                    )));
-                }
-                mf -= 1;
-                max_forwards = mf;
-            }
-    original_headers.insert(
-        header::MAX_FORWARDS,
-        header::HeaderValue::from(max_forwards as u16),
-    );
+        && let Ok(mut mf) = mf_str.parse::<u8>()
+    {
+        if mf == 0 {
+            warn!("{}: Max-Forwards reached 0, Loop Detected!", server_name);
+            return Err(Box::new(build_error_response(
+                "Loop Detected",
+                StatusCode::LOOP_DETECTED,
+            )));
+        }
+        mf -= 1;
+        max_forwards = mf;
+    }
 
     // 2. Strip Hop-by-Hop headers (including headers named in Connection header, RFC 7230 §6.1)
     let custom_hops: HeaderVec<6> = if let Some(conn_val) = original_headers.get(header::CONNECTION) {
@@ -129,36 +204,46 @@ pub fn prepare_proxy_headers(
         original_headers.remove(h);
     }
 
-    // 3. Unconditionally strip all known identity headers to prevent identity spoofing
-    for hdr_name in &IDENTITY_HEADER_NAMES {
-        original_headers.remove(hdr_name);
+    // 3. Strip untrusted identity/forwarding headers, credentials (`Authorization`/`Cookie`),
+    //    and non-allowlisted headers (when `forward_headers` allowlist is active).
+    let allow_client_auth =
+        !policy.strip_authorization || policy.preserve_authorization_for_subtargets;
+    let allow_client_cookie = !policy.strip_cookies || policy.preserve_cookies_for_subtargets;
+
+    let headers_to_strip: SmallVec<[header::HeaderName; 16]> = original_headers
+        .keys()
+        .filter(|name| {
+            if is_identity_like(name) || is_configured_cert_forwarding_header(name, config) {
+                return true;
+            }
+            let n = name.as_str();
+            if n == header::AUTHORIZATION.as_str() {
+                return !allow_client_auth;
+            }
+            if n == header::COOKIE.as_str() {
+                return !allow_client_cookie;
+            }
+            if let Some(allowlist) = &policy.forward_headers {
+                return !is_essential_wire_header(name) && !allowlist.contains(n);
+            }
+            false
+        })
+        .cloned()
+        .collect();
+    for h in &headers_to_strip {
+        original_headers.remove(h);
     }
 
-    // Also strip any custom header names configured for this server
-    if let Some(forward_config) = &config.client_cert_forwarding {
-        if let Some(h) = &forward_config.header_cert {
-            original_headers.remove(h.as_str());
-        }
-        if let Some(h) = &forward_config.header_san {
-            original_headers.remove(h.as_str());
-        }
-        if let Some(h) = &forward_config.header_roles {
-            original_headers.remove(h.as_str());
-        }
-        if let Some(h) = &forward_config.header_client_ip {
-            original_headers.remove(h.as_str());
-        }
+    if !policy.strip_cookie_names.is_empty() {
+        filter_cookie_header(original_headers, &policy.strip_cookie_names);
     }
 
-    // 4. Sanitize and manage Forwarded / X-Forwarded-* headers
-    // Unconditionally strip client-supplied forwarding headers at the edge proxy to prevent spoofing
-    original_headers.remove(header::HeaderName::from_static("forwarded"));
-    original_headers.remove(header::HeaderName::from_static("x-forwarded-for"));
-    original_headers.remove(header::HeaderName::from_static("x-real-ip"));
-    original_headers.remove(header::HeaderName::from_static("x-forwarded-host"));
-    original_headers.remove(header::HeaderName::from_static("x-forwarded-proto"));
+    // 4. Authoritatively set Max-Forwards and Client IP / Forwarded headers
+    original_headers.insert(
+        header::MAX_FORWARDS,
+        header::HeaderValue::from(max_forwards as u16),
+    );
 
-    // Authoritatively set Client IP headers from verified socket / PROXY-v2 address
     if let Some(addr) = extensions.get::<std::net::SocketAddr>()
         && !addr.ip().is_unspecified() {
             let ip_str = addr.ip().to_string();
@@ -348,24 +433,79 @@ mod tests {
     #[test]
     fn test_untrusted_identity_headers_stripped_without_forwarding_config() {
         let mut headers = hyper::HeaderMap::new();
-        headers.insert("x-client-cert", header::HeaderValue::from_static("fake-cert"));
-        headers.insert("x-client-san", header::HeaderValue::from_static("fake-admin"));
-        headers.insert("x-client-roles", header::HeaderValue::from_static("Admin"));
-        headers.insert("x-ssl-client-cert", header::HeaderValue::from_static("fake-ssl"));
-        headers.insert("x-user-roles", header::HeaderValue::from_static("SuperAdmin"));
-        headers.insert("forwarded", header::HeaderValue::from_static("for=1.2.3.4"));
+        for name in [
+            "x-client-cert",
+            "x-client-san",
+            "x-client-roles",
+            "x-ssl-client-cert",
+            "x-user-roles",
+            "forwarded",
+            "x-forwarded-user",
+            "x-forwarded-email",
+            "x-forwarded-groups",
+            "x-remote-user",
+            "remote-user",
+            "x-user-id",
+            "x-user",
+            "x-auth-request-user",
+            "x-auth-request-email",
+            "x-authenticated-user",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-original-url",
+            "x-rewrite-url",
+        ] {
+            headers.insert(
+                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                header::HeaderValue::from_static("spoofed"),
+            );
+        }
 
         let config = make_test_config(None);
         let extensions = hyper::http::Extensions::new();
+        let policy = RouteHeaderPolicy::default();
 
-        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
 
-        assert!(!headers.contains_key("x-client-cert"));
-        assert!(!headers.contains_key("x-client-san"));
-        assert!(!headers.contains_key("x-client-roles"));
-        assert!(!headers.contains_key("x-ssl-client-cert"));
-        assert!(!headers.contains_key("x-user-roles"));
-        assert!(!headers.contains_key("forwarded"));
+        for name in [
+            "x-client-cert",
+            "x-client-san",
+            "x-client-roles",
+            "x-ssl-client-cert",
+            "x-user-roles",
+            "forwarded",
+            "x-forwarded-user",
+            "x-forwarded-email",
+            "x-forwarded-groups",
+            "x-remote-user",
+            "remote-user",
+            "x-user-id",
+            "x-user",
+            "x-auth-request-user",
+            "x-auth-request-email",
+            "x-authenticated-user",
+            "true-client-ip",
+            "cf-connecting-ip",
+            "x-forwarded-port",
+            "x-forwarded-prefix",
+            "x-original-url",
+            "x-rewrite-url",
+        ] {
+            assert!(
+                !headers.contains_key(name),
+                "identity header '{name}' must be stripped"
+            );
+        }
     }
 
     #[test]
@@ -380,8 +520,17 @@ mod tests {
         let mut extensions = hyper::http::Extensions::new();
         let peer_addr: std::net::SocketAddr = "192.168.1.100:54321".parse().unwrap();
         extensions.insert(peer_addr);
+        let policy = RouteHeaderPolicy::default();
 
-        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
 
         assert_eq!(headers.get("x-real-ip").unwrap(), "192.168.1.100");
         assert_eq!(headers.get("x-forwarded-for").unwrap(), "192.168.1.100");
@@ -400,8 +549,17 @@ mod tests {
         let mut extensions = hyper::http::Extensions::new();
         let unspec_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
         extensions.insert(unspec_addr);
+        let policy = RouteHeaderPolicy::default();
 
-        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
 
         assert!(!headers.contains_key("x-forwarded-for"));
         assert!(!headers.contains_key("x-real-ip"));
@@ -429,13 +587,195 @@ mod tests {
         extensions.insert(Arc::new(vec![UserRole("Operator".to_string())]));
         let peer_addr: std::net::SocketAddr = "10.10.10.1:12345".parse().unwrap();
         extensions.insert(peer_addr);
+        let policy = RouteHeaderPolicy::default();
 
-        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config).unwrap();
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
 
         assert_eq!(headers.get("x-client-cert").unwrap(), "VERIFIED_PEM");
         assert_eq!(headers.get("x-client-san").unwrap(), "alice@praeco.internal");
         assert_eq!(headers.get("x-client-roles").unwrap(), "Operator");
         assert_eq!(headers.get("x-client-ip").unwrap(), "10.10.10.1");
+    }
+
+    #[test]
+    fn test_default_policy_strips_authorization_and_cookie_unless_router_jwt_set() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer gateway-user-jwt"),
+        );
+        headers.insert(
+            header::COOKIE,
+            header::HeaderValue::from_static("admin-jwt=secret; app_sid=abc"),
+        );
+        headers.insert("x-request-id", header::HeaderValue::from_static("req-123"));
+
+        let config = make_test_config(None);
+        let extensions = hyper::http::Extensions::new();
+        let policy = RouteHeaderPolicy::default();
+
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
+
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+        assert!(!headers.contains_key(header::COOKIE));
+        assert_eq!(headers.get("x-request-id").unwrap(), "req-123");
+
+        // When RouterParams.jwt is configured, authoritative backend JWT is injected
+        let mut headers_with_jwt = hyper::HeaderMap::new();
+        headers_with_jwt.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer client-jwt"),
+        );
+        let upstream_jwt = header::HeaderValue::from_static("Bearer upstream-service-jwt");
+        prepare_proxy_headers(
+            &mut headers_with_jwt,
+            "test_server",
+            Some(&upstream_jwt),
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            headers_with_jwt.get(header::AUTHORIZATION).unwrap(),
+            "Bearer upstream-service-jwt"
+        );
+    }
+
+    #[test]
+    fn test_selective_cookie_and_authorization_forwarding() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            header::HeaderValue::from_static("Bearer forwarded-client-token"),
+        );
+        headers.append(
+            header::COOKIE,
+            header::HeaderValue::from_static("theme=dark; admin-jwt=topsecret"),
+        );
+        headers.append(
+            header::COOKIE,
+            header::HeaderValue::from_static("csrf=xyz; extra_secret=nope"),
+        );
+
+        let config = make_test_config(None);
+        let extensions = hyper::http::Extensions::new();
+        let mut strip_names = HashSet::new();
+        strip_names.insert("admin-jwt".to_string());
+        strip_names.insert("extra_secret".to_string());
+
+        let policy = RouteHeaderPolicy {
+            strip_authorization: false,
+            strip_cookies: false,
+            strip_cookie_names: strip_names.clone(),
+            forward_headers: None,
+            preserve_authorization_for_subtargets: false,
+            preserve_cookies_for_subtargets: false,
+        };
+
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer forwarded-client-token"
+        );
+        assert_eq!(headers.get(header::COOKIE).unwrap(), "theme=dark; csrf=xyz");
+
+        // If all cookies match strip_cookie_names, the Cookie header is removed completely
+        let mut only_secret = hyper::HeaderMap::new();
+        only_secret.insert(
+            header::COOKIE,
+            header::HeaderValue::from_static("admin-jwt=topsecret"),
+        );
+        prepare_proxy_headers(
+            &mut only_secret,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
+        assert!(!only_secret.contains_key(header::COOKIE));
+    }
+
+    #[test]
+    fn test_forward_headers_allowlist_drops_unlisted_headers_and_preserves_wire_headers() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(header::HOST, header::HeaderValue::from_static("api.example.com"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert("x-request-id", header::HeaderValue::from_static("req-42"));
+        headers.insert("x-custom-secret", header::HeaderValue::from_static("leak"));
+        headers.insert(
+            header::USER_AGENT,
+            header::HeaderValue::from_static("curl/8.0"),
+        );
+        headers.insert("x-forwarded-user", header::HeaderValue::from_static("evil"));
+
+        let config = make_test_config(None);
+        let mut extensions = hyper::http::Extensions::new();
+        extensions.insert::<std::net::SocketAddr>("192.0.2.5:1234".parse().unwrap());
+
+        let mut allowlist = HashSet::new();
+        allowlist.insert("x-request-id".to_string());
+        // Even if misconfigured with an identity header, is_identity_like always takes precedence
+        allowlist.insert("x-forwarded-user".to_string());
+
+        let policy = RouteHeaderPolicy {
+            strip_authorization: true,
+            strip_cookies: true,
+            strip_cookie_names: HashSet::new(),
+            forward_headers: Some(allowlist),
+            preserve_authorization_for_subtargets: false,
+            preserve_cookies_for_subtargets: false,
+        };
+
+        prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(headers.get(header::HOST).unwrap(), "api.example.com");
+        assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(headers.get("x-request-id").unwrap(), "req-42");
+        assert!(headers.contains_key(header::MAX_FORWARDS));
+        assert_eq!(headers.get("x-real-ip").unwrap(), "192.0.2.5");
+        assert_eq!(headers.get("x-forwarded-proto").unwrap(), "https");
+        assert!(!headers.contains_key("x-custom-secret"));
+        assert!(!headers.contains_key(header::USER_AGENT));
+        assert!(!headers.contains_key("x-forwarded-user"));
     }
 
     #[test]

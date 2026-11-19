@@ -531,7 +531,12 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 | `max_retry_buffer_bytes` | Integer | Optional | `65536` (64 KiB) | Maximum request body size buffered in RAM for automatic retries on idempotent requests. Payloads exceeding this cap seamlessly stream (`PrefixedStreamBody`) without buffering the full upload in memory. |
 | `max_request_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum incoming request body size buffered in RAM for buffered-only routes (`grpc_transcoding` and `aggregate`). Must be `> 0`. Exceeding payloads are rejected with `413 Payload Too Large`. |
 | `max_response_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum response body size buffered in RAM for `grpc_transcoding` routes or cumulatively across all fan-out sub-targets of an `aggregate` route (additionally bounded by the 256 MiB process-wide response buffer budget). Must be `> 0`. |
-| `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Polling interval in seconds. Proactively pings `/health` (REST) or gRPC `health` method. Expected score payload: `{"score": 100}` (REST) or field tag 1 integer (gRPC). Score 0 quarantines node. |
+| `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Polling interval in seconds. Proactively pings `/health` (REST) or gRPC `health` method (request and 64 KiB body read share a 5 s timeout). Expected score payload: `{"score": 100}` (REST) or field tag 1 integer (gRPC). Score 0 quarantines node. |
+| `strip_authorization` | Boolean | Optional | `true` | Strips the client-supplied `Authorization` header before forwarding to upstream unless overridden by `[Server.RouterParams].jwt`, `forward_authorization = true`, or `"authorization"` in `forward_headers`. Contradicting `forward_authorization = true` is rejected at startup. |
+| `forward_authorization` | Boolean | Optional | `false` | Explicit opt-in to forward the client's `Authorization` header to upstream (ignored/overwritten if `[Server.RouterParams].jwt` is configured). |
+| `strip_cookies` | Boolean | Optional | `true` | Strips the entire client `Cookie` header before forwarding to upstream (automatically `false` if `strip_cookie_names` is non-empty or `"cookie"` is in `forward_headers`). |
+| `strip_cookie_names` | Array of Strings | Optional | `[]` | Specific cookie names to strip from `Cookie` headers while forwarding remaining cookies (automatically includes `[Server.Layers.JWT].cookie_fallback` when configured). Contradicting `strip_cookies = true` is rejected. |
+| `forward_headers` | Array of Strings | Optional | `None` (All non-identity) | Optional strict allowlist of client header names (case-insensitive) for sensitive upstreams (e.g. `["accept", "x-request-id"]`). When set, all unlisted headers except essential HTTP/gRPC wire-framing headers (`host`, `content-type`, `content-length`, `content-encoding`, `accept-encoding`, `te`, `grpc-*`) and Praeco-injected headers (`X-Forwarded-*`, `X-Real-IP`, `Max-Forwards`, `client_cert_forwarding`) are stripped. Hop-by-hop and identity-spoofing headers (`x-forwarded-*`, `x-auth-*`, `x-authenticated-*`, `x-remote-*`, `x-user*`, `x-client-*`, `x-ssl-*`, `ssl-client-*`, `x-original-*`, `x-rewrite-*`, `remote-*`, `true-client-ip`, `cf-connecting-ip`) are always stripped. |
 
 #### Upstream Connection Parameters (`[Server.RouterParams]`)
 
@@ -699,7 +704,7 @@ payload_mode = "keyed"          # "keyed" (default) or "broadcast"
 expose_upstream_errors = false  # default: sanitized HTTP reason phrases only
 deadline_ms = 2000              # optional route-wide deadline
 max_request_bytes = 1048576     # optional request cap (default: 4 MiB)
-max_response_bytes = 8388608    # optional cumulative response cap (default: 16 MiB)
+max_response_bytes = 8388608    # optional cumulative response cap (default: 4 MiB)
 allowed_roles = ["Admin", "Seller"]
 
 [[Server.ReverseRoutes."/api/dashboard".targets]]

@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Global 256 MiB Response Buffer Budget & 4 MiB Per-Route Default (`src/configuration/mod.rs`, `src/middleware/router/mod.rs`, `src/middleware/router/grpc_web.rs`, `src/middleware/router/aggregator/mod.rs`):**
   * Lowered `DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES` from 16 MiB to 4 MiB (`4 * 1024 * 1024`) and wired `route_info.max_response_bytes` into `grpc_transcoding` routes (`handle_grpc_web_with_limit`).
   * Added a lock-free process-wide 256 MiB `BufferBudget` (`DEFAULT_GLOBAL_RESPONSE_BUFFER_BUDGET_BYTES`) with RAII `BufferReservation` and `BudgetedBytesBody` / `ChunkedBytesBody` incremental release across `grpc_web` and `aggregator`, shedding excess buffered memory load with `503 Service Unavailable` without penalizing upstream circuit breakers.
+* **Upstream Header Policy, Credential Isolation & Health-Probe Body Timeout (`src/configuration/mod.rs`, `src/middleware/router/headers.rs`, `src/middleware/router/mod.rs`, `src/runner.rs`):**
+  * Replaced the fixed 28-header identity denylist in `headers::prepare_proxy_headers` with prefix/exact matching (`is_identity_like`: `x-forwarded-*`, `x-auth-*`, `x-authenticated-*`, `x-remote-*`, `x-user*`, `x-client-*`, `x-ssl-*`, `ssl-client-*`, `x-original-*`, `x-rewrite-*`, `remote-*`, `true-client-ip`, `cf-connecting-ip`, etc.) before authoritative header injection.
+  * Added `RouteHeaderPolicy` on `ParsedRoute` and per-route `RouteConfig` fields (`strip_authorization`, `forward_authorization`, `strip_cookies`, `strip_cookie_names`, `forward_headers`) stripping client `Authorization` and `Cookie` headers by default (with automatic `[Server.Layers.JWT].cookie_fallback` redaction when selective cookie forwarding is enabled), rejecting contradictory configs at startup, and preserving per-target `forward_headers` opt-ins on `aggregate` routes.
+  * Extracted `execute_health_probe` in `src/runner.rs` so both `client.request(req)` and the bounded (`64 KiB`) health-check response body read run inside the shared 5-second timeout (`ACTIVE_HEALTH_CHECK_TIMEOUT`).
 
 ---
 

@@ -1013,6 +1013,7 @@ mod tests {
             aggregate_deadline_ms: None,
             max_request_bytes: crate::configuration::DEFAULT_MAX_BUFFERED_REQUEST_BYTES,
             max_response_bytes: crate::configuration::DEFAULT_MAX_AGGREGATE_RESPONSE_BYTES,
+            header_policy: crate::configuration::RouteHeaderPolicy::default(),
         };
 
         let toml_str = r#"

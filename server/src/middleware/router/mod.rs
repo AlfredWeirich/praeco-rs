@@ -492,6 +492,7 @@ impl Service<Request<SrvBody>> for RouterService {
                 jwt_token.as_ref(),
                 &parts.extensions,
                 &self_clone.config,
+                &route_info.header_policy,
             ) {
                 return Ok(*err_resp);
             }

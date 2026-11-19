@@ -1730,3 +1730,156 @@ async fn test_grpc_request_blocked_by_ip_filter_returns_grpc_trailers_only_statu
     server_task2.abort();
     cancel_token.cancel();
 }
+
+#[tokio::test]
+async fn test_router_header_policy_and_credential_stripping_end_to_end() {
+    use hyper::header;
+    use tokio::sync::Mutex;
+
+    ensure_crypto_provider();
+
+    let spawn_capture_upstream = || async {
+        let captured: Arc<Mutex<Vec<hyper::HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured = captured_clone.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let captured = captured.clone();
+                        async move {
+                            captured.lock().await.push(req.headers().clone());
+                            Ok::<_, hyper::Error>(hyper::Response::new(Full::new(Bytes::from_static(
+                                b"{\"ok\":true}",
+                            ))))
+                        }
+                    });
+                    let _ = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+                });
+            }
+        });
+        (port, captured)
+    };
+
+    let (default_port, default_captured) = spawn_capture_upstream().await;
+    let (custom_port, custom_captured) = spawn_capture_upstream().await;
+
+    let toml_cfg = format!(
+        r#"
+        [[Server]]
+        name = "HeaderPolicyRouter"
+        ip = "127.0.0.1"
+        port = 8080
+        protocol = "http"
+        service = "Router"
+        authentication = "None"
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+
+        [Server.ReverseRoutes."/strict"]
+        upstreams = ["http://127.0.0.1:{default_port}"]
+
+        [Server.ReverseRoutes."/selective"]
+        upstreams = ["http://127.0.0.1:{custom_port}"]
+        forward_authorization = true
+        strip_cookie_names = ["admin-jwt"]
+        forward_headers = ["x-request-id"]
+
+        [Server.Layers]
+        enabled = ["TraceId"]
+    "#
+    );
+
+    let server_config = parse_server_config(&toml_cfg);
+    let stack = build_service_stack(&server_config).expect("build_service_stack must succeed");
+    let cancel_token = CancellationToken::new();
+    let peer_addr: SocketAddr = "198.51.100.77:51000".parse().unwrap();
+    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    let send_req = |uri: &'static str| {
+        let stack = stack.clone();
+        let oid_mapping = oid_mapping.clone();
+        let srv_token = cancel_token.clone();
+        async move {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let handler = ConnectionHandler::new(
+                    stack,
+                    peer_addr,
+                    Vec::new(),
+                    None,
+                    None,
+                    oid_mapping,
+                );
+                serve_http_connection(server_io, handler, srv_token).await;
+            });
+
+            let (mut sender, conn) =
+                hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+                    .await
+                    .expect("HTTP/1.1 handshake");
+            let conn_task = tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::HOST, "gateway.example")
+                .header(header::AUTHORIZATION, "Bearer secret-client-token")
+                .header(header::COOKIE, "admin-jwt=secret-jwt; app_sid=42")
+                .header("x-request-id", "req-007")
+                .header("x-unallowed-custom", "drop-me")
+                .header("x-forwarded-user", "spoofed-admin")
+                .header("remote-user", "spoofed-root")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("send request");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let _ = resp.into_body().collect().await.unwrap();
+
+            drop(sender);
+            let _ = conn_task.await;
+            server_task.abort();
+        }
+    };
+
+    // 1. Default route: Authorization, Cookie, and spoofed identity headers must be stripped.
+    send_req("/strict/items").await;
+    let strict_hdrs = default_captured.lock().await.pop().unwrap();
+    assert!(!strict_hdrs.contains_key(header::AUTHORIZATION));
+    assert!(!strict_hdrs.contains_key(header::COOKIE));
+    assert!(!strict_hdrs.contains_key("x-forwarded-user"));
+    assert!(!strict_hdrs.contains_key("remote-user"));
+    assert_eq!(strict_hdrs.get("x-request-id").unwrap(), "req-007");
+    assert_eq!(strict_hdrs.get("x-unallowed-custom").unwrap(), "drop-me");
+    assert_eq!(strict_hdrs.get("x-real-ip").unwrap(), "198.51.100.77");
+
+    // 2. Selective route: Authorization allowed, admin-jwt cookie stripped while app_sid preserved,
+    //    forward_headers allowlist preserves x-request-id and drops x-unallowed-custom.
+    send_req("/selective/items").await;
+    let sel_hdrs = custom_captured.lock().await.pop().unwrap();
+    assert_eq!(
+        sel_hdrs.get(header::AUTHORIZATION).unwrap(),
+        "Bearer secret-client-token"
+    );
+    assert_eq!(sel_hdrs.get(header::COOKIE).unwrap(), "app_sid=42");
+    assert_eq!(sel_hdrs.get("x-request-id").unwrap(), "req-007");
+    assert!(!sel_hdrs.contains_key("x-unallowed-custom"));
+    assert!(!sel_hdrs.contains_key("x-forwarded-user"));
+    assert!(!sel_hdrs.contains_key("remote-user"));
+    assert_eq!(sel_hdrs.get("x-real-ip").unwrap(), "198.51.100.77");
+
+    cancel_token.cancel();
+}

@@ -588,6 +588,24 @@ pub struct RouteConfig {
     /// Maximum response bytes buffered in RAM for `grpc_transcoding` routes or cumulatively
     /// across all sub-targets of an `aggregate` route. Defaults to 4 MiB.
     pub max_response_bytes: Option<usize>,
+    /// Strip client-supplied `Authorization` header before forwarding to upstream (default: `true`).
+    /// Note that `[Server.RouterParams].jwt` always overrides `Authorization` if configured.
+    pub strip_authorization: Option<bool>,
+    /// Explicit opt-in to forward the client's `Authorization` header to upstream (default: `false`).
+    pub forward_authorization: Option<bool>,
+    /// Strip the entire client `Cookie` header before forwarding to upstream (default: `true` unless
+    /// `strip_cookie_names` is non-empty or `"cookie"` is listed in `forward_headers`).
+    pub strip_cookies: Option<bool>,
+    /// Specific cookie names to strip from incoming `Cookie` headers while keeping other cookies
+    /// (implies `strip_cookies = false` if `strip_cookies` is omitted).
+    #[serde(default)]
+    pub strip_cookie_names: Vec<String>,
+    /// Optional explicit allowlist of client header names forwarded to sensitive upstreams
+    /// (e.g. `["content-type", "accept", "x-request-id"]`). Case-insensitive.
+    /// Hop-by-hop and identity-spoofing headers are always stripped; essential HTTP/gRPC wire
+    /// framing headers and Praeco-injected headers remain preserved.
+    #[serde(default)]
+    pub forward_headers: Option<Vec<String>>,
 }
 
 /// Default maximum request body size buffered in RAM for `grpc_transcoding` and `aggregate` routes (4 MiB).
@@ -705,6 +723,39 @@ pub struct ParsedAggregateTarget {
     pub timeout_ms: Option<u64>,
 }
 
+/// Compiled per-route upstream header sanitization and credential policy (`S-05`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHeaderPolicy {
+    /// Strip client-supplied `Authorization` header unless `[Server.RouterParams].jwt` injects one.
+    pub strip_authorization: bool,
+    /// Strip the entire client `Cookie` header.
+    pub strip_cookies: bool,
+    /// Specific cookie names stripped from incoming `Cookie` headers when `strip_cookies` is `false`.
+    /// Automatically includes `[Server.Layers.JWT].cookie_fallback` when configured.
+    pub strip_cookie_names: HashSet<String>,
+    /// Optional explicit allowlist of lowercased client header names permitted through to the upstream.
+    pub forward_headers: Option<HashSet<String>>,
+    /// For `aggregate` routes: whether any sub-target explicitly opted into forwarding `authorization`
+    /// via `sub_target.forward_headers`.
+    pub preserve_authorization_for_subtargets: bool,
+    /// For `aggregate` routes: whether any sub-target explicitly opted into forwarding `cookie`
+    /// via `sub_target.forward_headers`.
+    pub preserve_cookies_for_subtargets: bool,
+}
+
+impl Default for RouteHeaderPolicy {
+    fn default() -> Self {
+        Self {
+            strip_authorization: true,
+            strip_cookies: true,
+            strip_cookie_names: HashSet::new(),
+            forward_headers: None,
+            preserve_authorization_for_subtargets: false,
+            preserve_cookies_for_subtargets: false,
+        }
+    }
+}
+
 /// A processed reverse-proxy route ready for use by the router.
 ///
 /// Created from [`RouteConfig`] during [`ServerConfig::finalize`].
@@ -731,6 +782,8 @@ pub struct ParsedRoute {
     pub max_request_bytes: usize,
     /// Maximum cumulative response bytes buffered across all sub-targets of an `aggregate` route.
     pub max_response_bytes: usize,
+    /// Compiled header & credential sanitization policy for upstream forwarding (`S-05`).
+    pub header_policy: RouteHeaderPolicy,
 }
 
 impl ParsedRoute {
@@ -2073,6 +2126,110 @@ impl ServerConfig {
         Ok(parsed)
     }
 
+    /// Compiles and validates the per-route upstream header sanitization policy (`S-05`).
+    fn build_route_header_policy(
+        prefix: &str,
+        cfg: &RouteConfig,
+        cookie_fallback: Option<&str>,
+        aggregate_targets: &[Arc<ParsedAggregateTarget>],
+    ) -> Result<RouteHeaderPolicy, Error> {
+        if cfg.strip_authorization == Some(true) && cfg.forward_authorization == Some(true) {
+            return Err(Error::msg(format!(
+                "Configuration error: Route '{}' sets both 'strip_authorization = true' and 'forward_authorization = true'.",
+                prefix
+            )));
+        }
+
+        let mut allowlist: Option<HashSet<String>> = None;
+        let mut allowlist_has_auth = false;
+        let mut allowlist_has_cookie = false;
+
+        if let Some(raw_headers) = &cfg.forward_headers {
+            let mut set = HashSet::with_capacity(raw_headers.len());
+            for raw in raw_headers {
+                let normalized = raw.trim().to_ascii_lowercase();
+                if normalized.is_empty()
+                    || hyper::header::HeaderName::from_bytes(normalized.as_bytes()).is_err()
+                {
+                    return Err(Error::msg(format!(
+                        "Configuration error: Route '{}' forward_headers contains invalid HTTP header name '{}'.",
+                        prefix, raw
+                    )));
+                }
+                if normalized == "authorization" {
+                    allowlist_has_auth = true;
+                } else if normalized == "cookie" {
+                    allowlist_has_cookie = true;
+                }
+                set.insert(normalized);
+            }
+            allowlist = Some(set);
+        }
+
+        if cfg.strip_authorization == Some(true) && allowlist_has_auth {
+            return Err(Error::msg(format!(
+                "Configuration error: Route '{}' sets 'strip_authorization = true' while also allowing 'authorization' in 'forward_headers'.",
+                prefix
+            )));
+        }
+
+        let mut strip_cookie_names = HashSet::new();
+        for raw_name in &cfg.strip_cookie_names {
+            let trimmed = raw_name.trim();
+            if trimmed.is_empty() {
+                return Err(Error::msg(format!(
+                    "Configuration error: Route '{}' strip_cookie_names must not contain empty cookie names.",
+                    prefix
+                )));
+            }
+            strip_cookie_names.insert(trimmed.to_string());
+        }
+
+        if cfg.strip_cookies == Some(true) && !strip_cookie_names.is_empty() {
+            return Err(Error::msg(format!(
+                "Configuration error: Route '{}' sets 'strip_cookies = true' together with non-empty 'strip_cookie_names'.",
+                prefix
+            )));
+        }
+        if cfg.strip_cookies == Some(true) && allowlist_has_cookie {
+            return Err(Error::msg(format!(
+                "Configuration error: Route '{}' sets 'strip_cookies = true' while also allowing 'cookie' in 'forward_headers'.",
+                prefix
+            )));
+        }
+
+        if let Some(cb) = cookie_fallback.map(str::trim).filter(|s| !s.is_empty()) {
+            strip_cookie_names.insert(cb.to_string());
+        }
+
+        let strip_authorization = match (cfg.strip_authorization, cfg.forward_authorization) {
+            (Some(false), _) | (_, Some(true)) => false,
+            (Some(true), _) => true,
+            (None, _) => !allowlist_has_auth,
+        };
+
+        let strip_cookies = match cfg.strip_cookies {
+            Some(v) => v,
+            None => cfg.strip_cookie_names.is_empty() && !allowlist_has_cookie,
+        };
+
+        let preserve_authorization_for_subtargets = aggregate_targets
+            .iter()
+            .any(|t| t.forward_headers.contains("authorization"));
+        let preserve_cookies_for_subtargets = aggregate_targets
+            .iter()
+            .any(|t| t.forward_headers.contains("cookie"));
+
+        Ok(RouteHeaderPolicy {
+            strip_authorization,
+            strip_cookies,
+            strip_cookie_names,
+            forward_headers: allowlist,
+            preserve_authorization_for_subtargets,
+            preserve_cookies_for_subtargets,
+        })
+    }
+
     /// Parses the raw reverse route configuration into structured [`ParsedRoute`] objects.
     ///
     /// Routes are sorted by prefix length (longest first) so that the most
@@ -2090,6 +2247,11 @@ impl ServerConfig {
                 Protocol::Https => "https",
                 Protocol::Http => "http",
             };
+            let cookie_fallback = self
+                .layers
+                .jwt_config
+                .as_ref()
+                .and_then(|j| j.cookie_fallback.as_deref());
 
             for (prefix, cfg) in map {
                 if cfg.deadline_ms == Some(0) {
@@ -2120,6 +2282,12 @@ impl ServerConfig {
                 if cfg.backend_type == RouteBackendType::Aggregate {
                     let aggregate_targets =
                         Self::parse_aggregate_targets(prefix, cfg, proto_str)?;
+                    let header_policy = Self::build_route_header_policy(
+                        prefix,
+                        cfg,
+                        cookie_fallback,
+                        &aggregate_targets,
+                    )?;
                     let empty_target = Self::build_route_target(
                         &[],
                         proto_str,
@@ -2141,6 +2309,7 @@ impl ServerConfig {
                         aggregate_deadline_ms: cfg.deadline_ms,
                         max_request_bytes,
                         max_response_bytes,
+                        header_policy,
                     });
                     continue;
                 }
@@ -2157,6 +2326,9 @@ impl ServerConfig {
                         prefix
                     )));
                 }
+
+                let header_policy =
+                    Self::build_route_header_policy(prefix, cfg, cookie_fallback, &[])?;
 
                 let target = Self::build_route_target(
                     &cfg.upstreams,
@@ -2180,6 +2352,7 @@ impl ServerConfig {
                     aggregate_deadline_ms: None,
                     max_request_bytes,
                     max_response_bytes,
+                    header_policy,
                 });
             }
         }

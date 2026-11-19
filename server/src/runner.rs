@@ -933,64 +933,47 @@ pub fn spawn_router_health_checks_in(
                                 continue;
                             };
 
-                            match tokio::time::timeout(Duration::from_secs(5), client.request(req)).await {
-                                Ok(Ok(resp)) => {
-                                    let resp_status = resp.status();
-                                    let is_ok = resp_status == StatusCode::OK;
-                                    let mut health_score_ok = true;
-
-                                    if is_ok && is_grpc && grpc_health_path.is_some() {
-                                        use http_body_util::Limited;
-                                        let limited_body = Limited::new(resp.into_body(), 64 * 1024);
-                                        if let Ok(collected) = limited_body.collect().await
-                                            && let Some(score) = parse_grpc_health_score(&collected.to_bytes())
-                                        {
-                                            target_arc.upstreams[idx]
-                                                .current_score
-                                                .store(score, std::sync::atomic::Ordering::Relaxed);
-                                            if score == 0 {
-                                                health_score_ok = false;
-                                            }
-                                        } else {
-                                            health_score_ok = false;
-                                        }
-                                    } else if is_ok && !is_grpc {
-                                        use http_body_util::Limited;
-                                        let limited_body = Limited::new(resp.into_body(), 64 * 1024);
-                                        if let Ok(collected) = limited_body.collect().await
-                                            && let Some(score) = parse_rest_health_score(&collected.to_bytes())
-                                        {
-                                            target_arc.upstreams[idx]
-                                                .current_score
-                                                .store(score, std::sync::atomic::Ordering::Relaxed);
-                                            if score == 0 {
-                                                health_score_ok = false;
-                                            }
-                                        } else {
-                                            health_score_ok = false;
-                                        }
-                                    }
-
-                                    if is_ok && health_score_ok {
-                                        let current_score = target_arc.upstreams[idx].current_score.load(std::sync::atomic::Ordering::Relaxed);
-                                        tracing::trace!("{}: Health check successful for '{}', score: {}", server_name, final_uri, current_score);
-                                        if !target_arc.upstreams[idx].is_alive.load(std::sync::atomic::Ordering::Relaxed) {
-                                            info!("{}: Health check recovered '{}'", server_name, final_uri);
-                                            target_arc.upstreams[idx].mark_alive();
-                                        }
-                                    } else {
-                                        record_health_check_failure(&target_arc.upstreams[idx], || {
-                                            tracing::warn!(
-                                                "{}: Health check failed status {} for '{}' (Score OK: {})",
-                                                server_name,
-                                                resp_status,
-                                                final_uri,
-                                                health_score_ok
-                                            );
-                                        });
+                            match execute_health_probe(
+                                &client,
+                                req,
+                                is_grpc,
+                                ACTIVE_HEALTH_CHECK_TIMEOUT,
+                            )
+                            .await
+                            {
+                                HealthProbeResult::Healthy(score) => {
+                                    target_arc.upstreams[idx]
+                                        .current_score
+                                        .store(score, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::trace!(
+                                        "{}: Health check successful for '{}', score: {}",
+                                        server_name,
+                                        final_uri,
+                                        score
+                                    );
+                                    if !target_arc.upstreams[idx]
+                                        .is_alive
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        info!("{}: Health check recovered '{}'", server_name, final_uri);
+                                        target_arc.upstreams[idx].mark_alive();
                                     }
                                 }
-                                Ok(Err(e)) => {
+                                HealthProbeResult::Unhealthy {
+                                    status,
+                                    health_score_ok,
+                                } => {
+                                    record_health_check_failure(&target_arc.upstreams[idx], || {
+                                        tracing::warn!(
+                                            "{}: Health check failed status {} for '{}' (Score OK: {})",
+                                            server_name,
+                                            status,
+                                            final_uri,
+                                            health_score_ok
+                                        );
+                                    });
+                                }
+                                HealthProbeResult::NetworkError(e) => {
                                     record_health_check_failure(&target_arc.upstreams[idx], || {
                                         tracing::warn!(
                                             "{}: Health check network error for '{}': {}",
@@ -1000,11 +983,12 @@ pub fn spawn_router_health_checks_in(
                                         );
                                     });
                                 }
-                                Err(_) => {
+                                HealthProbeResult::TimedOut => {
                                     record_health_check_failure(&target_arc.upstreams[idx], || {
                                         tracing::warn!(
-                                            "{}: Health check timed out after 5s for '{}'",
+                                            "{}: Health check timed out after {}s for '{}'",
                                             server_name,
+                                            ACTIVE_HEALTH_CHECK_TIMEOUT.as_secs(),
                                             final_uri
                                         );
                                     });
@@ -1015,6 +999,82 @@ pub fn spawn_router_health_checks_in(
                 }
             });
         }
+    }
+}
+
+/// Overall deadline covering both response headers and bounded body read of an active health probe (`P-04`).
+const ACTIVE_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum bytes buffered from an active health-check response body (`64 KiB`).
+const ACTIVE_HEALTH_CHECK_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Outcome of executing a single active health-check HTTP or gRPC probe within a bounded deadline.
+#[derive(Debug, PartialEq, Eq)]
+enum HealthProbeResult {
+    /// Upstream returned `200 OK` and a positive health score.
+    Healthy(usize),
+    /// Upstream returned a non-200 HTTP status, unreadable body, or score `0`.
+    Unhealthy {
+        status: StatusCode,
+        health_score_ok: bool,
+    },
+    /// Transport/HTTP failure while sending the request.
+    NetworkError(String),
+    /// Request headers or body read exceeded the probe deadline.
+    TimedOut,
+}
+
+/// Executes an active health-check request and bounded body read under one shared timeout (`P-04`).
+async fn execute_health_probe<B>(
+    client: &hyper_util::client::legacy::Client<
+        common::client::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        B,
+    >,
+    req: Request<B>,
+    is_grpc: bool,
+    timeout_duration: Duration,
+) -> HealthProbeResult
+where
+    B: http_body::Body + Send + 'static + Unpin,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let probe = async {
+        let resp = client.request(req).await.map_err(|e| e.to_string())?;
+        let resp_status = resp.status();
+        if resp_status != StatusCode::OK {
+            return Ok(HealthProbeResult::Unhealthy {
+                status: resp_status,
+                health_score_ok: true,
+            });
+        }
+
+        let limited_body =
+            http_body_util::Limited::new(resp.into_body(), ACTIVE_HEALTH_CHECK_MAX_BODY_BYTES);
+        let Ok(collected) = limited_body.collect().await else {
+            return Ok(HealthProbeResult::Unhealthy {
+                status: resp_status,
+                health_score_ok: false,
+            });
+        };
+        let bytes = collected.to_bytes();
+        let score_opt = if is_grpc {
+            parse_grpc_health_score(&bytes)
+        } else {
+            parse_rest_health_score(&bytes)
+        };
+        match score_opt {
+            Some(score) if score > 0 => Ok(HealthProbeResult::Healthy(score)),
+            _ => Ok(HealthProbeResult::Unhealthy {
+                status: resp_status,
+                health_score_ok: false,
+            }),
+        }
+    };
+
+    match tokio::time::timeout(timeout_duration, probe).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(err_msg)) => HealthProbeResult::NetworkError(err_msg),
+        Err(_) => HealthProbeResult::TimedOut,
     }
 }
 
@@ -2488,5 +2548,102 @@ mod tests {
             .await
             .expect("start_single_server_reloadable must not deadlock when reload_tx is dropped")
             .expect("server task must not panic");
+    }
+
+    #[tokio::test]
+    async fn test_execute_health_probe_times_out_on_stalled_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        ensure_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Upstream immediately returns 200 OK headers with partial body, then stalls indefinitely.
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{\"score")
+                .await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let client = common::client::build_hyper_client(
+            tls_config,
+            common::client::ClientPoolConfig::default(),
+        );
+        let req = Request::builder()
+            .method(hyper::Method::GET)
+            .uri(format!("http://127.0.0.1:{}/health", port))
+            .body(http_body_util::Empty::<bytes::Bytes>::new().map_err(|e| match e {}).boxed())
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = execute_health_probe(&client, req, false, Duration::from_millis(120)).await;
+        assert_eq!(outcome, HealthProbeResult::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "slowloris health body must abort cleanly at probe timeout"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_execute_health_probe_evaluates_rest_score_and_zero_score() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        ensure_crypto_provider();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            for body in [r#"{"score": 85}"#, r#"{"score": 0}"#] {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut req_buf = [0u8; 1024];
+                    let _ = socket.read(&mut req_buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            }
+        });
+
+        let root_store = rustls::RootCertStore::empty();
+        let tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let client = common::client::build_hyper_client(
+            tls_config,
+            common::client::ClientPoolConfig::default(),
+        );
+
+        let make_req = || {
+            Request::builder()
+                .method(hyper::Method::GET)
+                .uri(format!("http://127.0.0.1:{}/health", port))
+                .body(http_body_util::Empty::<bytes::Bytes>::new().map_err(|e| match e {}).boxed())
+                .unwrap()
+        };
+
+        assert_eq!(
+            execute_health_probe(&client, make_req(), false, Duration::from_secs(2)).await,
+            HealthProbeResult::Healthy(85)
+        );
+        assert_eq!(
+            execute_health_probe(&client, make_req(), false, Duration::from_secs(2)).await,
+            HealthProbeResult::Unhealthy {
+                status: StatusCode::OK,
+                health_score_ok: false,
+            }
+        );
     }
 }

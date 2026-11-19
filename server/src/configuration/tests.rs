@@ -1082,3 +1082,114 @@ enabled = []
             "__Host- cookie paired with cookie_domain must be rejected in finalize()"
         );
     }
+
+    #[test]
+    fn test_route_header_policy_defaults_overrides_and_contradiction_checks() {
+        let valid_toml = r#"
+            name = "header_policy_router"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            service = "Router"
+            [Layers]
+            enabled = []
+            [Layers.JWT]
+            jwt_public_keys = []
+            expected_issuer = "idp"
+            expected_audience = "api"
+            cookie_fallback = "admin-jwt"
+
+            [ReverseRoutes."/default"]
+            upstreams = ["http://127.0.0.1:9001"]
+
+            [ReverseRoutes."/custom"]
+            upstreams = ["http://127.0.0.1:9002"]
+            forward_authorization = true
+            strip_cookie_names = ["csrf_secret"]
+            forward_headers = ["X-Request-Id", "Accept"]
+        "#;
+        let mut srv: ServerConfig = toml::from_str(valid_toml).unwrap();
+        srv.finalize().unwrap();
+
+        let default_route = srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/default")
+            .unwrap();
+        assert!(default_route.header_policy.strip_authorization);
+        assert!(default_route.header_policy.strip_cookies);
+        assert!(
+            default_route
+                .header_policy
+                .strip_cookie_names
+                .contains("admin-jwt")
+        );
+        assert!(default_route.header_policy.forward_headers.is_none());
+
+        let custom_route = srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/custom")
+            .unwrap();
+        assert!(!custom_route.header_policy.strip_authorization);
+        assert!(!custom_route.header_policy.strip_cookies);
+        assert!(
+            custom_route
+                .header_policy
+                .strip_cookie_names
+                .contains("csrf_secret")
+        );
+        assert!(
+            custom_route
+                .header_policy
+                .strip_cookie_names
+                .contains("admin-jwt")
+        );
+        let allowlist = custom_route.header_policy.forward_headers.as_ref().unwrap();
+        assert!(allowlist.contains("x-request-id"));
+        assert!(allowlist.contains("accept"));
+
+        let contradictory_auth = r#"
+            name = "bad_auth"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Router"
+            [Layers]
+            enabled = []
+            [ReverseRoutes."/"]
+            upstreams = ["http://127.0.0.1:9001"]
+            strip_authorization = true
+            forward_authorization = true
+        "#;
+        let mut s1: ServerConfig = toml::from_str(contradictory_auth).unwrap();
+        assert!(s1.finalize().is_err());
+
+        let contradictory_cookies = r#"
+            name = "bad_cookies"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Router"
+            [Layers]
+            enabled = []
+            [ReverseRoutes."/"]
+            upstreams = ["http://127.0.0.1:9001"]
+            strip_cookies = true
+            strip_cookie_names = ["sid"]
+        "#;
+        let mut s2: ServerConfig = toml::from_str(contradictory_cookies).unwrap();
+        assert!(s2.finalize().is_err());
+
+        let invalid_header_name = r#"
+            name = "bad_hdr"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Router"
+            [Layers]
+            enabled = []
+            [ReverseRoutes."/"]
+            upstreams = ["http://127.0.0.1:9001"]
+            forward_headers = ["invalid header"]
+        "#;
+        let mut s3: ServerConfig = toml::from_str(invalid_header_name).unwrap();
+        assert!(s3.finalize().is_err());
+    }
