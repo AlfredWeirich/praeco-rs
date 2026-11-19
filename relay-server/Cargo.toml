@@ -2,6 +2,7 @@
 name = "praeco-relay-server"
 version = "0.3.3"
 edition.workspace = true
+rust-version.workspace = true
 description = "Zero-Trust Layer-4 SNI Relay and Reverse Tunnel Server with mTLS SAN routing, Yamux multiplexing, E2EE TLS passthrough, and PROXY Protocol v2"
 license.workspace = true
 authors.workspace = true
@@ -9,6 +10,9 @@ repository.workspace = true
 
 keywords = ["relay", "tunnel", "zero-trust", "mtls", "sni-routing"]
 categories = ["network-programming", "cryptography", "authentication", "asynchronous"]
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = { workspace = true }

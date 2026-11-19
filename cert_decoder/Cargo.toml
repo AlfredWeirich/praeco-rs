@@ -2,6 +2,7 @@
 name = "praeco-cert-decoder"
 version = "0.5.0"
 edition.workspace = true
+rust-version.workspace = true
 description = "Certificate decoder utility for praeco-rs"
 license.workspace = true
 authors.workspace = true
@@ -10,6 +11,9 @@ repository.workspace = true
 
 keywords = ["x509", "certificates", "san", "decoder", "cli"]
 categories = ["command-line-utilities", "cryptography"]
+
+[lints]
+workspace = true
 
 [dependencies]
 asn1-rs = { workspace = true, features = ["bigint"] }

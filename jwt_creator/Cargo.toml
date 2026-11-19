@@ -2,6 +2,7 @@
 name = "praeco-jwt-creator"
 version = "0.5.0"
 edition.workspace = true
+rust-version.workspace = true
 description = "JWT generation utility for praeco-rs"
 license.workspace = true
 authors.workspace = true
@@ -10,6 +11,9 @@ repository.workspace = true
 
 keywords = ["jwt", "eddsa", "ed25519", "tokens", "cli"]
 categories = ["command-line-utilities", "cryptography", "authentication"]
+
+[lints]
+workspace = true
 
 [dependencies]
 common = { workspace = true, default-features = false, features = ["jwt"] }

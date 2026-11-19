@@ -2,6 +2,7 @@
 name = "praeco-common"
 version = "0.5.1"
 edition.workspace = true
+rust-version.workspace = true
 description = "Shared HTTP/TLS client utilities for praeco-rs"
 license.workspace = true
 authors.workspace = true
@@ -10,6 +11,9 @@ repository.workspace = true
 
 keywords = ["praeco", "tls", "jwt", "crypto", "utilities"]
 categories = ["cryptography", "authentication", "network-programming"]
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
