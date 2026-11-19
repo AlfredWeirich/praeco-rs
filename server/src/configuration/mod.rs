@@ -1009,6 +1009,18 @@ impl std::fmt::Debug for RouterParams {
     }
 }
 
+/// Behavior when the IdP dynamic claims webhook call fails or times out (`Q-06`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WebhookFailurePolicy {
+    /// Fail closed: reject the login/token request with `503 Service Unavailable` (default).
+    #[default]
+    Reject,
+    /// Fail open: fall back to static roles/OIDs extracted from the client certificate.
+    FallbackToCert,
+}
+
 /// Parameters for the Identity Provider (IdP) service.
 ///
 /// Controls how the IdP issues tokens and manages sessions.
@@ -1050,9 +1062,9 @@ pub struct IdpParams {
     /// Timeout for the webhook HTTP call in milliseconds (default: 3000).
     #[serde(default = "default_webhook_timeout")]
     pub claims_webhook_timeout_ms: u64,
-    /// Behavior when the webhook call fails ("fallback_to_cert" or "reject").
-    #[serde(default = "default_on_webhook_failure")]
-    pub on_webhook_failure: String,
+    /// Behavior when the webhook call fails (`"reject"` or `"fallback_to_cert"`).
+    #[serde(default)]
+    pub on_webhook_failure: WebhookFailurePolicy,
     /// Path to client certificate PEM for mTLS authentication to the webhook endpoint.
     pub claims_webhook_client_cert: Option<String>,
     /// Path to client private key for mTLS authentication to the webhook endpoint.
@@ -1067,7 +1079,6 @@ fn default_cookie_name() -> String { "__Host-jwt".to_string() }
 fn default_redirect() -> String { "/".to_string() }
 fn default_issuer() -> String { "praeco-idp".to_string() }
 fn default_webhook_timeout() -> u64 { 3000 }
-fn default_on_webhook_failure() -> String { "reject".to_string() }
 
 /// Validates RFC 6265 cookie name token syntax (RFC 7230 `tchar`: no CTLs, whitespace, or separators).
 fn is_valid_rfc6265_cookie_name(name: &str) -> bool {

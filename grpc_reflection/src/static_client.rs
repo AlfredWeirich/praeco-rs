@@ -14,8 +14,6 @@ pub mod system {
     tonic::include_proto!("system");
 }
 
-// remove the whole `use` item
-// use system::HealthStatus;
 use system::LoginRequest;
 use system::MetricsQuery;
 use system::identity_service_client::IdentityServiceClient;
@@ -23,6 +21,7 @@ use system::system_metrics_client::SystemMetricsClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     // 1. Create exactly ONE underlying HTTP/2 connection (Channel)
     let channel = tonic::transport::Endpoint::from_static("http://[::1]:50051")
         .connect()
@@ -45,9 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // sending it over the network, waiting for the HTTP/2 response, and
     // deserializing the binary back into the `AuthTokenResponse` struct.
     let response = identity_client.login(request).await?;
-    println!("RESPONSE={:?}", response.into_inner());
+    tracing::info!(response = ?response.into_inner(), "Identity login response received");
 
-    // 4. anaother gRPC call
+    // 4. Another gRPC call
     let request = tonic::Request::new(MetricsQuery {
         include_cpu: true,
         include_memory: true,
@@ -55,6 +54,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let response = metrics_client.get_system_status(request).await?;
     let status = response.into_inner();
-    println!("RESPONSE={:?}", status);
+    tracing::info!(status = ?status, "System status response received");
     Ok(())
 }

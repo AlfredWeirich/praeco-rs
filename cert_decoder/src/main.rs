@@ -46,53 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Subject: {}", x509.subject());
     println!("\n--- Extensions Found ---");
 
-    ////////////// All extensions
-
-    // for ext in x509.extensions() {
-    //     let oid_str = ext.oid.to_string();
-    //     print!("OID: {:<30}", oid_str);
-
-    //     // 1st attempt: Parse known X.509 standard extensions
-    //     match ext.parsed_extension() {
-    //         ParsedExtension::BasicConstraints(bc) => {
-    //             // Field is called 'path_len_constraint' instead of 'path_len'
-    //             println!(
-    //                 "-> Basic Constraints: CA={}, MaxPathLen={:?}",
-    //                 bc.ca, bc.path_len_constraint
-    //             );
-    //         }
-    //         ParsedExtension::KeyUsage(ku) => {
-    //             // Flags are available as bit properties
-    //             println!(
-    //                 "-> Key Usage: DigitalSig={}, KeyEnciph={}",
-    //                 ku.digital_signature(),
-    //                 ku.key_encipherment()
-    //             );
-    //         }
-    //         ParsedExtension::ExtendedKeyUsage(eku) => {
-    //             // Instead of a list of OIDs, the library offers flags for the most common types
-    //             println!(
-    //                 "-> Extended Key Usage: ClientAuth={}, ServerAuth={}",
-    //                 eku.client_auth, eku.server_auth
-    //             );
-    //         }
-    //         ParsedExtension::SubjectKeyIdentifier(ski) => {
-    //             println!("-> SKI: {:02X?}", ski.0);
-    //         }
-    //         ParsedExtension::AuthorityKeyIdentifier(aki) => {
-    //             // Field is called 'key_identifier'
-    //             println!("-> AKI: {:02X?}", aki.key_identifier);
-    //         }
-    //         _ => {
-    //             // Your custom OIDs end up here
-    //             if let Ok((_, ber)) = x509_parser::der_parser::parse_der(ext.value) {
-    //                 decode_ber_content(&ber.content, 0);
-    //             }
-    //         }
-    //     }
-    // }
-
-    ////////////// Only custom extensions
+    ////////////// Custom OID extensions
     for ext in x509.extensions() {
         let oid_str = ext.oid.to_string(); // Note: This works with large OIDs thanks to internal bigint support.
 

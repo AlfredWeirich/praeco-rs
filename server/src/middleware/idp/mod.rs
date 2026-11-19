@@ -214,13 +214,17 @@ impl IdpService {
                 }
                 Err(e) => {
                     error!("{}: Claims webhook failed: {}", self.server_name, e);
-                    if self.params.on_webhook_failure != "fallback_to_cert" {
-                        return Self::response_err(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Claims resolution failed",
-                        );
+                    match self.params.on_webhook_failure {
+                        crate::configuration::WebhookFailurePolicy::Reject => {
+                            return Self::response_err(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Claims resolution failed",
+                            );
+                        }
+                        crate::configuration::WebhookFailurePolicy::FallbackToCert => {
+                            // keep original certificate OIDs
+                        }
                     }
-                    // "fallback_to_cert" -> keep original OIDs
                 }
             }
         }
@@ -248,13 +252,17 @@ impl IdpService {
                 }
                 Err(e) => {
                     error!("{}: Claims webhook failed: {}", self.server_name, e);
-                    if self.params.on_webhook_failure != "fallback_to_cert" {
-                        return Self::response_err(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "Claims resolution failed"
-                        );
+                    match self.params.on_webhook_failure {
+                        crate::configuration::WebhookFailurePolicy::Reject => {
+                            return Self::response_err(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "Claims resolution failed",
+                            );
+                        }
+                        crate::configuration::WebhookFailurePolicy::FallbackToCert => {
+                            // keep original certificate OIDs
+                        }
                     }
-                    // "fallback_to_cert" -> keep original OIDs
                 }
             }
         }
@@ -987,7 +995,7 @@ mod tests {
             issuer: "praeco-idp".to_string(),
             claims_webhook_url: None,
             claims_webhook_timeout_ms: 1000,
-            on_webhook_failure: "reject".to_string(),
+            on_webhook_failure: crate::configuration::WebhookFailurePolicy::Reject,
             debug_show_session_id: Some(false),
             claims_webhook_client_cert: None,
             claims_webhook_client_key: None,

@@ -931,6 +931,75 @@ enabled = []
         let res: Result<Config, _> = toml::from_str(bad_toml);
         assert!(res.is_err(), "Unknown field 'protcol' must be rejected");
 
+        let bad_idp_unknown = r#"
+            name = "idp_unknown_field"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Idp"
+            [Layers]
+            enabled = []
+            [IdpParams]
+            jwt_private_key = "priv.pem"
+            on_webhok_failure = "reject"
+        "#;
+        assert!(
+            toml::from_str::<ServerConfig>(bad_idp_unknown).is_err(),
+            "Unknown field in [IdpParams] must be rejected"
+        );
+
+        let bad_webhook_policy = r#"
+            name = "idp_bad_policy"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Idp"
+            [Layers]
+            enabled = []
+            [IdpParams]
+            jwt_private_key = "priv.pem"
+            on_webhook_failure = "fallback"
+        "#;
+        assert!(
+            toml::from_str::<ServerConfig>(bad_webhook_policy).is_err(),
+            "Typo in on_webhook_failure must be rejected by WebhookFailurePolicy"
+        );
+
+        let ok_idp_default: ServerConfig = toml::from_str(
+            r#"
+            name = "idp_default_policy"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Idp"
+            [Layers]
+            enabled = []
+            [IdpParams]
+            jwt_private_key = "priv.pem"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            ok_idp_default.idp_params.as_ref().unwrap().on_webhook_failure,
+            WebhookFailurePolicy::Reject
+        );
+
+        let ok_idp_fallback: ServerConfig = toml::from_str(
+            r#"
+            name = "idp_fallback_policy"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Idp"
+            [Layers]
+            enabled = []
+            [IdpParams]
+            jwt_private_key = "priv.pem"
+            on_webhook_failure = "fallback_to_cert"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            ok_idp_fallback.idp_params.as_ref().unwrap().on_webhook_failure,
+            WebhookFailurePolicy::FallbackToCert
+        );
+
         let rp = RouterParams {
             protocol: Protocol::Https,
             authentication: AuthenticationMethod::Jwt,
@@ -1209,7 +1278,7 @@ enabled = []
             jwt_public_key: None,
             claims_webhook_url: None,
             claims_webhook_timeout_ms: 3000,
-            on_webhook_failure: "reject".to_string(),
+            on_webhook_failure: WebhookFailurePolicy::Reject,
             claims_webhook_client_cert: None,
             claims_webhook_client_key: None,
             claims_webhook_ca_cert: None,

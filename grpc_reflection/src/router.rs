@@ -93,13 +93,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
     }
 
-    println!("Router Core Booting...");
+    tracing::info!("Router Core Booting...");
 
     // 1. BUILD THE DYNAMIC SCHEMA POOL VIA NETWORK REFLECTION
-    println!(
-        "Connecting to microservice at {} to fetch schema...",
-        cli.backend
-    );
+    tracing::info!(backend = %cli.backend, "Connecting to microservice to fetch schema");
 
     let endpoint = Endpoint::from_shared(cli.backend.clone())?
         .connect_timeout(CONNECT_TIMEOUT)
@@ -139,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             continue; // Skip the reflection service itself
         }
 
-        println!("Discovered service via Reflection: {}", service_name);
+        tracing::info!(service = %service_name, "Discovered service via Reflection");
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(ServerReflectionRequest {
@@ -168,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let pool = Arc::new(pool);
-    println!("Dynamic schema pool built successfully over the network!");
+    tracing::info!("Dynamic schema pool built successfully over the network");
 
     // 2. PREPARE THE HTTP/2 BACKEND CLIENT
     let mut http_connector = HttpConnector::new();
@@ -182,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 3. START THE PUBLIC EDGE ROUTER (HTTP/1.1 REST)
     let listener = TcpListener::bind(cli.listen).await?;
     let conn_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
-    println!("Gateway JSON Endpoint listening on http://{}", cli.listen);
+    tracing::info!(listen = %cli.listen, "Gateway JSON Endpoint listening via HTTP");
 
     loop {
         let stream = match listener.accept().await {

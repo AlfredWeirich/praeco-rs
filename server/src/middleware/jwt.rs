@@ -38,8 +38,6 @@ use hyper::{Request, Response, StatusCode};
 use jsonwebtoken::DecodingKey;
 use pin_project::pin_project;
 use tower::{Layer, Service};
-#[allow(unused_imports)]
-use tracing::error;
 
 // === Internal Modules ===
 use crate::{ServiceRespBody, SrvError};

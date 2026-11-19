@@ -45,6 +45,7 @@ struct CreatorConfig {
     oids: Vec<String>,
     ttl1_secs: u64,
     ttl2_secs: u64,
+    quiet: bool,
 }
 
 impl Default for CreatorConfig {
@@ -60,6 +61,7 @@ impl Default for CreatorConfig {
             oids: vec!["1".to_string(), "2".to_string()],
             ttl1_secs: DEFAULT_TTL1_SECS,
             ttl2_secs: DEFAULT_TTL2_SECS,
+            quiet: false,
         }
     }
 }
@@ -80,9 +82,12 @@ impl CreatorConfig {
                     println!(
                         "Usage: praeco-jwt-creator [--private-key PATH] [--public-key PATH] \
 [--out1 PATH] [--out2 PATH] [--iss ISSUER] [--aud AUDIENCE] [--sub SUBJECT] \
-[--oids 1,2] [--ttl1 SECS] [--ttl2 SECS]"
+[--oids 1,2] [--ttl1 SECS] [--ttl2 SECS] [-q|--quiet]"
                     );
                     return Ok(None);
+                }
+                "-q" | "--quiet" => {
+                    cfg.quiet = true;
                 }
                 "--private-key" => {
                     cfg.private_key_path = iter
@@ -214,16 +219,25 @@ fn main() -> Result<(), String> {
     let now = current_timestamp()?;
     let (token1, token2, decoded_claims1, decoded_claims2) = create_and_verify_pair(&cfg, now)?;
 
-    println!("JWT 1: {token1}");
     write(&cfg.out1_path, &token1)
         .map_err(|e| format!("Failed to write {}: {e}", cfg.out1_path))?;
-
-    println!("JWT 2: {token2}");
     write(&cfg.out2_path, &token2)
         .map_err(|e| format!("Failed to write {}: {e}", cfg.out2_path))?;
 
-    println!("Decoded Claims 1: {decoded_claims1:?}");
-    println!("Decoded Claims 2: {decoded_claims2:?}");
+    if cfg.quiet {
+        println!(
+            "Wrote verified JWTs to {} and {} (--quiet: tokens suppressed)",
+            cfg.out1_path, cfg.out2_path
+        );
+    } else {
+        eprintln!(
+            "Notice: printing raw signed JWTs to stdout; pass --quiet to suppress token output."
+        );
+        println!("JWT 1: {token1}");
+        println!("JWT 2: {token2}");
+        println!("Decoded Claims 1: {decoded_claims1:?}");
+        println!("Decoded Claims 2: {decoded_claims2:?}");
+    }
 
     Ok(())
 }
@@ -281,6 +295,15 @@ mod tests {
 
     #[test]
     fn test_cli_parse_rejects_empty_issuer_or_invalid_ttl() {
+        let default_cfg = CreatorConfig::parse_from(["bin"]).unwrap().unwrap();
+        assert!(!default_cfg.quiet);
+
+        let quiet_cfg = CreatorConfig::parse_from(["bin", "--quiet"]).unwrap().unwrap();
+        assert!(quiet_cfg.quiet);
+
+        let short_quiet_cfg = CreatorConfig::parse_from(["bin", "-q"]).unwrap().unwrap();
+        assert!(short_quiet_cfg.quiet);
+
         assert!(CreatorConfig::parse_from(["bin", "--iss", ""]).is_err());
         assert!(CreatorConfig::parse_from(["bin", "--ttl1", "abc"]).is_err());
         assert!(CreatorConfig::parse_from(["bin", "--unknown"]).is_err());

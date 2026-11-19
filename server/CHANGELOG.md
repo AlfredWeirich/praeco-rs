@@ -50,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Rejected malformed, non-UTF-8, or duplicate `Max-Forwards` headers with `400 Bad Request` instead of silently resetting to `10` (`src/middleware/router/headers.rs`), replaced `as u16` with `u16::from(max_forwards)`, and documented gateway-wide method loop detection.
   * Fixed `normalize_segment` to preserve multi-byte UTF-8 via byte accumulation and bounds-check truncated `%` escapes with `bytes.get(...)` (`src/middleware/path_sanitizer.rs`).
   * Added `checked_add` length arithmetic in `parse_grpc_health_score` (`src/runner.rs`), penalized upstream circuit breakers (`record_failure_with_epoch`) on corrupt/short `< 5` byte or truncated gRPC-Web responses (`src/middleware/router/grpc_web.rs`), and added per-route `RouteConfig::retry_put_delete: Option<bool>` / `ParsedRoute::retry_put_delete: bool` (`true` by default) to opt out of `PUT`/`DELETE` retries (`src/configuration/mod.rs`, `src/middleware/router/{mod,http_proxy}.rs`).
+* **Typed `WebhookFailurePolicy` & Logging/Dead-Code Cleanup (`Q-05`, `Q-06`):**
+  * Replaced stringly-typed `IdpParams::on_webhook_failure: String` with `pub enum WebhookFailurePolicy` (`Reject` default, `FallbackToCert`; `#[serde(rename_all = "snake_case")]`, `#[non_exhaustive]`) so configuration typos fail fast at TOML load time (`src/configuration/mod.rs`, `src/middleware/idp/{mod,webhook}.rs`).
+  * Removed unused `tracing::error` import (`src/middleware/jwt.rs`), replaced `println!` calls with `tracing::info!` in `grpc_reflection`, removed commented-out extension blocks in `cert_decoder`, and added `--quiet` / stderr token-output notice to `jwt_creator`.
 
 ---
 
