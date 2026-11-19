@@ -526,7 +526,7 @@ This repository is organized as a Cargo workspace containing `praeco-rs` and com
 
 * [`server/` (`praeco-rs`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/server/Cargo.toml) – Core Zero-Trust API Gateway, library crate (`runner` + `stack` + optional `web` router), and CLI binary.
 * [`relay-server/` (`praeco-relay-server`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/relay-server/README.md) – Standalone Layer-4 SNI Relay Server for outbound zero-trust reverse tunnels (`yamux` + `PROXY v2`).
-* [`common/` (`praeco-common`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/common/Readme.md) – Shared JWT helpers, TLS/PKI builders, HTTP client pool, `PROXY v2` parser/encoder, and feature-gated `test-pki` ephemeral test PKI.
+* [`common/` (`praeco-common`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/common/Readme.md) – Shared JWT helpers (`jwt`), TLS/PKI builders (`tls`), HTTP client pool (`client`), `PROXY v2` parser/encoder, canonical IP normalization, and feature-gated `test-pki` ephemeral test PKI.
 * [`client/` (`praeco-client`)](https://github.com/AlfredWeirich/praeco-rs/blob/main/client/Readme.md) – High-performance HTTP/2, HTTP/3 (QUIC), and gRPC load/test client with mTLS support.
 * [`jwt_creator/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/jwt_creator/Readme.md) – CLI utility for generating Ed25519 keys and signing test JWTs.
 * [`cert_decoder/`](https://github.com/AlfredWeirich/praeco-rs/blob/main/cert_decoder/Readme.md) – Helper tool to inspect X.509 certificates and custom PKI OIDs.
