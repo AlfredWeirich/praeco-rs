@@ -102,6 +102,7 @@ fi
 
 LOG_LEVEL_UPPER=$(echo "$LOG_LEVEL" | tr '[:lower:]' '[:upper:]')
 export RUST_LOG="warn,praeco_rs=${LOG_LEVEL},praeco_rs::middleware::logger=${LOG_LEVEL_UPPER}"
+export RUSTFLAGS="${RUSTFLAGS:--C target-cpu=native}"
 
 echo "🚀 Starte Praeco Gateway (Modus: ${BUILD_MODE}, Log-Level: ${LOG_LEVEL})..."
 if [[ -n "$CONFIG_FILE" ]]; then
