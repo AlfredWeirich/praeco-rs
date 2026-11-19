@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.6.2] - 2026-11-19
+
+SemVer-compatible security, resilience, hot-reload, runtime, modularization, and workspace hardening release.
 
 ### Added
 * **Library Re-Export (`src/lib.rs`):**

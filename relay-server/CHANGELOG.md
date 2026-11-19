@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.3.4] - 2026-11-19
+
+Control-plane limits, live CRL & certificate expiry enforcement, Yamux/SNI/LRU runtime hardening, and modularization.
 
 ### Added
 * **Control-Plane Connection Limits & Live CRL / Certificate Expiry Enforcement (`src/config.rs`, `src/lib.rs`, `src/main.rs`):**
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Self-Contained Test PKI & Leaner Dependencies (`Cargo.toml`, `src/lib.rs`, `tests/integration_tests.rs`):**
   * Enabled `praeco-common` with `default-features = false` (omitting unused `hyper`, `hyper-rustls`, and `jsonwebtoken` dependencies from non-test builds) and delegated `canonicalize_ip` via SemVer-compatible `pub use common::canonical_client_ip as canonicalize_ip` (preserving `::1` and `::`).
   * Replaced all `server_certs/` / `client_certs/` references and external `openssl` CLI calls in unit and integration tests with ephemeral `common::test_pki::TestPki` (`praeco-common/test-pki`).
+* **Yamux Driver, Same-Cert Takeover, LRU Rate Limiter, Strict CRL & Modularization (`src/lib.rs`, `src/limits.rs`, `src/tls.rs`, `src/protocol.rs`, `src/tests.rs`):**
+  * Fixed Yamux driver lost-wakeup and inbound stream drain loops (using `std::task::Waker::noop()`) and scaled `build_yamux_config` receive windows tightly to `max(4 MiB, 256 KiB * max_streams)` instead of the `1 GiB` default.
+  * Added safe same-certificate dead-peer tunnel takeover (`Control::with_identity`, `try_register_tunnel_with_takeover`) after an unlocked liveness probe.
+  * Replaced fail-closed `RateLimitTable` saturation with expiry sweep and LRU eviction, sanitized SNI log strings via `sanitize_log_str`, added opt-in `PRAECO_STRICT_CRL` enforcement in `tls.rs`, and split `lib.rs` into `limits.rs`, `tls.rs`, `protocol.rs`, and `tests.rs` while keeping all `pub` exports intact.
 
 ---
 
