@@ -46,10 +46,9 @@ pub fn setup_mtls_acceptor(
     setup_mtls_acceptor_with_strict(ca_path, cert_path, key_path, crl_path, true)
 }
 
-/// Like [`setup_mtls_acceptor`], with an explicit `strict_crl` default (still overridable via
-/// `PRAECO_STRICT_CRL`).
+/// Like [`setup_mtls_acceptor`], with an explicit `strict_crl` setting.
 ///
-/// When strict CRL mode is active, expired, empty, unparseable, or `nextUpdate`-less CRLs are
+/// When `strict_crl` is `true`, expired, empty, unparseable, or `nextUpdate`-less CRLs are
 /// rejected at load time and `rustls`'s `enforce_revocation_expiration()` enforces `nextUpdate`
 /// during every subsequent mTLS handshake.
 pub fn setup_mtls_acceptor_with_strict(
@@ -57,7 +56,7 @@ pub fn setup_mtls_acceptor_with_strict(
     cert_path: &str,
     key_path: &str,
     crl_path: Option<&String>,
-    strict_crl_default: bool,
+    strict_crl: bool,
 ) -> Result<TlsAcceptor, RelayError> {
     let mut root_store = RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(ca_path)? {
@@ -67,7 +66,6 @@ pub fn setup_mtls_acceptor_with_strict(
     let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
 
     if let Some(path) = crl_path {
-        let strict_crl = common::crl::resolve_strict_crl(strict_crl_default);
         let crls =
             CertificateRevocationListDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
         if crls.is_empty() {
@@ -177,7 +175,7 @@ pub fn spawn_crl_reload_watcher(
     )
 }
 
-/// Like [`spawn_crl_reload_watcher`], with an explicit `strict_crl_default` flag.
+/// Like [`spawn_crl_reload_watcher`], with an explicit `strict_crl` flag.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_crl_reload_watcher_with_strict(
     ca_path: String,
@@ -187,7 +185,7 @@ pub fn spawn_crl_reload_watcher_with_strict(
     initial_acceptor: TlsAcceptor,
     reload_interval: Duration,
     cancel_token: CancellationToken,
-    strict_crl_default: bool,
+    strict_crl: bool,
 ) -> Result<tokio::sync::watch::Receiver<ControlPlaneReloadState>, RelayError> {
     let initial_serials = match crl_path.as_deref() {
         Some(p) => parse_revoked_serials_from_crl_pem(p)?,
@@ -247,7 +245,7 @@ pub fn spawn_crl_reload_watcher_with_strict(
                 let crl = path.clone();
                 move || -> Result<(TlsAcceptor, std::collections::HashSet<Vec<u8>>), RelayError> {
                     let acceptor =
-                        setup_mtls_acceptor_with_strict(&ca, &cert, &key, Some(&crl), strict_crl_default)?;
+                        setup_mtls_acceptor_with_strict(&ca, &cert, &key, Some(&crl), strict_crl)?;
                     let serials = parse_revoked_serials_from_crl_pem(&crl)?;
                     Ok((acceptor, serials))
                 }

@@ -416,7 +416,7 @@ Maps OID suffix numbers extracted from certificates or JWT claims to internal `U
 | :--- | :--- | :--- | :--- | :--- |
 | `ssl_client_ca` | String | **Mandatory** | *None* | Path to PEM-encoded CA certificate used to verify client certificates. |
 | `ssl_client_crl` | String | Optional | `None` | Path to PEM-encoded Certificate Revocation List (CRL). Parsed at startup and reload; rejects empty or malformed PEM/DER files fail-closed. |
-| `strict_crl` | Boolean | Optional | `true` | Enables fail-closed CRL validation: rejects expired, unparseable, or `nextUpdate`-less CRLs at startup/reload and enforces `nextUpdate` expiration at TLS handshake time via `rustls` `enforce_revocation_expiration()`. Overridable via `PRAECO_STRICT_CRL` (`1`/`true`/`yes` or `0`/`false`/`no`). |
+| `strict_crl` | Boolean | Optional | `true` | Enables fail-closed CRL validation: rejects expired, unparseable, or `nextUpdate`-less CRLs at startup/reload and enforces `nextUpdate` expiration at TLS handshake time via `rustls` `enforce_revocation_expiration()`. Configured solely via TOML (`Config.toml` / `conf.d/*.toml`). |
 
 ---
 
@@ -1019,7 +1019,7 @@ The Praeco Relay Server operates as a standalone public TCP/SNI edge router.
 | `server_key_path` | String | Optional | `"server_certs/self_signed/privkey_self.pem"` | Path to Relay's private key for the control plane. |
 | `crl_path` | String | Optional | `None` | Path to Certificate Revocation List (CRL) for revoking compromised backend gateways. Fail-closed parsing on startup/reload (preserves previous CRL state if a reload fails). |
 | `crl_reload_interval_secs` | Integer | Optional | `60` | Interval in seconds for background CRL reloading and active tunnel re-verification (`0` disables periodic reloads; `SIGHUP` still supported). |
-| `strict_crl` | Boolean | Optional | `true` | Enforces fail-closed `nextUpdate` validation at startup/reload and handshake-time `enforce_revocation_expiration()` (`PRAECO_STRICT_CRL` can override). |
+| `strict_crl` | Boolean | Optional | `true` | Enforces fail-closed `nextUpdate` validation at startup/reload and handshake-time `enforce_revocation_expiration()`. Configured solely via `RelayConfig.toml`. |
 | `enable_opentelemetry` | Boolean | Optional | `false` | Enables OpenTelemetry tracing for Relay connection events. |
 | `jaeger_endpoint` | String | Optional | `"http://localhost:4317"` | OTLP gRPC endpoint for Relay traces. |
 | `otel_log_level` | String | Optional | `"info"` | Log level filter for exported Relay telemetry spans. |

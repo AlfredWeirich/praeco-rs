@@ -192,7 +192,7 @@ pub fn tls_config(
                         "{server_name}: CRL file '{crl_path}' contains no CRL entries"
                     )));
                 }
-                let strict = common::crl::resolve_strict_crl(config.strict_crl);
+                let strict = config.strict_crl;
                 if strict {
                     enforce_crl_expiration = true;
                 }
@@ -258,15 +258,6 @@ pub fn tls_config(
     );
 
     Ok(config)
-}
-
-/// Returns `true` when strict CRL expiration enforcement is enabled.
-///
-/// Defaults to `true` (fail-closed) and can be explicitly overridden via
-/// `PRAECO_STRICT_CRL` (`"1"`/`"true"`/`"yes"` to enable, `"0"`/`"false"`/`"no"` to disable).
-#[inline]
-pub fn strict_crl_enabled() -> bool {
-    common::crl::resolve_strict_crl(true)
 }
 
 /// Validates a DER-encoded X.509 CRL against expiration (`nextUpdate`) and returns

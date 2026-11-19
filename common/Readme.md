@@ -5,7 +5,7 @@
 It is designed to be a central repository for reusable components such as:
 - **HTTP/TLS Connection Pooling**: Pre-configured `hyper` clients with `rustls` integration, active keep-alive probes, connect timeouts, and strict custom PKI isolation (`build_root_store` trusts *only* the configured custom CA without merging public Mozilla WebPKI roots unless `ca_path` is `None` or `build_root_store_with_webpki` is explicitly used).
 - **Client IP Canonicalization & XFF Parsing (`canonical_client_ip`, `client_ip_from_xff`)**: Normalizes client IP addresses across all rate limiters, connection trackers, and session stores by unwrapping IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d` $\to$ `a.b.c.d`), preserving loopback (`::1`) and unspecified (`::`) addresses, and masking standard IPv6 unicast addresses to their `/64` subnet prefix (`segments[0..4]`) to prevent IPv6 `/64` rotation bypasses; `client_ip_from_xff` resolves `X-Forwarded-For` strictly from right to left using `trusted_hops`.
-- **Shared CRL Validation (`crl` Feature)**: Centralizes fail-closed X.509 CRL expiration validation (`check_crl_not_expired`), `PRAECO_STRICT_CRL` resolution (`resolve_strict_crl`, defaulting to strict), and revoked serial extraction (`extract_revoked_serials_from_crls`) for both `praeco-rs` and `praeco-relay-server`.
+- **Shared CRL Validation (`crl` Feature)**: Centralizes fail-closed X.509 CRL expiration validation (`check_crl_not_expired`) and revoked serial extraction (`extract_revoked_serials_from_crls`) for both `praeco-rs` and `praeco-relay-server`.
 - **HAProxy PROXY-Protocol v2 (`proxy_protocol`)**: Binary encoder (`encode_proxy_v2`), strict fail-closed parser (`read_proxy_v2` with full 16-byte `InvalidMagic` header preservation and 512-byte payload bounds), and `PrefixedStream` for propagating real client IPs across Yamux Layer-4 tunnels.
 - **JWT Validation (`verify_jwt`)**: Shared token claims (`Claims`) and Ed25519/RSA validation helpers failing closed on empty/whitespace-only `expected_issuer` or `expected_audience`.
 - **Security Primitives**: Core structures used for authentication, OID role mapping (`UserRole`, `MtlsClaims`), and authorization.
@@ -20,7 +20,7 @@ It is designed to be a central repository for reusable components such as:
 This crate is primarily intended to be consumed by other `praeco-*` crates (like `praeco-rs`, `praeco-relay-server`, and `praeco-client`), but can be used standalone with granular Cargo features (`default = ["client", "crl", "jwt", "tls"]`):
 
 - **`proxy_protocol`, `canonical_client_ip` & `client_ip_from_xff`** are always available (even with `default-features = false`).
-- **`crl`**: `crl::{CrlValidationError, resolve_strict_crl, check_crl_not_expired, extract_revoked_serials_from_crls}`.
+- **`crl`**: `crl::{CrlValidationError, check_crl_not_expired, extract_revoked_serials_from_crls}`.
 - **`tls`**: `load_certs`, `load_single_key`, `build_root_store`, `build_tls_client_config`.
 - **`jwt`**: `Claims`, `load_decoding_keys`, `load_encoding_key`, `verify_jwt`, `sign_jwt`.
 - **`client`** *(implies `tls`)*: `client::{ClientPoolConfig, HttpsConnector, build_hyper_client}`.

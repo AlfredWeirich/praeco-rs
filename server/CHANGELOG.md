@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Fixed spoofable leftmost `X-Forwarded-For` extraction when `trust_forwarded_headers = true`: both `IpFilter` and rate limiters now share `extract_forwarded_ip_from_headers`, walking `X-Forwarded-For` (including multiple header lines) from right to left using `trusted_proxy_hops` (default `1`, `0` disables XFF) without falling back to `X-Real-IP` when `X-Forwarded-For` is present.
   * Added `pub trusted_proxy_hops: usize` to `IpFilterConfig`, `SimpleRateLimiterConfig`, and `TokenBucketRateLimiterConfig` (TOML-compatible via `#[serde(default)]`, SemVer-breaking for struct literals without `..Default::default()`), plus backward-compatible `extract_client_ip_with_hops`, `extract_rate_limit_key_with_hops`, and `.with_trusted_proxy_hops(...)` builders.
 * **Fail-Closed CRL Defaults & Handshake Expiration Enforcement (`src/tls_conf.rs`, `src/configuration/mod.rs`, `common/src/crl.rs`):**
-  * Centralised CRL parsing/expiration checks in `praeco-common::crl` and switched strict CRL mode to **fail-closed by default** (`ClientCertConfig::strict_crl: bool` defaulting to `true`, overridable via `PRAECO_STRICT_CRL`).
+  * Centralised CRL parsing/expiration checks in `praeco-common::crl`, removed the `PRAECO_STRICT_CRL` environment variable and `strict_crl_enabled()` in favour of pure TOML configuration, and switched strict CRL mode to **fail-closed by default** (`ClientCertConfig::strict_crl: bool` defaulting to `true`).
   * Enabled `WebPkiClientVerifierBuilder::enforce_revocation_expiration()` in strict mode so `rustls` enforces CRL `nextUpdate` on every handshake, and rejected empty CRL PEM files at load/reload time.
 
 ---

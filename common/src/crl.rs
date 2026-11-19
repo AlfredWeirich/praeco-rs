@@ -28,33 +28,6 @@ pub enum CrlValidationError {
     Expired { next_update: String },
 }
 
-/// Resolves whether strict CRL validation is active.
-///
-/// Honors explicit `PRAECO_STRICT_CRL` overrides (`"1"`/`"true"`/`"yes"` enables,
-/// `"0"`/`"false"`/`"no"` disables) and otherwise falls back to `config_default`
-/// (which defaults to `true` — fail-closed).
-pub fn resolve_strict_crl(config_default: bool) -> bool {
-    match std::env::var("PRAECO_STRICT_CRL") {
-        Ok(val) => {
-            let v = val.trim();
-            if v == "1"
-                || v.eq_ignore_ascii_case("true")
-                || v.eq_ignore_ascii_case("yes")
-            {
-                true
-            } else if v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("no")
-            {
-                false
-            } else {
-                config_default
-            }
-        }
-        Err(_) => config_default,
-    }
-}
-
 /// Checks a single DER-encoded X.509 CRL for structural validity and expiration (`nextUpdate`).
 pub fn check_crl_not_expired(crl_der: &[u8]) -> Result<(), CrlValidationError> {
     let (_, parsed_crl) = x509_parser::parse_x509_crl(crl_der)
