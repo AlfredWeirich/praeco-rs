@@ -11,8 +11,8 @@ This flow is designed for native apps or devices that have already been provisio
 **Procedure:**
 1. The client makes a `POST` request to `/auth/token`, presenting its valid mTLS client certificate to the gateway.
 2. The `praeco-rs` Connection Handler validates the certificate against the trusted Root CA.
-3. Upon successful TLS handshake, the IdP extracts the identity claims from the certificate:
-   - **Subject (`sub`)**: Extracted from the Subject Alternative Name (SAN) or the Common Name (CN) of the certificate.
+14. 3. Upon successful TLS handshake, the IdP extracts the identity claims from the certificate:
+   - **Subject (`sub`)**: Extracted from the Subject Alternative Name (SAN), falling back to the Common Name (CN), and then to a unique deterministic `"sha256:<hex>"` DER fingerprint of the leaf certificate if neither SAN nor CN is present.
    - **Roles/Permissions**: Extracted from custom Object Identifiers (OIDs) embedded in the certificate.
 4. The IdP generates a JWT signed with its private key, embedding these claims.
 5. The signed JWT is returned directly to the client in a JSON response (`{"token": "..."}`).
@@ -238,9 +238,9 @@ Resource Servers can periodically poll this endpoint to maintain an up-to-date c
 Praeco provides built-in support for token revocation and browser session invalidation:
 
 1. **Cryptographic `jti` (JWT ID):** Every JWT issued by the IdP is stamped with a unique UUIDv4 `jti`.
-2. **Bounded Denylist Storage (`JwtRevocationStore`):** Thread-safe in-memory storage tracks revoked `jti` entries until their natural expiration time (`exp`). To protect against memory exhaustion (OOM), `JwtRevocationStore` is bounded to `50,000` active entries (`MAX_REVOKED_ENTRIES = 50_000`), enforces a maximum `jti` length of `256` bytes (`MAX_JTI_LEN = 256`), and performs throttled expired-entry cleanup every `30` seconds (`REVOCATION_CLEANUP_INTERVAL_SECS = 30`).
+2. **Bounded Denylist Storage (`JwtRevocationStore`):** Thread-safe in-memory storage tracks revoked `jti` entries until `exp + JWT_EXP_LEEWAY_SECS` (`exp + 60s`, matching `jsonwebtoken`'s default validation leeway so tokens cannot be replayed during the grace window). To protect against memory exhaustion (OOM), `JwtRevocationStore` is bounded to `50,000` active entries (`MAX_REVOKED_ENTRIES = 50_000`), enforces a maximum `jti` length of `256` bytes (`MAX_JTI_LEN = 256`), and performs throttled expired-entry cleanup every `30` seconds (`REVOCATION_CLEANUP_INTERVAL_SECS = 30`).
 3. **Revocation Endpoint (`POST /auth/revoke`):**
-   - **Browser / Bearer Logout:** Calling `POST /auth/revoke` with an `Authorization: Bearer <token>` header or session cookie extracts the `jti` from the token and registers it in the revocation store.
+   - **Browser / Bearer Logout:** Calling `POST /auth/revoke` with an `Authorization: Bearer <token>` header or session cookie verifies the signature against the IdP's configured `decoding_keys`, extracts the `jti`, and registers it in the revocation store. Fails closed if a token is presented (`503 Service Unavailable` when no `decoding_keys` are configured; `401 Unauthorized` when signature verification fails). Calling `POST /auth/revoke` without a token returns `200 OK {"status":"cleared"}` and clears the cookie.
    - **mTLS-Protected Explicit Revocation:** Calling `POST /auth/revoke?jti=<UUID>` to revoke an explicit token ID requires a valid **mTLS client certificate** (`401 Unauthorized: mTLS required to revoke explicit JTI` without mTLS), preventing unauthenticated attackers from flooding the revocation store or revoking arbitrary sessions.
-   - **Cookie Invalidation:** Returns `Set-Cookie: <cookie_name>=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT` to clear the browser cookie immediately.
+   - **Cookie Invalidation:** Returns `Set-Cookie: <cookie_name>=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Max-Age=0; HttpOnly; Secure; SameSite=Lax` (plus `; Domain=...` unless `__Host-`-prefixed) to clear the browser cookie immediately.
 4. **Enforcement in `JwtAuthService`:** Before forwarding any request with a JWT to downstream microservices, the proxy checks the revocation store. Revoked tokens are immediately rejected with `401 Unauthorized`.

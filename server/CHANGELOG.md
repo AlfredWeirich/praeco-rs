@@ -32,6 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Fixed off-by-one EOF rejection in `LimitedReader::poll_read`, normalized `Content-Encoding` case-insensitively during request decompression, and added `Vary: Accept-Encoding` to compressed responses.
   * Validated `x-trace-id` against W3C `traceparent` syntax in `TraceIdLayer` before populating `traceparent` (preserving non-W3C `x-trace-id` headers while synthesizing a valid `traceparent`).
   * Enabled `overflow-checks = true` in `[profile.release]` and commented out host-specific `-C target-cpu=native` in `.cargo/config.toml` for portable builds.
+* **IdP & JWT Edge-Case Hardening (`src/middleware/idp/mod.rs`, `src/middleware/idp/session.rs`, `src/middleware/jwt.rs`):**
+  * Added `; Secure` attribute to the `POST /auth/revoke` logout cookie invalidation header (required by RFC 6265bis for `__Host-`-prefixed cookies).
+  * Made `POST /auth/revoke` fail closed when a bearer/cookie token is supplied: returns `503 Service Unavailable` if `decoding_keys` is empty and `401 Unauthorized` if no configured key verifies the token signature (preserving `200 OK {"status":"cleared"}` when called without a token to clear cookies).
+  * Added `JWT_EXP_LEEWAY_SECS` (`60` s, matching `jsonwebtoken::Validation` default `leeway`) to `JwtRevocationStore` revocation expiry timestamps in both `POST /auth/revoke` and `JwtAuthService::revoke_on_paths` so tokens revoked near `exp` cannot be replayed during the leeway grace window.
+  * Replaced the shared `"device"` mTLS `sub` fallback in `IdpService` with a deterministic `"sha256:<hex>"` leaf-certificate DER fingerprint (`cert_fingerprint_subject`) whenever SAN and CN are both absent (falling back to `"device"` only for non-PEM synthetic inputs).
+  * Removed plaintext `user_code` from `SessionStore::create_session` `trace!` logs and truncated `session_id` values in `session.rs` / `idp/mod.rs` logs via `redact_session_id` (first 8 characters + `"…"`).
 
 ### Changed & Fixed
 * **Lifecycle & Reproducible Test PKI (`src/server.rs`, `src/runner.rs`, `src/tls_conf.rs`, `tests/`):**
