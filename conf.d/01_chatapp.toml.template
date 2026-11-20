@@ -372,6 +372,8 @@
         upstreams = ["https://127.0.0.1:50053"]
         backend_type = "grpc_passthrough"
         allowed_roles = ["Admin", "Seller"]
+        # Das mTLS-angebundene ChatApp-Admin-Backend verifiziert admin-jwt eigenständig per JWKS:
+        strip_cookies = false
         # --- 3-State Circuit Breaker & Outlier-Detection (Defaults) ---
         cooldown_seconds = 10
         max_retries = 2

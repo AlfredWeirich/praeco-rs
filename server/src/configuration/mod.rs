@@ -736,7 +736,9 @@ pub struct RouteHeaderPolicy {
     /// Strip the entire client `Cookie` header.
     pub strip_cookies: bool,
     /// Specific cookie names stripped from incoming `Cookie` headers when `strip_cookies` is `false`.
-    /// Automatically includes `[Server.Layers.JWT].cookie_fallback` when configured.
+    /// Automatically includes `[Server.Layers.JWT].cookie_fallback` unless the route explicitly opts
+    /// into forwarding all cookies (`strip_cookies = false` without `strip_cookie_names`, or
+    /// `"cookie"` in `forward_headers`).
     pub strip_cookie_names: HashSet<String>,
     /// Optional explicit allowlist of lowercased client header names permitted through to the upstream.
     pub forward_headers: Option<HashSet<String>>,
@@ -2336,7 +2338,12 @@ impl ServerConfig {
             )));
         }
 
-        if let Some(cb) = cookie_fallback.map(str::trim).filter(|s| !s.is_empty()) {
+        let forward_all_cookies =
+            (cfg.strip_cookies == Some(false) && cfg.strip_cookie_names.is_empty())
+                || allowlist_has_cookie;
+        if !forward_all_cookies
+            && let Some(cb) = cookie_fallback.map(str::trim).filter(|s| !s.is_empty())
+        {
             strip_cookie_names.insert(cb.to_string());
         }
 

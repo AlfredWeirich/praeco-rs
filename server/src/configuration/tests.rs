@@ -1446,3 +1446,87 @@ enabled = []
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_route_header_policy_preserves_cookie_fallback_when_all_cookies_forwarded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let toml_str = r#"
+            name = "cookie_passthrough_router"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            service = "Router"
+            [Layers]
+            enabled = []
+            [Layers.JWT]
+            jwt_public_keys = []
+            expected_issuer = "praeco-idp"
+            expected_audience = "admin-dashboard"
+            cookie_fallback = "admin-jwt"
+
+            [ReverseRoutes."/pass-all"]
+            upstreams = ["http://127.0.0.1:9001"]
+            strip_cookies = false
+
+            [ReverseRoutes."/allowlist-cookie"]
+            upstreams = ["http://127.0.0.1:9002"]
+            forward_headers = ["Content-Type", "Cookie"]
+
+            [ReverseRoutes."/selective-strip"]
+            upstreams = ["http://127.0.0.1:9003"]
+            strip_cookies = false
+            strip_cookie_names = ["other_cookie"]
+        "#;
+        let mut srv: ServerConfig = toml::from_str(toml_str)?;
+        srv.finalize()?;
+
+        let pass_all = srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/pass-all")
+            .ok_or("missing /pass-all route")?;
+        assert!(!pass_all.header_policy.strip_cookies);
+        assert!(pass_all.header_policy.strip_cookie_names.is_empty());
+
+        let allowlist_cookie = srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/allowlist-cookie")
+            .ok_or("missing /allowlist-cookie route")?;
+        assert!(!allowlist_cookie.header_policy.strip_cookies);
+        assert!(allowlist_cookie.header_policy.strip_cookie_names.is_empty());
+
+        let selective = srv
+            .parsed_routes
+            .iter()
+            .find(|r| r.prefix == "/selective-strip")
+            .ok_or("missing /selective-strip route")?;
+        assert!(!selective.header_policy.strip_cookies);
+        assert!(selective.header_policy.strip_cookie_names.contains("other_cookie"));
+        assert!(selective.header_policy.strip_cookie_names.contains("admin-jwt"));
+
+        // Verify prepare_proxy_headers preserves admin-jwt on /pass-all
+        let mut req_headers = hyper::HeaderMap::new();
+        req_headers.insert(
+            hyper::header::COOKIE,
+            hyper::header::HeaderValue::from_static("admin-jwt=signed.jwt.token; theme=dark"),
+        );
+        let extensions = hyper::http::Extensions::new();
+        crate::middleware::router::headers::prepare_proxy_headers(
+            &mut req_headers,
+            "cookie_passthrough_router",
+            None,
+            &extensions,
+            &srv,
+            &pass_all.header_policy,
+        )
+        .map_err(|_| "prepare_proxy_headers unexpectedly failed")?;
+
+        let forwarded_cookie = req_headers
+            .get(hyper::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .ok_or("Cookie header must be preserved when strip_cookies = false")?;
+        assert!(forwarded_cookie.contains("admin-jwt=signed.jwt.token"));
+        assert!(forwarded_cookie.contains("theme=dark"));
+        Ok(())
+    }
