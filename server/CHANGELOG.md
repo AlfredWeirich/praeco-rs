@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **Typed `WebhookFailurePolicy` & Logging/Dead-Code Cleanup (`Q-05`, `Q-06`):**
   * Replaced stringly-typed `IdpParams::on_webhook_failure: String` with `pub enum WebhookFailurePolicy` (`Reject` default, `FallbackToCert`; `#[serde(rename_all = "snake_case")]`, `#[non_exhaustive]`) so configuration typos fail fast at TOML load time (`src/configuration/mod.rs`, `src/middleware/idp/{mod,webhook}.rs`).
   * Removed unused `tracing::error` import (`src/middleware/jwt.rs`), replaced `println!` calls with `tracing::info!` in `grpc_reflection`, removed commented-out extension blocks in `cert_decoder`, and added `--quiet` / stderr token-output notice to `jwt_creator`.
+  * **Breaking (`P2-01`)**: Changed `PemCertExtension`, `SanCertExtension`, and `OidCertExtension` to hold `Arc<str>` and `Arc<Vec<String>>` respectively (with `PartialEq`, `Eq`, `From`, `Deref`, and `AsRef` implementations) so `ConnectionHandler::handle` shares client certificate extensions zero-copy across requests without per-request heap clones.
 
 ---
 

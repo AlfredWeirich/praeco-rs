@@ -424,7 +424,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
         // Determine if the request has a valid mTLS certificate.
         let mtls_claims = if req.extensions().get::<crate::PemCertExtension>().is_some() {
             let sub = if let Some(san) = req.extensions().get::<crate::SanCertExtension>() {
-                san.0.clone()
+                san.0.to_string()
             } else if let Some(pem_ext) = req.extensions().get::<crate::PemCertExtension>() {
                 extract_cn_from_pem(&pem_ext.0)
                     .or_else(|| cert_fingerprint_subject(&pem_ext.0))
@@ -434,7 +434,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             };
 
             let oids = req.extensions().get::<crate::OidCertExtension>()
-                .map(|ext| ext.0.clone())
+                .map(|ext| (*ext.0).clone())
                 .unwrap_or_default();
 
             Some(Claims {
@@ -1196,10 +1196,10 @@ mod tests {
             .unwrap();
         req_mtls
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         req_mtls
             .extensions_mut()
-            .insert(crate::SanCertExtension("admin-device".to_string()));
+            .insert(crate::SanCertExtension::from("admin-device"));
 
         let resp_mtls = idp.ready().await.unwrap().call(req_mtls).await.unwrap();
         assert_eq!(resp_mtls.status(), StatusCode::OK);
@@ -1334,7 +1334,7 @@ mod tests {
             .unwrap();
         req_info_mtls
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         let resp_info_mtls = idp.ready().await.unwrap().call(req_info_mtls).await.unwrap();
         assert_eq!(resp_info_mtls.status(), StatusCode::OK);
 
@@ -1348,7 +1348,7 @@ mod tests {
             .unwrap();
         req_confirm_csrf
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         let resp_confirm_csrf = idp.ready().await.unwrap().call(req_confirm_csrf).await.unwrap();
         assert_eq!(resp_confirm_csrf.status(), StatusCode::FORBIDDEN);
 
@@ -1363,7 +1363,7 @@ mod tests {
             .unwrap();
         req_confirm_origin
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         let resp_confirm_origin = idp.ready().await.unwrap().call(req_confirm_origin).await.unwrap();
         assert_eq!(resp_confirm_origin.status(), StatusCode::FORBIDDEN);
 
@@ -1376,7 +1376,7 @@ mod tests {
             .unwrap();
         req_confirm_ok
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         let resp_confirm_ok = idp.ready().await.unwrap().call(req_confirm_ok).await.unwrap();
         assert_eq!(resp_confirm_ok.status(), StatusCode::OK);
     }
@@ -1446,10 +1446,10 @@ mod tests {
             .unwrap();
         req_confirm
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         req_confirm
             .extensions_mut()
-            .insert(crate::SanCertExtension("alice@example.test".to_string()));
+            .insert(crate::SanCertExtension::from("alice@example.test"));
         let resp_confirm = idp_host.ready().await.unwrap().call(req_confirm).await.unwrap();
         assert_eq!(resp_confirm.status(), StatusCode::OK);
 
@@ -1490,10 +1490,10 @@ mod tests {
             .unwrap();
         req_token
             .extensions_mut()
-            .insert(crate::PemCertExtension("dummy-pem".to_string()));
+            .insert(crate::PemCertExtension::from("dummy-pem"));
         req_token
             .extensions_mut()
-            .insert(crate::SanCertExtension("svc@example.test".to_string()));
+            .insert(crate::SanCertExtension::from("svc@example.test"));
         let resp_token = idp_domain.ready().await.unwrap().call(req_token).await.unwrap();
         assert_eq!(resp_token.status(), StatusCode::OK);
         let token_json: serde_json::Value = serde_json::from_slice(

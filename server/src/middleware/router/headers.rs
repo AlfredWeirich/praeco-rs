@@ -597,8 +597,8 @@ mod tests {
         let config = make_test_config(Some(forwarding));
 
         let mut extensions = hyper::http::Extensions::new();
-        extensions.insert(crate::PemCertExtension("VERIFIED_PEM".to_string()));
-        extensions.insert(crate::SanCertExtension("alice@praeco.internal".to_string()));
+        extensions.insert(crate::PemCertExtension::from("VERIFIED_PEM"));
+        extensions.insert(crate::SanCertExtension::from("alice@praeco.internal"));
         extensions.insert(Arc::new(vec![UserRole("Operator".to_string())]));
         let peer_addr: std::net::SocketAddr = "10.10.10.1:12345".parse().unwrap();
         extensions.insert(peer_addr);

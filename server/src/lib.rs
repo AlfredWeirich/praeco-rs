@@ -407,16 +407,111 @@ use std::sync::Arc;
 /// `ConnectionHandler` is cheaply cloneable: the inner service uses
 /// [`BoxCloneService`] (internally `Arc`-based) and the role list is
 /// wrapped in an [`Arc`].
-#[derive(Clone, Debug)]
-pub struct PemCertExtension(pub String);
+/// Verified client certificate PEM stored behind a shared `Arc<str>` so per-request
+/// extension injection clones only a reference count rather than the full certificate text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PemCertExtension(pub Arc<str>);
 
-#[derive(Clone, Debug)]
-pub struct SanCertExtension(pub String);
+impl From<String> for PemCertExtension {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value))
+    }
+}
 
-/// Raw OID suffix strings extracted from the client certificate.
+impl From<&str> for PemCertExtension {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<Arc<str>> for PemCertExtension {
+    fn from(value: Arc<str>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::Deref for PemCertExtension {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for PemCertExtension {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Verified client certificate SAN stored behind a shared `Arc<str>` to avoid
+/// per-request heap allocations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SanCertExtension(pub Arc<str>);
+
+impl From<String> for SanCertExtension {
+    fn from(value: String) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<&str> for SanCertExtension {
+    fn from(value: &str) -> Self {
+        Self(Arc::from(value))
+    }
+}
+
+impl From<Arc<str>> for SanCertExtension {
+    fn from(value: Arc<str>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::Deref for SanCertExtension {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SanCertExtension {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Raw OID suffix strings extracted from the client certificate, stored behind an `Arc`
+/// so per-request extension injection is zero-copy.
 /// Preserved so that the IdP service can embed them in issued JWTs.
-#[derive(Clone, Debug)]
-pub struct OidCertExtension(pub Vec<String>);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OidCertExtension(pub Arc<Vec<String>>);
+
+impl From<Vec<String>> for OidCertExtension {
+    fn from(value: Vec<String>) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl From<Arc<Vec<String>>> for OidCertExtension {
+    fn from(value: Arc<Vec<String>>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::ops::Deref for OidCertExtension {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<[String]> for OidCertExtension {
+    fn as_ref(&self) -> &[String] {
+        &self.0
+    }
+}
 
 #[derive(Clone)]
 enum ServiceSource {
@@ -717,19 +812,17 @@ impl ConnectionHandler {
         };
         req.extensions_mut().insert(roles_to_inject);
 
-        // 3. Inject cert information if present
-        if let Some(ref pem) = self.client_cert_pem {
-            req.extensions_mut()
-                .insert(PemCertExtension(pem.to_string()));
+        // 3. Inject cert information if present (zero-copy Arc move)
+        if let Some(pem) = self.client_cert_pem {
+            req.extensions_mut().insert(PemCertExtension(pem));
         }
-        if let Some(ref san) = self.client_cert_san {
-            req.extensions_mut()
-                .insert(SanCertExtension(san.to_string()));
+        if let Some(san) = self.client_cert_san {
+            req.extensions_mut().insert(SanCertExtension(san));
         }
 
         // 4. Inject raw OIDs for downstream services (e.g. IdP) to embed in JWTs
         if !self.client_oids.is_empty() {
-            req.extensions_mut().insert(OidCertExtension((*self.client_oids).clone()));
+            req.extensions_mut().insert(OidCertExtension(self.client_oids));
         }
 
         // === gRPC Client Protocol Negotiation Check ===
@@ -1054,5 +1147,90 @@ mod tests {
             Poll::Ready(Ok(r)) => assert_eq!(r.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR),
             _ => panic!("expected Poll::Ready(Ok(500))"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_connection_handler_shares_cert_extensions_zero_copy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Mutex;
+
+        type CapturedCertExtensions = (
+            Arc<str>,
+            Arc<str>,
+            Arc<Vec<String>>,
+        );
+
+        let captured: Arc<Mutex<Vec<CapturedCertExtensions>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+
+        let inspect_svc = tower::service_fn(move |req: Request<SrvBody>| {
+            let captured = Arc::clone(&captured_clone);
+            async move {
+                let pem = req
+                    .extensions()
+                    .get::<PemCertExtension>()
+                    .map(|ext| Arc::clone(&ext.0))
+                    .ok_or_else(|| SrvError::Other("missing PemCertExtension".into()))?;
+                let san = req
+                    .extensions()
+                    .get::<SanCertExtension>()
+                    .map(|ext| Arc::clone(&ext.0))
+                    .ok_or_else(|| SrvError::Other("missing SanCertExtension".into()))?;
+                let oids = req
+                    .extensions()
+                    .get::<OidCertExtension>()
+                    .map(|ext| Arc::clone(&ext.0))
+                    .ok_or_else(|| SrvError::Other("missing OidCertExtension".into()))?;
+
+                let mut guard = captured
+                    .lock()
+                    .map_err(|_| SrvError::Other("mutex poisoned".into()))?;
+                guard.push((pem, san, oids));
+
+                Ok::<_, SrvError>(Response::new(
+                    Full::new(Bytes::from_static(b"ok"))
+                        .map_err(SrvError::from)
+                        .boxed(),
+                ))
+            }
+        });
+
+        let addr: SocketAddr = "127.0.0.1:4242".parse()?;
+        let handler = ConnectionHandler::new(
+            BoxedCloneService::new(inspect_svc),
+            addr,
+            vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
+            Some("-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----".to_string()),
+            Some("device@praeco.internal".to_string()),
+            Arc::new(HashMap::new()),
+        );
+
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/test")
+                .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+            let resp = handler.clone().handle(req).await?;
+            assert_eq!(resp.status(), hyper::StatusCode::OK);
+        }
+
+        let guard = captured
+            .lock()
+            .map_err(|_| "mutex poisoned")?;
+        assert_eq!(guard.len(), 2);
+        let (pem1, san1, oids1) = &guard[0];
+        let (pem2, san2, oids2) = &guard[1];
+        assert!(Arc::ptr_eq(pem1, pem2));
+        assert!(Arc::ptr_eq(san1, san2));
+        assert!(Arc::ptr_eq(oids1, oids2));
+
+        // Verify trait ergonomics (Deref, AsRef, PartialEq) on From-constructed extensions
+        let pem_from = PemCertExtension::from("abc");
+        let san_from = SanCertExtension::from(String::from("san"));
+        let oid_from = OidCertExtension::from(vec!["1.2.3".to_string()]);
+        assert_eq!(&*pem_from, "abc");
+        assert_eq!(san_from.as_ref(), "san");
+        assert_eq!(&*oid_from, &["1.2.3".to_string()]);
+
+        Ok(())
     }
 }

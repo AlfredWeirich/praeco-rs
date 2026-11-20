@@ -108,7 +108,7 @@ pub fn extract_rate_limit_key_with_hops<ReqBody>(
             if let Some(san) = req.extensions().get::<crate::SanCertExtension>()
                 && !san.0.is_empty()
             {
-                return RateLimitKey::ClientCert(san.0.clone());
+                return RateLimitKey::ClientCert(san.0.to_string());
             }
             // 3. Fallback to client IP
             extract_ip_key(req, trust_forwarded_headers, trusted_proxy_hops)
