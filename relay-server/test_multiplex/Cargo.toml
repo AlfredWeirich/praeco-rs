@@ -13,3 +13,11 @@ yamux = "0.14"
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
 futures = "0.3"
+
+[[bin]]
+name = "yamux_example_client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "yamux_example_server"
+path = "src/bin/server.rs"

@@ -36,8 +36,9 @@ use std::{
 
 /// The global singleton holder for the parsed configuration.
 ///
-/// Initialised once by [`Config::init`] and then immutably borrowed for the
-/// lifetime of the process.
+/// Initialised by [`Config::init`] and atomically swapped on `SIGHUP` hot-reloads
+/// via [`Config::update_global`] so readers calling [`Config::try_global`] or
+/// [`Config::global`] always observe the latest validated configuration.
 static CONFIG: OnceLock<ArcSwap<Config>> = OnceLock::new();
 
 // ============================================================================

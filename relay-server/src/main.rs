@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_appender::{non_blocking::WorkerGuard, rolling::RollingFileAppender};
-use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
+use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
 
 #[cfg(unix)]
 async fn wait_for_shutdown() -> Result<()> {
@@ -47,6 +47,23 @@ async fn wait_for_shutdown() -> Result<()> {
     let _ = tokio::signal::ctrl_c().await;
     info!("Shutdown signal received. Shutting down Relay Server...");
     Ok(())
+}
+
+/// Distinct `FormatFields` newtype for the file `fmt::Layer` so its `FormattedFields<N>`
+/// span extension does not collide with `stdout_layer`'s `FormattedFields<DefaultFields>`
+/// (which otherwise causes `on_record` to append recorded fields twice and leaks ANSI
+/// color escapes into the file log).
+#[derive(Default)]
+struct FileFormatFields(fmt::format::DefaultFields);
+
+impl<'writer> fmt::FormatFields<'writer> for FileFormatFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
 }
 
 /// Configures tracing, daily rolling file logging (if `log_dir` is configured),
@@ -131,6 +148,7 @@ fn setup_tracing(
         let (non_blocking_appender, guard) = tracing_appender::non_blocking(file_appender);
 
         let file_layer = tracing_subscriber::fmt::layer()
+            .fmt_fields(FileFormatFields::default())
             .with_ansi(false)
             .with_writer(non_blocking_appender)
             .with_filter(
@@ -320,4 +338,87 @@ async fn main() -> Result<()> {
         let _ = provider.shutdown();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FileFormatFields;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::{Registry, fmt, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedWriter {
+        fn into_string(self) -> Result<String, Box<dyn std::error::Error>> {
+            let bytes = self
+                .0
+                .lock()
+                .map_err(|_| "SharedWriter mutex poisoned")?
+                .clone();
+            Ok(String::from_utf8(bytes)?)
+        }
+    }
+
+    impl io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut guard = self
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("SharedWriter mutex poisoned"))?;
+            guard.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> fmt::MakeWriter<'a> for SharedWriter {
+        type Writer = SharedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn test_dual_fmt_layers_do_not_leak_ansi_or_duplicate_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let stdout_buf = SharedWriter::default();
+        let file_buf = SharedWriter::default();
+
+        let stdout_layer = fmt::layer().with_ansi(true).with_writer(stdout_buf.clone());
+        let file_layer = fmt::layer()
+            .fmt_fields(FileFormatFields::default())
+            .with_ansi(false)
+            .with_writer(file_buf.clone());
+
+        let subscriber = Registry::default().with(stdout_layer).with(file_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "relay_request",
+                sni = "demo.example.test",
+                route = tracing::field::Empty
+            );
+            let _enter = span.enter();
+            tracing::Span::current().record("route", "primary-tunnel");
+            tracing::info!("relayed stream");
+        });
+
+        let stdout_out = stdout_buf.into_string()?;
+        let file_out = file_buf.into_string()?;
+
+        assert_eq!(stdout_out.matches("primary-tunnel").count(), 1);
+        assert_eq!(file_out.matches("route=").count(), 1);
+        assert_eq!(file_out.matches("primary-tunnel").count(), 1);
+        assert!(
+            !file_out.contains('\x1b'),
+            "file log must not contain ANSI escapes: {file_out}"
+        );
+        Ok(())
+    }
 }

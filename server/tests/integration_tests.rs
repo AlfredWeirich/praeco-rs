@@ -1883,3 +1883,145 @@ async fn test_router_header_policy_and_credential_stripping_end_to_end() {
 
     cancel_token.cancel();
 }
+
+/// 13. Hot-Reload (`Q2-01` / `Q-02` / `Q-09`): `ArcSwap` stack swap updates `JwtAuthLayer`
+///     (`oid_mapping`), `InspectionLayer` (`AllowedPathes`), and inner services on an active handler.
+#[tokio::test]
+async fn test_dynamic_stack_hot_reload_updates_jwt_oid_mapping_and_inspection()
+-> Result<(), Box<dyn std::error::Error>> {
+    use http_body_util::combinators::BoxBody;
+    use praeco_rs::configuration::RoleVec;
+
+    const TEST_PRIV_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/IrnOV6maFjmtsjchLt6\n-----END PRIVATE KEY-----\n";
+    const TEST_PUB_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAk2Zye1IFLZDkM9awuejFhYgrETKpGldlqBFSGOEM/os=\n-----END PUBLIC KEY-----\n";
+
+    let pki = common::test_pki::TestPki::new();
+    let pki_dir = pki
+        .public_ca_pem
+        .parent()
+        .ok_or("TestPki missing temp parent directory")?;
+    let jwt_pub_path = pki_dir.join("hot_reload_jwt_pub.pem");
+    std::fs::write(&jwt_pub_path, TEST_PUB_KEY)?;
+
+    let role_echo = || {
+        tower::service_fn(|req: Request<SrvBody>| async move {
+            let roles = req
+                .extensions()
+                .get::<Arc<RoleVec<6>>>()
+                .map(|r| {
+                    r.iter()
+                        .map(|role| role.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_default();
+            let body: BoxBody<Bytes, SrvError> =
+                Full::new(Bytes::from(roles)).map_err(SrvError::from).boxed();
+            Ok::<_, SrvError>(hyper::Response::new(body))
+        })
+        .boxed_clone_sync()
+    };
+
+    let make_cfg = |oid_role: &str, allowed_prefix: &str, allowed_regex: &str| {
+        let toml_str = format!(
+            r#"
+            [[Server]]
+            name = "HotReloadJwtInspectionTest"
+            ip = "127.0.0.1"
+            port = 8443
+            protocol = "http"
+            service = "Echo"
+            authentication = "None"
+
+            [Server.oid_mapping]
+            "9" = "{oid_role}"
+
+            [Server.AllowedPathes.GET]
+            "{allowed_prefix}" = ["{allowed_regex}"]
+
+            [Server.Layers]
+            enabled = ["JwtAuth", "Inspection"]
+
+            [Server.Layers.JWT]
+            jwt_public_keys = ["{jwt_pub}"]
+            expected_issuer = "hot-reload-idp"
+            expected_audience = "hot-reload-api"
+            "#,
+            jwt_pub = jwt_pub_path.display(),
+        );
+        parse_server_config(&toml_str)
+    };
+
+    let cfg_v1 = make_cfg("Viewer", "/v1/*", "^/v1/[a-z]+$");
+    let stack_v1 = build_service_stack_with_base(&cfg_v1, role_echo())?;
+    let dynamic_stack = Arc::new(ArcSwap::from_pointee(stack_v1));
+
+    let addr: SocketAddr = "127.0.0.1:4242".parse()?;
+    let handler = ConnectionHandler::with_dynamic_stack(
+        Arc::clone(&dynamic_stack),
+        addr,
+        Vec::new(),
+        None,
+        None,
+        Arc::new(cfg_v1.oid_mapping.clone()),
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes())?;
+    let claims = common::Claims {
+        sub: "alice".to_string(),
+        iss: "hot-reload-idp".to_string(),
+        aud: Some("hot-reload-api".to_string()),
+        exp: now as usize + 3600,
+        oids: vec!["9".to_string()],
+        jti: Some("hot-reload-jti-1".to_string()),
+    };
+    let token = common::sign_jwt(&claims, &enc_key)?;
+
+    // Before reload: /v1/items succeeds with role "Viewer"; /v2/items blocked by InspectionLayer.
+    let req_v1_before = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/items")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_v1_before = handler.clone().handle(req_v1_before).await?;
+    assert_eq!(resp_v1_before.status(), StatusCode::OK);
+    let body_v1_before = resp_v1_before.into_body().collect().await?.to_bytes();
+    assert_eq!(&body_v1_before[..], b"Viewer");
+
+    let req_v2_before = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/items")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_v2_before = handler.clone().handle(req_v2_before).await?;
+    assert_eq!(resp_v2_before.status(), StatusCode::FORBIDDEN);
+
+    // Hot-reload stack: change oid_mapping "9" -> "Admin" and AllowedPathes -> /v2/*
+    let cfg_v2 = make_cfg("Admin", "/v2/*", "^/v2/[a-z]+$");
+    let stack_v2 = build_service_stack_with_base(&cfg_v2, role_echo())?;
+    dynamic_stack.store(Arc::new(stack_v2));
+
+    // After reload on the same ConnectionHandler: /v1/items is rejected, /v2/items yields "Admin".
+    let req_v1_after = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/items")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_v1_after = handler.clone().handle(req_v1_after).await?;
+    assert_eq!(resp_v1_after.status(), StatusCode::FORBIDDEN);
+
+    let req_v2_after = Request::builder()
+        .method(Method::GET)
+        .uri("/v2/items")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_v2_after = handler.handle(req_v2_after).await?;
+    assert_eq!(resp_v2_after.status(), StatusCode::OK);
+    let body_v2_after = resp_v2_after.into_body().collect().await?.to_bytes();
+    assert_eq!(&body_v2_after[..], b"Admin");
+
+    Ok(())
+}
