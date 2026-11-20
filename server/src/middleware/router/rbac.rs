@@ -50,7 +50,12 @@ pub fn enforce_rbac(
     server_name: &str,
 ) -> Result<(), Box<Response<ServiceRespBody>>> {
     let path = parts.uri.path();
-    if path.contains(';') || path.to_ascii_lowercase().contains("%3b") {
+    if path.contains(';')
+        || path
+            .as_bytes()
+            .windows(3)
+            .any(|w| w.eq_ignore_ascii_case(b"%3b"))
+    {
         crate::configuration::ServerMetrics::inc_blocked_auth_rbac(server_name);
         warn!(
             "{}: Forbidden: matrix parameter ';' is not permitted in RBAC path '{}'",
@@ -330,11 +335,26 @@ mod tests {
         let admin_slash = create_request("/api/Admin/", Some(vec!["Admin"]));
         assert!(enforce_rbac(&admin_slash, &route, Some(&compiled), "test_srv").is_ok());
 
-        // Semicolon matrix parameter must be rejected even for Admin
-        let admin_semi = create_request("/api/Admin;v=1", Some(vec!["Admin"]));
-        let res = enforce_rbac(&admin_semi, &route, Some(&compiled), "test_srv");
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err().status(), StatusCode::FORBIDDEN);
+        // Semicolon matrix parameter must be rejected even for Admin (including %3b / %3B zero-alloc check)
+        for bad_path in ["/api/Admin;v=1", "/api/Admin%3bv=1", "/api/Admin%3Bv=1"] {
+            let admin_semi = create_request(bad_path, Some(vec!["Admin"]));
+            let res = enforce_rbac(&admin_semi, &route, Some(&compiled), "test_srv");
+            assert!(res.is_err());
+            assert_eq!(
+                res.err().map(|r| r.status()),
+                Some(StatusCode::FORBIDDEN),
+                "path '{bad_path}' must be rejected with 403"
+            );
+        }
+
+        // Short paths (< 3 bytes) and unrelated percent-encodings must not panic or false-positive
+        for ok_path in ["/", "/%3", "/public%3a"] {
+            let parts = create_request(ok_path, Some(vec!["Guest"]));
+            assert!(
+                enforce_rbac(&parts, &route, Some(&compiled), "test_srv").is_ok(),
+                "path '{ok_path}' must not trigger semicolon rejection"
+            );
+        }
     }
 }
 

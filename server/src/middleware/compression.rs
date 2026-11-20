@@ -112,13 +112,20 @@ pub struct SrvCompressionService<S> {
     server_name: &'static str,
 }
 
+/// Pre-negotiated response compression algorithm computed zero-allocation on request entry (`P2-06`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum NegotiatedEncoding {
+    None,
+    Gzip,
+    Brotli,
+}
+
 #[pin_project]
 pub struct SrvCompressionFuture<F> {
     #[pin]
     inner: F,
     server_name: &'static str,
-    accept_encoding: String,
-    is_head_request: bool,
+    negotiated_encoding: NegotiatedEncoding,
 }
 
 /// Checks whether `accept_encoding` permits `target_coding` with a quality value `q > 0`.
@@ -165,7 +172,6 @@ where
         };
 
         // Determine which compression algorithm to use (if any).
-        let accept_header = this.accept_encoding;
         let server_name = *this.server_name;
         let status = resp.status();
         let is_bodiless_status = status.is_informational()
@@ -182,27 +188,24 @@ where
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/grpc"));
 
-        let algo = if *this.is_head_request || is_bodiless_status || already_encoded || is_grpc {
-            None
-        } else if accepts_coding(accept_header, "gzip") {
-            Some("gzip")
-        } else if accepts_coding(accept_header, "br") {
-            Some("br")
+        let algo = if is_bodiless_status || already_encoded || is_grpc {
+            NegotiatedEncoding::None
         } else {
-            None
+            *this.negotiated_encoding
         };
 
-        if let Some(encoding) = algo {
+        if algo != NegotiatedEncoding::None {
+            let encoding = match algo {
+                NegotiatedEncoding::Gzip => "gzip",
+                NegotiatedEncoding::Brotli => "br",
+                NegotiatedEncoding::None => unreachable!(),
+            };
             tracing::trace!("{}: Compressing body with {}", server_name, encoding);
             // Content-Length is unknown for a streaming compressed body.
             resp.headers_mut().remove(CONTENT_LENGTH);
             resp.headers_mut().insert(
                 CONTENT_ENCODING,
-                hyper::header::HeaderValue::from_static(if encoding == "gzip" {
-                    "gzip"
-                } else {
-                    "br"
-                }),
+                hyper::header::HeaderValue::from_static(encoding),
             );
             append_vary_accept_encoding(resp.headers_mut());
 
@@ -219,7 +222,7 @@ where
             let body_reader = StreamReader::new(data_stream);
 
             // 2. Compress & Wrap in Frames
-            let new_body: SrvBody = if encoding == "gzip" {
+            let new_body: SrvBody = if algo == NegotiatedEncoding::Gzip {
                 let encoder = GzipEncoder::new(body_reader);
                 let stream = ReaderStream::new(encoder).map(|res| res.map(Frame::data));
                 tracing::trace!("{}: Compress response with GZip", server_name);
@@ -274,22 +277,29 @@ where
     fn call(&mut self, req: Request<SrvBody>) -> Self::Future {
         let server_name = self.server_name;
 
-        let is_head_request = req.method() == hyper::Method::HEAD;
-        // Capture the Accept-Encoding header before moving the request.
-        let accept_encoding = req
-            .headers()
-            .get(ACCEPT_ENCODING)
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let negotiated_encoding = if req.method() == hyper::Method::HEAD {
+            NegotiatedEncoding::None
+        } else {
+            let accept_encoding = req
+                .headers()
+                .get(ACCEPT_ENCODING)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if accepts_coding(accept_encoding, "gzip") {
+                NegotiatedEncoding::Gzip
+            } else if accepts_coding(accept_encoding, "br") {
+                NegotiatedEncoding::Brotli
+            } else {
+                NegotiatedEncoding::None
+            }
+        };
 
         let fut = self.inner.call(req);
 
         SrvCompressionFuture {
             inner: fut,
             server_name,
-            accept_encoding,
-            is_head_request,
+            negotiated_encoding,
         }
     }
 }
@@ -751,6 +761,27 @@ mod tests {
         // 1. q=0 must not compress
         let resp_q0 = run(Some("application/json"), None, "gzip;q=0", full_body(PAYLOAD)).await;
         assert!(resp_q0.headers().get(CONTENT_ENCODING).is_none());
+
+        // 1b. gzip;q=0 with br enabled selects NegotiatedEncoding::Brotli and compresses as br
+        let resp_br = run(
+            Some("application/json"),
+            None,
+            "gzip;q=0, br;q=1.0",
+            full_body(PAYLOAD),
+        )
+        .await;
+        assert_eq!(
+            resp_br
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("br")
+        );
+        let compressed_br = resp_br.into_body().collect().await?.to_bytes();
+        let mut decoder = BrotliDecoder::new(compressed_br.as_ref());
+        let mut decompressed = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut decoder, &mut decompressed).await?;
+        assert_eq!(decompressed.as_slice(), PAYLOAD);
 
         // 2. HEAD request must not compress or strip Content-Length
         let inner_head = service_fn(|_req: Request<SrvBody>| async move {

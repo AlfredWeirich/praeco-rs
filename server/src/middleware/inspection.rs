@@ -139,7 +139,7 @@ where
         let query = req.uri().query().unwrap_or("");
 
         // Defense-in-depth: Canonicalize path for allow-list matching and block traversal attempts
-        let canonical_path = match crate::middleware::path_sanitizer::sanitize_and_normalize_path(path) {
+        let canonical_path = match crate::middleware::path_sanitizer::sanitize_and_normalize_path_cow(path) {
             Ok(p) => p,
             Err(e) => {
                 crate::configuration::ServerMetrics::inc_blocked_inspection(server_name);
@@ -190,5 +190,56 @@ impl<S> InspectionService<S> {
         .boxed();
 
         crate::build_infallible_response(StatusCode::FORBIDDEN, None, body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::configuration::AllowedPathes;
+    use http_body_util::Empty;
+    use std::collections::HashMap;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn test_inspection_allows_clean_paths_and_blocks_traversal_with_cow()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut get_rules = HashMap::new();
+        get_rules.insert(
+            "/api/items".to_string(),
+            vec!["^/api/items(\\?page=\\d+)?$".to_string()],
+        );
+        let raw = AllowedPathes {
+            get: Some(get_rules),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledAllowedPathes::from_raw(&raw)?);
+        let inner = tower::service_fn(|_req: Request<crate::SrvBody>| async move {
+            Ok::<_, SrvError>(Response::new(
+                Full::new(Bytes::from_static(b"ok"))
+                    .map_err(SrvError::from)
+                    .boxed(),
+            ))
+        });
+        let svc = InspectionLayer::new(compiled, "test_srv").layer(inner);
+
+        let clean_req = Request::builder()
+            .uri("/api/items")
+            .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+        let resp_ok = svc.clone().oneshot(clean_req).await?;
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        let query_req = Request::builder()
+            .uri("/api/items?page=2")
+            .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+        let resp_query = svc.clone().oneshot(query_req).await?;
+        assert_eq!(resp_query.status(), StatusCode::OK);
+
+        let traversal_req = Request::builder()
+            .uri("/api/../api/items")
+            .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+        let resp_blocked = svc.oneshot(traversal_req).await?;
+        assert_eq!(resp_blocked.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 }

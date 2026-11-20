@@ -645,27 +645,30 @@ impl WebRouter {
         tower::service_fn(move |mut req: Request<SrvBody>| {
             let routes = Arc::clone(&routes);
             async move {
-                let method = req.method().clone();
-                let path = req.uri().path().to_owned();
+                let matched_route = routes
+                    .get(req.method())
+                    .and_then(|router| router.at(req.uri().path()).ok())
+                    .map(|matched| {
+                        let params: HashMap<String, String> = matched
+                            .params
+                            .iter()
+                            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                            .collect();
+                        (Arc::clone(matched.value), params)
+                    });
 
-                if let Some(router) = routes.get(&method)
-                    && let Ok(matched) = router.at(&path)
-                {
-                    let params: HashMap<String, String> = matched
-                        .params
-                        .iter()
-                        .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                        .collect();
-                    let handler = Arc::clone(matched.value);
+                if let Some((handler, params)) = matched_route {
                     req.extensions_mut().insert(PathParams(params));
                     return handler(req).await;
                 }
 
                 // Check if another HTTP method matches the same path -> 405 Method Not Allowed
+                let method = req.method();
+                let path = req.uri().path();
                 let mut allowed: Vec<&str> = routes
                     .iter()
                     .filter(|(m, _)| *m != method)
-                    .filter_map(|(m, router)| router.at(&path).ok().map(|_| m.as_str()))
+                    .filter_map(|(m, router)| router.at(path).ok().map(|_| m.as_str()))
                     .collect();
 
                 if !allowed.is_empty() {
@@ -804,6 +807,22 @@ mod tests {
             .oneshot(make_req(Method::POST, "/echo", Some(b"not-json")))
             .await?;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Method mismatch on an existing route path returns 405 with sorted Allow header
+        let res_405 = svc
+            .clone()
+            .oneshot(make_req(Method::DELETE, "/ping", None))
+            .await?;
+        assert_eq!(res_405.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            res_405.headers().get(header::ALLOW).and_then(|v| v.to_str().ok()),
+            Some("GET")
+        );
+
+        let res_404 = svc
+            .oneshot(make_req(Method::GET, "/missing", None))
+            .await?;
+        assert_eq!(res_404.status(), StatusCode::NOT_FOUND);
 
         Ok(())
     }

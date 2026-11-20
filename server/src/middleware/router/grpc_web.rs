@@ -903,10 +903,16 @@ pub async fn build_grpc_pool(
         endpoint = endpoint.tls_config(tls)?;
     }
 
+    const MAX_REFLECTION_SERVICES: usize = 256;
+    const MAX_DESCRIPTOR_FILES: usize = 1024;
+    const REFLECTION_CHANNEL_CAPACITY: usize = 16;
+
     let channel = endpoint.connect().await?;
     let mut reflection_client = ServerReflectionClient::new(channel);
 
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    // Reuse a single bidirectional gRPC ServerReflection stream for ListServices and
+    // all subsequent FileContainingSymbol requests, deduplicating shared imports (P2-07).
+    let (tx, rx) = tokio::sync::mpsc::channel(REFLECTION_CHANNEL_CAPACITY);
     tx.send(ServerReflectionRequest {
         host: String::new(),
         message_request: Some(MessageRequest::ListServices(String::new())),
@@ -921,47 +927,59 @@ pub async fn build_grpc_pool(
 
     let mut response_stream = response.into_inner();
     let mut current_services = Vec::new();
+    let mut seen_services = std::collections::HashSet::new();
 
     if let Some(res) = response_stream.message().await?
         && let Some(tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::ListServicesResponse(list_res)) = res.message_response
     {
+        if list_res.service.len() > MAX_REFLECTION_SERVICES {
+            return Err(format!(
+                "gRPC reflection returned too many services ({} > max {})",
+                list_res.service.len(),
+                MAX_REFLECTION_SERVICES
+            )
+            .into());
+        }
         for service in list_res.service {
-            current_services.push(service.name);
+            if !service.name.starts_with("grpc.reflection")
+                && seen_services.insert(service.name.clone())
+            {
+                current_services.push(service.name);
+            }
         }
     }
-    drop(tx);
 
     let mut pool = DescriptorPool::new();
+    let mut seen_files: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
 
     for service_name in current_services {
-        if service_name.starts_with("grpc.reflection") {
-            continue;
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
         tx.send(ServerReflectionRequest {
             host: String::new(),
             message_request: Some(MessageRequest::FileContainingSymbol(service_name)),
         })
         .await?;
 
-        let response: tonic::Response<
-            tonic::Streaming<tonic_reflection::pb::v1alpha::ServerReflectionResponse>,
-        > = reflection_client
-            .server_reflection_info(tonic::Request::new(ReceiverStream::new(rx)))
-            .await?;
-
-        let mut response_stream = response.into_inner();
-
         if let Some(res) = response_stream.message().await?
             && let Some(tonic_reflection::pb::v1alpha::server_reflection_response::MessageResponse::FileDescriptorResponse(fd_res)) = res.message_response
         {
             for fd_bytes in fd_res.file_descriptor_proto {
-                let fd_proto = prost::Message::decode(fd_bytes.as_ref())?;
+                let raw_slice: &[u8] = fd_bytes.as_ref();
+                if seen_files.contains(raw_slice) {
+                    continue;
+                }
+                if seen_files.len() >= MAX_DESCRIPTOR_FILES {
+                    return Err(format!(
+                        "gRPC reflection exceeded maximum descriptor file limit ({MAX_DESCRIPTOR_FILES})"
+                    )
+                    .into());
+                }
+                seen_files.insert(raw_slice.to_vec());
+                let fd_proto = prost::Message::decode(raw_slice)?;
                 pool.add_file_descriptor_proto(fd_proto)?;
             }
         }
     }
+    drop(tx);
 
     Ok(Arc::new(pool))
 }
@@ -1483,5 +1501,291 @@ mod tests {
             assert!(global_flag);
         }
         assert_eq!(small_global.remaining(), 40);
+    }
+
+    #[tokio::test]
+    async fn test_build_grpc_pool_reuses_single_stream_deduplicates_imports_and_enforces_limits()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use tonic_reflection::pb::v1alpha::{
+            FileDescriptorResponse, ListServiceResponse, ServerReflectionResponse, ServiceResponse,
+            server_reflection_response::MessageResponse as RespMessage,
+            server_reflection_server::{ServerReflection, ServerReflectionServer},
+        };
+
+        #[derive(Clone)]
+        enum MockMode {
+            Normal {
+                common_bytes: Vec<u8>,
+                alpha_bytes: Vec<u8>,
+                beta_bytes: Vec<u8>,
+            },
+            TooManyServices,
+            TooManyDescriptors {
+                payloads: Vec<Vec<u8>>,
+            },
+        }
+
+        #[derive(Clone)]
+        struct MockReflection {
+            mode: MockMode,
+            stream_count: Arc<AtomicUsize>,
+        }
+
+        #[tonic::async_trait]
+        impl ServerReflection for MockReflection {
+            type ServerReflectionInfoStream = ReceiverStream<Result<ServerReflectionResponse, tonic::Status>>;
+
+            async fn server_reflection_info(
+                &self,
+                request: tonic::Request<
+                    tonic::Streaming<tonic_reflection::pb::v1alpha::ServerReflectionRequest>,
+                >,
+            ) -> Result<tonic::Response<Self::ServerReflectionInfoStream>, tonic::Status> {
+                self.stream_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut inbound = request.into_inner();
+                let mode = self.mode.clone();
+                let (out_tx, out_rx) = tokio::sync::mpsc::channel(16);
+
+                tokio::spawn(async move {
+                    while let Ok(Some(req)) = inbound.message().await {
+                        let msg_resp = match req.message_request {
+                            Some(MessageRequest::ListServices(_)) => match &mode {
+                                MockMode::Normal { .. } => {
+                                    RespMessage::ListServicesResponse(ListServiceResponse {
+                                        service: vec![
+                                            ServiceResponse {
+                                                name: "grpc.reflection.v1alpha.ServerReflection"
+                                                    .to_string(),
+                                            },
+                                            ServiceResponse {
+                                                name: "svc.Alpha".to_string(),
+                                            },
+                                            ServiceResponse {
+                                                name: "svc.Beta".to_string(),
+                                            },
+                                            // Duplicate entry must also be ignored cleanly
+                                            ServiceResponse {
+                                                name: "svc.Alpha".to_string(),
+                                            },
+                                        ],
+                                    })
+                                }
+                                MockMode::TooManyServices => {
+                                    let service = (0..257)
+                                        .map(|i| ServiceResponse {
+                                            name: format!("svc.Service{i}"),
+                                        })
+                                        .collect();
+                                    RespMessage::ListServicesResponse(ListServiceResponse {
+                                        service,
+                                    })
+                                }
+                                MockMode::TooManyDescriptors { .. } => {
+                                    RespMessage::ListServicesResponse(ListServiceResponse {
+                                        service: vec![ServiceResponse {
+                                            name: "svc.Bulk".to_string(),
+                                        }],
+                                    })
+                                }
+                            },
+                            Some(MessageRequest::FileContainingSymbol(sym)) => match &mode {
+                                MockMode::Normal {
+                                    common_bytes,
+                                    alpha_bytes,
+                                    beta_bytes,
+                                } => {
+                                    let files = if sym == "svc.Alpha" {
+                                        vec![common_bytes.clone(), alpha_bytes.clone()]
+                                    } else {
+                                        vec![common_bytes.clone(), beta_bytes.clone()]
+                                    };
+                                    RespMessage::FileDescriptorResponse(FileDescriptorResponse {
+                                        file_descriptor_proto: files,
+                                    })
+                                }
+                                MockMode::TooManyServices => {
+                                    RespMessage::FileDescriptorResponse(FileDescriptorResponse {
+                                        file_descriptor_proto: Vec::new(),
+                                    })
+                                }
+                                MockMode::TooManyDescriptors { payloads } => {
+                                    RespMessage::FileDescriptorResponse(FileDescriptorResponse {
+                                        file_descriptor_proto: payloads.clone(),
+                                    })
+                                }
+                            },
+                            _ => {
+                                let _ = out_tx
+                                    .send(Err(tonic::Status::unimplemented(
+                                        "unsupported reflection request",
+                                    )))
+                                    .await;
+                                break;
+                            }
+                        };
+
+                        if out_tx
+                            .send(Ok(ServerReflectionResponse {
+                                valid_host: String::new(),
+                                original_request: None,
+                                message_response: Some(msg_resp),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+
+                Ok(tonic::Response::new(ReceiverStream::new(out_rx)))
+            }
+        }
+
+        async fn spawn_mock_reflection(
+            mode: MockMode,
+        ) -> Result<
+            (
+                Uri,
+                Arc<AtomicUsize>,
+                tokio::sync::oneshot::Sender<()>,
+                tokio::task::JoinHandle<()>,
+            ),
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            let stream_count = Arc::new(AtomicUsize::new(0));
+            let svc = MockReflection {
+                mode,
+                stream_count: Arc::clone(&stream_count),
+            };
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let _ = tonic::transport::Server::builder()
+                    .add_service(ServerReflectionServer::new(svc))
+                    .serve_with_incoming_shutdown(incoming, async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+            let uri: Uri = format!("http://127.0.0.1:{port}").parse()?;
+            Ok((uri, stream_count, shutdown_tx, handle))
+        }
+
+        // Build shared common.proto + alpha.proto + beta.proto descriptors
+        let common_fd = FileDescriptorProto {
+            name: Some("common.proto".into()),
+            package: Some("common".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("SharedMsg".into()),
+                field: vec![FieldDescriptorProto {
+                    name: Some("id".into()),
+                    json_name: Some("id".into()),
+                    number: Some(1),
+                    label: Some(Label::Optional as i32),
+                    r#type: Some(Type::String as i32),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let alpha_fd = FileDescriptorProto {
+            name: Some("alpha.proto".into()),
+            package: Some("svc".into()),
+            dependency: vec!["common.proto".into()],
+            syntax: Some("proto3".into()),
+            service: vec![ServiceDescriptorProto {
+                name: Some("Alpha".into()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("Ping".into()),
+                    input_type: Some(".common.SharedMsg".into()),
+                    output_type: Some(".common.SharedMsg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let beta_fd = FileDescriptorProto {
+            name: Some("beta.proto".into()),
+            package: Some("svc".into()),
+            dependency: vec!["common.proto".into()],
+            syntax: Some("proto3".into()),
+            service: vec![ServiceDescriptorProto {
+                name: Some("Beta".into()),
+                method: vec![MethodDescriptorProto {
+                    name: Some("Pong".into()),
+                    input_type: Some(".common.SharedMsg".into()),
+                    output_type: Some(".common.SharedMsg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let common_bytes = common_fd.encode_to_vec();
+        let alpha_bytes = alpha_fd.encode_to_vec();
+        let beta_bytes = beta_fd.encode_to_vec();
+
+        // 1. Single bidirectional stream + shared import deduplication
+        let (uri, count, tx_stop, handle) = spawn_mock_reflection(MockMode::Normal {
+            common_bytes,
+            alpha_bytes,
+            beta_bytes,
+        })
+        .await?;
+        let pool = build_grpc_pool(&uri, None).await?;
+        let _ = tx_stop.send(());
+        let _ = handle.await;
+
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "build_grpc_pool must reuse a single bidirectional stream for ListServices and FileContainingSymbol"
+        );
+        assert!(pool.get_service_by_name("svc.Alpha").is_some());
+        assert!(pool.get_service_by_name("svc.Beta").is_some());
+        assert!(pool.get_message_by_name("common.SharedMsg").is_some());
+
+        // 2. Rejects responses exceeding MAX_REFLECTION_SERVICES (256)
+        let (uri_srv_cap, _, tx_stop_2, handle_2) =
+            spawn_mock_reflection(MockMode::TooManyServices).await?;
+        let err_srv = build_grpc_pool(&uri_srv_cap, None)
+            .await
+            .err()
+            .ok_or("expected service limit error")?;
+        let _ = tx_stop_2.send(());
+        let _ = handle_2.await;
+        assert!(err_srv.to_string().contains("too many services"));
+
+        // 3. Rejects responses exceeding MAX_DESCRIPTOR_FILES (1024)
+        let payloads = (0..1025)
+            .map(|i| {
+                FileDescriptorProto {
+                    name: Some(format!("f{i}.proto")),
+                    package: Some(format!("p{i}")),
+                    syntax: Some("proto3".into()),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+            })
+            .collect();
+        let (uri_fd_cap, _, tx_stop_3, handle_3) =
+            spawn_mock_reflection(MockMode::TooManyDescriptors { payloads }).await?;
+        let err_fd = build_grpc_pool(&uri_fd_cap, None)
+            .await
+            .err()
+            .ok_or("expected descriptor file limit error")?;
+        let _ = tx_stop_3.send(());
+        let _ = handle_3.await;
+        assert!(err_fd.to_string().contains("descriptor file limit"));
+
+        Ok(())
     }
 }

@@ -1637,6 +1637,7 @@ async fn handle_h3_connection(
     };
     let oids = client_meta.oids;
     let client_cert_pem: Option<Arc<str>> = client_meta.pem.map(Arc::from);
+    let encoded_pem_header = crate::precompute_encoded_pem_header(client_cert_pem.as_deref());
     let client_cert_san: Option<Arc<str>> = client_meta.san.map(Arc::from);
 
     let mut cached_oid_map = live_oid_mapping.load_full();
@@ -1681,6 +1682,7 @@ async fn handle_h3_connection(
                     let roles_for_req = shared_roles.clone();
                     let shared_oids_for_req = shared_oids.clone();
                     let req_cert_pem = client_cert_pem.clone();
+                    let req_encoded_pem_hdr = encoded_pem_header.clone();
                     let req_cert_san = client_cert_san.clone();
 
                     stream_tasks.spawn(async move {
@@ -1700,6 +1702,7 @@ async fn handle_h3_connection(
                                     peer_addr,
                                     roles_for_req,
                                     req_cert_pem,
+                                    req_encoded_pem_hdr,
                                     req_cert_san,
                                     shared_oids_for_req,
                                 );

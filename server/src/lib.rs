@@ -513,6 +513,19 @@ impl AsRef<[String]> for OidCertExtension {
     }
 }
 
+/// Pre-encoded URL-escaped PEM client certificate [`hyper::header::HeaderValue`] cached once
+/// per mTLS connection so [`crate::middleware::router::headers::prepare_proxy_headers`] reuses
+/// it zero-copy across requests (`P2-05`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EncodedPemCertHeaderExtension(pub hyper::header::HeaderValue);
+
+/// URL-encodes `pem` and converts it into a [`hyper::header::HeaderValue`] once per connection.
+fn precompute_encoded_pem_header(pem: Option<&str>) -> Option<hyper::header::HeaderValue> {
+    let pem = pem?;
+    let escaped = urlencoding::encode(pem);
+    hyper::header::HeaderValue::from_str(escaped.as_ref()).ok()
+}
+
 #[derive(Clone)]
 enum ServiceSource {
     Static(BoxedCloneService),
@@ -575,8 +588,11 @@ pub struct ConnectionHandler {
     /// updates via a single `Arc::ptr_eq` check per request.
     dynamic_oid_mapping: Option<DynamicOidMapping>,
 
-    /// The client's full certificate in PEM format, URL-encoded (shared across clones).
+    /// The client's full certificate in PEM format (shared across clones).
     client_cert_pem: Option<Arc<str>>,
+
+    /// Pre-encoded URL-escaped PEM client certificate header value computed once per connection (`P2-05`).
+    encoded_pem_header: Option<hyper::header::HeaderValue>,
 
     /// The client's Subject Alternative Name (SAN, shared across clones).
     client_cert_san: Option<Arc<str>>,
@@ -616,13 +632,16 @@ impl ConnectionHandler {
         oid_mapping: Arc<std::collections::HashMap<String, UserRole>>,
     ) -> Self {
         let final_roles = resolve_roles_from_oids(&oids, &oid_mapping);
+        let client_cert_pem = client_cert_pem.map(Arc::<str>::from);
+        let encoded_pem_header = precompute_encoded_pem_header(client_cert_pem.as_deref());
 
         Self {
             service_source: ServiceSource::Static(service),
             client_addr: addr,
             client_roles: Arc::new(final_roles),
             dynamic_oid_mapping: None,
-            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_pem,
+            encoded_pem_header,
             client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
@@ -640,13 +659,16 @@ impl ConnectionHandler {
         oid_mapping: Arc<std::collections::HashMap<String, UserRole>>,
     ) -> Self {
         let final_roles = resolve_roles_from_oids(&oids, &oid_mapping);
+        let client_cert_pem = client_cert_pem.map(Arc::<str>::from);
+        let encoded_pem_header = precompute_encoded_pem_header(client_cert_pem.as_deref());
 
         Self {
             service_source: ServiceSource::Dynamic(dynamic_stack),
             client_addr: addr,
             client_roles: Arc::new(final_roles),
             dynamic_oid_mapping: None,
-            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_pem,
+            encoded_pem_header,
             client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
@@ -672,6 +694,8 @@ impl ConnectionHandler {
             cached_map,
             cached_roles: Arc::clone(&final_roles),
         }));
+        let client_cert_pem = client_cert_pem.map(Arc::<str>::from);
+        let encoded_pem_header = precompute_encoded_pem_header(client_cert_pem.as_deref());
 
         Self {
             service_source: ServiceSource::Dynamic(dynamic_stack),
@@ -681,7 +705,8 @@ impl ConnectionHandler {
                 live: oid_mapping,
                 state,
             }),
-            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_pem,
+            encoded_pem_header,
             client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids: Arc::new(oids),
         }
@@ -707,12 +732,16 @@ impl ConnectionHandler {
         client_cert_san: Option<String>,
         client_oids: Arc<Vec<String>>,
     ) -> Self {
+        let client_cert_pem = client_cert_pem.map(Arc::<str>::from);
+        let encoded_pem_header = precompute_encoded_pem_header(client_cert_pem.as_deref());
+
         Self {
             service_source: ServiceSource::Static(service),
             client_addr: addr,
             client_roles: roles,
             dynamic_oid_mapping: None,
-            client_cert_pem: client_cert_pem.map(Arc::<str>::from),
+            client_cert_pem,
+            encoded_pem_header,
             client_cert_san: client_cert_san.map(Arc::<str>::from),
             client_oids,
         }
@@ -728,23 +757,28 @@ impl ConnectionHandler {
         client_cert_san: Option<String>,
         client_oids: Arc<Vec<String>>,
     ) -> Self {
+        let client_cert_pem = client_cert_pem.map(Arc::<str>::from);
+        let encoded_pem_header = precompute_encoded_pem_header(client_cert_pem.as_deref());
         Self::with_dynamic_stack_shared_arc(
             dynamic_stack,
             addr,
             roles,
-            client_cert_pem.map(Arc::<str>::from),
+            client_cert_pem,
+            encoded_pem_header,
             client_cert_san.map(Arc::<str>::from),
             client_oids,
         )
     }
 
     /// Internal zero-allocation variant sharing pre-allocated `Arc<str>` cert metadata
-    /// across multiplexed HTTP/3 streams on the same connection.
+    /// and pre-encoded PEM [`hyper::header::HeaderValue`] across multiplexed HTTP/3 streams
+    /// on the same connection.
     pub(crate) fn with_dynamic_stack_shared_arc(
         dynamic_stack: Arc<arc_swap::ArcSwap<BoxedCloneService>>,
         addr: SocketAddr,
         roles: Arc<crate::configuration::RoleVec<6>>,
         client_cert_pem: Option<Arc<str>>,
+        encoded_pem_header: Option<hyper::header::HeaderValue>,
         client_cert_san: Option<Arc<str>>,
         client_oids: Arc<Vec<String>>,
     ) -> Self {
@@ -754,6 +788,7 @@ impl ConnectionHandler {
             client_roles: roles,
             dynamic_oid_mapping: None,
             client_cert_pem,
+            encoded_pem_header,
             client_cert_san,
             client_oids,
         }
@@ -812,9 +847,13 @@ impl ConnectionHandler {
         };
         req.extensions_mut().insert(roles_to_inject);
 
-        // 3. Inject cert information if present (zero-copy Arc move)
+        // 3. Inject cert information if present (zero-copy Arc / HeaderValue move)
         if let Some(pem) = self.client_cert_pem {
             req.extensions_mut().insert(PemCertExtension(pem));
+        }
+        if let Some(encoded_pem_hdr) = self.encoded_pem_header {
+            req.extensions_mut()
+                .insert(EncodedPemCertHeaderExtension(encoded_pem_hdr));
         }
         if let Some(san) = self.client_cert_san {
             req.extensions_mut().insert(SanCertExtension(san));
@@ -998,6 +1037,7 @@ impl Clone for ConnectionHandler {
             client_roles: self.client_roles.clone(),
             dynamic_oid_mapping: self.dynamic_oid_mapping.clone(),
             client_cert_pem: self.client_cert_pem.clone(),
+            encoded_pem_header: self.encoded_pem_header.clone(),
             client_cert_san: self.client_cert_san.clone(),
             client_oids: self.client_oids.clone(),
         }
@@ -1171,6 +1211,17 @@ mod tests {
                     .get::<PemCertExtension>()
                     .map(|ext| Arc::clone(&ext.0))
                     .ok_or_else(|| SrvError::Other("missing PemCertExtension".into()))?;
+                let encoded_pem = req
+                    .extensions()
+                    .get::<EncodedPemCertHeaderExtension>()
+                    .map(|ext| ext.0.clone())
+                    .ok_or_else(|| {
+                        SrvError::Other("missing EncodedPemCertHeaderExtension".into())
+                    })?;
+                assert_eq!(
+                    encoded_pem.as_bytes(),
+                    urlencoding::encode(&pem).as_bytes()
+                );
                 let san = req
                     .extensions()
                     .get::<SanCertExtension>()

@@ -137,6 +137,17 @@ fn filter_cookie_header(headers: &mut hyper::HeaderMap, strip_cookie_names: &Has
     }
 }
 
+/// Formats an [`std::net::IpAddr`] onto a fixed stack buffer and converts it into a
+/// [`header::HeaderValue`] without heap `String` allocation (`P2-05`).
+fn ip_addr_to_header_value(ip: std::net::IpAddr) -> Option<header::HeaderValue> {
+    use std::io::Write as _;
+    let mut buf = [0u8; 64];
+    let mut cursor = std::io::Cursor::new(&mut buf[..]);
+    write!(cursor, "{ip}").ok()?;
+    let len = cursor.position() as usize;
+    header::HeaderValue::from_bytes(&buf[..len]).ok()
+}
+
 /// Cleans and prepares HTTP headers for upstream forwarding according to the route's [`RouteHeaderPolicy`].
 ///
 /// Security operations performed:
@@ -259,14 +270,14 @@ pub fn prepare_proxy_headers(
         header::HeaderValue::from(u16::from(max_forwards)),
     );
 
-    if let Some(addr) = extensions.get::<std::net::SocketAddr>()
-        && !addr.ip().is_unspecified() {
-            let ip_str = addr.ip().to_string();
-            if let Ok(ip_val) = header::HeaderValue::from_str(&ip_str) {
-                original_headers.insert("x-real-ip", ip_val.clone());
-                original_headers.insert("x-forwarded-for", ip_val);
-            }
-        }
+    let peer_addr = extensions.get::<std::net::SocketAddr>();
+    let client_ip_val = peer_addr.and_then(|addr| ip_addr_to_header_value(addr.ip()));
+    if let (Some(addr), Some(ip_val)) = (peer_addr, &client_ip_val)
+        && !addr.ip().is_unspecified()
+    {
+        original_headers.insert("x-real-ip", ip_val.clone());
+        original_headers.insert("x-forwarded-for", ip_val.clone());
+    }
 
     // Manage X-Forwarded-Proto (always authoritative from gateway configuration)
     let proto_val = match config.protocol {
@@ -291,18 +302,25 @@ pub fn prepare_proxy_headers(
     // 6. Inject verified client-cert identity headers IF AND ONLY IF client_cert_forwarding is configured
     if let Some(forward_config) = &config.client_cert_forwarding {
         tracing::trace!("Client cert forwarding is ENABLED in config!");
-        if let Some(header_cert) = &forward_config.header_cert
-            && let Some(pem) = extensions.get::<crate::PemCertExtension>() {
-                let pem_escaped = urlencoding::encode(&pem.0).into_owned();
-                if let Ok(hdr_val) = header::HeaderValue::from_str(&pem_escaped) {
-                    if let Ok(hdr_name) = header::HeaderName::from_bytes(header_cert.as_bytes()) {
-                        tracing::trace!("Injecting PEM into header: {}", hdr_name);
-                        original_headers.insert(hdr_name, hdr_val);
-                    }
-                } else {
-                    tracing::warn!("FAILED to convert escaped PEM to HeaderValue");
+        if let Some(header_cert) = &forward_config.header_cert {
+            let encoded_hdr = extensions
+                .get::<crate::EncodedPemCertHeaderExtension>()
+                .map(|ext| ext.0.clone())
+                .or_else(|| {
+                    extensions.get::<crate::PemCertExtension>().and_then(|pem| {
+                        let pem_escaped = urlencoding::encode(&pem.0);
+                        header::HeaderValue::from_str(pem_escaped.as_ref()).ok()
+                    })
+                });
+            if let Some(hdr_val) = encoded_hdr {
+                if let Ok(hdr_name) = header::HeaderName::from_bytes(header_cert.as_bytes()) {
+                    tracing::trace!("Injecting PEM into header: {}", hdr_name);
+                    original_headers.insert(hdr_name, hdr_val);
                 }
+            } else if extensions.get::<crate::PemCertExtension>().is_some() {
+                tracing::warn!("FAILED to convert escaped PEM to HeaderValue");
             }
+        }
         if let Some(header_san) = &forward_config.header_san {
             tracing::trace!("Config expects SAN header name: '{}'", header_san);
             if let Some(san) = extensions.get::<crate::SanCertExtension>() {
@@ -358,14 +376,12 @@ pub fn prepare_proxy_headers(
                 }
         }
         if let Some(header_ip) = &forward_config.header_client_ip
-            && let Some(addr) = extensions.get::<std::net::SocketAddr>() {
-                let ip_str = addr.ip().to_string();
-                if let Ok(hdr_val) = header::HeaderValue::from_str(&ip_str)
-                    && let Ok(hdr_name) = header::HeaderName::from_bytes(header_ip.as_bytes()) {
-                        tracing::trace!("Injecting Client IP into header: {}", hdr_name);
-                        original_headers.insert(hdr_name, hdr_val);
-                    }
-            }
+            && let Some(hdr_val) = client_ip_val
+            && let Ok(hdr_name) = header::HeaderName::from_bytes(header_ip.as_bytes())
+        {
+            tracing::trace!("Injecting Client IP into header: {}", hdr_name);
+            original_headers.insert(hdr_name, hdr_val);
+        }
     } else {
         tracing::trace!("Client cert forwarding is NOT enabled in config!");
     }
@@ -890,5 +906,67 @@ mod tests {
         assert!(headers.contains_key(header::HOST));
         assert!(headers.contains_key(header::CONTENT_TYPE));
         assert!(headers.contains_key(header::CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn test_prepare_proxy_headers_prefers_preencoded_pem_and_reuses_ip_value()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let forwarding = ClientCertForwardingConfig {
+            header_cert: Some("x-client-cert".to_string()),
+            header_san: None,
+            header_roles: None,
+            header_client_ip: Some("x-client-ip".to_string()),
+        };
+        let config = make_test_config(Some(forwarding));
+        let policy = RouteHeaderPolicy::default();
+
+        // 1. Pre-encoded PEM extension is used directly, and IPv6 populates all 3 IP headers
+        let mut headers = hyper::HeaderMap::new();
+        let mut extensions = hyper::http::Extensions::new();
+        extensions.insert(crate::PemCertExtension::from("RAW_SHOULD_NOT_BE_REENCODED"));
+        extensions.insert(crate::EncodedPemCertHeaderExtension(
+            header::HeaderValue::from_static("PRE_ENCODED_PEM%0A"),
+        ));
+        let ipv6_addr: std::net::SocketAddr = "[2001:db8::1]:8443".parse()?;
+        extensions.insert(ipv6_addr);
+
+        prepare_proxy_headers(&mut headers, "test_server", None, &extensions, &config, &policy)
+            .map_err(|resp| format!("unexpected error status: {}", resp.status()))?;
+
+        assert_eq!(headers.get("x-client-cert").and_then(|v| v.to_str().ok()), Some("PRE_ENCODED_PEM%0A"));
+        assert_eq!(headers.get("x-real-ip").and_then(|v| v.to_str().ok()), Some("2001:db8::1"));
+        assert_eq!(headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()), Some("2001:db8::1"));
+        assert_eq!(headers.get("x-client-ip").and_then(|v| v.to_str().ok()), Some("2001:db8::1"));
+
+        // 2. Unspecified peer IP omits x-real-ip / x-forwarded-for while still setting header_client_ip
+        let mut unspec_headers = hyper::HeaderMap::new();
+        let mut unspec_ext = hyper::http::Extensions::new();
+        let unspec_addr: std::net::SocketAddr = "0.0.0.0:1234".parse()?;
+        unspec_ext.insert(unspec_addr);
+        prepare_proxy_headers(&mut unspec_headers, "test_server", None, &unspec_ext, &config, &policy)
+            .map_err(|resp| format!("unexpected error status: {}", resp.status()))?;
+
+        assert!(!unspec_headers.contains_key("x-real-ip"));
+        assert!(!unspec_headers.contains_key("x-forwarded-for"));
+        assert_eq!(unspec_headers.get("x-client-ip").and_then(|v| v.to_str().ok()), Some("0.0.0.0"));
+
+        // 3. Fallback URL-encodes raw PemCertExtension when pre-encoded extension is absent
+        let mut fallback_headers = hyper::HeaderMap::new();
+        let mut fallback_ext = hyper::http::Extensions::new();
+        fallback_ext.insert(crate::PemCertExtension::from("LINE1\nLINE2"));
+        prepare_proxy_headers(
+            &mut fallback_headers,
+            "test_server",
+            None,
+            &fallback_ext,
+            &config,
+            &policy,
+        )
+        .map_err(|resp| format!("unexpected error status: {}", resp.status()))?;
+        assert_eq!(
+            fallback_headers.get("x-client-cert").and_then(|v| v.to_str().ok()),
+            Some("LINE1%0ALINE2")
+        );
+        Ok(())
     }
 }

@@ -2622,9 +2622,9 @@ impl CompiledAllowedPathes {
     /// matching regex rules.
     pub fn is_allowed(&self, method: &str, path: &str, query: &str) -> bool {
         let full_path = if query.is_empty() {
-            path.to_string()
+            std::borrow::Cow::Borrowed(path)
         } else {
-            format!("{}?{}", path, query)
+            std::borrow::Cow::Owned(format!("{path}?{query}"))
         };
 
         match method {
