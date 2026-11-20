@@ -355,7 +355,7 @@ fn metrics_registry() -> &'static dashmap::DashMap<String, Arc<ServerMetrics>> {
 
 mod resilience;
 pub use resilience::{CachedDescriptorPool, LbStrategy, RouteTarget, UpstreamNode};
-use resilience::update_ema_ms;
+use resilience::EmaState;
 
 /// Lock-free per-server operational and security counters (`Ordering::Relaxed`).
 #[derive(Debug, Default)]
@@ -398,6 +398,8 @@ pub struct ServerMetrics {
     pub last_response_ms: std::sync::atomic::AtomicU64,
     /// Exponential moving average request latency in milliseconds.
     pub ema_response_ms: std::sync::atomic::AtomicU64,
+    /// Packed microsecond EMA state distinguishing uninitialized from 0 ms (`Q2-08`).
+    ema_state: EmaState,
 }
 
 impl ServerMetrics {
@@ -511,7 +513,8 @@ impl ServerMetrics {
             }
             _ => {}
         }
-        update_ema_ms(&self.last_response_ms, &self.ema_response_ms, latency_ms);
+        self.ema_state
+            .update(&self.last_response_ms, &self.ema_response_ms, latency_ms);
     }
 }
 

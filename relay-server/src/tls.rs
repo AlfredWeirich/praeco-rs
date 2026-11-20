@@ -58,12 +58,26 @@ pub fn setup_mtls_acceptor_with_strict(
     crl_path: Option<&String>,
     strict_crl: bool,
 ) -> Result<TlsAcceptor, RelayError> {
+    setup_mtls_acceptor_and_serials(ca_path, cert_path, key_path, crl_path, strict_crl)
+        .map(|(acceptor, _)| acceptor)
+}
+
+/// Builds the mTLS [`TlsAcceptor`] and extracts revoked certificate serial numbers from a
+/// **single** read of the CRL PEM file (preventing duplicate disk I/O and TOCTOU skew, `Q2-07`).
+fn setup_mtls_acceptor_and_serials(
+    ca_path: &str,
+    cert_path: &str,
+    key_path: &str,
+    crl_path: Option<&String>,
+    strict_crl: bool,
+) -> Result<(TlsAcceptor, std::collections::HashSet<Vec<u8>>), RelayError> {
     let mut root_store = RootCertStore::empty();
     for cert in CertificateDer::pem_file_iter(ca_path)? {
         root_store.add(cert?)?;
     }
 
     let mut verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+    let mut revoked_serials = std::collections::HashSet::new();
 
     if let Some(path) = crl_path {
         let crls =
@@ -87,6 +101,12 @@ pub fn setup_mtls_acceptor_with_strict(
                 }
             }
         }
+        revoked_serials = common::crl::extract_revoked_serials_from_crls(&crls).map_err(|err| {
+            RelayError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid CRL '{path}': {err}"),
+            ))
+        })?;
         verifier_builder = verifier_builder.with_crls(crls);
         if strict_crl {
             verifier_builder = verifier_builder.enforce_revocation_expiration();
@@ -103,7 +123,7 @@ pub fn setup_mtls_acceptor_with_strict(
         .with_client_cert_verifier(verifier)
         .with_single_cert(certs, key)?;
 
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok((TlsAcceptor::from(Arc::new(config)), revoked_serials))
 }
 
 /// Parses all revoked certificate serial numbers (raw DER integer bytes) from a PEM-encoded CRL file.
@@ -196,6 +216,7 @@ pub fn spawn_crl_reload_watcher_with_strict(
         revoked_serials: Arc::new(initial_serials),
     });
 
+    #[cfg(not(unix))]
     if crl_path.is_none() || reload_interval.is_zero() {
         // Keep sender alive in a lightweight task until shutdown so receivers don't see channel close.
         tokio::spawn(async move {
@@ -206,19 +227,32 @@ pub fn spawn_crl_reload_watcher_with_strict(
     }
 
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(reload_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // Consume immediate first tick
-        ticker.tick().await;
+        let mut ticker = (crl_path.is_some() && !reload_interval.is_zero()).then(|| {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + reload_interval,
+                reload_interval,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
 
         #[cfg(unix)]
         let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).ok();
 
         loop {
+            let tick_fut = async {
+                match ticker.as_mut() {
+                    Some(interval) => {
+                        interval.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+
             #[cfg(unix)]
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
-                _ = ticker.tick() => {}
+                _ = tick_fut => {}
                 Some(_) = async {
                     match sighup.as_mut() {
                         Some(sig) => sig.recv().await,
@@ -232,23 +266,15 @@ pub fn spawn_crl_reload_watcher_with_strict(
             #[cfg(not(unix))]
             tokio::select! {
                 _ = cancel_token.cancelled() => break,
-                _ = ticker.tick() => {}
+                _ = tick_fut => {}
             }
 
-            let Some(ref path) = crl_path else {
-                continue;
-            };
             let reload_res = tokio::task::spawn_blocking({
                 let ca = ca_path.clone();
                 let cert = cert_path.clone();
                 let key = key_path.clone();
-                let crl = path.clone();
-                move || -> Result<(TlsAcceptor, std::collections::HashSet<Vec<u8>>), RelayError> {
-                    let acceptor =
-                        setup_mtls_acceptor_with_strict(&ca, &cert, &key, Some(&crl), strict_crl)?;
-                    let serials = parse_revoked_serials_from_crl_pem(&crl)?;
-                    Ok((acceptor, serials))
-                }
+                let crl = crl_path.clone();
+                move || setup_mtls_acceptor_and_serials(&ca, &cert, &key, crl.as_ref(), strict_crl)
             })
             .await;
 
@@ -262,17 +288,17 @@ pub fn spawn_crl_reload_watcher_with_strict(
                 Ok(Err(e)) => {
                     warn!(
                         target: "relay::control_plane",
-                        crl_path = %path,
+                        crl_path = %crl_path.as_deref().unwrap_or("<none>"),
                         error = %e,
-                        "Failed to reload CRL on control plane; keeping previous CRL state"
+                        "Failed to reload mTLS acceptor/CRL on control plane; keeping previous state"
                     );
                 }
                 Err(e) => {
                     warn!(
                         target: "relay::control_plane",
-                        crl_path = %path,
+                        crl_path = %crl_path.as_deref().unwrap_or("<none>"),
                         error = %e,
-                        "CRL reload task failed; keeping previous CRL state"
+                        "mTLS/CRL reload task failed; keeping previous state"
                     );
                 }
             }
@@ -299,5 +325,49 @@ pub fn extract_allowed_snis(cert_der: &[u8]) -> Vec<String> {
         }
     }
     allowed_snis
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_setup_mtls_acceptor_and_serials_single_pass_and_watcher_without_crl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pki = common::test_pki::TestPki::new();
+        let ca = common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string();
+        let cert = common::test_pki::TestPki::s(&pki.relay_server_pem).to_string();
+        let key = common::test_pki::TestPki::s(&pki.relay_server_key).to_string();
+        let crl = common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string();
+
+        // 1. Single-pass CRL load returns both TlsAcceptor and parsed revoked serials
+        let (_acc_with_crl, serials_with_crl) =
+            setup_mtls_acceptor_and_serials(&ca, &cert, &key, Some(&crl), true)?;
+        assert_eq!(serials_with_crl.len(), 1);
+
+        // 2. crl_path = None reloads certs cleanly with empty serial set
+        let (_acc_no_crl, serials_no_crl) =
+            setup_mtls_acceptor_and_serials(&ca, &cert, &key, None, true)?;
+        assert!(serials_no_crl.is_empty());
+
+        // 3. Watcher with crl_path = None and interval = 0 stays alive until cancelled
+        let initial = setup_mtls_acceptor_with_strict(&ca, &cert, &key, None, true)?;
+        let cancel = CancellationToken::new();
+        let mut rx = spawn_crl_reload_watcher_with_strict(
+            ca,
+            cert,
+            key,
+            None,
+            initial,
+            Duration::ZERO,
+            cancel.clone(),
+            true,
+        )?;
+        assert!(rx.borrow().revoked_serials.is_empty());
+        cancel.cancel();
+        // Once cancelled, watcher exits cleanly and sender drops
+        let _ = rx.changed().await;
+        Ok(())
+    }
 }
 

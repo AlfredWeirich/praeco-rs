@@ -3,21 +3,47 @@
 use hyper::Uri;
 use serde::Deserialize;
 
-/// Updates a `last` latency sample and its exponential moving average (`alpha = 0.25`).
-#[inline]
-pub(super) fn update_ema_ms(
-    last: &std::sync::atomic::AtomicU64,
-    ema: &std::sync::atomic::AtomicU64,
-    sample_ms: u64,
-) {
-    last.store(sample_ms, std::sync::atomic::Ordering::Relaxed);
-    let prev = ema.load(std::sync::atomic::Ordering::Relaxed);
-    let next = if prev == 0 {
-        sample_ms
-    } else {
-        (prev.saturating_mul(3).saturating_add(sample_ms)) / 4
-    };
-    ema.store(next, std::sync::atomic::Ordering::Relaxed);
+const EMA_INITIALIZED_BIT: u64 = 1u64 << 63;
+const MAX_EMA_US: u64 = u64::MAX >> 1;
+
+/// Atomic microsecond-precision EMA tracker (`alpha = 0.25`) packed into a single `u64`
+/// with bit 63 marking initialization, preventing 0 ms rounding decay from triggering
+/// 100% latency spikes on subsequent requests (`Q2-08`).
+#[derive(Debug, Default)]
+pub(crate) struct EmaState(std::sync::atomic::AtomicU64);
+
+impl EmaState {
+    /// Updates `last_ms` and `ema_ms` atomically from a new `sample_ms` observation.
+    #[inline]
+    pub(crate) fn update(
+        &self,
+        last_ms: &std::sync::atomic::AtomicU64,
+        ema_ms: &std::sync::atomic::AtomicU64,
+        sample_ms: u64,
+    ) {
+        last_ms.store(sample_ms, std::sync::atomic::Ordering::Relaxed);
+        let sample_us = sample_ms.saturating_mul(1000).min(MAX_EMA_US);
+        let mut prev = self.0.load(std::sync::atomic::Ordering::Relaxed);
+        let out_ms = loop {
+            let next_us = if prev & EMA_INITIALIZED_BIT == 0 {
+                sample_us
+            } else {
+                let prev_us = prev & !EMA_INITIALIZED_BIT;
+                (prev_us.saturating_mul(3).saturating_add(sample_us)) / 4
+            };
+            let next = EMA_INITIALIZED_BIT | next_us.min(MAX_EMA_US);
+            match self.0.compare_exchange_weak(
+                prev,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break next_us / 1000,
+                Err(actual) => prev = actual,
+            }
+        };
+        ema_ms.store(out_ms, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 
@@ -68,6 +94,8 @@ pub struct UpstreamNode {
     pub last_response_ms: std::sync::atomic::AtomicU64,
     /// Exponential moving average (EMA) of response header latency (in milliseconds).
     pub ema_response_ms: std::sync::atomic::AtomicU64,
+    /// Packed microsecond EMA state distinguishing "uninitialized" from 0 ms (`Q2-08`).
+    ema_state: EmaState,
 }
 
 impl UpstreamNode {
@@ -91,13 +119,15 @@ impl UpstreamNode {
             failover_retries: std::sync::atomic::AtomicU64::new(0),
             last_response_ms: std::sync::atomic::AtomicU64::new(0),
             ema_response_ms: std::sync::atomic::AtomicU64::new(0),
+            ema_state: EmaState::default(),
         }
     }
 
     /// Records the observed response header latency (in milliseconds) and updates the EMA.
     #[inline]
     pub fn record_latency_ms(&self, sample_ms: u64) {
-        update_ema_ms(&self.last_response_ms, &self.ema_response_ms, sample_ms);
+        self.ema_state
+            .update(&self.last_response_ms, &self.ema_response_ms, sample_ms);
     }
 
     /// Returns the current [`CircuitState`](crate::middleware::router::circuit_breaker::CircuitState) of this node.
@@ -434,7 +464,8 @@ impl RouteTarget {
         }
     }
 
-    /// Selects the next upstream node based on the configured load-balancing strategy.
+    /// Selects the next upstream node based on the configured load-balancing strategy,
+    /// returning `None` if no upstreams are configured (`Q2-08`, panic-free).
     ///
     /// Stack-allocated for up to 8 upstream nodes via `SmallVec` to eliminate per-request
     /// heap allocations on the router hot path.
@@ -442,10 +473,14 @@ impl RouteTarget {
         &self,
         client_ip: Option<&std::net::SocketAddr>,
         failed_uris: &[Uri],
-    ) -> &UpstreamNode {
+    ) -> Option<&UpstreamNode> {
+        if self.upstreams.is_empty() {
+            return None;
+        }
+
         // Fast-path for single-backend routes: zero heap allocations, no circuit-breaker filtering needed
         if self.upstreams.len() == 1 {
-            return &self.upstreams[0];
+            return self.upstreams.first();
         }
 
         // Collect available candidates on the stack (no heap alloc for <= 8 nodes).
@@ -468,8 +503,11 @@ impl RouteTarget {
             }
         }
 
+        if candidates.is_empty() {
+            return None;
+        }
         if candidates.len() == 1 {
-            return candidates[0];
+            return candidates.first().copied();
         }
 
         match self.strategy {
@@ -477,11 +515,11 @@ impl RouteTarget {
                 let count = self
                     .rr_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                candidates[count % candidates.len()]
+                candidates.get(count % candidates.len()).copied()
             }
             LbStrategy::Random => {
                 let index = rand::random_range(0..candidates.len());
-                candidates[index]
+                candidates.get(index).copied()
             }
             LbStrategy::LeastConnections => candidates
                 .iter()
@@ -490,7 +528,7 @@ impl RouteTarget {
                     node.active_connections
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
-                .unwrap_or_else(|| candidates[0]),
+                .or_else(|| candidates.first().copied()),
             LbStrategy::Sticky => {
                 let hash = if let Some(addr) = client_ip {
                     use std::hash::{Hash, Hasher};
@@ -501,7 +539,7 @@ impl RouteTarget {
                     // Fallback to random if no IP is provided
                     rand::random_range(0..candidates.len())
                 };
-                candidates[hash % candidates.len()]
+                candidates.get(hash % candidates.len()).copied()
             }
             LbStrategy::HighestScore => candidates
                 .iter()
@@ -510,7 +548,69 @@ impl RouteTarget {
                     node.current_score
                         .load(std::sync::atomic::Ordering::Relaxed)
                 })
-                .unwrap_or_else(|| candidates[0]),
+                .or_else(|| candidates.first().copied()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn test_next_upstream_returns_none_on_empty_upstreams_across_all_strategies() {
+        let strategies = [
+            LbStrategy::RoundRobin,
+            LbStrategy::Random,
+            LbStrategy::LeastConnections,
+            LbStrategy::Sticky,
+            LbStrategy::HighestScore,
+        ];
+        let ip: std::net::SocketAddr = match "127.0.0.1:4000".parse() {
+            Ok(a) => a,
+            Err(e) => panic!("valid test addr: {e}"),
+        };
+        for strategy in strategies {
+            let target = RouteTarget {
+                upstreams: Vec::new(),
+                strategy,
+                rr_counter: std::sync::atomic::AtomicUsize::new(0),
+                cooldown_seconds: 10,
+                max_retries: 0,
+                failure_threshold: 3,
+                max_retry_buffer_bytes: 65536,
+                active_health_check_interval: 0,
+                grpc_pool: tokio::sync::RwLock::new(None),
+                grpc_reflection_lock: tokio::sync::Mutex::new(()),
+            };
+            assert!(target.next_upstream(Some(&ip), &[]).is_none());
+            assert!(target.next_upstream(None, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn test_ema_state_avoids_zero_reset_spike_after_sub_millisecond_samples() {
+        let last = AtomicU64::new(0);
+        let ema = AtomicU64::new(0);
+        let state = EmaState::default();
+
+        // Initial sub-millisecond sample initializes EMA to 0 ms (and marks initialized)
+        state.update(&last, &ema, 0);
+        assert_eq!(last.load(Ordering::Relaxed), 0);
+        assert_eq!(ema.load(Ordering::Relaxed), 0);
+
+        // Next 40 ms sample must smooth to (0*3 + 40)/4 = 10 ms, NOT spike to 40 ms
+        state.update(&last, &ema, 40);
+        assert_eq!(last.load(Ordering::Relaxed), 40);
+        assert_eq!(ema.load(Ordering::Relaxed), 10);
+
+        // Decay back to 0 ms via many 0 ms samples, then verify next 40 ms still smooths to 10 ms
+        for _ in 0..40 {
+            state.update(&last, &ema, 0);
+        }
+        assert_eq!(ema.load(Ordering::Relaxed), 0);
+        state.update(&last, &ema, 40);
+        assert_eq!(ema.load(Ordering::Relaxed), 10);
     }
 }

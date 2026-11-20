@@ -257,7 +257,13 @@ pub(super) async fn forward_with_failover(
         };
         attempts += 1;
 
-        let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
+        let Some(upstream_node) = target.next_upstream(client_addr.as_ref(), &failed_nodes) else {
+            return Ok(mode.build_error(
+                "No upstream servers configured",
+                StatusCode::BAD_GATEWAY,
+                "14", // UNAVAILABLE
+            ));
+        };
         let backend_base_uri = &upstream_node.uri;
         let mut probe_guard =
             super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds);

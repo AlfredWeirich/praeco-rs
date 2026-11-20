@@ -289,7 +289,12 @@ pub(crate) async fn handle_grpc_web_with_budget(
         };
         attempts += 1;
 
-        let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
+        let Some(upstream_node) = target.next_upstream(client_addr.as_ref(), &failed_nodes) else {
+            return Ok(build_error_response(
+                "No upstream servers configured",
+                StatusCode::BAD_GATEWAY,
+            ));
+        };
         let backend_base_uri = &upstream_node.uri;
         let mut probe_guard =
             super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds);
