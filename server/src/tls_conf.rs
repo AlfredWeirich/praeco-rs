@@ -447,56 +447,91 @@ pub fn extract_oids_from_cert(cert_der: &[u8]) -> Vec<String> {
 ///
 /// A `Vec<String>` of OID suffixes (e.g. `["1", "2.3"]`). Empty if no
 /// matching extensions are found or if `base_oid` is `None`/empty.
-pub fn extract_oids_from_cert_with_base(cert_der: &[u8], base_oid: Option<&[u64]>) -> Vec<String> {
+/// Extracts matching OID suffixes relative to `base_oid` from an already-parsed [`X509Certificate`].
+fn extract_oids_from_x509(x509: &X509Certificate<'_>, base_oid: Option<&[u64]>) -> Vec<String> {
     let mut oids = Vec::new();
-
-    // 1. Get the pre-computed base OID.
-    //    If not configured or empty, there's nothing to match against.
     let base_components = match base_oid {
         Some(v) if !v.is_empty() => v,
         _ => return oids,
     };
 
-    // 2. Parse the DER-encoded certificate using x509-parser.
-    if let Ok((_, x509)) = X509Certificate::from_der(cert_der) {
-        for ext in x509.extensions() {
-            // Get an iterator over the OID's integer components.
-            let mut oid_iter = match ext.oid.iter() {
-                Some(iter) => iter, // Correct for x509-parser v0.16+
-                None => continue,   // Parsing failed or empty
-            };
+    for ext in x509.extensions() {
+        // Get an iterator over the OID's integer components.
+        let mut oid_iter = match ext.oid.iter() {
+            Some(iter) => iter, // Correct for x509-parser v0.16+
+            None => continue,   // Parsing failed or empty
+        };
 
-            // 3. CHECK PREFIX — Compare each component of the base OID against
-            //    the certificate extension's OID, both in u64 space.
-            let mut is_match = true;
-            for &base_part in base_components {
-                match oid_iter.next() {
-                    Some(cert_part) => {
-                        if cert_part != base_part {
-                            is_match = false;
-                            break;
-                        }
-                    }
-                    None => {
-                        // The extension's OID is shorter than the base — no match.
+        // CHECK PREFIX — Compare each component of the base OID against
+        // the certificate extension's OID, both in u64 space.
+        let mut is_match = true;
+        for &base_part in base_components {
+            match oid_iter.next() {
+                Some(cert_part) => {
+                    if cert_part != base_part {
                         is_match = false;
                         break;
                     }
                 }
-            }
-
-            // 4. EXTRACT SUFFIX — Collect the remaining components after the
-            //    base prefix into a dot-separated string.
-            if is_match {
-                let suffix_parts: Vec<String> = oid_iter.map(|u| u.to_string()).collect();
-
-                if !suffix_parts.is_empty() {
-                    oids.push(suffix_parts.join("."));
+                None => {
+                    // The extension's OID is shorter than the base — no match.
+                    is_match = false;
+                    break;
                 }
+            }
+        }
+
+        // EXTRACT SUFFIX — Collect the remaining components after the
+        // base prefix into a dot-separated string.
+        if is_match {
+            let suffix_parts: Vec<String> = oid_iter.map(|u| u.to_string()).collect();
+
+            if !suffix_parts.is_empty() {
+                oids.push(suffix_parts.join("."));
             }
         }
     }
     oids
+}
+
+/// Extracts the first `DNSName` SAN entry from an already-parsed [`X509Certificate`].
+fn extract_san_from_x509(x509: &X509Certificate<'_>) -> Option<String> {
+    tracing::debug!("Successfully parsed X509 cert. Looking for SAN extension...");
+    let mut found_san_ext = false;
+    for ext in x509.extensions() {
+        if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
+            ext.parsed_extension()
+        {
+            found_san_ext = true;
+            tracing::debug!(
+                "Found SubjectAlternativeName extension. Iterating GeneralNames..."
+            );
+            for name in &san.general_names {
+                tracing::debug!("Found GeneralName: {:?}", name);
+                if let x509_parser::extensions::GeneralName::DNSName(domain) = name {
+                    tracing::debug!("Extracted DNSName SAN: {}", domain);
+                    return Some(domain.to_string());
+                }
+            }
+        }
+    }
+    if !found_san_ext {
+        tracing::debug!("No SubjectAlternativeName extension found in client cert!");
+    }
+    None
+}
+
+pub fn extract_oids_from_cert_with_base(cert_der: &[u8], base_oid: Option<&[u64]>) -> Vec<String> {
+    match base_oid {
+        Some(v) if !v.is_empty() => {}
+        _ => return Vec::new(),
+    }
+
+    if let Ok((_, x509)) = X509Certificate::from_der(cert_der) {
+        extract_oids_from_x509(&x509, base_oid)
+    } else {
+        Vec::new()
+    }
 }
 
 /// Extracts the full PEM-encoded certificate and its SAN (Subject Alternative Name)
@@ -506,37 +541,13 @@ pub fn extract_cert_san_and_pem(cert_der: &[u8]) -> (Option<String>, Option<Stri
     let pem = ::pem::encode(&::pem::Pem::new("CERTIFICATE", cert_der));
 
     // 2. Extract SAN
-    let mut san_dns = None;
-    match X509Certificate::from_der(cert_der) {
-        Ok((_, x509)) => {
-            tracing::debug!("Successfully parsed X509 cert. Looking for SAN extension...");
-            let mut found_san_ext = false;
-            for ext in x509.extensions() {
-                if let x509_parser::extensions::ParsedExtension::SubjectAlternativeName(san) =
-                    ext.parsed_extension()
-                {
-                    found_san_ext = true;
-                    tracing::debug!(
-                        "Found SubjectAlternativeName extension. Iterating GeneralNames..."
-                    );
-                    for name in &san.general_names {
-                        tracing::debug!("Found GeneralName: {:?}", name);
-                        if let x509_parser::extensions::GeneralName::DNSName(domain) = name {
-                            san_dns = Some(domain.to_string());
-                            tracing::debug!("Extracted DNSName SAN: {}", domain);
-                            break;
-                        }
-                    }
-                }
-            }
-            if !found_san_ext {
-                tracing::debug!("No SubjectAlternativeName extension found in client cert!");
-            }
-        }
+    let san_dns = match X509Certificate::from_der(cert_der) {
+        Ok((_, x509)) => extract_san_from_x509(&x509),
         Err(e) => {
             tracing::warn!("Failed to parse client cert DER: {:?}", e);
+            None
         }
-    }
+    };
     (Some(pem), san_dns)
 }
 
@@ -569,15 +580,30 @@ pub fn extract_client_metadata(
 /// (the first certificate in the provided chain) using an explicit `base_oid`.
 ///
 /// Any subsequent intermediate or extra certificates in the chain are intentionally
-/// ignored to prevent privilege escalation via injected certificates.
+/// ignored to prevent privilege escalation via injected certificates. Parses the
+/// leaf DER certificate at most once for both SAN and OID extraction (`P2-09`).
 pub fn extract_client_metadata_with_base(
     certs: Option<&[CertificateDer<'_>]>,
     base_oid: Option<&[u64]>,
 ) -> ClientIdentityMetadata {
     if let Some(leaf) = certs.and_then(|c| c.first()) {
-        let (pem, san) = extract_cert_san_and_pem(leaf.as_ref());
-        let oids = extract_oids_from_cert_with_base(leaf.as_ref(), base_oid);
-        ClientIdentityMetadata { oids, pem, san }
+        let leaf_der = leaf.as_ref();
+        let pem = ::pem::encode(&::pem::Pem::new("CERTIFICATE", leaf_der));
+        let (san, oids) = match X509Certificate::from_der(leaf_der) {
+            Ok((_, x509)) => (
+                extract_san_from_x509(&x509),
+                extract_oids_from_x509(&x509, base_oid),
+            ),
+            Err(e) => {
+                tracing::warn!("Failed to parse client cert DER: {:?}", e);
+                (None, Vec::new())
+            }
+        };
+        ClientIdentityMetadata {
+            oids,
+            pem: Some(pem),
+            san,
+        }
     } else {
         ClientIdentityMetadata::default()
     }
@@ -988,6 +1014,33 @@ mod tests {
             Some(rustls::HandshakeKind::Full)
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_extract_client_metadata_with_base_single_der_parse_extracts_pem_san_and_oids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pki = common::test_pki::TestPki::new();
+        let certs = common::load_certs(
+            common::test_pki::TestPki::s(&pki.praeco_client_pem),
+            "test_single_pass_meta",
+        )?;
+        let leaf_der = certs
+            .first()
+            .ok_or("missing leaf cert in praeco_client_pem")?
+            .as_ref();
+        let base_oid = [1u64, 3, 6, 1, 4, 1, 65111];
+
+        let meta = extract_client_metadata_with_base(Some(&certs), Some(&base_oid));
+        let (expected_pem, expected_san) = extract_cert_san_and_pem(leaf_der);
+        let expected_oids = extract_oids_from_cert_with_base(leaf_der, Some(&base_oid));
+
+        assert!(meta.pem.is_some());
+        assert!(meta.san.as_deref().is_some_and(|s| s.ends_with(".aweirich.eu")));
+        assert_eq!(meta.pem, expected_pem);
+        assert_eq!(meta.san, expected_san);
+        assert_eq!(meta.oids, vec!["1"]);
+        assert_eq!(meta.oids, expected_oids);
         Ok(())
     }
 }

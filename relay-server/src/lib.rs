@@ -1155,21 +1155,11 @@ pub async fn run_data_plane_with_stream_timeout(
             }
         };
 
-        // --- Socket-level TCP Keepalive ---
-        if let Some(keepalive_dur) = tcp_keepalive {
-            let sock_ref = socket2::SockRef::from(&client_stream);
-            let keepalive = socket2::TcpKeepalive::new()
-                .with_time(keepalive_dur)
-                .with_interval(Duration::from_secs(10));
-            let _ = sock_ref.set_tcp_keepalive(&keepalive);
-            let _ = sock_ref.set_tcp_nodelay(true);
-        }
-
         // --- Rate Limiting Check (Aggregated IPv6 on /64, bounded with LRU eviction) ---
         let canonical_ip = canonicalize_ip(client_addr.ip());
         if !rate_limits.check_and_consume(canonical_ip, rate, burst) {
             warn!(target: "relay::data_plane", client_ip = %client_addr, "Rate limit exceeded, dropping connection");
-            continue; // Drop instantly
+            continue; // Drop instantly before any socket syscalls
         }
 
         // --- Concurrency Limit Check (Global & Per-IP /64 Cap) ---
@@ -1180,6 +1170,16 @@ pub async fn run_data_plane_with_stream_timeout(
                 continue;
             }
         };
+
+        // --- Socket-level TCP Options (only for accepted connections, TCP_NODELAY unconditional, P2-09) ---
+        let _ = client_stream.set_nodelay(true);
+        if let Some(keepalive_dur) = tcp_keepalive {
+            let sock_ref = socket2::SockRef::from(&client_stream);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(keepalive_dur)
+                .with_interval(Duration::from_secs(10));
+            let _ = sock_ref.set_tcp_keepalive(&keepalive);
+        }
 
         let local_addr = client_stream.local_addr().unwrap_or(client_addr);
         let tunnels = tunnels.clone();

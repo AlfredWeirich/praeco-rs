@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Added a process-wide takeover metric counter (`same_cert_takeover_count() -> u64`) and warning logs whenever an unresponsive tunnel is displaced by a reconnecting same-certificate peer.
 * **Dependency Alignment (`Cargo.toml`, `src/lib.rs`, `Q-03`):**
   * Updated `socket2` to `0.6` (`set_tcp_nodelay`) to match `tokio`/`hyper-util`/`quinn`/`tonic` and remove duplicate `socket2 0.5`.
+* **Data-Plane Admission Ordering & Unconditional `TCP_NODELAY` (`src/lib.rs`, `P2-09`):**
+  * Moved `run_data_plane_with_stream_timeout` socket options (`TCP_NODELAY` and optional `tcp_keepalive`) after rate-limit and per-IP concurrency admission checks so rejected connections incur zero `setsockopt` syscalls and accepted connections always enable `TCP_NODELAY` even when `tcp_keepalive = None`.
 
 ---
 
