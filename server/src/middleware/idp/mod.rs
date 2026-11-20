@@ -467,7 +467,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 1. Start a new DeviceAuth login session (Frontend calls this)
             (Method::POST, "/auth/login") => {
-                if let Err(msg) = verify_same_origin(req.headers()) {
+                if let Err(msg) = verify_same_origin(req.uri(), req.headers()) {
                     tracing::warn!("{}: Blocked cross-site POST /auth/login", self.server_name);
                     return IdpFuture::Ready {
                         response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
@@ -567,7 +567,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 2b. View session user_code on device (requires mTLS client cert or valid poll_secret)
             (Method::GET, "/auth/session_info") => {
-                if let Err(msg) = verify_same_origin(req.headers()) {
+                if let Err(msg) = verify_same_origin(req.uri(), req.headers()) {
                     tracing::warn!("{}: Blocked cross-site GET /auth/session_info", self.server_name);
                     return IdpFuture::Ready {
                         response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
@@ -603,7 +603,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 3. Confirm a session (Device with mTLS calls this)
             (Method::POST, "/auth/confirm") => {
-                if let Err(msg) = verify_same_origin(req.headers()) {
+                if let Err(msg) = verify_same_origin(req.uri(), req.headers()) {
                     tracing::warn!("{}: Blocked cross-site POST /auth/confirm", self.server_name);
                     return IdpFuture::Ready {
                         response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
@@ -703,7 +703,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 5. Revoke a JWT session / token (Logout & Revocation)
             (Method::POST, "/auth/revoke") => {
-                if let Err(msg) = verify_same_origin(req.headers()) {
+                if let Err(msg) = verify_same_origin(req.uri(), req.headers()) {
                     tracing::warn!("{}: Blocked cross-site POST /auth/revoke", self.server_name);
                     return IdpFuture::Ready {
                         response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
@@ -925,11 +925,56 @@ fn cert_fingerprint_subject(pem_str: &str) -> Option<String> {
     Some(sub)
 }
 
+/// Extracts and validates the effective request authority from `uri.authority()` (`:authority`
+/// pseudo-header in HTTP/2 and HTTP/3) and HTTP/1.1 `Host` header(s).
+///
+/// Fails closed on non-ASCII, empty, or duplicate `Host` headers as well as mismatches
+/// between `:authority` and `Host` (RFC 9113 §8.3.1).
+fn extract_validated_request_authority<'a>(
+    uri: &'a hyper::Uri,
+    headers: &'a hyper::HeaderMap,
+) -> Result<Option<&'a str>, &'static str> {
+    let uri_authority = uri.authority().map(|a| a.as_str());
+
+    let mut host_iter = headers.get_all(hyper::header::HOST).iter();
+    let header_host = match host_iter.next() {
+        Some(raw) => {
+            if host_iter.next().is_some() {
+                return Err("Duplicate Host header");
+            }
+            let Ok(h) = raw.to_str() else {
+                return Err("Invalid Host header");
+            };
+            let trimmed = h.trim();
+            if trimmed.is_empty() {
+                return Err("Invalid Host header");
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    if let (Some(u_auth), Some(h_auth)) = (uri_authority, header_host)
+        && !u_auth.eq_ignore_ascii_case(h_auth)
+    {
+        return Err("Mismatched Host and authority");
+    }
+
+    Ok(uri_authority.or(header_host))
+}
+
 /// Rejects browser cross-site / cross-origin requests while permitting native
 /// non-browser clients (e.g., mobile apps or `curl`) that omit `Sec-Fetch-Site`
-/// and `Origin` headers. Fails closed on non-ASCII / malformed header values.
-pub(crate) fn verify_same_origin(headers: &hyper::HeaderMap) -> Result<(), &'static str> {
-    if let Some(raw_sfs) = headers.get("sec-fetch-site") {
+/// and `Origin` headers.
+///
+/// Fails closed on non-ASCII / malformed header values, duplicate/conflicting `Host`
+/// headers, and mismatches against either the HTTP/1.1 `Host` header or the
+/// HTTP/2 / HTTP/3 `:authority` pseudo-header stored in `uri.authority()`.
+pub(crate) fn verify_same_origin(
+    uri: &hyper::Uri,
+    headers: &hyper::HeaderMap,
+) -> Result<(), &'static str> {
+    for raw_sfs in headers.get_all("sec-fetch-site") {
         let Ok(sec_fetch_site) = raw_sfs.to_str() else {
             return Err("Invalid Sec-Fetch-Site header");
         };
@@ -940,19 +985,37 @@ pub(crate) fn verify_same_origin(headers: &hyper::HeaderMap) -> Result<(), &'sta
         }
     }
 
-    if let Some(raw_origin) = headers.get(hyper::header::ORIGIN) {
+    let req_authority = extract_validated_request_authority(uri, headers)?;
+
+    let mut origin_iter = headers.get_all(hyper::header::ORIGIN).iter();
+    if let Some(raw_origin) = origin_iter.next() {
+        if origin_iter.next().is_some() {
+            return Err("Duplicate Origin header");
+        }
         let Ok(origin) = raw_origin.to_str() else {
             return Err("Invalid Origin header");
         };
-        let origin_authority = origin
-            .strip_prefix("https://")
-            .or_else(|| origin.strip_prefix("http://"))
-            .map(|rest| rest.split('/').next().unwrap_or(rest));
-        let host = headers
-            .get(hyper::header::HOST)
-            .and_then(|v| v.to_str().ok());
-        match (origin_authority, host) {
-            (Some(orig_host), Some(req_host)) if orig_host.eq_ignore_ascii_case(req_host) => {}
+        let (origin_scheme, origin_authority) = match origin.split_once("://") {
+            Some((scheme, rest))
+                if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") =>
+            {
+                (scheme, rest)
+            }
+            _ => return Err("Cross-origin request blocked"),
+        };
+
+        if origin_authority.is_empty() || origin_authority.contains(['/', '?', '#', '@']) {
+            return Err("Cross-origin request blocked");
+        }
+
+        if let Some(uri_scheme) = uri.scheme_str()
+            && !uri_scheme.eq_ignore_ascii_case(origin_scheme)
+        {
+            return Err("Cross-origin request blocked");
+        }
+
+        match req_authority {
+            Some(req_host) if origin_authority.eq_ignore_ascii_case(req_host) => {}
             _ => return Err("Cross-origin request blocked"),
         }
     }
@@ -1446,5 +1509,71 @@ mod tests {
         )
         .expect("token from POST /auth/token must pass verify_jwt");
         assert_eq!(claims.sub, "svc@example.test");
+    }
+
+    #[tokio::test]
+    async fn test_idp_http2_http3_authority_same_origin_login_and_revoke() -> Result<(), Box<dyn std::error::Error>> {
+        use tower::Service;
+
+        let mut idp = create_test_idp_service();
+
+        // 1. Browser HTTP/2 POST /auth/login: :authority in URI, Origin set, NO Host header
+        let req_h2_login = Request::builder()
+            .method(Method::POST)
+            .version(hyper::Version::HTTP_2)
+            .uri("https://192.168.178.45:1339/auth/login")
+            .header(hyper::header::ORIGIN, "https://192.168.178.45:1339")
+            .header("sec-fetch-site", "same-origin")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_h2_login = idp.ready().await?.call(req_h2_login).await?;
+        assert_eq!(resp_h2_login.status(), StatusCode::OK);
+        let login_bytes = resp_h2_login.into_body().collect().await?.to_bytes();
+        let login_json: serde_json::Value = serde_json::from_slice(&login_bytes)?;
+        assert!(login_json["session"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(login_json["poll_secret"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(login_json["user_code"].as_str().is_some_and(|s| !s.is_empty()));
+
+        // 2. Browser HTTP/2 POST /auth/revoke: :authority in URI, matching Origin, NO Host header
+        let req_h2_revoke = Request::builder()
+            .method(Method::POST)
+            .version(hyper::Version::HTTP_2)
+            .uri("https://192.168.178.45:1339/auth/revoke")
+            .header(hyper::header::ORIGIN, "https://192.168.178.45:1339")
+            .header("sec-fetch-site", "same-origin")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_h2_revoke = idp.ready().await?.call(req_h2_revoke).await?;
+        assert_eq!(resp_h2_revoke.status(), StatusCode::OK);
+
+        // 3. Cross-origin request over HTTP/2 (:authority mismatch) -> 403 Forbidden
+        let req_h2_cross = Request::builder()
+            .method(Method::POST)
+            .version(hyper::Version::HTTP_2)
+            .uri("https://192.168.178.45:1339/auth/login")
+            .header(hyper::header::ORIGIN, "https://evil.example.net")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_h2_cross = idp.ready().await?.call(req_h2_cross).await?;
+        assert_eq!(resp_h2_cross.status(), StatusCode::FORBIDDEN);
+
+        // 4. Direct unit checks for scheme mismatch, Host/:authority conflict, duplicate/empty Host, malformed Origin
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::ORIGIN, hyper::header::HeaderValue::from_static("http://192.168.178.45:1339"));
+        let https_uri: hyper::Uri = "https://192.168.178.45:1339/auth/login".parse()?;
+        assert!(verify_same_origin(&https_uri, &h).is_err(), "scheme downgrade must be blocked");
+
+        h.insert(hyper::header::ORIGIN, hyper::header::HeaderValue::from_static("https://192.168.178.45:1339"));
+        h.insert(hyper::header::HOST, hyper::header::HeaderValue::from_static("other.example:1339"));
+        assert!(verify_same_origin(&https_uri, &h).is_err(), "conflicting Host and :authority must be blocked");
+
+        let mut h_dup = hyper::HeaderMap::new();
+        h_dup.insert(hyper::header::ORIGIN, hyper::header::HeaderValue::from_static("https://192.168.178.45:1339"));
+        h_dup.append(hyper::header::HOST, hyper::header::HeaderValue::from_static("192.168.178.45:1339"));
+        h_dup.append(hyper::header::HOST, hyper::header::HeaderValue::from_static("192.168.178.45:1339"));
+        assert!(verify_same_origin(&"/auth/login".parse()?, &h_dup).is_err(), "duplicate Host headers must be rejected");
+
+        let mut h_bad_origin = hyper::HeaderMap::new();
+        h_bad_origin.insert(hyper::header::ORIGIN, hyper::header::HeaderValue::from_static("https://evil@192.168.178.45:1339"));
+        assert!(verify_same_origin(&https_uri, &h_bad_origin).is_err(), "Origin with userinfo must be rejected");
+
+        Ok(())
     }
 }

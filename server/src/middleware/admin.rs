@@ -937,7 +937,7 @@ pub fn handle_admin_request_with_prefix(
             );
         }
 
-        if let Err(reason) = crate::middleware::idp::verify_same_origin(headers) {
+        if let Err(reason) = crate::middleware::idp::verify_same_origin(uri, headers) {
             tracing::warn!(
                 target: "admin::audit",
                 reason = %reason,
@@ -1426,6 +1426,44 @@ mod tests {
             Some("/api/GetPraecoStatus"),
         );
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[test]
+    fn test_admin_post_same_origin_http2_authority_without_host_header() -> Result<(), Box<dyn std::error::Error>> {
+        let mut router_srv = ServerConfig {
+            name: "mounted_admin_h2".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8443),
+            service: crate::configuration::ServiceType::Router,
+            ..Default::default()
+        };
+        router_srv.finalize()?;
+
+        let uri: Uri = "https://127.0.0.1:8443/api/GetPraecoStatus?action=mark_dead&upstream=http://127.0.0.1:50051/".parse()?;
+        let mut h2_same_origin = HeaderMap::new();
+        h2_same_origin.insert(header::ORIGIN, header::HeaderValue::from_static("https://127.0.0.1:8443"));
+        h2_same_origin.insert("sec-fetch-site", header::HeaderValue::from_static("same-origin"));
+
+        let resp_ok = handle_admin_request_with_prefix(
+            &uri,
+            &Method::POST,
+            &h2_same_origin,
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        let mut h2_cross_origin = HeaderMap::new();
+        h2_cross_origin.insert(header::ORIGIN, header::HeaderValue::from_static("https://evil.example:8443"));
+        let resp_forbidden = handle_admin_request_with_prefix(
+            &uri,
+            &Method::POST,
+            &h2_cross_origin,
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(resp_forbidden.status(), StatusCode::FORBIDDEN);
         Ok(())
     }
 }
