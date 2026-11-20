@@ -47,7 +47,9 @@ use crate::{
         idp::IdpService,
         limit::GrpcStreamPolicy,
     },
-    tls_conf::{extract_client_metadata_with_base, tls_config},
+    tls_conf::{
+        PreservedTlsSessionState, extract_client_metadata_with_base, tls_config_preserving_sessions,
+    },
 };
 
 /// Wraps a `tower_http::services::ServeDir` (with or without fallback) into
@@ -666,6 +668,21 @@ fn apply_layers_internal(
 /// Returns [`SrvError::Other`] if required certificate paths are missing or invalid.
 #[tracing::instrument(skip_all, fields(server = %config.name), err)]
 pub fn build_rustls_config(config: &ServerConfig) -> Result<RustlsServerConfig, SrvError> {
+    build_rustls_config_preserving_sessions(config, None).map(|(cfg, _)| cfg)
+}
+
+/// Like [`build_rustls_config`], but preserves TLS session caches and ticket keys from
+/// `previous` when client authentication mode, session settings, and loaded client
+/// CA/CRL DER bytes are unchanged across a hot-reload (`P2-08`).
+///
+/// # Errors
+///
+/// Returns [`SrvError::Other`] if required certificate paths are missing or invalid.
+#[tracing::instrument(skip_all, fields(server = %config.name), err)]
+pub fn build_rustls_config_preserving_sessions(
+    config: &ServerConfig,
+    previous: Option<&PreservedTlsSessionState>,
+) -> Result<(RustlsServerConfig, PreservedTlsSessionState), SrvError> {
     let server_certs = config.server_certs.as_ref().ok_or_else(|| {
         SrvError::Other(format!("{}: HTTPS enabled but no server_certs", config.name))
     })?;
@@ -684,8 +701,14 @@ pub fn build_rustls_config(config: &ServerConfig) -> Result<RustlsServerConfig, 
         .static_name
         .ok_or_else(|| SrvError::Other(format!("{}: static_name missing", config.name)))?;
 
-    tls_config(static_name, server_certs, client_certs, config.authentication)
-        .map_err(|e| SrvError::Other(e.to_string()))
+    tls_config_preserving_sessions(
+        static_name,
+        server_certs,
+        client_certs,
+        config.authentication,
+        previous,
+    )
+    .map_err(|e| SrvError::Other(e.to_string()))
 }
 
 /// Builds the outbound mTLS [`tokio_rustls::TlsConnector`] used by Praeco to

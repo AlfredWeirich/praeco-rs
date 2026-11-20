@@ -1,26 +1,90 @@
 use hyper::header::{
-    CONTENT_SECURITY_POLICY, HeaderValue, STRICT_TRANSPORT_SECURITY, X_CONTENT_TYPE_OPTIONS,
+    CONTENT_SECURITY_POLICY, HeaderName, HeaderValue, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
+    X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
 };
 use hyper::{Request, Response};
+use pin_project::pin_project;
 use std::{
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
-use pin_project::pin_project;
 use tower::{Layer, Service};
 
 use crate::configuration::SecurityHeadersConfig;
 
+/// Pre-parsed [`HeaderValue`]s built once at [`SecurityHeadersLayer::new`] time so
+/// the request hot path performs a single `Arc::clone` instead of cloning 5 `String`s
+/// and re-parsing 5 headers on every response (`P2-04`).
+#[derive(Debug)]
+struct PrecomputedSecurityHeaders {
+    csp: Option<HeaderValue>,
+    hsts: Option<HeaderValue>,
+    x_content_type_options: Option<HeaderValue>,
+    x_frame_options: Option<HeaderValue>,
+    referrer_policy: Option<HeaderValue>,
+}
+
+fn parse_header_value(name: &'static str, raw: &str) -> Option<HeaderValue> {
+    match HeaderValue::from_str(raw) {
+        Ok(val) => Some(val),
+        Err(e) => {
+            tracing::warn!(
+                header = name,
+                error = %e,
+                "Ignoring invalid SecurityHeaders value"
+            );
+            None
+        }
+    }
+}
+
+impl PrecomputedSecurityHeaders {
+    fn from_config(config: &SecurityHeadersConfig) -> Self {
+        Self {
+            csp: parse_header_value("content-security-policy", &config.content_security_policy),
+            hsts: parse_header_value(
+                "strict-transport-security",
+                &config.strict_transport_security,
+            ),
+            x_content_type_options: parse_header_value(
+                "x-content-type-options",
+                &config.x_content_type_options,
+            ),
+            x_frame_options: parse_header_value("x-frame-options", &config.x_frame_options),
+            referrer_policy: parse_header_value("referrer-policy", &config.referrer_policy),
+        }
+    }
+
+    fn apply(&self, headers: &mut hyper::HeaderMap) {
+        let pairs: [(HeaderName, &Option<HeaderValue>); 5] = [
+            (CONTENT_SECURITY_POLICY, &self.csp),
+            (STRICT_TRANSPORT_SECURITY, &self.hsts),
+            (X_CONTENT_TYPE_OPTIONS, &self.x_content_type_options),
+            (X_FRAME_OPTIONS, &self.x_frame_options),
+            (REFERRER_POLICY, &self.referrer_policy),
+        ];
+        for (name, val) in pairs {
+            if let Some(hv) = val {
+                headers.insert(name, hv.clone());
+            }
+        }
+    }
+}
+
 /// A Tower layer that applies security headers to all responses.
 #[derive(Clone)]
 pub struct SecurityHeadersLayer {
-    config: SecurityHeadersConfig,
+    headers: Arc<PrecomputedSecurityHeaders>,
 }
 
 impl SecurityHeadersLayer {
+    /// Creates a new [`SecurityHeadersLayer`], pre-parsing all header values once.
     pub fn new(config: SecurityHeadersConfig) -> Self {
-        Self { config }
+        Self {
+            headers: Arc::new(PrecomputedSecurityHeaders::from_config(&config)),
+        }
     }
 }
 
@@ -30,7 +94,7 @@ impl<S> Layer<S> for SecurityHeadersLayer {
     fn layer(&self, inner: S) -> Self::Service {
         SecurityHeadersMiddleware {
             inner,
-            config: self.config.clone(),
+            headers: Arc::clone(&self.headers),
         }
     }
 }
@@ -39,14 +103,14 @@ impl<S> Layer<S> for SecurityHeadersLayer {
 #[derive(Clone)]
 pub struct SecurityHeadersMiddleware<S> {
     inner: S,
-    config: SecurityHeadersConfig,
+    headers: Arc<PrecomputedSecurityHeaders>,
 }
 
 #[pin_project]
 pub struct SecurityHeadersFuture<F> {
     #[pin]
     inner: F,
-    config: SecurityHeadersConfig,
+    headers: Arc<PrecomputedSecurityHeaders>,
 }
 
 impl<F, B, E> Future for SecurityHeadersFuture<F>
@@ -58,31 +122,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
         let mut response = std::task::ready!(this.inner.poll(cx))?;
-
-        let headers = response.headers_mut();
-
-        if let Ok(csp) = HeaderValue::from_str(&this.config.content_security_policy) {
-            headers.insert(CONTENT_SECURITY_POLICY, csp);
-        }
-        if let Ok(hsts) = HeaderValue::from_str(&this.config.strict_transport_security) {
-            headers.insert(STRICT_TRANSPORT_SECURITY, hsts);
-        }
-        if let Ok(nosniff) = HeaderValue::from_str(&this.config.x_content_type_options) {
-            headers.insert(X_CONTENT_TYPE_OPTIONS, nosniff);
-        }
-        if let Ok(xframe) = HeaderValue::from_str(&this.config.x_frame_options) {
-            headers.insert(
-                hyper::header::HeaderName::from_static("x-frame-options"),
-                xframe,
-            );
-        }
-        if let Ok(refpol) = HeaderValue::from_str(&this.config.referrer_policy) {
-            headers.insert(
-                hyper::header::HeaderName::from_static("referrer-policy"),
-                refpol,
-            );
-        }
-
+        this.headers.apply(response.headers_mut());
         Poll::Ready(Ok(response))
     }
 }
@@ -107,7 +147,52 @@ where
         let fut = self.inner.call(req);
         SecurityHeadersFuture {
             inner: fut,
-            config: self.config.clone(),
+            headers: Arc::clone(&self.headers),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use tower::{ServiceExt, service_fn};
+
+    #[tokio::test]
+    async fn test_security_headers_preparses_and_shares_header_values()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cfg = SecurityHeadersConfig {
+            content_security_policy: "default-src 'self'".to_string(),
+            // Invalid header value (contains newline) must be ignored cleanly at construction
+            x_frame_options: "DENY\r\ninjected: 1".to_string(),
+            ..Default::default()
+        };
+
+        let layer = SecurityHeadersLayer::new(cfg);
+        let svc1 = layer.layer(service_fn(|_req: Request<Full<Bytes>>| async {
+            Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+        }));
+        let svc2 = svc1.clone();
+        assert!(Arc::ptr_eq(&svc1.headers, &svc2.headers));
+
+        let resp = svc1
+            .oneshot(Request::new(Full::new(Bytes::new())))
+            .await?;
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get(CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'self'")
+        );
+        assert!(headers.get(STRICT_TRANSPORT_SECURITY).is_some());
+        assert!(headers.get(X_CONTENT_TYPE_OPTIONS).is_some());
+        assert!(headers.get(REFERRER_POLICY).is_some());
+        assert!(
+            headers.get(X_FRAME_OPTIONS).is_none(),
+            "invalid X-Frame-Options must not be inserted"
+        );
+        Ok(())
     }
 }

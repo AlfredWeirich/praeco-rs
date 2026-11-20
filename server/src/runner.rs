@@ -33,9 +33,10 @@ use crate::{
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::router::build_grpc_pool,
     stack::{
-        build_rustls_config, build_service_stack, build_tunnel_tls_connector, serve_http_connection,
+        build_rustls_config_preserving_sessions, build_service_stack, build_tunnel_tls_connector,
+        serve_http_connection,
     },
-    tls_conf::extract_client_metadata_with_base,
+    tls_conf::{PreservedTlsSessionState, extract_client_metadata_with_base},
 };
 
 /// Spawns and drives all enabled [`ServerConfig`] instances in `config` until
@@ -393,10 +394,13 @@ async fn serve_listeners(
             server_config.name, tunnel.target_url
         );
         let initial_tls = reload_rx.borrow().tls_config.clone();
-        let tls_config: Arc<RustlsServerConfig> = match initial_tls {
-            Some(cfg) => cfg,
-            None => match build_rustls_config(server_config.as_ref()) {
-                Ok(cfg) => Arc::new(cfg),
+        let (tls_config, mut last_resumption): (
+            Arc<RustlsServerConfig>,
+            Option<PreservedTlsSessionState>,
+        ) = match initial_tls {
+            Some(cfg) => (cfg, None),
+            None => match build_rustls_config_preserving_sessions(server_config.as_ref(), None) {
+                Ok((cfg, resumption)) => (Arc::new(cfg), Some(resumption)),
                 Err(e) => {
                     error!("{}: TLS Setup Error: {:?}", server_config.name, e);
                     return;
@@ -429,9 +433,19 @@ async fn serve_listeners(
                         watcher_base_oid.store(Arc::new(
                             snap.config.parsed_pki_base_oid.as_deref().map(Arc::from),
                         ));
-                        let new_tls = snap.tls_config.or_else(|| {
-                            build_rustls_config(snap.config.as_ref()).ok().map(Arc::new)
-                        });
+                        let new_tls = match snap.tls_config {
+                            Some(cfg) => Some(cfg),
+                            None => match build_rustls_config_preserving_sessions(
+                                snap.config.as_ref(),
+                                last_resumption.as_ref(),
+                            ) {
+                                Ok((cfg, next_resumption)) => {
+                                    last_resumption = Some(next_resumption);
+                                    Some(Arc::new(cfg))
+                                }
+                                Err(_) => None,
+                            },
+                        };
                         if let Some(tls_cfg) = new_tls {
                             watcher_acceptor.store(Arc::new(tokio_rustls::TlsAcceptor::from(tls_cfg)));
                         }
@@ -503,10 +517,13 @@ async fn serve_listeners(
     // === HTTPS / DUAL STACK PATH ===
     if server_config.protocol == Protocol::Https {
         let initial_tls = reload_rx.borrow().tls_config.clone();
-        let tls_config: Arc<RustlsServerConfig> = match initial_tls {
-            Some(cfg) => cfg,
-            None => match build_rustls_config(server_config.as_ref()) {
-                Ok(cfg) => Arc::new(cfg),
+        let (tls_config, initial_resumption): (
+            Arc<RustlsServerConfig>,
+            Option<PreservedTlsSessionState>,
+        ) = match initial_tls {
+            Some(cfg) => (cfg, None),
+            None => match build_rustls_config_preserving_sessions(server_config.as_ref(), None) {
+                Ok((cfg, resumption)) => (Arc::new(cfg), Some(resumption)),
                 Err(e) => {
                     error!("{}: TLS Setup Error: {:?}", server_config.name, e);
                     return;
@@ -527,6 +544,7 @@ async fn serve_listeners(
             Some(barrier),
             live_pki_base_oid,
             Some(reload_rx),
+            initial_resumption,
         )
         .await
         {
@@ -1242,6 +1260,7 @@ async fn spawn_dual_stack_inner(
         release_barrier,
         Arc::new(ArcSwap::from_pointee(pki_base_oid)),
         None,
+        None,
     )
     .await
 }
@@ -1259,6 +1278,7 @@ async fn spawn_dual_stack_reloadable(
     release_barrier: Option<Arc<SocketReleaseBarrier>>,
     live_pki_base_oid: Arc<ArcSwap<Option<Arc<[u64]>>>>,
     reload_rx: Option<tokio::sync::watch::Receiver<ServerReloadUpdate>>,
+    mut last_resumption: Option<PreservedTlsSessionState>,
 ) -> Result<DualStackHandles, SrvError> {
     // Bind everything first: on failure the already-bound socket is simply dropped.
     let tcp_listener = TcpListener::bind(server_addr)
@@ -1293,9 +1313,19 @@ async fn spawn_dual_stack_reloadable(
                         watcher_base_oid.store(Arc::new(
                             snap.config.parsed_pki_base_oid.as_deref().map(Arc::from),
                         ));
-                        let new_tls = snap.tls_config.or_else(|| {
-                            build_rustls_config(snap.config.as_ref()).ok().map(Arc::new)
-                        });
+                        let new_tls = match snap.tls_config {
+                            Some(cfg) => Some(cfg),
+                            None => match build_rustls_config_preserving_sessions(
+                                snap.config.as_ref(),
+                                last_resumption.as_ref(),
+                            ) {
+                                Ok((cfg, next_resumption)) => {
+                                    last_resumption = Some(next_resumption);
+                                    Some(Arc::new(cfg))
+                                }
+                                Err(_) => None,
+                            },
+                        };
                         if let Some(tls_cfg) = new_tls {
                             watcher_acceptor.store(Arc::new(tokio_rustls::TlsAcceptor::from(
                                 tls_cfg.clone(),

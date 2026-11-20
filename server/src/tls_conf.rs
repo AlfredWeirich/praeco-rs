@@ -117,6 +117,27 @@ impl ResolvesServerCert for DynamicCertResolver {
 /// with (optional) client certificate verification.
 ///
 /// # ALPN Protocols
+/// Snapshot of the loaded client PKI and session resumption handles produced when building
+/// a [`rustls::ServerConfig`].
+///
+/// Passing this state to [`tls_config_preserving_sessions`] on a `SIGHUP` hot-reload
+/// reuses the in-memory session cache and session ticketer whenever client PKI material
+/// (`ca_ders`, `crl_ders`), authentication mode, and session resumption settings are
+/// unchanged, avoiding full-handshake storms across connected clients (`P2-08`).
+#[derive(Clone)]
+pub struct PreservedTlsSessionState {
+    require_client_auth: bool,
+    session_cache_size: Option<usize>,
+    session_tickets: bool,
+    ca_ders: Vec<Vec<u8>>,
+    crl_ders: Vec<Vec<u8>>,
+    session_storage: Arc<dyn rustls::server::StoresServerSessions>,
+    ticketer: Arc<dyn rustls::server::ProducesTickets>,
+}
+
+/// Builds a [`rustls::ServerConfig`] for HTTPS or mTLS listeners.
+///
+/// Delegates to [`tls_config_preserving_sessions`] with `previous = None`.
 ///
 /// The returned config advertises support for `h3`, `h2`, and `http/1.1` in
 /// that preference order, enabling HTTP/3, HTTP/2, and HTTP/1.1 negotiation.
@@ -131,6 +152,30 @@ pub fn tls_config(
     client_ca_configs: Option<&[ClientCertConfig]>,
     authentication_method: crate::configuration::AuthenticationMethod,
 ) -> Result<RustlsServerConfig, Error> {
+    tls_config_preserving_sessions(
+        server_name,
+        server_cert_config,
+        client_ca_configs,
+        authentication_method,
+        None,
+    )
+    .map(|(cfg, _)| cfg)
+}
+
+/// Like [`tls_config`], but preserves the TLS [`ServerSessionMemoryCache`](rustls::server::ServerSessionMemoryCache)
+/// and `Ticketer` from `previous` when client authentication mode, session policy, and
+/// loaded client CA/CRL DER bytes are unchanged (`P2-08`).
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`tls_config`].
+pub fn tls_config_preserving_sessions(
+    server_name: &'static str,
+    server_cert_config: &ServerCertConfig,
+    client_ca_configs: Option<&[ClientCertConfig]>,
+    authentication_method: crate::configuration::AuthenticationMethod,
+    previous: Option<&PreservedTlsSessionState>,
+) -> Result<(RustlsServerConfig, PreservedTlsSessionState), Error> {
     let fallback_key = load_certified_key(server_name, server_cert_config)?;
     let cert_resolver = Arc::new(DynamicCertResolver::with_fallback(
         server_name,
@@ -142,6 +187,9 @@ pub fn tls_config(
 
     let require_client_auth = authentication_method == crate::configuration::AuthenticationMethod::ClientCert
         || authentication_method == crate::configuration::AuthenticationMethod::OptionalClientCert;
+
+    let mut loaded_ca_ders: Vec<Vec<u8>> = Vec::new();
+    let mut loaded_crl_ders: Vec<Vec<u8>> = Vec::new();
 
     // Determine if client authentication (mTLS) is required
     let config = if require_client_auth {
@@ -166,6 +214,7 @@ pub fn tls_config(
             // Load one or more CA certs for this config
             let ca_certs = load_certs(&config.ssl_client_ca, server_name)?;
             for ca in ca_certs {
+                loaded_ca_ders.push(ca.as_ref().to_vec());
                 // Add each CA cert to the root store for client verification
                 root_store
                     .add(ca)
@@ -197,6 +246,7 @@ pub fn tls_config(
                             "{server_name}: Rejecting CRL '{crl_path}' because strict CRL validation is enabled and the CRL is expired or invalid"
                         )));
                     }
+                    loaded_crl_ders.push(crl.as_ref().to_vec());
                     trace!("{server_name}: Added CRL from {crl_path}");
                     crls.push(crl);
                 }
@@ -240,47 +290,66 @@ pub fn tls_config(
     let mut config = config;
     let has_crl =
         client_ca_configs.is_some_and(|cas| cas.iter().any(|c| c.ssl_client_crl.is_some()));
-    let effective_cache_size = server_cert_config.session_cache_size.unwrap_or({
-        if !require_client_auth {
-            crate::configuration::DEFAULT_TLS_SESSION_CACHE_SIZE
-        } else if has_crl {
-            0
-        } else {
-            crate::configuration::DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE
-        }
-    });
 
-    if effective_cache_size == 0 {
-        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    } else {
-        if require_client_auth && has_crl {
-            tracing::warn!(
-                "{}: Stateful TLS session cache ({} slots) enabled alongside mTLS CRLs; resumed sessions skip client certificate & CRL re-verification.",
-                server_name,
-                effective_cache_size
-            );
-        }
-        config.session_storage =
-            rustls::server::ServerSessionMemoryCache::new(effective_cache_size);
+    if server_cert_config.session_tickets && has_crl {
+        return Err(Error::msg(format!(
+            "{server_name}: 'session_tickets = true' cannot be combined with mTLS CRL verification ('ssl_client_crl')"
+        )));
     }
 
-    if server_cert_config.session_tickets {
-        if has_crl {
-            return Err(Error::msg(format!(
-                "{server_name}: 'session_tickets = true' cannot be combined with mTLS CRL verification ('ssl_client_crl')"
-            )));
+    let can_preserve_resumption = previous.is_some_and(|prev| {
+        prev.require_client_auth == require_client_auth
+            && prev.session_cache_size == server_cert_config.session_cache_size
+            && prev.session_tickets == server_cert_config.session_tickets
+            && (!require_client_auth
+                || (prev.ca_ders == loaded_ca_ders && prev.crl_ders == loaded_crl_ders))
+    });
+
+    if let Some(prev) = previous.filter(|_| can_preserve_resumption) {
+        config.session_storage = Arc::clone(&prev.session_storage);
+        config.ticketer = Arc::clone(&prev.ticketer);
+        trace!(
+            "{}: Preserved TLS session cache and ticketer across hot-reload",
+            server_name
+        );
+    } else {
+        let effective_cache_size = server_cert_config.session_cache_size.unwrap_or({
+            if !require_client_auth {
+                crate::configuration::DEFAULT_TLS_SESSION_CACHE_SIZE
+            } else if has_crl {
+                0
+            } else {
+                crate::configuration::DEFAULT_MTLS_TLS_SESSION_CACHE_SIZE
+            }
+        });
+
+        if effective_cache_size == 0 {
+            config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        } else {
+            if require_client_auth && has_crl {
+                tracing::warn!(
+                    "{}: Stateful TLS session cache ({} slots) enabled alongside mTLS CRLs; resumed sessions skip client certificate & CRL re-verification.",
+                    server_name,
+                    effective_cache_size
+                );
+            }
+            config.session_storage =
+                rustls::server::ServerSessionMemoryCache::new(effective_cache_size);
         }
-        if require_client_auth {
-            tracing::warn!(
-                "{}: Stateless TLS session tickets enabled on mTLS server; resumed sessions skip client certificate checks for up to 12h.",
-                server_name
-            );
+
+        if server_cert_config.session_tickets {
+            if require_client_auth {
+                tracing::warn!(
+                    "{}: Stateless TLS session tickets enabled on mTLS server; resumed sessions skip client certificate checks for up to 12h.",
+                    server_name
+                );
+            }
+            config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new().map_err(|e| {
+                Error::msg(format!(
+                    "{server_name}: Failed to initialize TLS session ticketer: {e}"
+                ))
+            })?;
         }
-        config.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new().map_err(|e| {
-            Error::msg(format!(
-                "{server_name}: Failed to initialize TLS session ticketer: {e}"
-            ))
-        })?;
     }
 
     // Enable ALPN for HTTP/3, HTTP/2, and HTTP/1.1 negotiation.
@@ -293,7 +362,17 @@ pub fn tls_config(
         if require_client_auth { "mTLS" } else { "HTTPS" }
     );
 
-    Ok(config)
+    let preserved_state = PreservedTlsSessionState {
+        require_client_auth,
+        session_cache_size: server_cert_config.session_cache_size,
+        session_tickets: server_cert_config.session_tickets,
+        ca_ders: loaded_ca_ders,
+        crl_ders: loaded_crl_ders,
+        session_storage: Arc::clone(&config.session_storage),
+        ticketer: Arc::clone(&config.ticketer),
+    };
+
+    Ok((config, preserved_state))
 }
 
 /// Validates a DER-encoded X.509 CRL against expiration (`nextUpdate`) and returns
@@ -739,6 +818,174 @@ mod tests {
                 crate::configuration::AuthenticationMethod::ClientCert,
             )
             .is_ok()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_tls_config_preserving_sessions_resumes_across_reload_and_invalidates_on_crl_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+
+        let drive_handshake = |server_cfg: &Arc<RustlsServerConfig>,
+                               client_cfg: &Arc<rustls::ClientConfig>|
+         -> Result<Option<rustls::HandshakeKind>, Box<dyn std::error::Error>> {
+            let sni = rustls::pki_types::ServerName::try_from("localhost".to_string())?;
+            let mut client = rustls::ClientConnection::new(Arc::clone(client_cfg), sni)?;
+            let mut server = rustls::ServerConnection::new(Arc::clone(server_cfg))?;
+
+            let mut c2s = Vec::new();
+            let mut s2c = Vec::new();
+            for _ in 0..16 {
+                let mut tmp = Vec::new();
+                while client.wants_write() {
+                    client.write_tls(&mut tmp)?;
+                }
+                c2s.extend_from_slice(&tmp);
+
+                if !c2s.is_empty() {
+                    let mut cursor = std::io::Cursor::new(&c2s);
+                    let read = server.read_tls(&mut cursor)?;
+                    c2s.drain(..read);
+                    server.process_new_packets()?;
+                }
+
+                let mut stmp = Vec::new();
+                while server.wants_write() {
+                    server.write_tls(&mut stmp)?;
+                }
+                s2c.extend_from_slice(&stmp);
+
+                if !s2c.is_empty() {
+                    let mut cursor = std::io::Cursor::new(&s2c);
+                    let read = client.read_tls(&mut cursor)?;
+                    s2c.drain(..read);
+                    client.process_new_packets()?;
+                }
+
+                if !client.is_handshaking() && !server.is_handshaking() {
+                    // Drain any post-handshake TLS 1.3 NewSessionTicket messages from server to client
+                    if !s2c.is_empty() {
+                        let mut cursor = std::io::Cursor::new(&s2c);
+                        let read = client.read_tls(&mut cursor)?;
+                        s2c.drain(..read);
+                        client.process_new_packets()?;
+                    }
+                    if !server.wants_write() && !client.wants_write() && s2c.is_empty() && c2s.is_empty() {
+                        break;
+                    }
+                }
+            }
+
+            Ok(server.handshake_kind())
+        };
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certs(common::test_pki::TestPki::s(&pki.public_ca_pem), "test_client")? {
+            root_store.add(cert)?;
+        }
+
+        // 1. Non-mTLS HTTPS with session_cache + session_tickets resumes seamlessly after reload
+        let srv_cert = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            session_cache_size: Some(64),
+            session_tickets: true,
+        };
+        let (cfg_v1, state_v1) = tls_config_preserving_sessions(
+            "resumption_pub",
+            &srv_cert,
+            None,
+            crate::configuration::AuthenticationMethod::None,
+            None,
+        )?;
+        let (cfg_v2, _state_v2) = tls_config_preserving_sessions(
+            "resumption_pub",
+            &srv_cert,
+            None,
+            crate::configuration::AuthenticationMethod::None,
+            Some(&state_v1),
+        )?;
+
+        let mut pub_client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store.clone())
+            .with_no_client_auth();
+        pub_client_cfg.resumption = rustls::client::Resumption::in_memory_sessions(32);
+        let pub_client_cfg = Arc::new(pub_client_cfg);
+
+        assert_eq!(
+            drive_handshake(&Arc::new(cfg_v1), &pub_client_cfg)?,
+            Some(rustls::HandshakeKind::Full)
+        );
+        assert_eq!(
+            drive_handshake(&Arc::new(cfg_v2), &pub_client_cfg)?,
+            Some(rustls::HandshakeKind::Resumed)
+        );
+
+        // 2. mTLS with explicit session cache preserves sessions when CRL bytes are unchanged,
+        //    and invalidates resumption immediately when CRL bytes change on reload.
+        let mtls_srv_cert = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            session_cache_size: Some(64),
+            session_tickets: false,
+        };
+        let ca_v1 = vec![ClientCertConfig {
+            ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+            ssl_client_crl: Some(common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string()),
+            strict_crl: true,
+        }];
+        let (mtls_v1, mtls_state_v1) = tls_config_preserving_sessions(
+            "resumption_mtls",
+            &mtls_srv_cert,
+            Some(&ca_v1),
+            crate::configuration::AuthenticationMethod::ClientCert,
+            None,
+        )?;
+        let (mtls_v2_same_crl, mtls_state_v2) = tls_config_preserving_sessions(
+            "resumption_mtls",
+            &mtls_srv_cert,
+            Some(&ca_v1),
+            crate::configuration::AuthenticationMethod::ClientCert,
+            Some(&mtls_state_v1),
+        )?;
+
+        let ca_v3_updated_crl = vec![ClientCertConfig {
+            ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+            ssl_client_crl: Some(
+                common::test_pki::TestPki::s(&pki.relay_crl_revoking_client_pem).to_string(),
+            ),
+            strict_crl: true,
+        }];
+        let (mtls_v3_new_crl, _) = tls_config_preserving_sessions(
+            "resumption_mtls",
+            &mtls_srv_cert,
+            Some(&ca_v3_updated_crl),
+            crate::configuration::AuthenticationMethod::ClientCert,
+            Some(&mtls_state_v2),
+        )?;
+
+        let client_certs = load_certs(common::test_pki::TestPki::s(&pki.nosan_client_pem), "cli")?;
+        let client_key = load_single_key(common::test_pki::TestPki::s(&pki.nosan_client_key), "cli")?;
+        let mut mtls_client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_client_auth_cert(client_certs, client_key)?;
+        mtls_client_cfg.resumption = rustls::client::Resumption::in_memory_sessions(32);
+        let mtls_client_cfg = Arc::new(mtls_client_cfg);
+
+        assert_eq!(
+            drive_handshake(&Arc::new(mtls_v1), &mtls_client_cfg)?,
+            Some(rustls::HandshakeKind::Full)
+        );
+        assert_eq!(
+            drive_handshake(&Arc::new(mtls_v2_same_crl), &mtls_client_cfg)?,
+            Some(rustls::HandshakeKind::Resumed)
+        );
+        assert_eq!(
+            drive_handshake(&Arc::new(mtls_v3_new_crl), &mtls_client_cfg)?,
+            Some(rustls::HandshakeKind::Full)
         );
 
         Ok(())
