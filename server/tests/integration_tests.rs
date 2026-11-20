@@ -2025,3 +2025,169 @@ async fn test_dynamic_stack_hot_reload_updates_jwt_oid_mapping_and_inspection()
 
     Ok(())
 }
+
+/// 14. End-to-End Router `S2-04`: `MaxPayloadLayer` rejects disguised chunked `application/grpc`
+///     bodies exceeding `max_bytes` on REST routes while allowing multi-frame streams on `grpc_passthrough`.
+#[tokio::test]
+async fn test_router_max_payload_blocks_disguised_grpc_on_rest_but_allows_grpc_passthrough()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hyper_util::server::conn::auto;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_port = listener.local_addr()?.port();
+    let cancel_token = CancellationToken::new();
+    let upstream_cancel = cancel_token.clone();
+
+    tokio::spawn(async move {
+        loop {
+            let accept_res = tokio::select! {
+                _ = upstream_cancel.cancelled() => break,
+                res = listener.accept() => res,
+            };
+            let Ok((stream, _)) = accept_res else {
+                break;
+            };
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
+                    let collected = req.into_body().collect().await;
+                    match collected {
+                        Ok(body) => Ok::<_, hyper::Error>(hyper::Response::new(Full::new(
+                            Bytes::from(format!("ok:{}", body.to_bytes().len())),
+                        ))),
+                        Err(e) => Err(e),
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+
+    let toml_cfg = format!(
+        r#"
+        [[Server]]
+        name = "MixedRouterMaxPayloadTest"
+        ip = "127.0.0.1"
+        port = 8080
+        protocol = "http"
+        service = "Router"
+        authentication = "None"
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+
+        [Server.ReverseRoutes."/api"]
+        upstreams = ["http://127.0.0.1:{upstream_port}"]
+        backend_type = "rest"
+
+        [Server.ReverseRoutes."/grpc.Echo"]
+        upstreams = ["http://127.0.0.1:{upstream_port}"]
+        backend_type = "grpc_passthrough"
+
+        [Server.Layers]
+        enabled = ["MaxPayload"]
+
+        [Server.Layers.MaxPayload]
+        max_bytes = 25
+    "#
+    );
+
+    let server_config = parse_server_config(&toml_cfg);
+    let stack = build_service_stack(&server_config)?;
+    let peer_addr: SocketAddr = "198.51.100.88:52000".parse()?;
+    let oid_mapping = Arc::new(server_config.oid_mapping.clone());
+
+    let mut framed_payload = Vec::new();
+    for b in *b"AB" {
+        framed_payload.push(0x00);
+        framed_payload.extend_from_slice(&(15u32).to_be_bytes());
+        framed_payload.extend_from_slice(&[b; 15]);
+    }
+
+    let send_chunked = |uri: &'static str, use_h2: bool| {
+        let stack = stack.clone();
+        let oid_mapping = oid_mapping.clone();
+        let srv_token = cancel_token.clone();
+        let payload = framed_payload.clone();
+        async move {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                let handler = ConnectionHandler::new(
+                    stack,
+                    peer_addr,
+                    Vec::new(),
+                    None,
+                    None,
+                    oid_mapping,
+                );
+                serve_http_connection(server_io, handler, srv_token).await;
+            });
+
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>>(2);
+            struct ChanBody {
+                rx: tokio::sync::mpsc::Receiver<
+                    Result<hyper::body::Frame<Bytes>, std::convert::Infallible>,
+                >,
+            }
+            impl hyper::body::Body for ChanBody {
+                type Data = Bytes;
+                type Error = std::convert::Infallible;
+                fn poll_frame(
+                    mut self: std::pin::Pin<&mut Self>,
+                    cx: &mut std::task::Context<'_>,
+                ) -> std::task::Poll<
+                    Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>,
+                > {
+                    self.rx.poll_recv(cx)
+                }
+            }
+            tx.send(Ok(hyper::body::Frame::data(Bytes::from(payload))))
+                .await?;
+            drop(tx);
+
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(hyper::header::HOST, "gateway.example")
+                .header(hyper::header::CONTENT_TYPE, "application/grpc")
+                .body(ChanBody { rx })?;
+
+            let resp = if use_h2 {
+                let (mut sender, conn) =
+                    hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(client_io))
+                        .await?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let resp = sender.send_request(req).await?;
+                drop(sender);
+                let _ = conn_task.await;
+                resp
+            } else {
+                let (mut sender, conn) =
+                    hyper::client::conn::http1::handshake(TokioIo::new(client_io)).await?;
+                let conn_task = tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                let resp = sender.send_request(req).await?;
+                drop(sender);
+                let _ = conn_task.await;
+                resp
+            };
+
+            let status = resp.status();
+            let _ = resp.into_body().collect().await;
+            server_task.abort();
+            Ok::<_, Box<dyn std::error::Error>>(status)
+        }
+    };
+
+    assert_eq!(send_chunked("/api/upload", false).await?, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(send_chunked("/grpc.Echo/Stream", true).await?, StatusCode::OK);
+
+    cancel_token.cancel();
+    Ok(())
+}

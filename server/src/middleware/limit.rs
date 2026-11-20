@@ -58,6 +58,35 @@ pub(crate) fn is_payload_too_large_error(err: &(dyn std::error::Error + 'static)
 /// stream body limits when no explicit stream cap is configured.
 const DEFAULT_GRPC_STREAM_MULTIPLIER: usize = 64;
 
+/// Controls when `MaxPayloadLayer` allows `Content-Type: application/grpc` requests
+/// to use per-message gRPC framing and the cumulative `max_stream_bytes` cap instead
+/// of the strict single-body `max_bytes` cap (`S2-04`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum GrpcStreamPolicy {
+    /// Never allow gRPC framing / `max_stream_bytes` expansion; every request is
+    /// strictly bounded by `max_bytes` regardless of its `Content-Type` header.
+    Disabled,
+    /// Allow gRPC framing only when the sanitized request URI path matches one of
+    /// the configured `grpc_passthrough` route prefixes.
+    AllowPrefixes(Arc<[String]>),
+    /// Allow gRPC framing for any request advertising `Content-Type: application/grpc*`
+    /// (default for [`MaxPayloadLayer::new`] and embedded custom gRPC bases).
+    #[default]
+    AllowAnyGrpcContentType,
+}
+
+/// Checks if a normalized request path matches a configured route prefix on a segment boundary.
+fn matches_route_prefix(normalized_path: &str, prefix: &str) -> bool {
+    let normalized_prefix = prefix.trim_end_matches('/');
+    if normalized_prefix.is_empty() {
+        return prefix == "/";
+    }
+    normalized_path == normalized_prefix
+        || normalized_path
+            .strip_prefix(normalized_prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// A Tower [`Layer`] that wraps a service with payload size enforcement.
 #[derive(Clone)]
 pub struct MaxPayloadLayer {
@@ -65,6 +94,8 @@ pub struct MaxPayloadLayer {
     max_bytes: usize,
     /// Optional cumulative maximum stream body size in bytes for `application/grpc` requests.
     max_stream_bytes: Option<usize>,
+    /// Policy governing which routes/services may opt into gRPC framing (`S2-04`).
+    grpc_stream_policy: GrpcStreamPolicy,
     /// Server name label for tracing output.
     server_name: &'static str,
 }
@@ -72,13 +103,16 @@ pub struct MaxPayloadLayer {
 impl MaxPayloadLayer {
     /// Creates a new `MaxPayloadLayer`.
     ///
-    /// For `application/grpc` streams, enforces `max_bytes` per gRPC message frame
-    /// and a cumulative stream cap of `max_bytes.saturating_mul(64)` by default
-    /// (override via [`MaxPayloadLayer::with_max_stream_bytes`]).
+    /// For `application/grpc` streams allowed by [`GrpcStreamPolicy`], enforces
+    /// `max_bytes` per gRPC message frame and a cumulative stream cap of
+    /// `max_bytes.saturating_mul(64)` by default
+    /// (override via [`MaxPayloadLayer::with_max_stream_bytes`] and restrict routes
+    /// via [`MaxPayloadLayer::with_grpc_stream_policy`]).
     pub fn new(max_bytes: usize, server_name: &'static str) -> Self {
         Self {
             max_bytes,
             max_stream_bytes: Some(max_bytes.saturating_mul(DEFAULT_GRPC_STREAM_MULTIPLIER)),
+            grpc_stream_policy: GrpcStreamPolicy::AllowAnyGrpcContentType,
             server_name,
         }
     }
@@ -86,6 +120,13 @@ impl MaxPayloadLayer {
     /// Configures the cumulative stream body byte limit for `application/grpc` requests.
     pub fn with_max_stream_bytes(mut self, max_stream_bytes: Option<usize>) -> Self {
         self.max_stream_bytes = max_stream_bytes;
+        self
+    }
+
+    /// Restricts when `Content-Type: application/grpc` may activate gRPC framing
+    /// and `max_stream_bytes` (e.g., only on `RouteBackendType::GrpcPassthrough` routes).
+    pub fn with_grpc_stream_policy(mut self, grpc_stream_policy: GrpcStreamPolicy) -> Self {
+        self.grpc_stream_policy = grpc_stream_policy;
         self
     }
 }
@@ -98,6 +139,7 @@ impl<S> Layer<S> for MaxPayloadLayer {
             inner,
             max_bytes: self.max_bytes,
             max_stream_bytes: self.max_stream_bytes,
+            grpc_stream_policy: self.grpc_stream_policy.clone(),
             server_name: self.server_name,
         }
     }
@@ -109,7 +151,29 @@ pub struct MaxPayloadService<S> {
     inner: S,
     max_bytes: usize,
     max_stream_bytes: Option<usize>,
+    grpc_stream_policy: GrpcStreamPolicy,
     server_name: &'static str,
+}
+
+impl<S> MaxPayloadService<S> {
+    fn allows_grpc_streaming(&self, raw_uri_path: &str) -> bool {
+        match &self.grpc_stream_policy {
+            GrpcStreamPolicy::Disabled => false,
+            GrpcStreamPolicy::AllowAnyGrpcContentType => true,
+            GrpcStreamPolicy::AllowPrefixes(prefixes) => {
+                // Fail-closed: if the URI path contains traversal or illegal escapes,
+                // never grant the expanded gRPC stream budget.
+                let Ok(normalized) =
+                    crate::middleware::path_sanitizer::sanitize_and_normalize_path_cow(raw_uri_path)
+                else {
+                    return false;
+                };
+                prefixes
+                    .iter()
+                    .any(|prefix| matches_route_prefix(&normalized, prefix))
+            }
+        }
+    }
 }
 
 #[pin_project(project = MaxPayloadFutureProj)]
@@ -202,7 +266,7 @@ where
         }
 
         // Stage 2: Streaming byte counter (zero-alloc check excluding base64 grpc-web-text)
-        let is_grpc = req
+        let has_grpc_content_type = req
             .headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -213,6 +277,7 @@ where
                     && !(b.len() >= 25
                         && b[..25].eq_ignore_ascii_case(b"application/grpc-web-text"))
             });
+        let is_grpc = has_grpc_content_type && self.allows_grpc_streaming(req.uri().path());
 
         let grpc_state = if is_grpc {
             Some(GrpcFramingState::Header {
@@ -350,7 +415,7 @@ where
                             }
                         }
                     } else {
-                        *this.current_bytes += data.len();
+                        *this.current_bytes = this.current_bytes.saturating_add(data.len());
 
                         if *this.current_bytes > *this.max_bytes {
                             return Poll::Ready(Some(Err(SrvError::PayloadTooLarge {
@@ -1137,6 +1202,132 @@ mod tests {
             .body(Full::new(Bytes::from(bad_grpc_frame)).map_err(SrvError::from).boxed())?;
         let resp_bad_grpc = svc.ready().await?.call(req_bad_grpc).await?;
         assert_eq!(resp_bad_grpc.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_grpc_stream_policy_blocks_non_grpc_route_bypass()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let make_inner = || {
+            service_fn(|mut req: Request<SrvBody>| async move {
+                let mut total = 0usize;
+                while let Some(frame) = req.body_mut().frame().await {
+                    let frame = frame?;
+                    if let Some(data) = frame.data_ref() {
+                        total += data.len();
+                    }
+                }
+                let body: SrvBody = Full::new(Bytes::from(format!("{total}")))
+                    .map_err(SrvError::from)
+                    .boxed();
+                Ok::<Response<SrvBody>, SrvError>(Response::new(body))
+            })
+        };
+
+        // Construct a 40-byte payload disguised as two 15-byte gRPC frames (each <= max_bytes=25,
+        // total 40 bytes > max_bytes=25, <= 64*25).
+        let mut disguised_body = Vec::new();
+        for byte in *b"AB" {
+            disguised_body.push(0x00);
+            disguised_body.extend_from_slice(&(15u32).to_be_bytes());
+            disguised_body.extend_from_slice(&[byte; 15]);
+        }
+        assert_eq!(disguised_body.len(), 40);
+
+        let send_chunked_grpc_header = |mut svc: MaxPayloadService<_>, uri: &str| {
+            let body_bytes = disguised_body.clone();
+            let uri = uri.to_string();
+            async move {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, SrvError>>(2);
+                struct StreamBody {
+                    rx: tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, SrvError>>,
+                }
+                impl Body for StreamBody {
+                    type Data = Bytes;
+                    type Error = SrvError;
+                    fn poll_frame(
+                        mut self: Pin<&mut Self>,
+                        cx: &mut Context<'_>,
+                    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+                    {
+                        self.rx.poll_recv(cx)
+                    }
+                }
+                tx.send(Ok(http_body::Frame::data(Bytes::from(body_bytes))))
+                    .await?;
+                drop(tx);
+                let req = Request::builder()
+                    .uri(uri)
+                    .header(hyper::header::CONTENT_TYPE, "application/grpc")
+                    .body(StreamBody { rx }.boxed())?;
+                let resp = svc.ready().await?.call(req).await?;
+                Ok::<_, Box<dyn std::error::Error>>(resp)
+            }
+        };
+
+        // 1. GrpcStreamPolicy::Disabled rejects disguised >25-byte body with 413
+        let disabled_svc = MaxPayloadLayer::new(25, "test_disabled")
+            .with_grpc_stream_policy(GrpcStreamPolicy::Disabled)
+            .layer(make_inner());
+        let resp_disabled = send_chunked_grpc_header(disabled_svc, "/api/upload").await?;
+        assert_eq!(resp_disabled.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 2. AllowPrefixes(["/grpc.Chat"]) allows matching gRPC route (/grpc.Chat/Stream),
+        //    but strictly caps REST (/api/upload), prefix-similar (/grpc.ChatEvil/Stream),
+        //    and traversal (/grpc.Chat/../api/upload) at max_bytes=25 (413).
+        let prefix_layer = MaxPayloadLayer::new(25, "test_prefix_policy")
+            .with_grpc_stream_policy(GrpcStreamPolicy::AllowPrefixes(Arc::from([
+                "/grpc.Chat".to_string()
+            ])));
+
+        let resp_allowed =
+            send_chunked_grpc_header(prefix_layer.clone().layer(make_inner()), "/grpc.Chat/Stream")
+                .await?;
+        assert_eq!(resp_allowed.status(), StatusCode::OK);
+
+        for blocked_uri in [
+            "/api/upload",
+            "/grpc.ChatEvil/Stream",
+            "/grpc.Chat/../api/upload",
+            "/grpc.Chat/%2e%2e/api/upload",
+            "/grpc.Chat/%2E%2E/api/upload",
+        ] {
+            let resp_blocked =
+                send_chunked_grpc_header(prefix_layer.clone().layer(make_inner()), blocked_uri)
+                    .await?;
+            assert_eq!(
+                resp_blocked.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "expected 413 for non-gRPC or traversal URI '{blocked_uri}'"
+            );
+        }
+
+        // 3. Trailing-slash prefix matches exact base path (/grpc.Chat) and subpaths (/grpc.Chat/Call)
+        let trailing_layer = MaxPayloadLayer::new(25, "test_trailing_slash_prefix")
+            .with_grpc_stream_policy(GrpcStreamPolicy::AllowPrefixes(Arc::from([
+                "/grpc.Chat/".to_string()
+            ])));
+        for allowed_uri in ["/grpc.Chat", "/grpc.Chat/Call"] {
+            let resp =
+                send_chunked_grpc_header(trailing_layer.clone().layer(make_inner()), allowed_uri)
+                    .await?;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let resp_trailing_evil = send_chunked_grpc_header(
+            trailing_layer.layer(make_inner()),
+            "/grpc.ChatEvil/Call",
+        )
+        .await?;
+        assert_eq!(resp_trailing_evil.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 4. Root prefix ("/") matches any normalized path
+        let root_layer = MaxPayloadLayer::new(25, "test_root_prefix")
+            .with_grpc_stream_policy(GrpcStreamPolicy::AllowPrefixes(Arc::from(["/".to_string()])));
+        let resp_root =
+            send_chunked_grpc_header(root_layer.layer(make_inner()), "/any.Service/Call").await?;
+        assert_eq!(resp_root.status(), StatusCode::OK);
+
         Ok(())
     }
 }

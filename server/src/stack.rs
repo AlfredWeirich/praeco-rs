@@ -33,8 +33,8 @@ use crate::{
     BoxCloneSyncService, BoxCloneSyncServiceExt, BoxedCloneService, ConnectionHandler, SrvBody,
     SrvError,
     configuration::{
-        AuthenticationMethod, CompiledAllowedPathes, MiddlewareLayer, RateLimiter, ServerConfig,
-        ServerMetrics, ServiceType, TunnelConfig, UserRole,
+        AuthenticationMethod, CompiledAllowedPathes, MiddlewareLayer, RateLimiter,
+        RouteBackendType, ServerConfig, ServerMetrics, ServiceType, TunnelConfig, UserRole,
     },
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::{
@@ -45,6 +45,7 @@ use crate::{
         alt_svc::AltSvcLayer,
         compression::{SrvCompressionLayer, SrvDecompressionLayer},
         idp::IdpService,
+        limit::GrpcStreamPolicy,
     },
     tls_conf::{extract_client_metadata_with_base, tls_config},
 };
@@ -203,6 +204,18 @@ pub fn build_service_stack_with_base(
     server_config: &Arc<ServerConfig>,
     base_service: BoxedCloneService,
 ) -> Result<BoxedCloneService, SrvError> {
+    build_service_stack_internal(
+        server_config,
+        base_service,
+        GrpcStreamPolicy::AllowAnyGrpcContentType,
+    )
+}
+
+fn build_service_stack_internal(
+    server_config: &Arc<ServerConfig>,
+    base_service: BoxedCloneService,
+    grpc_stream_policy: GrpcStreamPolicy,
+) -> Result<BoxedCloneService, SrvError> {
     let layers = server_config
         .layers
         .build_middleware_layers(&server_config.name)
@@ -223,13 +236,14 @@ pub fn build_service_stack_with_base(
         .ok_or_else(|| SrvError::Other(format!("{}: static_name missing", server_config.name)))?;
 
     let has_outer_sanitizer = sanitizer_precedes_security_layers(&layers);
-    let applied = apply_layers(
+    let applied = apply_layers_internal(
         base_service,
         layers,
         static_name,
         compiled_allowed_pathes.clone(),
         server_config.port.unwrap_or(0),
         Arc::new(server_config.oid_mapping.clone()),
+        &grpc_stream_policy,
     )?;
 
     // Security: Enforce RFC 3986 path canonicalization and reject traversal/illegal encodings
@@ -297,6 +311,27 @@ pub fn build_service_stack_with_base(
         .service(sanitized);
 
     Ok(traced.boxed_clone_sync())
+}
+
+fn derive_grpc_stream_policy(server_config: &ServerConfig) -> GrpcStreamPolicy {
+    match server_config.service {
+        ServiceType::Router => {
+            let grpc_prefixes: Vec<String> = server_config
+                .parsed_routes
+                .iter()
+                .filter(|r| r.backend_type == RouteBackendType::GrpcPassthrough)
+                .map(|r| r.prefix.clone())
+                .collect();
+            if grpc_prefixes.is_empty() {
+                GrpcStreamPolicy::Disabled
+            } else {
+                GrpcStreamPolicy::AllowPrefixes(Arc::from(grpc_prefixes))
+            }
+        }
+        ServiceType::Echo | ServiceType::Admin | ServiceType::Idp | ServiceType::StaticFiles => {
+            GrpcStreamPolicy::Disabled
+        }
+    }
 }
 
 /// Builds the complete `tower::Service` stack for a single server instance.
@@ -367,7 +402,8 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
         }
     };
 
-    build_service_stack_with_base(server_config, base_service)
+    let grpc_stream_policy = derive_grpc_stream_policy(server_config);
+    build_service_stack_internal(server_config, base_service, grpc_stream_policy)
 }
 
 /// Applies the configured middleware layers to the base service.
@@ -387,6 +423,26 @@ pub fn apply_layers(
     compiled_allowed_pathes: Arc<CompiledAllowedPathes>,
     server_port: u16,
     oid_mapping: Arc<HashMap<String, UserRole>>,
+) -> Result<BoxedCloneService, SrvError> {
+    apply_layers_internal(
+        service,
+        layers,
+        server_name,
+        compiled_allowed_pathes,
+        server_port,
+        oid_mapping,
+        &GrpcStreamPolicy::AllowAnyGrpcContentType,
+    )
+}
+
+fn apply_layers_internal(
+    service: BoxedCloneService,
+    layers: Vec<MiddlewareLayer>,
+    server_name: &'static str,
+    compiled_allowed_pathes: Arc<CompiledAllowedPathes>,
+    server_port: u16,
+    oid_mapping: Arc<HashMap<String, UserRole>>,
+    grpc_stream_policy: &GrpcStreamPolicy,
 ) -> Result<BoxedCloneService, SrvError> {
     let mut svc = service;
     for layer in layers.into_iter().rev() {
@@ -489,6 +545,7 @@ pub fn apply_layers(
                     .boxed_clone_sync()
             }
             MiddlewareLayer::MaxPayload(max_bytes) => MaxPayloadLayer::new(max_bytes, server_name)
+                .with_grpc_stream_policy(grpc_stream_policy.clone())
                 .layer(svc)
                 .boxed_clone_sync(),
             MiddlewareLayer::AltSvc => AltSvcLayer::new(server_port).layer(svc).boxed_clone_sync(),
@@ -1343,5 +1400,99 @@ mod tunnel_peer_tests {
             }),
             MiddlewareLayer::PathSanitizer,
         ]));
+    }
+
+    #[tokio::test]
+    async fn test_build_service_stack_restricts_grpc_stream_policy_on_non_grpc_servers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::{GrpcStreamPolicy, build_service_stack, derive_grpc_stream_policy};
+        use crate::{SrvError, configuration::Config};
+        use bytes::Bytes;
+        use http_body_util::BodyExt;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let echo_toml = r#"
+            [[Server]]
+            name = "EchoMaxPayloadPolicyTest"
+            ip = "127.0.0.1"
+            port = 8080
+            protocol = "http"
+            service = "Echo"
+            authentication = "None"
+
+            [Server.Layers]
+            enabled = ["MaxPayload"]
+
+            [Server.Layers.MaxPayload]
+            max_bytes = 25
+        "#;
+        let mut echo_cfg: Config = toml::from_str(echo_toml)?;
+        echo_cfg.servers[0].finalize()?;
+        let echo_srv = Arc::new(echo_cfg.servers.remove(0));
+        assert_eq!(derive_grpc_stream_policy(&echo_srv), GrpcStreamPolicy::Disabled);
+
+        let echo_stack = build_service_stack(&echo_srv)?;
+        let mut disguised_body = Vec::new();
+        for b in *b"AB" {
+            disguised_body.push(0x00);
+            disguised_body.extend_from_slice(&(15u32).to_be_bytes());
+            disguised_body.extend_from_slice(&[b; 15]);
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, SrvError>>(2);
+        struct ChanBody {
+            rx: tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, SrvError>>,
+        }
+        impl http_body::Body for ChanBody {
+            type Data = Bytes;
+            type Error = SrvError;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                self.rx.poll_recv(cx)
+            }
+        }
+        tx.send(Ok(http_body::Frame::data(Bytes::from(disguised_body))))
+            .await?;
+        drop(tx);
+
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri("/")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(ChanBody { rx }.boxed())?;
+        let resp = echo_stack.oneshot(req).await?;
+        assert_eq!(resp.status(), hyper::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let router_toml = r#"
+            [[Server]]
+            name = "RouterMixedGrpcPolicyTest"
+            ip = "127.0.0.1"
+            port = 8081
+            protocol = "http"
+            service = "Router"
+            authentication = "None"
+
+            [Server.Layers]
+            enabled = []
+
+            [Server.ReverseRoutes."/api"]
+            upstreams = ["http://127.0.0.1:9001"]
+            backend_type = "rest"
+
+            [Server.ReverseRoutes."/chat.ChatService"]
+            upstreams = ["http://127.0.0.1:9002"]
+            backend_type = "grpc_passthrough"
+        "#;
+        let mut router_cfg: Config = toml::from_str(router_toml)?;
+        router_cfg.servers[0].finalize()?;
+        assert_eq!(
+            derive_grpc_stream_policy(&router_cfg.servers[0]),
+            GrpcStreamPolicy::AllowPrefixes(Arc::from(["/chat.ChatService".to_string()]))
+        );
+
+        Ok(())
     }
 }
