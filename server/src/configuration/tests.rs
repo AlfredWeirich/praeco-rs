@@ -1530,3 +1530,60 @@ enabled = []
         assert!(forwarded_cookie.contains("theme=dark"));
         Ok(())
     }
+
+    #[test]
+    fn test_finalize_counts_multi_crl_bundle_and_rejects_mixed_strict_crl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let dir = pki
+            .relay_crl_pem
+            .parent()
+            .ok_or("TestPki missing parent directory")?;
+        let crl_bundle_path = dir.join("multi_crl_bundle.pem");
+        let crl1 = std::fs::read_to_string(&pki.relay_crl_pem)?;
+        let crl2 = std::fs::read_to_string(&pki.relay_crl_revoking_client_pem)?;
+        std::fs::write(&crl_bundle_path, format!("{crl1}\n{crl2}"))?;
+
+        let mut srv = ServerConfig {
+            name: "multi_crl_finalize".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8443),
+            protocol: Protocol::Https,
+            authentication: AuthenticationMethod::ClientCert,
+            server_certs: Some(ServerCertConfig {
+                ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+                ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key)
+                    .to_string(),
+                ..Default::default()
+            }),
+            client_certs: Some(vec![ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+                ssl_client_crl: Some(crl_bundle_path.to_string_lossy().to_string()),
+                strict_crl: true,
+            }]),
+            ..Default::default()
+        };
+        srv.finalize()?;
+        assert_eq!(srv.pki_info.crl_revoked_certs_count, 2);
+        assert!(srv.pki_info.crl_next_update_unix.is_some());
+
+        // Mixing strict_crl = true and strict_crl = false on CRL-bearing client_certs must fail
+        srv.client_certs = Some(vec![
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+                ssl_client_crl: Some(common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string()),
+                strict_crl: true,
+            },
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.public_ca_pem).to_string(),
+                ssl_client_crl: Some(
+                    common::test_pki::TestPki::s(&pki.relay_crl_revoking_client_pem).to_string(),
+                ),
+                strict_crl: false,
+            },
+        ]);
+        assert!(srv.finalize().is_err());
+
+        Ok(())
+    }

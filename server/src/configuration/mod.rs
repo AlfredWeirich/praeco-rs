@@ -1218,6 +1218,37 @@ pub struct ClientCertConfig {
     pub strict_crl: bool,
 }
 
+/// Validates that all `[[Server.client_certs]]` entries supplying an `ssl_client_crl`
+/// share the same `strict_crl` policy (`S2-08`).
+///
+/// `rustls::server::WebPkiClientVerifier` only supports verifier-wide
+/// `enforce_revocation_expiration()`, so mixing `strict_crl = true` and
+/// `strict_crl = false` across CRL-bearing entries would silently apply strict
+/// enforcement to CAs marked permissive. Returns whether expiration enforcement
+/// should be enabled.
+pub(crate) fn ensure_uniform_crl_strictness(
+    server_name: &str,
+    client_certs: &[ClientCertConfig],
+) -> Result<bool, Error> {
+    let mut seen_strict = false;
+    let mut seen_permissive = false;
+    for cfg in client_certs {
+        if cfg.ssl_client_crl.is_some() {
+            if cfg.strict_crl {
+                seen_strict = true;
+            } else {
+                seen_permissive = true;
+            }
+        }
+    }
+    if seen_strict && seen_permissive {
+        return Err(Error::msg(format!(
+            "Configuration error in Server '{server_name}': mixing 'strict_crl = true' and 'strict_crl = false' across [[Server.client_certs]] entries with 'ssl_client_crl' is not supported because rustls applies CRL expiration enforcement uniformly across all CRLs. Use uniform 'strict_crl' values or split the CAs onto separate server instances."
+        )));
+    }
+    Ok(seen_strict)
+}
+
 /// Configuration for client certificate forwarding.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -1807,11 +1838,16 @@ impl ServerConfig {
 
         // Extract CRL metadata if client_certs are configured
         if let Some(ref client_certs) = self.client_certs {
+            ensure_uniform_crl_strictness(&self.name, client_certs)?;
             use rustls_pki_types::{CertificateRevocationListDer, pem::PemObject};
             for cc in client_certs {
                 if let Some(ref crl_path) = cc.ssl_client_crl
-                    && let Ok(crl_der) = CertificateRevocationListDer::from_pem_file(crl_path)
-                        && let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref()) {
+                    && let Ok(crl_iter) = CertificateRevocationListDer::pem_file_iter(crl_path)
+                {
+                    for crl_res in crl_iter {
+                        if let Ok(crl_der) = crl_res
+                            && let Ok((_, parsed_crl)) = x509_parser::parse_x509_crl(crl_der.as_ref())
+                        {
                             pki_info.crl_revoked_certs_count +=
                                 parsed_crl.iter_revoked_certificates().count();
                             if let Some(next_up) = parsed_crl.next_update() {
@@ -1822,6 +1858,8 @@ impl ServerConfig {
                                 };
                             }
                         }
+                    }
+                }
             }
         }
         self.pki_info = pki_info;

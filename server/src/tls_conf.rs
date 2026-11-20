@@ -155,10 +155,13 @@ pub fn tls_config(
             ))
         })?;
 
+        let enforce_crl_expiration =
+            crate::configuration::ensure_uniform_crl_strictness(server_name, client_certs)
+                .map_err(|e| Error::msg(e.to_string()))?;
+
         // Collect Certificate Revocation Lists (CRLs) if specified in client CA configs.
         // CRLs allow the server to reject certificates that have been revoked by the CA.
         let mut crls: Vec<CertificateRevocationListDer<'_>> = Vec::with_capacity(20);
-        let mut enforce_crl_expiration = false;
         for config in client_certs {
             // Load one or more CA certs for this config
             let ca_certs = load_certs(&config.ssl_client_ca, server_name)?;
@@ -188,9 +191,6 @@ pub fn tls_config(
                     )));
                 }
                 let strict = config.strict_crl;
-                if strict {
-                    enforce_crl_expiration = true;
-                }
                 for crl in loaded_crls {
                     if !warn_if_crl_expired(server_name, crl_path, crl.as_ref()) && strict {
                         return Err(Error::msg(format!(
@@ -680,5 +680,67 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_tls_config_rejects_mixed_strict_crl_across_client_cas()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+        let srv_cert = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            ..Default::default()
+        };
+
+        // 1. Mixed strict_crl on two CRL-bearing client_certs must fail closed
+        let mixed_cas = vec![
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+                ssl_client_crl: Some(common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string()),
+                strict_crl: true,
+            },
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.public_ca_pem).to_string(),
+                ssl_client_crl: Some(
+                    common::test_pki::TestPki::s(&pki.relay_crl_revoking_client_pem).to_string(),
+                ),
+                strict_crl: false,
+            },
+        ];
+        assert!(
+            tls_config(
+                "mixed_crl_strictness",
+                &srv_cert,
+                Some(&mixed_cas),
+                crate::configuration::AuthenticationMethod::ClientCert,
+            )
+            .is_err()
+        );
+
+        // 2. Second CA without CRL (strict_crl = false) does not conflict with first CA's CRL
+        let non_conflicting_cas = vec![
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.relay_ca_pem).to_string(),
+                ssl_client_crl: Some(common::test_pki::TestPki::s(&pki.relay_crl_pem).to_string()),
+                strict_crl: true,
+            },
+            ClientCertConfig {
+                ssl_client_ca: common::test_pki::TestPki::s(&pki.public_ca_pem).to_string(),
+                ssl_client_crl: None,
+                strict_crl: false,
+            },
+        ];
+        assert!(
+            tls_config(
+                "non_conflicting_crl_strictness",
+                &srv_cert,
+                Some(&non_conflicting_cas),
+                crate::configuration::AuthenticationMethod::ClientCert,
+            )
+            .is_ok()
+        );
+
+        Ok(())
     }
 }

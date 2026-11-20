@@ -311,23 +311,17 @@ pub fn verify_jwt_with_options(
         ));
     }
 
-    // If the token header specifies a `kid` of the form `"praeco-key-<N>"`,
-    // route directly to the 1-based key slot (O(1) single-key verification).
-    // Fail fast if `<N>` is out of range or malformed.
+    // If the token header specifies a `kid`, it must use the `"praeco-key-<N>"`
+    // slot format (1-based O(1) lookup). Unknown or out-of-range `kid` values
+    // fail closed immediately instead of scanning all decoding keys (S2-07).
     let candidate_keys: &[DecodingKey] = match header.kid.as_deref() {
         Some(kid) => {
-            if let Some(idx_str) = kid.strip_prefix("praeco-key-") {
-                let idx = idx_str
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|&i| i >= 1 && i <= decoding_keys.len())
-                    .ok_or_else(|| {
-                        Error::msg("JWT verification failed: unknown key ID (kid)")
-                    })?;
-                &decoding_keys[idx - 1..idx]
-            } else {
-                decoding_keys
-            }
+            let idx = kid
+                .strip_prefix("praeco-key-")
+                .and_then(|idx_str| idx_str.parse::<usize>().ok())
+                .filter(|&i| i >= 1 && i <= decoding_keys.len())
+                .ok_or_else(|| Error::msg("JWT verification failed: unknown key ID (kid)"))?;
+            &decoding_keys[idx - 1..idx]
         }
         None => decoding_keys,
     };
@@ -476,12 +470,28 @@ pub fn build_tls_client_config(
 ///
 /// Returns an error if the custom CA certificate file cannot be read or parsed.
 #[cfg(feature = "tls")]
+fn add_custom_ca_certs(root_store: &mut RootCertStore, path: &str) -> Result<(), Error> {
+    let root_certs = load_certs(path, "root_store")?;
+    for cert in root_certs {
+        root_store.add(cert).map_err(|e| {
+            Error::msg(format!(
+                "Failed to add CA certificate from '{path}' to RootCertStore: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Builds a `RootCertStore` from an optional custom CA PEM file, or falls back to WebPKI roots.
+///
+/// When `ca_path` is `Some(path)`, **only** the custom CA certificates are trusted (strict isolation),
+/// and any unparsable or invalid CA certificate fails closed (`Err`).
+#[cfg(feature = "tls")]
 pub fn build_root_store(ca_path: &Option<String>) -> Result<RootCertStore, Error> {
     let mut root_store = RootCertStore::empty();
     if let Some(path) = ca_path {
         // Enforce strict private PKI isolation: only trust the configured custom CA!
-        let root_cert = load_certs(path, "root_store")?;
-        root_store.add_parsable_certificates(root_cert);
+        add_custom_ca_certs(&mut root_store, path)?;
     } else {
         // No custom CA configured: fall back to well-known WebPKI roots for public internet
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -495,8 +505,7 @@ pub fn build_root_store_with_webpki(ca_path: &Option<String>) -> Result<RootCert
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(path) = ca_path {
-        let root_cert = load_certs(path, "root_store")?;
-        root_store.add_parsable_certificates(root_cert);
+        add_custom_ca_certs(&mut root_store, path)?;
     }
     Ok(root_store)
 }
@@ -727,6 +736,17 @@ mod tests {
         let token_kid_oob = sign_jwt_with_kid(&valid_claims, &enc_key, Some("praeco-key-99")).unwrap();
         assert!(verify_jwt(&token_kid_oob, &keys, "praeco-idp", "admin-dashboard").is_err());
 
+        // Unknown non-`praeco-key-*` kid must fail closed in O(1) without key-scan fallback (S2-07)
+        match sign_jwt_with_kid(&valid_claims, &enc_key, Some("external-random-kid")) {
+            Ok(token_unknown_prefix) => {
+                assert!(
+                    verify_jwt(&token_unknown_prefix, &keys, "praeco-idp", "admin-dashboard")
+                        .is_err()
+                );
+            }
+            Err(e) => panic!("signing with custom kid must succeed: {e}"),
+        }
+
         // 4. Oversized token (> MAX_JWT_TOKEN_LEN) and malformed structure rejected before crypto
         let oversized = format!("a.{}.c", "b".repeat(MAX_JWT_TOKEN_LEN));
         assert!(verify_jwt(&oversized, std::slice::from_ref(&dec_key), "praeco-idp", "admin-dashboard").is_err());
@@ -816,6 +836,28 @@ mod tests {
         let combined_store = build_root_store_with_webpki(&Some(ca_path))
             .expect("build_root_store_with_webpki should succeed");
         assert!(combined_store.len() > 100);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn test_build_root_store_rejects_corrupt_der_cert_fail_closed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pki = crate::test_pki::TestPki::new();
+        let dir = pki
+            .relay_ca_pem
+            .parent()
+            .ok_or("TestPki missing parent dir")?;
+        let bad_ca_path = dir.join("corrupt_ca.pem");
+        // Valid PEM framing containing truncated/invalid DER bytes (rejected by rustls-webpki)
+        std::fs::write(
+            &bad_ca_path,
+            "-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
+        )?;
+        let bad_ca_str = bad_ca_path.to_string_lossy().to_string();
+
+        assert!(build_root_store(&Some(bad_ca_str.clone())).is_err());
+        assert!(build_root_store_with_webpki(&Some(bad_ca_str)).is_err());
+        Ok(())
     }
 
     #[test]
