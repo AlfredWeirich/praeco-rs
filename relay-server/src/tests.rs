@@ -1053,3 +1053,18 @@ use std::net::IpAddr;
         cancel.cancel();
         let _ = std::fs::remove_file(&working_crl);
     }
+
+    #[test]
+    fn test_token_bucket_rejected_consume_does_not_refresh_last_update() {
+        let mut bucket = TokenBucket::new(1.0);
+        assert!(bucket.consume(0.0, 1.0));
+        let ts_after_consume = bucket.last_update();
+
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(!bucket.consume(0.0, 1.0));
+        assert_eq!(
+            bucket.last_update(),
+            ts_after_consume,
+            "rejected consume must not advance last_update and pin exhausted entries"
+        );
+    }

@@ -134,6 +134,12 @@ impl IdpService {
             hyper::header::CONTENT_TYPE,
             hyper::header::HeaderValue::from_static(content_type),
         );
+        if content_type != "application/jwk-set+json" {
+            resp.headers_mut().insert(
+                hyper::header::CACHE_CONTROL,
+                hyper::header::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+            );
+        }
         resp
     }
 
@@ -376,57 +382,37 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             }
         }
 
-        // Extract query parameters and headers manually
+        // Extract and percent-decode query parameters and headers
         let query = req.uri().query().unwrap_or("").to_string();
-        let session_id = query.split('&')
-            .find_map(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                if parts.next()? == "session" {
-                    parts.next().map(|s| s.to_string())
-                } else {
-                    None
+        let mut session_id = None;
+        let mut query_poll_secret = None;
+        let mut query_user_code = None;
+        let mut requested_aud = None;
+        let mut explicit_jti_param = None;
+        for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+            match k.as_ref() {
+                "session" if session_id.is_none() => session_id = Some(v.into_owned()),
+                "poll_secret" if query_poll_secret.is_none() => {
+                    query_poll_secret = Some(v.into_owned())
                 }
-            });
+                "code" if query_user_code.is_none() => query_user_code = Some(v.into_owned()),
+                "aud" if requested_aud.is_none() => requested_aud = Some(v.into_owned()),
+                "jti" if explicit_jti_param.is_none() => explicit_jti_param = Some(v.into_owned()),
+                _ => {}
+            }
+        }
 
-        let poll_secret = query.split('&')
-            .find_map(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                if parts.next()? == "poll_secret" {
-                    parts.next().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                req.headers()
-                    .get("x-poll-secret")
-                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-            });
+        let poll_secret = query_poll_secret.or_else(|| {
+            req.headers()
+                .get("x-poll-secret")
+                .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+        });
 
-        let user_code = query.split('&')
-            .find_map(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                if parts.next()? == "code" {
-                    parts.next().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                req.headers()
-                    .get("x-user-code")
-                    .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-            });
-
-        let requested_aud = query.split('&')
-            .find_map(|kv| {
-                let mut parts = kv.splitn(2, '=');
-                if parts.next()? == "aud" {
-                    parts.next().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
+        let user_code = query_user_code.or_else(|| {
+            req.headers()
+                .get("x-user-code")
+                .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+        });
 
         let client_ip = req.extensions().get::<std::net::SocketAddr>().map(|a| a.ip());
 
@@ -481,6 +467,12 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 1. Start a new DeviceAuth login session (Frontend calls this)
             (Method::POST, "/auth/login") => {
+                if let Err(msg) = verify_same_origin(req.headers()) {
+                    tracing::warn!("{}: Blocked cross-site POST /auth/login", self.server_name);
+                    return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
+                    };
+                }
                 if let Some(ref a) = requested_aud
                     && !self.params.allowed_audiences.is_empty() && !self.params.allowed_audiences.contains(a) {
                         return IdpFuture::Ready {
@@ -711,6 +703,12 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 5. Revoke a JWT session / token (Logout & Revocation)
             (Method::POST, "/auth/revoke") => {
+                if let Err(msg) = verify_same_origin(req.headers()) {
+                    tracing::warn!("{}: Blocked cross-site POST /auth/revoke", self.server_name);
+                    return IdpFuture::Ready {
+                        response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
+                    };
+                }
                 let token_from_header = req.headers()
                     .get(hyper::header::AUTHORIZATION)
                     .and_then(|v| v.to_str().ok())
@@ -765,6 +763,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
                         validation.validate_exp = false;
                         validation.validate_aud = false;
+                        validation.set_issuer(&[&self.params.issuer]);
                         if let Ok(data) = jsonwebtoken::decode::<Claims>(&token_str, key, &validation) {
                             verified_token = true;
                             if let Some(jti) = data.claims.jti {
@@ -811,14 +810,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
                 // Explicit ?jti=... query parameter revocation is restricted to mTLS-authenticated callers
                 // to prevent unauthenticated JTI revocation DoS and RevocationStore memory exhaustion.
-                if let Some(explicit_jti) = query.split('&').find_map(|kv| {
-                    let mut parts = kv.splitn(2, '=');
-                    if parts.next()? == "jti" {
-                        parts.next().map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                }) {
+                if let Some(explicit_jti) = explicit_jti_param {
                     if mtls_claims.is_none() {
                         return IdpFuture::Ready {
                             response: Some(Self::response_err(
@@ -935,23 +927,30 @@ fn cert_fingerprint_subject(pem_str: &str) -> Option<String> {
 
 /// Rejects browser cross-site / cross-origin requests while permitting native
 /// non-browser clients (e.g., mobile apps or `curl`) that omit `Sec-Fetch-Site`
-/// and `Origin` headers.
-fn verify_same_origin(headers: &hyper::HeaderMap) -> Result<(), &'static str> {
-    if let Some(sec_fetch_site) = headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-        && !sec_fetch_site.eq_ignore_ascii_case("same-origin")
-        && !sec_fetch_site.eq_ignore_ascii_case("none")
-    {
-        return Err("Cross-site request blocked");
+/// and `Origin` headers. Fails closed on non-ASCII / malformed header values.
+pub(crate) fn verify_same_origin(headers: &hyper::HeaderMap) -> Result<(), &'static str> {
+    if let Some(raw_sfs) = headers.get("sec-fetch-site") {
+        let Ok(sec_fetch_site) = raw_sfs.to_str() else {
+            return Err("Invalid Sec-Fetch-Site header");
+        };
+        if !sec_fetch_site.eq_ignore_ascii_case("same-origin")
+            && !sec_fetch_site.eq_ignore_ascii_case("none")
+        {
+            return Err("Cross-site request blocked");
+        }
     }
 
-    if let Some(origin) = headers.get(hyper::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+    if let Some(raw_origin) = headers.get(hyper::header::ORIGIN) {
+        let Ok(origin) = raw_origin.to_str() else {
+            return Err("Invalid Origin header");
+        };
         let origin_authority = origin
             .strip_prefix("https://")
             .or_else(|| origin.strip_prefix("http://"))
             .map(|rest| rest.split('/').next().unwrap_or(rest));
-        let host = headers.get(hyper::header::HOST).and_then(|v| v.to_str().ok());
+        let host = headers
+            .get(hyper::header::HOST)
+            .and_then(|v| v.to_str().ok());
         match (origin_authority, host) {
             (Some(orig_host), Some(req_host)) if orig_host.eq_ignore_ascii_case(req_host) => {}
             _ => return Err("Cross-origin request blocked"),

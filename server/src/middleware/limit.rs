@@ -182,28 +182,37 @@ where
         let max_bytes = self.max_bytes;
         let server_name = self.server_name;
 
-        // Stage 1: Content-Length header fast path
-        if let Some(content_length_str) = req.headers().get(CONTENT_LENGTH)
-            && let Ok(content_length) = content_length_str.to_str().unwrap_or("").parse::<usize>()
-                && content_length > max_bytes {
-                    crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
-                    let msg = "Payload too large (Header check)";
-                    tracing::warn!("{}: {}", server_name, msg);
-                    return MaxPayloadFuture::HeaderRejected {
-                        response: Some(build_413_response(msg)),
-                    };
-                }
+        // Stage 1: Content-Length header fast path (fail-closed on overflowing or malformed values)
+        for content_length_val in req.headers().get_all(CONTENT_LENGTH) {
+            let invalid_or_exceeds = match content_length_val.to_str() {
+                Ok(s) => match s.trim().parse::<usize>() {
+                    Ok(len) => len > max_bytes,
+                    Err(_) => true,
+                },
+                Err(_) => true,
+            };
+            if invalid_or_exceeds {
+                crate::configuration::ServerMetrics::inc_payload_too_large(server_name);
+                let msg = "Payload too large (Header check)";
+                tracing::warn!("{}: {}", server_name, msg);
+                return MaxPayloadFuture::HeaderRejected {
+                    response: Some(build_413_response(msg)),
+                };
+            }
+        }
 
-        // Stage 2: Streaming byte counter
+        // Stage 2: Streaming byte counter (zero-alloc check excluding base64 grpc-web-text)
         let is_grpc = req
             .headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                let s = s.trim().to_lowercase();
-                s.starts_with("application/grpc")
-            })
-            .unwrap_or(false);
+            .is_some_and(|s| {
+                let b = s.trim().as_bytes();
+                b.len() >= 16
+                    && b[..16].eq_ignore_ascii_case(b"application/grpc")
+                    && !(b.len() >= 25
+                        && b[..25].eq_ignore_ascii_case(b"application/grpc-web-text"))
+            });
 
         let grpc_state = if is_grpc {
             Some(GrpcFramingState::Header {
@@ -301,6 +310,14 @@ where
                                     offset += to_copy;
 
                                     if *pos == 5 {
+                                        if buf[0] > 1 {
+                                            return Poll::Ready(Some(Err(
+                                                SrvError::PayloadTooLarge {
+                                                    current: *this.current_bytes,
+                                                    max: *this.max_bytes,
+                                                },
+                                            )));
+                                        }
                                         let msg_len = u32::from_be_bytes([
                                             buf[1], buf[2], buf[3], buf[4],
                                         ]) as usize;
@@ -1089,5 +1106,37 @@ mod tests {
         notify.notify_one();
         let resp2 = fut2.await.unwrap().unwrap();
         assert_eq!(resp2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_max_payload_rejects_malformed_content_length_and_invalid_grpc_flag() -> Result<(), Box<dyn std::error::Error>> {
+        let inner_svc = service_fn(|mut req: Request<SrvBody>| async move {
+            while let Some(frame) = req.body_mut().frame().await {
+                frame?;
+            }
+            let body: SrvBody = Full::new(Bytes::from("OK")).map_err(SrvError::from).boxed();
+            Ok::<Response<SrvBody>, SrvError>(Response::new(body))
+        });
+
+        let layer = MaxPayloadLayer::new(64, "test_malformed_cl");
+        let mut svc = layer.layer(inner_svc);
+
+        // 1. Overflowing Content-Length (> usize::MAX) must fail-closed in Stage 1 with 413
+        let req_overflow = Request::builder()
+            .uri("/upload")
+            .header(CONTENT_LENGTH, "999999999999999999999999999999999999999")
+            .body(Full::new(Bytes::from_static(b"hi")).map_err(SrvError::from).boxed())?;
+        let resp_overflow = svc.ready().await?.call(req_overflow).await?;
+        assert_eq!(resp_overflow.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // 2. Invalid gRPC compression flag (0x02 > 1) must be rejected with 413
+        let bad_grpc_frame = vec![0x02, 0x00, 0x00, 0x00, 0x01, 0xAA];
+        let req_bad_grpc = Request::builder()
+            .uri("/chat.Service/Call")
+            .header(hyper::header::CONTENT_TYPE, "application/grpc")
+            .body(Full::new(Bytes::from(bad_grpc_frame)).map_err(SrvError::from).boxed())?;
+        let resp_bad_grpc = svc.ready().await?.call(req_bad_grpc).await?;
+        assert_eq!(resp_bad_grpc.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        Ok(())
     }
 }

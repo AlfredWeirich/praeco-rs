@@ -231,21 +231,16 @@ where
             }
         }
         _ = async {
-            let tick_interval_secs = 10;
-            let max_idle_ticks = std::cmp::max(1, timeout.as_secs() / tick_interval_secs);
-            let mut idle_ticks = 0;
-
-            let mut interval = tokio::time::interval(Duration::from_secs(tick_interval_secs));
+            let tick_period = (timeout / 4).clamp(Duration::from_millis(20), Duration::from_secs(10));
+            let mut last_activity = tokio::time::Instant::now();
+            let mut interval = tokio::time::interval_at(last_activity + tick_period, tick_period);
             loop {
                 interval.tick().await;
-                // Swap the flag to false. If it was true, we had activity.
+                // Swap the flag to false. If it was true, we had activity since the last tick.
                 if had_activity.swap(false, Ordering::Relaxed) {
-                    idle_ticks = 0;
-                } else {
-                    idle_ticks += 1;
-                    if idle_ticks >= max_idle_ticks {
-                        break;
-                    }
+                    last_activity = tokio::time::Instant::now();
+                } else if last_activity.elapsed() >= timeout {
+                    break;
                 }
             }
         } => {

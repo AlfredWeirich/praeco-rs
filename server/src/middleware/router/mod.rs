@@ -413,7 +413,6 @@ impl Service<Request<SrvBody>> for RouterService {
             }
 
             let client_addr = parts.extensions.get::<std::net::SocketAddr>().copied();
-            headers::inject_real_ip(&mut parts);
 
             // Defense-in-depth: Validate and canonicalize URI path
             match crate::middleware::path_sanitizer::sanitize_and_normalize_uri(&parts.uri) {

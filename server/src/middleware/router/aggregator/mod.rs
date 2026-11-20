@@ -456,7 +456,7 @@ async fn collect_sub_outcome(
     let budget_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let budgeted_body = SharedBudgetBody {
         inner: resp.into_body(),
-        remaining_budget: shared_budget,
+        remaining_budget: Arc::clone(&shared_budget),
         exceeded: budget_exceeded.clone(),
         reservation: &mut reservation,
         global_exceeded: &mut global_exceeded,
@@ -516,6 +516,7 @@ async fn collect_sub_outcome(
     if sub_target.backend_type == RouteBackendType::Rest
         && let Err(e) = serde_json::from_slice::<IgnoredAny>(&bytes)
     {
+        shared_budget.fetch_add(bytes.len(), Ordering::Relaxed);
         warn!(
             "Aggregate target '{}' returned non-JSON REST response: {}",
             sub_target.key, e
@@ -942,18 +943,7 @@ pub(crate) async fn handle_aggregate_with_budget(
                     sub_global_budget,
                     expose_upstream_errors,
                 );
-                let outcome = match effective_timeout {
-                    Some(dur) => match tokio::time::timeout(dur, fut).await {
-                        Ok(o) => o,
-                        Err(_) => SubOutcome::Failed {
-                            status: StatusCode::GATEWAY_TIMEOUT,
-                            grpc_status: None,
-                            client_message: "Gateway Timeout".to_string(),
-                            internal_detail: format!("Sub-request timed out after {:?}", dur),
-                        },
-                    },
-                    None => fut.await,
-                };
+                let outcome = fut.await;
                 (idx, outcome)
             }
             .instrument(span),

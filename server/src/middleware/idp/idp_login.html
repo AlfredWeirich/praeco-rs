@@ -192,7 +192,7 @@
         <div class="user-code-box" id="user-code-box" style="display: none;">
             <div class="user-code-title">Verification Code</div>
             <div class="user-code-digits" id="user-code-digits">---</div>
-            <div class="user-code-note">Optionaler Bestätigungscode (Quishing-Schutz)</div>
+            <div class="user-code-note">Erforderlicher Bestätigungscode (Quishing-Schutz)</div>
         </div>
 
         <div class="status" id="status-container">
@@ -257,11 +257,10 @@
                     codeBox.style.display = 'block';
                 }
 
-                // 3. Poll for status confirmation using poll_secret binding
+                // 3. Poll for status confirmation using poll_secret binding (via X-Poll-Secret header)
                 const pollInterval = setInterval(async () => {
                     try {
-                        const statusUrl = '/auth/status?session=' + encodeURIComponent(sessionId) +
-                            '&poll_secret=' + encodeURIComponent(pollSecret);
+                        const statusUrl = '/auth/status?session=' + encodeURIComponent(sessionId);
                         const statusRes = await fetch(statusUrl, {
                             credentials: 'include',
                             headers: {

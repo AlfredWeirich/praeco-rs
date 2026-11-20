@@ -40,13 +40,18 @@ impl RateLimitTable {
             .retain(|_, bucket| bucket.last_update().elapsed() < max_idle);
     }
 
-    fn maybe_sweep_when_saturated(&self) {
+    fn maybe_sweep_when_saturated(&self, rate: f32, burst: f32) {
         if let Ok(mut last) = self.last_sweep.try_lock()
             && last.elapsed() >= SATURATED_SWEEP_INTERVAL
         {
-            *last = Instant::now();
+            let now = Instant::now();
+            *last = now;
             drop(last);
-            self.sweep_expired(BUCKET_IDLE_TTL);
+            self.buckets.retain(|_, bucket| {
+                let elapsed = now.duration_since(bucket.last_update());
+                let refilled = bucket.tokens + elapsed.as_secs_f32() * rate;
+                elapsed < BUCKET_IDLE_TTL && (rate <= 0.0 || refilled < burst)
+            });
         }
     }
 
@@ -56,7 +61,7 @@ impl RateLimitTable {
         }
 
         if self.buckets.len() >= self.max_entries {
-            self.maybe_sweep_when_saturated();
+            self.maybe_sweep_when_saturated(rate, burst);
             if self.buckets.len() >= self.max_entries {
                 let mut guard = self
                     .overflow_bucket
@@ -114,14 +119,11 @@ impl TokenBucket {
         let elapsed = now.duration_since(self.last_update).as_secs_f32();
 
         // Refill tokens based on elapsed time and rate
-        self.tokens += elapsed * rate;
-        if self.tokens > burst {
-            self.tokens = burst;
-        }
-        self.last_update = now;
+        let new_tokens = (self.tokens + elapsed * rate).min(burst);
 
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if new_tokens >= 1.0 {
+            self.tokens = new_tokens - 1.0;
+            self.last_update = now;
             true
         } else {
             false
@@ -162,14 +164,16 @@ pub struct RelayConnectionGuard {
 impl Drop for RelayConnectionGuard {
     fn drop(&mut self) {
         self.tracker.global_count.fetch_sub(1, Ordering::SeqCst);
-        if let Some(mut count) = self.tracker.ip_counts.get_mut(&self.ip)
-            && *count > 0
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            self.tracker.ip_counts.entry(self.ip)
         {
-            *count -= 1;
+            let count = entry.get_mut();
+            if *count <= 1 {
+                entry.remove();
+            } else {
+                *count -= 1;
+            }
         }
-        // Atomically remove only if still zero under the shard write lock
-        // so a concurrent acquire() cannot have its increment wiped out.
-        self.tracker.ip_counts.remove_if(&self.ip, |_, c| *c == 0);
     }
 }
 

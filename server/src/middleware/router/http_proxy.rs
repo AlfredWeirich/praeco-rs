@@ -259,17 +259,9 @@ pub(super) async fn forward_with_failover(
 
         let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
-        let mut probe_guard = is_multi_node.then(|| {
-            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds)
-        });
-        let request_epoch = probe_guard.as_ref().map_or_else(
-            || {
-                upstream_node
-                    .circuit_epoch
-                    .load(std::sync::atomic::Ordering::Acquire)
-            },
-            |pg| pg.epoch(),
-        );
+        let mut probe_guard =
+            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds);
+        let request_epoch = probe_guard.epoch();
         let conn_guard = ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
         let target_uri = build_upstream_uri(backend_base_uri, matched_params, original_uri)?;
@@ -322,9 +314,7 @@ pub(super) async fn forward_with_failover(
                         "{}: Upstream {} request timed out after {:?} for {}",
                         server_name, proto_label, timeout_dur, backend_base_uri
                     );
-                    if let Some(ref mut pg) = probe_guard {
-                        pg.complete();
-                    }
+                    probe_guard.complete();
                     let tripped = upstream_node
                         .record_failure_with_epoch(target.failure_threshold, request_epoch);
                     if tripped {
@@ -381,9 +371,7 @@ pub(super) async fn forward_with_failover(
         match resp_result {
             Ok(res) => {
                 upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
-                if let Some(ref mut pg) = probe_guard {
-                    pg.complete();
-                }
+                probe_guard.complete();
                 if mode.is_outlier(res.status(), res.headers()) {
                     let status = res.status();
                     let tripped = upstream_node
@@ -501,9 +489,7 @@ pub(super) async fn forward_with_failover(
                             "{}: Backend connection failed to {}: {}",
                             server_name, backend_base_uri, e
                         );
-                        if let Some(ref mut pg) = probe_guard {
-                            pg.complete();
-                        }
+                        probe_guard.complete();
                         target.mark_dead(backend_base_uri);
                         failed_nodes.push(backend_base_uri.clone());
 
@@ -1328,6 +1314,55 @@ mod tests {
         assert!(is_method_idempotent_for_retry(&Method::DELETE, true));
         assert!(!is_method_idempotent_for_retry(&Method::PUT, false));
         assert!(!is_method_idempotent_for_retry(&Method::DELETE, false));
+    }
+
+    #[test]
+    fn test_single_node_circuit_breaker_recovers_after_cooldown() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::configuration::{LbStrategy, RouteTarget, UpstreamNode};
+        use crate::middleware::router::circuit_breaker::{CircuitState, ProbeGuard};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let uri: Uri = "http://127.0.0.1:18080".parse()?;
+        let node = UpstreamNode::new(uri);
+        let target = RouteTarget {
+            upstreams: vec![node],
+            strategy: LbStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            cooldown_seconds: 1,
+            max_retries: 0,
+            failure_threshold: 2,
+            max_retry_buffer_bytes: 65536,
+            active_health_check_interval: 0,
+            grpc_pool: tokio::sync::RwLock::new(None),
+            grpc_reflection_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let single_node = &target.upstreams[0];
+        single_node.mark_dead();
+        assert_eq!(single_node.circuit_state(), CircuitState::Open);
+        assert!(!single_node.is_alive.load(Ordering::Acquire));
+
+        // Simulate cooldown elapsed by backdating last_failure_time by 5 seconds
+        let backdated = single_node
+            .last_failure_time
+            .load(Ordering::Acquire)
+            .saturating_sub(5)
+            .max(1);
+        single_node
+            .last_failure_time
+            .store(backdated, Ordering::Release);
+
+        // Single-node route creates ProbeGuard unconditionally -> transitions Open -> HalfOpen
+        let mut probe_guard = ProbeGuard::new(single_node, target.cooldown_seconds);
+        let epoch = probe_guard.epoch();
+        assert_eq!(single_node.circuit_state(), CircuitState::HalfOpen);
+
+        // Successful response completes ProbeGuard and transitions HalfOpen -> Closed
+        probe_guard.complete();
+        single_node.record_success_with_epoch(epoch);
+        assert_eq!(single_node.circuit_state(), CircuitState::Closed);
+        assert!(single_node.is_alive.load(Ordering::Acquire));
+        Ok(())
     }
 }
 

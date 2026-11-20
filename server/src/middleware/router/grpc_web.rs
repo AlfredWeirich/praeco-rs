@@ -273,7 +273,12 @@ pub(crate) async fn handle_grpc_web_with_budget(
     global_budget: &Arc<super::BufferBudget>,
 ) -> Result<Response<ServiceRespBody>, SrvError> {
     let mut failed_nodes = Vec::new();
-    let max_retries = target.max_retries;
+    let is_multi_node = target.upstreams.len() > 1;
+    let max_retries = if is_multi_node {
+        target.max_retries.min(target.upstreams.len() - 1)
+    } else {
+        0
+    };
     let mut attempts = 0;
 
     loop {
@@ -286,18 +291,9 @@ pub(crate) async fn handle_grpc_web_with_budget(
 
         let upstream_node = target.next_upstream(client_addr.as_ref(), &failed_nodes);
         let backend_base_uri = &upstream_node.uri;
-        let is_multi_node = target.upstreams.len() > 1;
-        let mut probe_guard = is_multi_node.then(|| {
-            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds)
-        });
-        let request_epoch = probe_guard.as_ref().map_or_else(
-            || {
-                upstream_node
-                    .circuit_epoch
-                    .load(std::sync::atomic::Ordering::Acquire)
-            },
-            |pg| pg.epoch(),
-        );
+        let mut probe_guard =
+            super::circuit_breaker::ProbeGuard::new(upstream_node, target.cooldown_seconds);
+        let request_epoch = probe_guard.epoch();
         let _conn_guard =
             super::upstreams::ConnectionGuard::new(target.clone(), backend_base_uri.clone());
 
@@ -374,9 +370,7 @@ pub(crate) async fn handle_grpc_web_with_budget(
                                 );
                                 pool_opt = Some(stale);
                             } else {
-                                if let Some(ref mut pg) = probe_guard {
-                                    pg.complete();
-                                }
+                                probe_guard.complete();
                                 upstream_node.record_failure_with_epoch(
                                     target.failure_threshold,
                                     request_epoch,
@@ -573,22 +567,11 @@ pub(crate) async fn handle_grpc_web_with_budget(
                     "{}: gRPC transcoding request to {} timed out after {:?}",
                     server_name, backend_base_uri, req_timeout
                 );
-                if let Some(ref mut pg) = probe_guard {
-                    pg.complete();
-                }
+                probe_guard.complete();
                 upstream_node.record_failure_with_epoch(target.failure_threshold, request_epoch);
                 failed_nodes.push(backend_base_uri.clone());
-
-                if attempts <= max_retries {
-                    upstream_node
-                        .failover_retries
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(
-                        "{}: Retrying gRPC transcoding request after timeout... (Attempt {}/{})",
-                        server_name, attempts, max_retries
-                    );
-                    continue;
-                }
+                // gRPC transcoding calls are non-idempotent POST requests that have already
+                // been dispatched to the backend; do not replay after a post-send timeout.
                 return Ok(build_error_response(
                     "Gateway Timeout",
                     StatusCode::GATEWAY_TIMEOUT,
@@ -599,9 +582,7 @@ pub(crate) async fn handle_grpc_web_with_budget(
         match req_result {
             Ok(mut res) => {
                 upstream_node.record_latency_ms(req_start.elapsed().as_millis() as u64);
-                if let Some(ref mut pg) = probe_guard {
-                    pg.complete();
-                }
+                probe_guard.complete();
                 if res.status() != StatusCode::OK {
                     let status = res.status();
                     warn!(
@@ -612,16 +593,6 @@ pub(crate) async fn handle_grpc_web_with_budget(
                         upstream_node
                             .record_failure_with_epoch(target.failure_threshold, request_epoch);
                         failed_nodes.push(backend_base_uri.clone());
-                        if attempts <= max_retries {
-                            upstream_node
-                                .failover_retries
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            warn!(
-                                "{}: Retrying gRPC transcoding request after HTTP {}... (Attempt {}/{})",
-                                server_name, status, attempts, max_retries
-                            );
-                            continue;
-                        }
                     }
                     let msg = status.canonical_reason().unwrap_or("Bad Gateway");
                     return Ok(build_error_response(msg, status));
@@ -806,9 +777,7 @@ pub(crate) async fn handle_grpc_web_with_budget(
                 ));
             }
             Err(e) => {
-                if let Some(ref mut pg) = probe_guard {
-                    pg.complete();
-                }
+                probe_guard.complete();
                 error!(
                     "{}: Backend connection failed to {}: {}",
                     server_name, backend_base_uri, e
@@ -816,15 +785,14 @@ pub(crate) async fn handle_grpc_web_with_budget(
                 target.mark_dead(backend_base_uri);
                 failed_nodes.push(backend_base_uri.clone());
 
-                if attempts <= max_retries {
+                if e.is_connect() && attempts <= max_retries {
                     upstream_node
                         .failover_retries
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     warn!(
-                        "{}: Retrying gRPC request... (Attempt {}/{})",
+                        "{}: Retrying gRPC request after connect error... (Attempt {}/{})",
                         server_name, attempts, max_retries
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 } else {
                     return Ok(build_error_response("Bad Gateway", StatusCode::BAD_GATEWAY));

@@ -118,6 +118,34 @@ pub struct SrvCompressionFuture<F> {
     inner: F,
     server_name: &'static str,
     accept_encoding: String,
+    is_head_request: bool,
+}
+
+/// Checks whether `accept_encoding` permits `target_coding` with a quality value `q > 0`.
+fn accepts_coding(accept_encoding: &str, target_coding: &str) -> bool {
+    for item in accept_encoding.split(',') {
+        let mut parts = item.trim().split(';');
+        let Some(coding) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if !coding.eq_ignore_ascii_case(target_coding) {
+            continue;
+        }
+        let mut allowed = true;
+        for param in parts {
+            if let Some((k, v)) = param.trim().split_once('=')
+                && k.trim().eq_ignore_ascii_case("q")
+                && let Ok(q) = v.trim().parse::<f32>()
+                && q <= 0.0
+            {
+                allowed = false;
+            }
+        }
+        if allowed {
+            return true;
+        }
+    }
+    false
 }
 
 impl<F, E> Future for SrvCompressionFuture<F>
@@ -139,9 +167,14 @@ where
         // Determine which compression algorithm to use (if any).
         let accept_header = this.accept_encoding;
         let server_name = *this.server_name;
+        let status = resp.status();
+        let is_bodiless_status = status.is_informational()
+            || status == hyper::StatusCode::NO_CONTENT
+            || status == hyper::StatusCode::NOT_MODIFIED;
 
-        // Skip compression if the response is already compressed or is a gRPC stream
-        // (compressing a gRPC response body strips HTTP/2 trailers like `grpc-status`).
+        // Skip compression if the response is bodiless (HEAD / 1xx / 204 / 304),
+        // already compressed, or is a gRPC stream (compressing a gRPC response body
+        // strips HTTP/2 trailers like `grpc-status`).
         let already_encoded = resp.headers().contains_key(CONTENT_ENCODING);
         let is_grpc = resp
             .headers()
@@ -149,11 +182,11 @@ where
             .and_then(|v| v.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/grpc"));
 
-        let algo = if already_encoded || is_grpc {
+        let algo = if *this.is_head_request || is_bodiless_status || already_encoded || is_grpc {
             None
-        } else if accept_header.contains("gzip") {
+        } else if accepts_coding(accept_header, "gzip") {
             Some("gzip")
-        } else if accept_header.contains("br") {
+        } else if accepts_coding(accept_header, "br") {
             Some("br")
         } else {
             None
@@ -241,6 +274,7 @@ where
     fn call(&mut self, req: Request<SrvBody>) -> Self::Future {
         let server_name = self.server_name;
 
+        let is_head_request = req.method() == hyper::Method::HEAD;
         // Capture the Accept-Encoding header before moving the request.
         let accept_encoding = req
             .headers()
@@ -255,6 +289,7 @@ where
             inner: fut,
             server_name,
             accept_encoding,
+            is_head_request,
         }
     }
 }
@@ -704,5 +739,49 @@ mod tests {
             .await
             .expect("payload of exact max_bytes must succeed without off-by-one 413");
         assert_eq!(resp.status(), hyper::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_compression_skips_head_204_and_q_zero() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(!accepts_coding("gzip;q=0", "gzip"));
+        assert!(!accepts_coding("gzip; q=0.000", "gzip"));
+        assert!(accepts_coding("gzip;q=0, br;q=1.0", "br"));
+        assert!(!accepts_coding("deflate", "br"));
+
+        // 1. q=0 must not compress
+        let resp_q0 = run(Some("application/json"), None, "gzip;q=0", full_body(PAYLOAD)).await;
+        assert!(resp_q0.headers().get(CONTENT_ENCODING).is_none());
+
+        // 2. HEAD request must not compress or strip Content-Length
+        let inner_head = service_fn(|_req: Request<SrvBody>| async move {
+            let mut r = Response::new(full_body(b""));
+            r.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("128"));
+            Ok::<Response<SrvBody>, SrvError>(r)
+        });
+        let svc_head = SrvCompressionLayer::new("test_head").layer(inner_head);
+        let req_head = Request::builder()
+            .method(hyper::Method::HEAD)
+            .header(ACCEPT_ENCODING, "gzip")
+            .body(full_body(b""))?;
+        let resp_head = svc_head.oneshot(req_head).await?;
+        assert!(resp_head.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(
+            resp_head.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            Some("128")
+        );
+
+        // 3. 204 No Content must not compress
+        let inner_204 = service_fn(|_req: Request<SrvBody>| async move {
+            let mut r = Response::new(full_body(b""));
+            *r.status_mut() = hyper::StatusCode::NO_CONTENT;
+            Ok::<Response<SrvBody>, SrvError>(r)
+        });
+        let svc_204 = SrvCompressionLayer::new("test_204").layer(inner_204);
+        let req_204 = Request::builder()
+            .header(ACCEPT_ENCODING, "gzip")
+            .body(full_body(b""))?;
+        let resp_204 = svc_204.oneshot(req_204).await?;
+        assert!(resp_204.headers().get(CONTENT_ENCODING).is_none());
+        Ok(())
     }
 }

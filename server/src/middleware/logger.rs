@@ -205,7 +205,7 @@ fn sanitize_headers(headers: &hyper::HeaderMap) -> hyper::HeaderMap {
 ///
 /// Note: `code` is kept visible strictly on `/auth/confirm` for device onboarding pairing codes,
 /// and redacted on all other paths (e.g. OAuth authorization-code callbacks).
-fn sanitize_uri(uri: &hyper::Uri) -> String {
+pub(crate) fn sanitize_uri(uri: &hyper::Uri) -> String {
     let path = uri.path();
     if let Some(query) = uri.query() {
         let sanitized_query: Vec<String> = query

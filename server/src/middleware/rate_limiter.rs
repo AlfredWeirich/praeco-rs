@@ -175,11 +175,11 @@ impl KeyedSimpleRateLimitStore {
 
         // 1. Fast path (O(1)): Key is already tracked in the map
         if let Some(mut entry) = self.entries.get_mut(key) {
-            entry.last_seen = now;
             if now < entry.next_allowed {
                 let wait_secs = (entry.next_allowed.duration_since(now).as_secs_f64()).ceil().max(1.0) as u64;
                 return Err(wait_secs);
             } else {
+                entry.last_seen = now;
                 entry.next_allowed = now + limit_duration;
                 return Ok(());
             }
@@ -223,7 +223,10 @@ impl KeyedSimpleRateLimitStore {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
             && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
-                self.cleanup(now);
+                let ttl = self.ttl;
+                self.entries.retain(|_, entry| {
+                    now.duration_since(entry.last_seen) < ttl && now < entry.next_allowed
+                });
             }
     }
 
@@ -484,15 +487,15 @@ impl KeyedTokenBucketStore {
         if let Some(mut entry) = self.entries.get_mut(key) {
             let elapsed = now.duration_since(entry.last_refill);
             let added = elapsed.as_secs_f64() * rate;
-            entry.tokens = (entry.tokens + added).min(cap_f64);
-            entry.last_refill = now;
-            entry.last_seen = now;
+            let new_tokens = (entry.tokens + added).min(cap_f64);
 
-            if entry.tokens >= 1.0 {
-                entry.tokens -= 1.0;
+            if new_tokens >= 1.0 {
+                entry.tokens = new_tokens - 1.0;
+                entry.last_refill = now;
+                entry.last_seen = now;
                 return Ok(());
             } else {
-                let needed = 1.0 - entry.tokens;
+                let needed = 1.0 - new_tokens;
                 let retry_after_secs = (needed / rate).ceil().max(1.0) as u64;
                 return Err(retry_after_secs);
             }
@@ -500,7 +503,7 @@ impl KeyedTokenBucketStore {
 
         // 2. Slow path for new unknown keys: enforce hard max_entries cap (Fail-Closed)
         if self.entries.len() >= self.max_entries {
-            self.maybe_cleanup_when_full(now);
+            self.maybe_cleanup_when_full(now, cap_f64, rate);
             if self.entries.len() >= self.max_entries {
                 return Err(1);
             }
@@ -537,11 +540,16 @@ impl KeyedTokenBucketStore {
             }
     }
 
-    fn maybe_cleanup_when_full(&self, now: Instant) {
+    fn maybe_cleanup_when_full(&self, now: Instant, cap_f64: f64, rate: f64) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
             && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
                 *last_cleanup = now;
-                self.cleanup(now);
+                let ttl = self.ttl;
+                self.entries.retain(|_, entry| {
+                    let within_ttl = now.duration_since(entry.last_seen) < ttl;
+                    let refilled = entry.tokens + now.duration_since(entry.last_refill).as_secs_f64() * rate;
+                    within_ttl && (rate <= 0.0 || refilled < cap_f64)
+                });
             }
     }
 
@@ -1072,5 +1080,25 @@ mod tests {
         req2.extensions_mut().insert(unspecified_peer);
         let resp2 = limiter.call(req2).await.unwrap();
         assert_eq!(resp2.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_rejected_requests_do_not_pin_stale_entries_across_ttl() {
+        let store = KeyedTokenBucketStore::new(2, Duration::from_millis(40));
+        let key1 = RateLimitKey::Ip(IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1)));
+
+        // Consume the single token (refill = 1 per 60s so it stays exhausted)
+        assert!(store.try_consume(&key1, 1, 1, Duration::from_secs(60)).is_ok());
+        assert!(store.try_consume(&key1, 1, 1, Duration::from_secs(60)).is_err());
+
+        // Sleep past the 40ms TTL while issuing rejected requests
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(store.try_consume(&key1, 1, 1, Duration::from_secs(60)).is_err());
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(store.try_consume(&key1, 1, 1, Duration::from_secs(60)).is_err());
+
+        // Because rejected requests do not refresh last_seen, cleanup evicts the stale entry
+        store.cleanup(Instant::now());
+        assert_eq!(store.len(), 0);
     }
 }

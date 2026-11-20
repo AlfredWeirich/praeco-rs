@@ -152,32 +152,32 @@ impl SessionStore {
         // 1. Throttled Cleanup
         self.maybe_cleanup_expired();
 
-        // 2. IP Rate Limiting
-        if let Some(ip) = client_ip {
+        // 2. IP Rate Limiting (falls back to 0.0.0.0 bucket when SocketAddr extension is absent)
+        let ip = client_ip.unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        if !self.ip_rate_limits.contains_key(&ip)
+            && self.ip_rate_limits.len() >= self.max_active_sessions * 2
+        {
+            self.cleanup_expired_force();
             if !self.ip_rate_limits.contains_key(&ip)
                 && self.ip_rate_limits.len() >= self.max_active_sessions * 2
             {
-                self.cleanup_expired_force();
-                if !self.ip_rate_limits.contains_key(&ip)
-                    && self.ip_rate_limits.len() >= self.max_active_sessions * 2
-                {
-                    warn!("IdP IP rate limit table capacity reached");
-                    return Err(CreateSessionError::CapacityExceeded);
-                }
-            }
-            let mut rate_entry = self.ip_rate_limits.entry(ip).or_insert((0, Instant::now()));
-            let (count, start) = rate_entry.value_mut();
-            if start.elapsed() > RATE_LIMIT_WINDOW {
-                *count = 1;
-                *start = Instant::now();
-            } else {
-                *count += 1;
-                if *count > MAX_LOGIN_REQUESTS_PER_MINUTE {
-                    warn!("IdP rate limit exceeded for IP: {}", ip);
-                    return Err(CreateSessionError::RateLimited);
-                }
+                warn!("IdP IP rate limit table capacity reached");
+                return Err(CreateSessionError::CapacityExceeded);
             }
         }
+        let mut rate_entry = self.ip_rate_limits.entry(ip).or_insert((0, Instant::now()));
+        let (count, start) = rate_entry.value_mut();
+        if start.elapsed() > RATE_LIMIT_WINDOW {
+            *count = 1;
+            *start = Instant::now();
+        } else {
+            *count += 1;
+            if *count > MAX_LOGIN_REQUESTS_PER_MINUTE {
+                warn!("IdP rate limit exceeded for IP: {}", ip);
+                return Err(CreateSessionError::RateLimited);
+            }
+        }
+        drop(rate_entry);
 
         // 3. Capacity Check
         if self.sessions.len() >= self.max_active_sessions {
@@ -249,9 +249,9 @@ impl SessionStore {
             return Err(ConfirmError::AlreadyConfirmed);
         }
 
-        // Mandatory user_code verification (case-insensitive, ignoring optional dashes, constant-time)
+        // Mandatory user_code verification (case-insensitive, ignoring optional dashes, constant-time, bounded length)
         let code_matches = match user_code {
-            Some(code) if !code.trim().is_empty() => {
+            Some(code) if !code.trim().is_empty() && code.len() <= 32 => {
                 let clean_input: String = code
                     .chars()
                     .filter(|c| *c != '-')

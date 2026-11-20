@@ -245,6 +245,8 @@ pub fn build_service_stack_with_base(
     use tower_http::trace::{DefaultOnResponse, OnResponse, TraceLayer};
 
     let default_on_response = DefaultOnResponse::new().level(Level::INFO);
+    let req_metrics = ServerMetrics::for_server(static_name);
+    let resp_metrics = Arc::clone(&req_metrics);
     let traced = tower::ServiceBuilder::new()
         .map_response(|res: hyper::Response<_>| {
             res.map(|b| http_body_util::BodyExt::map_err(b, SrvError::from).boxed())
@@ -252,15 +254,18 @@ pub fn build_service_stack_with_base(
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(move |request: &hyper::Request<_>| {
-                    ServerMetrics::inc_total_requests(static_name);
+                    req_metrics
+                        .total_requests
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let path = request.uri().path();
                     let method = request.method();
+                    let safe_uri = crate::middleware::logger::sanitize_uri(request.uri());
                     let otel_name = format!("{} {}", method, path);
                     let span = info_span!(
                         "request",
                         otel.name = otel_name.as_str(),
                         http.method = %method,
-                        http.uri = %request.uri(),
+                        http.uri = %safe_uri,
                         traceparent = tracing::field::Empty
                     );
                     opentelemetry::global::get_text_map_propagator(|propagator| {
@@ -281,8 +286,7 @@ pub fn build_service_stack_with_base(
                     move |response: &hyper::Response<_>,
                           latency: Duration,
                           span: &tracing::Span| {
-                        ServerMetrics::record_response(
-                            static_name,
+                        resp_metrics.record_completed_response(
                             response.status().as_u16(),
                             latency.as_millis() as u64,
                         );

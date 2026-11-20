@@ -425,9 +425,15 @@ enum ServiceSource {
 }
 
 #[derive(Clone)]
+struct DynamicOidState {
+    cached_map: Arc<std::collections::HashMap<String, UserRole>>,
+    cached_roles: Arc<crate::configuration::RoleVec<6>>,
+}
+
+#[derive(Clone)]
 struct DynamicOidMapping {
     live: Arc<arc_swap::ArcSwap<std::collections::HashMap<String, UserRole>>>,
-    cached_map: Arc<std::collections::HashMap<String, UserRole>>,
+    state: Arc<arc_swap::ArcSwap<DynamicOidState>>,
 }
 
 fn resolve_roles_from_oids(
@@ -566,15 +572,19 @@ impl ConnectionHandler {
         oid_mapping: Arc<arc_swap::ArcSwap<std::collections::HashMap<String, UserRole>>>,
     ) -> Self {
         let cached_map = oid_mapping.load_full();
-        let final_roles = resolve_roles_from_oids(&oids, &cached_map);
+        let final_roles = Arc::new(resolve_roles_from_oids(&oids, &cached_map));
+        let state = Arc::new(arc_swap::ArcSwap::from_pointee(DynamicOidState {
+            cached_map,
+            cached_roles: Arc::clone(&final_roles),
+        }));
 
         Self {
             service_source: ServiceSource::Dynamic(dynamic_stack),
             client_addr: addr,
-            client_roles: Arc::new(final_roles),
+            client_roles: final_roles,
             dynamic_oid_mapping: Some(DynamicOidMapping {
                 live: oid_mapping,
-                cached_map,
+                state,
             }),
             client_cert_pem: client_cert_pem.map(Arc::<str>::from),
             client_cert_san: client_cert_san.map(Arc::<str>::from),
@@ -690,11 +700,17 @@ impl ConnectionHandler {
 
         // 2. Zero-cost injection on the hot path (`Arc::ptr_eq` check when dynamic OIDs are used).
         let roles_to_inject = if let Some(ref dyn_oid) = self.dynamic_oid_mapping {
-            let current_map = dyn_oid.live.load();
-            if Arc::ptr_eq(&current_map, &dyn_oid.cached_map) {
-                self.client_roles.clone()
+            let current_map = dyn_oid.live.load_full();
+            let cached = dyn_oid.state.load();
+            if Arc::ptr_eq(&current_map, &cached.cached_map) {
+                Arc::clone(&cached.cached_roles)
             } else {
-                Arc::new(resolve_roles_from_oids(&self.client_oids, &current_map))
+                let new_roles = Arc::new(resolve_roles_from_oids(&self.client_oids, &current_map));
+                dyn_oid.state.store(Arc::new(DynamicOidState {
+                    cached_map: current_map,
+                    cached_roles: Arc::clone(&new_roles),
+                }));
+                new_roles
             }
         } else {
             self.client_roles.clone()

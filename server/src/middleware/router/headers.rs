@@ -137,17 +137,6 @@ fn filter_cookie_header(headers: &mut hyper::HeaderMap, strip_cookie_names: &Has
     }
 }
 
-/// Extracts the client's IP from request extensions and injects it as the `X-Real-IP` header.
-pub fn inject_real_ip(parts: &mut hyper::http::request::Parts) {
-    let client_addr = parts.extensions.get::<std::net::SocketAddr>().copied();
-    if let Some(addr) = client_addr {
-        let ip_str = addr.ip().to_string();
-        if let Ok(hv) = header::HeaderValue::from_str(&ip_str) {
-            parts.headers.insert("X-Real-IP", hv);
-        }
-    }
-}
-
 /// Cleans and prepares HTTP headers for upstream forwarding according to the route's [`RouteHeaderPolicy`].
 ///
 /// Security operations performed:
@@ -209,19 +198,20 @@ pub fn prepare_proxy_headers(
         max_forwards = mf;
     }
 
-    // 2. Strip Hop-by-Hop headers (including headers named in Connection header, RFC 7230 §6.1)
-    let custom_hops: HeaderVec<6> = if let Some(conn_val) = original_headers.get(header::CONNECTION) {
+    // 2. Strip Hop-by-Hop headers (including headers named in all Connection headers, RFC 7230 §6.1),
+    //    while protecting essential HTTP/gRPC wire framing headers from being stripped.
+    let mut custom_hops: HeaderVec<6> = SmallVec::new();
+    for conn_val in original_headers.get_all(header::CONNECTION) {
         if let Ok(conn_str) = conn_val.to_str() {
-            conn_str
-                .split(',')
-                .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
-                .collect()
-        } else {
-            SmallVec::new()
+            for token in conn_str.split(',') {
+                if let Ok(hdr_name) = header::HeaderName::from_bytes(token.trim().as_bytes())
+                    && !is_essential_wire_header(&hdr_name)
+                {
+                    custom_hops.push(hdr_name);
+                }
+            }
         }
-    } else {
-        SmallVec::new()
-    };
+    }
     for h in &custom_hops {
         original_headers.remove(h);
     }
@@ -388,19 +378,19 @@ pub fn prepare_proxy_headers(
 /// Strips hop-by-hop headers per RFC 7230 §6.1 / RFC 9110 and removes the upstream
 /// `Server` header to prevent leaking internal backend implementation details.
 pub fn clean_response_headers(headers: &mut hyper::HeaderMap) {
-    // 1. Strip headers named in Connection header
-    let custom_hops: HeaderVec<6> = if let Some(conn_val) = headers.get(header::CONNECTION) {
+    // 1. Strip headers named in all Connection headers (preserving essential wire headers)
+    let mut custom_hops: HeaderVec<6> = SmallVec::new();
+    for conn_val in headers.get_all(header::CONNECTION) {
         if let Ok(conn_str) = conn_val.to_str() {
-            conn_str
-                .split(',')
-                .filter_map(|h| header::HeaderName::from_bytes(h.trim().as_bytes()).ok())
-                .collect()
-        } else {
-            SmallVec::new()
+            for token in conn_str.split(',') {
+                if let Ok(hdr_name) = header::HeaderName::from_bytes(token.trim().as_bytes())
+                    && !is_essential_wire_header(&hdr_name)
+                {
+                    custom_hops.push(hdr_name);
+                }
+            }
         }
-    } else {
-        SmallVec::new()
-    };
+    }
     for h in &custom_hops {
         headers.remove(h);
     }
@@ -866,5 +856,39 @@ mod tests {
             prepare_proxy_headers(&mut h_dup, "test_server", None, &extensions, &config, &policy)
                 .unwrap_err();
         assert_eq!(err_dup.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_multiple_connection_headers_strip_custom_hops_and_preserve_essential_wire_headers() {
+        let config = make_test_config(None);
+        let extensions = hyper::http::Extensions::new();
+        let policy = RouteHeaderPolicy::default();
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(header::HOST, header::HeaderValue::from_static("api.example.com"));
+        headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+        headers.insert(header::CONTENT_LENGTH, header::HeaderValue::from_static("12"));
+        headers.insert("x-hop-one", header::HeaderValue::from_static("1"));
+        headers.insert("x-hop-two", header::HeaderValue::from_static("2"));
+        headers.append(header::CONNECTION, header::HeaderValue::from_static("x-hop-one, host"));
+        headers.append(
+            header::CONNECTION,
+            header::HeaderValue::from_static("x-hop-two, content-length, content-type"),
+        );
+
+        let res = prepare_proxy_headers(
+            &mut headers,
+            "test_server",
+            None,
+            &extensions,
+            &config,
+            &policy,
+        );
+        assert!(res.is_ok());
+        assert!(!headers.contains_key("x-hop-one"));
+        assert!(!headers.contains_key("x-hop-two"));
+        assert!(headers.contains_key(header::HOST));
+        assert!(headers.contains_key(header::CONTENT_TYPE));
+        assert!(headers.contains_key(header::CONTENT_LENGTH));
     }
 }

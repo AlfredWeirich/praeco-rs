@@ -318,6 +318,20 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
     }
 }
 
+/// Escapes a Prometheus / OpenMetrics label value (`\`, `"`, and `\n`) per exposition format rules.
+fn escape_prometheus_label(val: &str) -> String {
+    let mut out = String::with_capacity(val.len());
+    for ch in val.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 /// Formats the current [`AdminStatusResponse`] into Prometheus / OpenMetrics text exposition format.
 pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     let mut out = String::with_capacity(4096);
@@ -335,9 +349,10 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_requests_total Total incoming HTTP/gRPC requests per server.\n");
     out.push_str("# TYPE praeco_server_requests_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         out.push_str(&format!(
             "praeco_server_requests_total{{server=\"{}\"}} {}\n",
-            srv.name, srv.traffic_and_security.total_requests
+            srv_name, srv.traffic_and_security.total_requests
         ));
     }
     out.push('\n');
@@ -345,9 +360,10 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_active_connections Active client connections per server.\n");
     out.push_str("# TYPE praeco_server_active_connections gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         out.push_str(&format!(
             "praeco_server_active_connections{{server=\"{}\"}} {}\n",
-            srv.name, srv.traffic_and_security.active_connections
+            srv_name, srv.traffic_and_security.active_connections
         ));
     }
     out.push('\n');
@@ -355,13 +371,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_connections_rejected_total Connections rejected by connection limits.\n");
     out.push_str("# TYPE praeco_server_connections_rejected_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         out.push_str(&format!(
             "praeco_server_connections_rejected_total{{server=\"{}\",reason=\"global_limit\"}} {}\n",
-            srv.name, srv.traffic_and_security.connections_rejected_global
+            srv_name, srv.traffic_and_security.connections_rejected_global
         ));
         out.push_str(&format!(
             "praeco_server_connections_rejected_total{{server=\"{}\",reason=\"ip_limit\"}} {}\n",
-            srv.name, srv.traffic_and_security.connections_rejected_ip
+            srv_name, srv.traffic_and_security.connections_rejected_ip
         ));
     }
     out.push('\n');
@@ -369,6 +386,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_blocked_requests_total Blocked requests per server by security or limit layer.\n");
     out.push_str("# TYPE praeco_server_blocked_requests_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         let ts = &srv.traffic_and_security;
         for (reason, count) in [
             ("ip_filter", ts.blocked_ip_filter),
@@ -383,7 +401,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
         ] {
             out.push_str(&format!(
                 "praeco_server_blocked_requests_total{{server=\"{}\",reason=\"{}\"}} {}\n",
-                srv.name, reason, count
+                srv_name, reason, count
             ));
         }
     }
@@ -392,6 +410,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_responses_total Completed HTTP responses per server by status class.\n");
     out.push_str("# TYPE praeco_server_responses_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         let ts = &srv.traffic_and_security;
         for (status_class, count) in [
             ("2xx", ts.responses_2xx),
@@ -401,7 +420,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
         ] {
             out.push_str(&format!(
                 "praeco_server_responses_total{{server=\"{}\",status_class=\"{}\"}} {}\n",
-                srv.name, status_class, count
+                srv_name, status_class, count
             ));
         }
     }
@@ -410,9 +429,10 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_last_response_ms Most recent observed request latency per server in milliseconds.\n");
     out.push_str("# TYPE praeco_server_last_response_ms gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         out.push_str(&format!(
             "praeco_server_last_response_ms{{server=\"{}\"}} {}\n",
-            srv.name, srv.traffic_and_security.last_response_ms
+            srv_name, srv.traffic_and_security.last_response_ms
         ));
     }
     out.push('\n');
@@ -420,9 +440,10 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_server_ema_response_ms Exponential moving average request latency per server in milliseconds.\n");
     out.push_str("# TYPE praeco_server_ema_response_ms gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         out.push_str(&format!(
             "praeco_server_ema_response_ms{{server=\"{}\"}} {}\n",
-            srv.name, srv.traffic_and_security.ema_response_ms
+            srv_name, srv.traffic_and_security.ema_response_ms
         ));
     }
     out.push('\n');
@@ -431,9 +452,10 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# TYPE praeco_server_cert_days_remaining gauge\n");
     for srv in &status.servers {
         if let Some(days) = srv.pki.server_cert_days_remaining {
+            let srv_name = escape_prometheus_label(&srv.name);
             out.push_str(&format!(
                 "praeco_server_cert_days_remaining{{server=\"{}\"}} {}\n",
-                srv.name, days
+                srv_name, days
             ));
         }
     }
@@ -442,8 +464,11 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_circuit_state Circuit breaker state per upstream (0=Closed, 1=Open, 2=HalfOpen).\n");
     out.push_str("# TYPE praeco_upstream_circuit_state gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 let state_num = match up.circuit_state {
                     "Closed" => 0,
                     "Open" => 1,
@@ -452,7 +477,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
                 };
                 out.push_str(&format!(
                     "praeco_upstream_circuit_state{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, state_num
+                    srv_name, route_prefix, up_uri, state_num
                 ));
             }
         }
@@ -462,13 +487,16 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_alive Whether the upstream node is marked alive (1=alive, 0=dead).\n");
     out.push_str("# TYPE praeco_upstream_alive gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_alive{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name,
-                    route.prefix,
-                    up.uri,
+                    srv_name,
+                    route_prefix,
+                    up_uri,
                     if up.is_alive { 1 } else { 0 }
                 ));
             }
@@ -479,11 +507,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_active_connections Active in-flight requests to the upstream node.\n");
     out.push_str("# TYPE praeco_upstream_active_connections gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_active_connections{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.active_connections
+                    srv_name, route_prefix, up_uri, up.active_connections
                 ));
             }
         }
@@ -493,11 +524,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_requests_total Total requests dispatched to the upstream node.\n");
     out.push_str("# TYPE praeco_upstream_requests_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_requests_total{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.total_requests
+                    srv_name, route_prefix, up_uri, up.total_requests
                 ));
             }
         }
@@ -507,11 +541,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_failures_total Total failures observed on the upstream node.\n");
     out.push_str("# TYPE praeco_upstream_failures_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_failures_total{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.total_failures
+                    srv_name, route_prefix, up_uri, up.total_failures
                 ));
             }
         }
@@ -521,11 +558,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_circuit_trips_total Total times the upstream circuit breaker tripped to OPEN.\n");
     out.push_str("# TYPE praeco_upstream_circuit_trips_total counter\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_circuit_trips_total{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.circuit_trips
+                    srv_name, route_prefix, up_uri, up.circuit_trips
                 ));
             }
         }
@@ -535,11 +575,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_ema_response_ms Exponential moving average response latency in milliseconds.\n");
     out.push_str("# TYPE praeco_upstream_ema_response_ms gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_ema_response_ms{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.ema_response_ms
+                    srv_name, route_prefix, up_uri, up.ema_response_ms
                 ));
             }
         }
@@ -549,11 +592,14 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     out.push_str("# HELP praeco_upstream_consecutive_failures Consecutive outlier failures observed on the upstream node.\n");
     out.push_str("# TYPE praeco_upstream_consecutive_failures gauge\n");
     for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
         for route in &srv.routes {
+            let route_prefix = escape_prometheus_label(&route.prefix);
             for up in &route.upstreams {
+                let up_uri = escape_prometheus_label(&up.uri);
                 out.push_str(&format!(
                     "praeco_upstream_consecutive_failures{{server=\"{}\",route=\"{}\",upstream=\"{}\"}} {}\n",
-                    srv.name, route.prefix, up.uri, up.consecutive_failures
+                    srv_name, route_prefix, up_uri, up.consecutive_failures
                 ));
             }
         }
@@ -891,15 +937,10 @@ pub fn handle_admin_request_with_prefix(
             );
         }
 
-        if let Some(sec_fetch_site) = headers
-            .get("sec-fetch-site")
-            .and_then(|v| v.to_str().ok())
-            && !sec_fetch_site.eq_ignore_ascii_case("same-origin")
-            && !sec_fetch_site.eq_ignore_ascii_case("none")
-        {
+        if let Err(reason) = crate::middleware::idp::verify_same_origin(headers) {
             tracing::warn!(
                 target: "admin::audit",
-                sec_fetch_site = %sec_fetch_site,
+                reason = %reason,
                 path = %path,
                 "Blocked cross-site POST admin control action"
             );
@@ -1355,5 +1396,36 @@ mod tests {
             Some("/api/GetPraecoStatus"),
         );
         assert_eq!(csrf_resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_prometheus_metrics_escapes_labels_and_blocks_cross_origin_post() -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            escape_prometheus_label("srv\"1\\test\ninject"),
+            "srv\\\"1\\\\test\\ninject"
+        );
+
+        let mut router_srv = ServerConfig {
+            name: "mounted_admin_origin".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8080),
+            service: crate::configuration::ServiceType::Router,
+            ..Default::default()
+        };
+        router_srv.finalize()?;
+
+        let mut origin_headers = HeaderMap::new();
+        origin_headers.insert(header::HOST, header::HeaderValue::from_static("127.0.0.1:8080"));
+        origin_headers.insert(header::ORIGIN, header::HeaderValue::from_static("https://evil.example"));
+        let uri: Uri = "http://127.0.0.1:8080/api/GetPraecoStatus?action=mark_dead&upstream=http://127.0.0.1:50051/".parse()?;
+        let resp = handle_admin_request_with_prefix(
+            &uri,
+            &Method::POST,
+            &origin_headers,
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        Ok(())
     }
 }

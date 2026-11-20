@@ -620,9 +620,15 @@ async fn handle_control_connection_with_reload<S>(
     let expiry_wait = Duration::from_secs(remaining_lifetime_secs.min(30 * 24 * 3600));
     let expiry_timer = tokio::time::sleep(expiry_wait);
     tokio::pin!(expiry_timer);
+    let mut pending_liveness_probe = false;
 
     loop {
         tokio::select! {
+            biased;
+            () = takeover_token.cancelled() => {
+                info!(target: "relay::control_plane", sni = %sanitize_log_str(&sni), "Closing stale tunnel after same-certificate takeover");
+                break;
+            }
             () = std::future::poll_fn(|cx| {
                 // Loop steps 1 & 2 so after every completed outbound stream we re-poll
                 // `rx` until it returns `Poll::Pending` (preventing lost wakeups).
@@ -630,11 +636,19 @@ async fn handle_control_connection_with_reload<S>(
                     while pending_outbound.is_none() {
                         match rx.poll_recv(cx) {
                             std::task::Poll::Ready(Some(resp_tx)) => {
+                                if resp_tx.is_closed() {
+                                    continue;
+                                }
                                 pending_outbound = Some(resp_tx);
                             }
                             std::task::Poll::Ready(None) => return std::task::Poll::Ready(()),
                             std::task::Poll::Pending => break,
                         }
+                    }
+
+                    if pending_outbound.as_ref().is_some_and(|tx| tx.is_closed()) {
+                        pending_outbound = None;
+                        continue;
                     }
 
                     if pending_outbound.is_some()
@@ -647,7 +661,9 @@ async fn handle_control_connection_with_reload<S>(
                     break;
                 }
 
-                // 3. Drive inbound streams and connection progress continuously until Pending
+                // 3. Drive inbound streams and connection progress continuously until Pending.
+                // Always polled with the real task Context `cx` so the underlying TcpStream read waker
+                // is never clobbered by a no-op waker.
                 loop {
                     match connection.poll_next_inbound(cx) {
                         std::task::Poll::Ready(Some(Ok(unexpected_stream))) => {
@@ -662,32 +678,21 @@ async fn handle_control_connection_with_reload<S>(
                             info!(target: "relay::control_plane", sni = %sanitize_log_str(&sni), "Tunnel closed cleanly");
                             return std::task::Poll::Ready(());
                         }
-                        std::task::Poll::Pending => break,
+                        std::task::Poll::Pending => {
+                            if pending_liveness_probe {
+                                pending_liveness_probe = false;
+                                probe_seq = probe_seq.wrapping_add(1);
+                                let _ = probe_ack_tx.send(probe_seq);
+                            }
+                            break;
+                        }
                     }
                 }
 
                 std::task::Poll::Pending
             }) => break,
             () = probe_notify.notified() => {
-                let mut noop_cx = std::task::Context::from_waker(std::task::Waker::noop());
-                match connection.poll_next_inbound(&mut noop_cx) {
-                    std::task::Poll::Ready(Some(Err(_))) | std::task::Poll::Ready(None) => {
-                        break;
-                    }
-                    std::task::Poll::Ready(Some(Ok(unexpected))) => {
-                        drop(unexpected);
-                        probe_seq = probe_seq.wrapping_add(1);
-                        let _ = probe_ack_tx.send(probe_seq);
-                    }
-                    std::task::Poll::Pending => {
-                        probe_seq = probe_seq.wrapping_add(1);
-                        let _ = probe_ack_tx.send(probe_seq);
-                    }
-                }
-            }
-            () = takeover_token.cancelled() => {
-                info!(target: "relay::control_plane", sni = %sanitize_log_str(&sni), "Closing stale tunnel after same-certificate takeover");
-                break;
+                pending_liveness_probe = true;
             }
             () = &mut expiry_timer => {
                 if current_unix_timestamp() >= cert_not_after_ts {

@@ -126,9 +126,6 @@
     ssl_client_key = "/Users/fredi/Data/Projekte/Rust/ios_test/260809_ChatApp/rust_core/certs/proxy-client.key"
     ssl_root_certificate = "/Users/fredi/Data/Projekte/Rust/ios_test/260809_ChatApp/rust_core/certs/ca.pem"
 
-    [Server.Layers.RateLimiter]
-    requests_per_second = 500000
-
     [Server.Layers.TokenBucketRateLimiter]
     max_capacity = 1000     
     refill = 50           
@@ -213,7 +210,7 @@
         "2" = "Seller"
     
     [Server.Layers]
-        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+        enabled = ["TraceId", "Logger", "SecurityHeaders", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
         allow_cidrs = []

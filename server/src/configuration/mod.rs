@@ -485,31 +485,32 @@ impl ServerMetrics {
     /// Records the HTTP status class and end-to-end latency for a completed response.
     #[inline]
     pub fn record_response(server_name: &str, status_code: u16, latency_ms: u64) {
-        let metrics = Self::for_server(server_name);
+        Self::for_server(server_name).record_completed_response(status_code, latency_ms);
+    }
+
+    /// Records the HTTP status class and end-to-end latency directly on a pre-resolved [`ServerMetrics`] handle.
+    #[inline]
+    pub fn record_completed_response(&self, status_code: u16, latency_ms: u64) {
         match status_code {
             200..=299 => {
-                metrics
-                    .responses_2xx
+                self.responses_2xx
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             300..=399 => {
-                metrics
-                    .responses_3xx
+                self.responses_3xx
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             400..=499 => {
-                metrics
-                    .responses_4xx
+                self.responses_4xx
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             500..=599 => {
-                metrics
-                    .responses_5xx
+                self.responses_5xx
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             _ => {}
         }
-        update_ema_ms(&metrics.last_response_ms, &metrics.ema_response_ms, latency_ms);
+        update_ema_ms(&self.last_response_ms, &self.ema_response_ms, latency_ms);
     }
 }
 
