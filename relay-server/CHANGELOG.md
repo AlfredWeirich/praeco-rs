@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security & Hardening (Breaking API Changes for Next Minor `0.4.0`)
+---
+
+## [0.4.0] - 2026-11-22
+
+Fail-closed CRL defaults, SIGHUP reload without initial CRL, O(1) rate-limit overflow protection, same-certificate dead-peer takeover metrics, single-pass CRL reload, and data-plane admission optimizations.
+
+### Security, Hardening & Performance (Breaking API Changes)
 * **Fail-Closed CRL Loading, Handshake Expiration Enforcement & Non-Blocking Reload (`src/tls.rs`, `src/config.rs`, `src/lib.rs`, `src/main.rs`):**
   * Propagated CRL PEM/DER parse errors and empty-CRL errors in `parse_revoked_serials_from_crl_pem` and `setup_mtls_acceptor_with_strict` (using shared `common::crl`) instead of silently downgrading to an empty revocation set.
   * Changed `spawn_crl_reload_watcher` (and added `spawn_crl_reload_watcher_with_strict`) to return `Result<watch::Receiver<ControlPlaneReloadState>, RelayError>` so corrupt initial CRLs fail startup fast, while failed live/SIGHUP reloads preserve the previous CRL state and run off the async executor via `tokio::task::spawn_blocking`.

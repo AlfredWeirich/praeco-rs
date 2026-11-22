@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security & Hardening (Breaking API Changes for Next Minor `0.7.0`)
+---
+
+## [0.7.0] - 2026-11-22
+
+Major security, PKI/CRL fail-closed defaults, protocol resilience, hot-reload session preservation, zero-copy/zero-alloc hot paths, and gRPC reflection stream optimization release.
+
+### Security, Hardening & Performance (Breaking API Changes)
 * **Right-to-Left `X-Forwarded-For` Resolution (`src/middleware/ip_filter.rs`, `src/middleware/rate_limiter.rs`, `src/configuration/mod.rs`, `src/stack.rs`):**
   * Fixed spoofable leftmost `X-Forwarded-For` extraction when `trust_forwarded_headers = true`: both `IpFilter` and rate limiters now share `extract_forwarded_ip_from_headers`, walking `X-Forwarded-For` (including multiple header lines) from right to left using `trusted_proxy_hops` (default `1`, `0` disables XFF) without falling back to `X-Real-IP` when `X-Forwarded-For` is present.
   * Added `pub trusted_proxy_hops: usize` to `IpFilterConfig`, `SimpleRateLimiterConfig`, and `TokenBucketRateLimiterConfig` (TOML-compatible via `#[serde(default)]`, SemVer-breaking for struct literals without `..Default::default()`), plus backward-compatible `extract_client_ip_with_hops`, `extract_rate_limit_key_with_hops`, and `.with_trusted_proxy_hops(...)` builders.

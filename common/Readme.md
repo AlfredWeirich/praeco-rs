@@ -28,14 +28,14 @@ This crate is primarily intended to be consumed by other `praeco-*` crates (like
 
 ```toml
 [dependencies]
-praeco-common = "0.5.1"
+praeco-common = "0.6.0"
 
 # Minimal usage (e.g., Layer-4 relay needing only `proxy_protocol` + `canonical_client_ip`):
-# praeco-common = { version = "0.5.1", default-features = false }
+# praeco-common = { version = "0.6.0", default-features = false }
 
 # For self-contained integration tests using ephemeral `TestPki`:
 # [dev-dependencies]
-# praeco-common = { version = "0.5.1", features = ["test-pki"] }
+# praeco-common = { version = "0.6.0", features = ["test-pki"] }
 ```
 
 ## Example (Rust)
