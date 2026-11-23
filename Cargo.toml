@@ -96,7 +96,7 @@ dashmap = "6.2"
 yamux = "0.14"
 matchit = "0.9"
 local-ip-address = "0.6"
-url = "2.5"
+url = "2.5.9"
 urlencoding = "2.1"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli"] }
 mimalloc = { version = "0.1", features = ["v3"] }
