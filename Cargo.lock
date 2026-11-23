@@ -1978,7 +1978,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-rs"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "arc-swap",

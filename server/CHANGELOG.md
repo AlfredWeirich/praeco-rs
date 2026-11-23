@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.1] - 2026-11-23
+
+### Security & Dependencies
+* **Security Dependency Update (`RUSTSEC-2026-0592`):** Raised workspace `url` minimum requirement from `2.5` to `2.5.9` to pull the stack-overflow fix in `Url::origin()` on nested `blob:` URLs.
+
+---
+
 ## [0.7.0] - 2026-11-22
 
 Major security, PKI/CRL fail-closed defaults, protocol resilience, hot-reload session preservation, zero-copy/zero-alloc hot paths, and gRPC reflection stream optimization release.
@@ -70,7 +77,6 @@ Major security, PKI/CRL fail-closed defaults, protocol resilience, hot-reload se
   * **Router IP/PEM Header Caching & Zero-Allocation Middleware Hot Paths (`P2-05`, `P2-06`):** Eliminated repeated `addr.ip().to_string()` formatting and per-request PEM `urlencoding::encode` work by formatting peer IPs once on a stack buffer (`ip_addr_to_header_value` in `headers.rs`) and caching `EncodedPemCertHeaderExtension` once per mTLS/QUIC connection (`ConnectionHandler`, `runner.rs`); removed per-request `String` allocations across `InspectionService` (`sanitize_and_normalize_path_cow`), `CompiledAllowedPathes::is_allowed` (`Cow::Borrowed`), `SrvCompressionService` (`NegotiatedEncoding` copy enum), `rbac::enforce_rbac` (`windows(3).eq_ignore_ascii_case`), and `WebRouter::into_service` (borrowed method/path).
   * **Single-Stream gRPC Reflection & Descriptor Deduplication (`P2-07`):** Refactored `grpc_web::build_grpc_pool` to reuse one bidirectional `server_reflection_info` stream for `ListServices` and all `FileContainingSymbol` lookups, deduplicate shared imported `FileDescriptorProto` payloads via `seen_files`, and enforce `MAX_REFLECTION_SERVICES` (`256`) and `MAX_DESCRIPTOR_FILES` (`1024`) bounds.
   * **Single-Pass Client X.509 Metadata Extraction (`P2-09`):** Refactored `tls_conf::extract_client_metadata_with_base` to parse the leaf DER certificate once (`X509Certificate::from_der`) for both SAN and OID extraction instead of parsing twice per mTLS/QUIC connection.
-  * **Security Dependency Update (`RUSTSEC-2026-0592`):** Raised workspace `url` minimum requirement from `2.5` to `2.5.9` to pull the stack-overflow fix in `Url::origin()` on nested `blob:` URLs.
 
 ---
 
