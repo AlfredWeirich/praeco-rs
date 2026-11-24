@@ -11,6 +11,7 @@ repository.workspace = true
 
 keywords.workspace = true
 categories.workspace = true
+exclude = ["examples/aggregate_fanout"]
 
 [lints]
 workspace = true

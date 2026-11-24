@@ -690,15 +690,47 @@ allowed_roles = ["Admin", "Seller"]
 
 #### Parallel Fan-Out Aggregator (`backend_type = "aggregate"`)
 
-An `aggregate` route accepts a single client `GET` or `POST` request, fans it out concurrently to multiple `rest` and `grpc_transcoding` backend targets (each with its own load balancer, 3-state circuit breaker, active health checks, and reflection cache), and assembles their JSON payloads into one response object keyed by `target.key`.
+An `aggregate` route accepts a single client `GET` or `POST` request (other HTTP methods return `405 Method Not Allowed`), fans out concurrently across multiple `rest` and `grpc_transcoding` sub-targets—each with its own independent load balancer, 3-state circuit breaker, active health checks, and gRPC reflection schema cache—and assembles their JSON responses into a single JSON object keyed by `target.key`.
 
-- **`POST` payloads (`payload_mode`):** Defaults to `"keyed"` (fail-closed: the request body must be a JSON object whose top-level keys match configured `target.key` values; each target receives only `body[target.key]`, and targets whose key is omitted receive `{}` — never sibling targets' payloads). Set `payload_mode = "broadcast"` to forward the full request body unchanged to all targets.
-- **`GET` query parameters & `forward_query`:** Operator-pinned query parameters in `target.path` always take precedence (conflicting client query keys are dropped to prevent parameter pollution). Optionally set `forward_query = ["user_id"]` per target to restrict forwarded client params (`[]` disables forwarding). For `grpc_transcoding` targets, effective query parameters are automatically converted to a JSON object (e.g. `?user_id=42` $\rightarrow$ `{"user_id": "42"}`).
-- **Headers & credentials (`forward_headers`):** Conditional/range headers (`If-None-Match`, `If-Modified-Since`, `Range`, …) are always stripped so no single sub-request turns the aggregate into `304`/`206`. Client `Authorization` and `Cookie` headers are stripped by default unless explicitly listed in a target's `forward_headers` (gateway-injected `[Server.RouterParams].jwt` tokens are preserved).
-- **Partial failures (`expose_upstream_errors`):** Targets with `required = true` (default) abort remaining sub-requests immediately on failure and return `502`/`504`. Targets with `required = false` degrade gracefully with `"<key>": null` and an `"_errors": { "<key>": { "status": ..., "message": ... } }` entry. Raw upstream error texts are logged on the server and replaced with canonical HTTP reason phrases by default (`expose_upstream_errors = false`).
+> [!NOTE]
+> `[[Server]]` configures **only** Praeco's own gateway listener (e.g. `127.0.0.1:8080`). Each target's `upstreams` list defines the external backend endpoints Praeco fans out to; Praeco does not spawn those backend services itself.
 
-- **Deadlines & Memory Limits (`timeout_ms`, `deadline_ms`, `max_request_bytes`, `max_response_bytes`):** Set `timeout_ms` per target and/or `deadline_ms` on the route so slow optional targets degrade to `504` instead of holding back the whole response. Incoming buffered request bodies are capped by `max_request_bytes` (default: 4 MiB, returning `413 Payload Too Large`), and cumulative sub-responses across all targets are capped by `max_response_bytes` (default: 4 MiB, returning `502 Bad Gateway`) as well as the process-wide 256 MiB `BufferBudget` (returning `503 Service Unavailable` when exhausted, with incremental RAII release as `ChunkedBytesBody` yields chunks to Hyper).
-- **gRPC Status Mapping:** For `grpc_transcoding` targets, non-zero `grpc-status` headers/trailers (both Trailers-Only and trailing error frames after data) are mapped to HTTP statuses (`NOT_FOUND` $\rightarrow$ `404`, `UNAVAILABLE` $\rightarrow$ `503`, `DEADLINE_EXCEEDED` $\rightarrow$ `504`, `PERMISSION_DENIED` $\rightarrow$ `403`, `UNAUTHENTICATED` $\rightarrow$ `401`, etc.) and reported with `"grpc_status"` inside `"_errors"`.
+##### Route-Level Parameters (`[Server.ReverseRoutes."/path"]`)
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `backend_type` | String | **Mandatory** | `"rest"` | Set to `"aggregate"` (or alias `"fanout"`). Top-level `upstreams` must be omitted or `[]`. |
+| `targets` | Array of Tables | **Mandatory** | `[]` | Ordered list of `[[Server.ReverseRoutes."/path".targets]]` sub-target definitions. At least one target is required. |
+| `payload_mode` | String | Optional | `"keyed"` | Controls how incoming `POST` JSON request bodies are distributed:<br>• `"keyed"` *(default, fail-closed)*: Body must be a JSON object whose top-level keys match configured `target.key` values. Unknown top-level keys or non-object bodies are rejected before fan-out with `400 Bad Request`. Each target receives **only** `body[target.key]` (or `{}` if its key is omitted — never sibling targets' payloads).<br>• `"broadcast"`: Forwards the full incoming request body unchanged to all targets (REST `GET`/`HEAD` targets always send an empty body). |
+| `expose_upstream_errors` | Boolean | Optional | `false` | Controls error detail visibility on failed sub-requests. When `false`, raw upstream error payloads are logged server-side only and clients receive canonical HTTP reason phrases (e.g. `"Not Found"`, `"Gateway Timeout"`). When `true`, up to 1 KiB of the upstream error snippet is included. |
+| `deadline_ms` | Integer | Optional | `None` | Overall route-wide deadline in milliseconds capping all concurrent sub-requests. When exceeded, unfinished `required = true` targets abort the route with `504 Gateway Timeout`; unfinished `required = false` targets degrade to `null` + `504` in `_errors`. |
+| `max_request_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum incoming request body size buffered in RAM (`> 0`). Oversized payloads are rejected early with `413 Payload Too Large`. |
+| `max_response_bytes` | Integer | Optional | `4194304` (4 MiB) | Cumulative response memory cap across all sub-targets (`> 0`, returning `502 Bad Gateway` if exceeded). Additionally bounded by the process-wide 256 MiB `BufferBudget` (`503 Service Unavailable` when exhausted), with incremental RAII memory release as `ChunkedBytesBody` streams frames to Hyper. |
+| `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC enforced before fan-out (`403 Forbidden` if caller lacks a matching mTLS OID or JWT role). |
+
+##### Sub-Target Parameters (`[[Server.ReverseRoutes."/path".targets]]`)
+
+| Parameter | Data Type | Requirement | Default Value | Description & Runtime Behavior |
+| :--- | :--- | :--- | :--- | :--- |
+| `key` | String | **Mandatory** | — | Unique JSON key in the aggregated output object (and top-level key in `payload_mode = "keyed"` requests). Must be non-empty, unique within the route, and cannot be `"_errors"`. |
+| `backend_type` | String | Optional | `"rest"` | Protocol handler for this sub-target: `"rest"` or `"grpc_transcoding"` (alias `"grpc"`). |
+| `upstreams` | Array of Strings | **Mandatory** | `[]` | One or more backend base URLs (e.g. `["http://10.0.0.1:8081", "http://10.0.0.2:8081"]`) forming this target's independent load-balanced pool. |
+| `path` | String | **Mandatory** | — | Relative backend URI starting with `/` (must not include scheme/host), decoupling the public aggregate route path from the backend's endpoint:<br>• For `grpc_transcoding`: must match `/<Package.Service>/<Method>` (e.g. `"/user.UserService/GetUser"`).<br>• For `rest`: backend path plus optional **operator-pinned query parameters** (e.g. `"/v1/notifications?tenant=acme"`). Parameter names embedded in `path` (such as `tenant` in a multi-tenant service — not a reserved keyword) are pinned at startup and can **never** be overridden or duplicated by the client (anti-parameter-pollution). |
+| `method` | String | Optional | Client method (`POST` for gRPC) | Optional HTTP method override for `rest` sub-requests (e.g. `method = "GET"` forces a `GET` with an empty body even when the client sends `POST /api/dashboard`). `grpc_transcoding` targets always use `POST`; configuring any other method on a gRPC target is rejected at startup. |
+| `required` | Boolean | Optional | `true` | Failure policy:<br>• `true`: Aborts all remaining sub-requests immediately on error/timeout and returns the error status (`4xx`/`502`/`504`) to the client.<br>• `false`: Degrades gracefully under `200 OK` by setting `"<key>": null` and adding `"_errors": { "<key>": { "status": ..., "grpc_status": ..., "message": ... } }`. |
+| `timeout_ms` | Integer | Optional | `[Server.RouterParams].request_timeout_seconds` | Per-target timeout in milliseconds (`> 0`), bounded by the route's `deadline_ms` if configured. Useful so slow optional targets degrade to `504` without delaying the whole response. |
+| `forward_query` | Array of Strings | Optional | `None` (All non-pinned) | Allowlist of client query parameter names forwarded to this target (`[]` disables forwarding). Operator-pinned query keys in `path` always win and are dropped from the client query. On `GET` requests (or empty `POST` bodies), `grpc_transcoding` targets convert the effective query parameters into a JSON object (`?user_id=42` → `{"user_id": "42"}`); setting `forward_query = ["user_id"]` prevents unrelated REST query params from causing unknown-field Protobuf deserialization errors. |
+| `forward_headers` | Array of Strings | Optional | `[]` | Case-insensitive per-target credential allowlist (e.g. `["authorization"]`, `["cookie"]`). Client `Authorization` and `Cookie` headers are stripped by default, while gateway-injected `[Server.RouterParams].jwt` tokens remain preserved. Conditional/range headers (`If-None-Match`, `If-Modified-Since`, `Range`, …) are always stripped so no single target produces `304`/`206`, and `Accept-Encoding` is stripped on `rest` targets so JSON can be spliced zero-copy. |
+| `strategy` | String | Optional | `"RoundRobin"` | Independent per-target load-balancing strategy across `upstreams`: `"RoundRobin"`, `"Random"`, `"LeastConnections"`, `"Sticky"`, or `"HighestScore"`. |
+| `cooldown_seconds` | Integer | Optional | `10` | Per-target circuit-breaker `Open` duration before allowing a `HalfOpen` probe. |
+| `max_retries` | Integer | Optional | `2` | Per-target automatic failover retries across healthy nodes in `upstreams` (on idempotent REST methods). |
+| `failure_threshold` | Integer | Optional | `3` | Consecutive `502`/`503`/`504` (or gRPC `14 UNAVAILABLE`) responses before this target's node trips to `Open`. |
+| `max_retry_buffer_bytes` | Integer | Optional | `65536` (64 KiB) | Maximum request body size buffered for per-target retries. |
+| `active_health_check_interval` | Integer | Optional | `0` (Disabled) | Independent background `/health` (REST) or `health` (gRPC) polling interval in seconds for this target's nodes (reflected in `/health` and `/upstreams`). |
+
+- **gRPC Status Mapping:** For `grpc_transcoding` targets, non-zero `grpc-status` headers/trailers (both Trailers-Only and trailing error frames after data) are mapped to HTTP statuses (`NOT_FOUND` → `404`, `UNAVAILABLE` → `503`, `DEADLINE_EXCEEDED` → `504`, `PERMISSION_DENIED` → `403`, `UNAUTHENTICATED` → `401`, etc.) and reported with `"grpc_status"` inside `"_errors"` for optional targets.
+
+##### Example Configuration & Request/Response Flow
 
 ```toml
 [Server.ReverseRoutes."/api/dashboard"]
@@ -716,6 +748,8 @@ backend_type = "grpc_transcoding"
 upstreams = ["https://127.0.0.1:50051"]
 path = "/user.UserService/GetUser"
 timeout_ms = 1000
+forward_query = ["user_id"]     # prevents unknown REST query params on GET /api/dashboard
+forward_headers = []
 required = true
 
 [[Server.ReverseRoutes."/api/dashboard".targets]]
@@ -728,6 +762,59 @@ timeout_ms = 500
 forward_query = ["limit"]       # optional allowlist (never overrides tenant=acme)
 forward_headers = []            # optional credential allowlist (e.g. ["authorization"])
 required = false
+```
+
+Given an incoming client request:
+
+```http
+POST /api/dashboard?limit=2&tenant=evil&extra=1 HTTP/2
+Content-Type: application/json
+Authorization: Bearer client-token
+If-None-Match: "etag-1"
+
+{ "user": { "user_id": "42" } }
+```
+
+Praeco dispatches both sub-requests concurrently:
+1. **`user` (`grpc_transcoding`):** `HTTP/2 POST /user.UserService/GetUser` to `https://127.0.0.1:50051` with `content-type: application/grpc`, stripped client credentials/conditional headers, and a 5-byte gRPC Protobuf frame encoded from `{"user_id": "42"}` via Server Reflection.
+2. **`notifications` (`rest`):** `GET /v1/notifications?tenant=acme&limit=2` to `http://127.0.0.1:8081` with an empty body (`method = "GET"`), `tenant=acme` preserved (`tenant=evil` dropped), `extra=1` filtered out by `forward_query = ["limit"]`, and client `Authorization`/`Cookie`/`Accept-Encoding`/`If-None-Match` stripped.
+
+Merged `200 OK` response (or graceful degradation if `notifications` exceeds `timeout_ms = 500`):
+
+```json
+// Both targets succeeded:
+{
+  "user": { "id": "42", "name": "Alice (42)", "role": "Admin" },
+  "notifications": { "tenant": "acme", "limit": 2, "items": [ ... ] }
+}
+
+// Optional target `notifications` timed out (> 500ms):
+{
+  "user": { "id": "42", "name": "Alice (42)", "role": "Admin" },
+  "notifications": null,
+  "_errors": {
+    "notifications": { "status": 504, "message": "Gateway Timeout" }
+  }
+}
+```
+
+##### Runnable End-to-End Example
+
+A complete, self-contained workspace crate demonstrating this exact setup (Tonic gRPC backend with `v1alpha`/`v1` Server Reflection + Hyper REST backend + Praeco `Config.toml`) is available under [`server/examples/aggregate_fanout/`](server/examples/aggregate_fanout/README.md):
+
+- Configuration: [`server/examples/aggregate_fanout/Config.toml`](server/examples/aggregate_fanout/Config.toml)
+- Crate manifest: [`server/examples/aggregate_fanout/Cargo.toml`](server/examples/aggregate_fanout/Cargo.toml)
+- Implementation & tests: [`server/examples/aggregate_fanout/src/main.rs`](server/examples/aggregate_fanout/src/main.rs)
+
+```bash
+# Run the self-contained 6-scenario end-to-end demo:
+cargo run -p aggregate_fanout
+
+# Keep gateway + mock backends running until Ctrl+C for manual curl testing:
+cargo run -p aggregate_fanout -- --serve
+
+# Run config and end-to-end integration tests:
+cargo test -p aggregate_fanout
 ```
 
 ---

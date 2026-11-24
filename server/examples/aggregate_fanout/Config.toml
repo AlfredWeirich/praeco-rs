@@ -1,0 +1,85 @@
+###############################################################################
+# PRAECO AGGREGATE FAN-OUT EXAMPLE CONFIGURATION
+# Demonstrates `backend_type = "aggregate"` across a gRPC-transcoding target
+# (via Server Reflection) and an optional REST target.
+###############################################################################
+
+# Disable background OTLP export so the standalone example runs self-contained
+# without requiring a local Jaeger/OTLP collector.
+enable_opentelemetry = false
+
+[[Server]]
+name = "AggregateFanoutGateway"
+ip = "127.0.0.1"
+port = 8080
+enabled = true
+protocol = "http"
+authentication = "None"
+service = "Router"
+graceful_shutdown_timeout_seconds = 5
+
+[Server.connection_limits]
+max_connections = 1024
+max_connections_per_ip = 64
+
+[Server.Layers]
+# Ordered outermost -> innermost: TraceId generates W3C traceparent / x-trace-id,
+# IpFilter restricts access to loopback, MaxPayload caps incoming bodies, and
+# SecurityHeaders hardens every HTTP response.
+enabled = ["TraceId", "IpFilter", "MaxPayload", "SecurityHeaders"]
+
+[Server.Layers.IpFilter]
+allow_cidrs = ["127.0.0.1/32", "::1/128"]
+deny_cidrs = []
+trust_forwarded_headers = false
+
+[Server.Layers.MaxPayload]
+max_bytes = 1048576
+
+[Server.Layers.SecurityHeaders]
+content_security_policy = "default-src 'none'"
+strict_transport_security = "max-age=63072000; includeSubDomains"
+x_content_type_options = "nosniff"
+x_frame_options = "DENY"
+referrer_policy = "no-referrer"
+
+[Server.RouterParams]
+protocol = "http"
+authentication = "None"
+connect_timeout_seconds = 5
+request_timeout_seconds = 10
+idle_timeout_seconds = 60
+grpc_reflection_timeout_seconds = 5
+grpc_reflection_ttl_seconds = 600
+
+[Server.ReverseRoutes."/api/dashboard"]
+backend_type = "aggregate"
+payload_mode = "keyed"          # "keyed" (default) or "broadcast"
+expose_upstream_errors = false  # Sanitize upstream error bodies to canonical HTTP reason phrases
+deadline_ms = 2000              # Overall route deadline across all concurrent targets
+max_request_bytes = 1048576     # 1 MiB incoming body buffer cap
+max_response_bytes = 8388608    # 8 MiB cumulative response buffer cap across all targets
+
+[[Server.ReverseRoutes."/api/dashboard".targets]]
+key = "user"
+backend_type = "grpc_transcoding"
+upstreams = ["http://127.0.0.1:50051"]
+path = "/user.UserService/GetUser"
+timeout_ms = 1000
+# Restrict GET query forwarding to `user_id` so mixed GET queries (e.g. `?user_id=42&limit=1`)
+# don't inject unknown fields into `UserReq` during Protobuf JSON deserialization;
+# POST keyed requests receive `body["user"]`.
+forward_query = ["user_id"]
+forward_headers = []
+required = true
+
+[[Server.ReverseRoutes."/api/dashboard".targets]]
+key = "notifications"
+backend_type = "rest"
+upstreams = ["http://127.0.0.1:8081"]
+path = "/v1/notifications?tenant=acme"
+method = "GET"
+timeout_ms = 500
+forward_query = ["limit", "extra"]       # Only forward `limit` (operator-pinned `tenant=acme` always wins)
+forward_headers = []            # Strip client Authorization/Cookie headers by default
+required = false                # Degrade gracefully to null + `_errors.notifications` on failure/timeout

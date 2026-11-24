@@ -9,6 +9,7 @@ members = [
     "relay-server",
     "relay-server/test_multiplex",
     "examples/https_web_server",
+    "server/examples/aggregate_fanout",
 ]
 resolver = "3"
 
