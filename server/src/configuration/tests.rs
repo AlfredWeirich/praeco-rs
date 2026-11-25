@@ -655,7 +655,10 @@
                 &admin_srv.name,
             )
             .unwrap();
-            assert!(cache_cfg.match_request("GET", "/admin/index.html").is_some());
+            let admin_rule = cache_cfg
+                .match_request("GET", "/admin/index.html")
+                .expect("Cache rule for /admin/index.html missing");
+            assert_eq!(admin_rule.respect_cache_control, Some(false));
             assert!(cache_cfg.match_request("GET", "/favicon.ico").is_some());
             assert!(cache_cfg.match_request("GET", "/apple-touch-icon.png").is_some());
             assert!(cache_cfg.match_request("GET", "/api/GetPraecoStatus").is_none());

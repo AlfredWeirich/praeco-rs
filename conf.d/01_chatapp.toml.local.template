@@ -250,6 +250,9 @@
     [Server.Layers.Cache.rules."/admin*"]
         ttl_seconds = 300
         scope = "per_role"
+        # Backend sendet `Cache-Control: no-store, no-cache, must-revalidate` gegen Browser-Caching;
+        # Praeco cacht hinter JwtAuth+Rbac im Gateway-RAM und reicht den Header unverändert durch:
+        respect_cache_control = false
 
     [Server.Layers.Cache.rules."/favicon.ico"]
         ttl_seconds = 3600
