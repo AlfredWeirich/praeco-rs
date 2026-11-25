@@ -475,7 +475,7 @@ Reflects incoming request headers, method, path, and body back to the caller. Re
 ---
 
 ### Admin & Telemetry Service (`service = "Admin"` / `backend_type = "admin"`)
-Exposes real-time, lock-free gateway telemetry (server list, connection limits, per-layer security/limit block counters, HTTP status-class counts, end-to-end latency, PKI expiration status, route configurations, upstream 3-State Circuit Breaker states `Closed` / `Open` / `HalfOpen`, active connections, consecutive failures, remaining cooldown timers, and process uptime) as well as Prometheus/OpenMetrics text metrics.
+Exposes real-time, lock-free gateway telemetry (server list, connection limits, per-layer security/limit block counters, HTTP status-class counts, end-to-end latency, process-wide and per-server HTTP response cache occupancy & outcome counters in `/status`, PKI expiration status, route configurations, upstream 3-State Circuit Breaker states `Closed` / `Open` / `HalfOpen`, active connections, consecutive failures, remaining cooldown timers, and process uptime) as well as Prometheus/OpenMetrics text metrics.
 
 Can be mounted in two ways:
 1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) strictly serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), `/healthz`, and `/health`. Any unrecognized path returns `404 Not Found` (`{"error":"Not Found"}`).
@@ -485,8 +485,10 @@ Can be mounted in two ways:
 
 #### Exposed Prometheus Metrics (`/metrics`)
 - **Process & Auth:** `praeco_uptime_seconds`, `praeco_revoked_jwt_tokens`
+- **Process-Wide Cache:** `praeco_cache_entries`, `praeco_cache_bytes_used`
 - **Per-Server Traffic & Connections:** `praeco_server_requests_total`, `praeco_server_active_connections`, `praeco_server_connections_rejected_total{reason="global_limit|ip_limit"}`
 - **Per-Server Security & Limit Rejections (`praeco_server_blocked_requests_total`):** `reason` labels `ip_filter`, `inspection`, `path_sanitizer`, `jwt_auth`, `auth_rbac`, `rate_limited`, `concurrency_limit`, `payload_too_large`, `decompression_limit`
+- **Per-Server Cache Outcomes:** `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`
 - **Per-Server Responses & Latency:** `praeco_server_responses_total{status_class="2xx|3xx|4xx|5xx"}`, `praeco_server_last_response_ms`, `praeco_server_ema_response_ms`
 - **Per-Server PKI:** `praeco_server_cert_days_remaining`
 - **Per-Upstream:** `praeco_upstream_circuit_state`, `praeco_upstream_alive`, `praeco_upstream_active_connections`, `praeco_upstream_requests_total`, `praeco_upstream_failures_total`, `praeco_upstream_circuit_trips_total`, `praeco_upstream_ema_response_ms`, `praeco_upstream_consecutive_failures`
@@ -1215,7 +1217,7 @@ Enables process-wide W-TinyLFU HTTP response caching with cancellation-safe `Sin
 | `respect_cache_control` | Boolean | Optional | `[cache].respect_cache_control` | Per-rule override for `Cache-Control` / `Pragma` evaluation. |
 | `expose_cache_header` | Boolean | Optional | `[cache].expose_cache_header` | Per-rule override for `x-praeco-cache` and `age` response headers. |
 
-> **Admin Telemetry & Purging:** Cache metrics are exported on `/metrics` as `praeco_cache_entries`, `praeco_cache_bytes_used`, and `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`. Authenticated/CSRF-checked `POST /status?action=purge_cache` clears all entries (or `&namespace=<name>` for a single namespace).
+> **Admin Telemetry & Purging:** Cache status and outcome counters are exposed in `/status` JSON under `.cache` (process-wide configuration, `entries`, `bytes_used`, and totals) and `.servers[*].cache` (server active state, namespace, rule count, and counters), as well as on `/metrics` as `praeco_cache_entries`, `praeco_cache_bytes_used`, and `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`. Authenticated/CSRF-checked `POST /status?action=purge_cache` clears all entries (or `&namespace=<name>` for a single namespace).
 
 ```toml
 [Server.Layers]

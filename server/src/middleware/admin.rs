@@ -51,7 +51,37 @@ pub struct AdminStatusResponse {
     pub uptime_seconds: u64,
     pub timestamp_unix: u64,
     pub summary: AdminSummary,
+    pub cache: AdminCacheStatus,
     pub servers: Vec<AdminServerStatus>,
+}
+
+/// Process-wide W-TinyLFU HTTP response cache configuration, occupancy, and aggregated counters.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AdminCacheStatus {
+    /// Whether the process-wide HTTP response cache is enabled.
+    pub enabled: bool,
+    /// Approximate number of entries currently stored in the shared W-TinyLFU cache.
+    pub entries: u64,
+    /// Approximate byte weight currently held by the shared W-TinyLFU cache.
+    pub bytes_used: u64,
+    /// Configured maximum RAM byte budget across all cached responses.
+    pub max_bytes: u64,
+    /// Configured default TTL in seconds when a rule omits `ttl_seconds`.
+    pub default_ttl_seconds: u64,
+    /// Configured global maximum body size in bytes eligible for caching.
+    pub max_entry_bytes: usize,
+    /// Whether `Cache-Control` / `Pragma` directives are honored by default.
+    pub respect_cache_control: bool,
+    /// Whether `x-praeco-cache` and `age` response headers are attached by default.
+    pub expose_cache_header: bool,
+    /// Aggregated cache hits across all reported servers.
+    pub total_hits: u64,
+    /// Aggregated cache misses across all reported servers.
+    pub total_misses: u64,
+    /// Aggregated Singleflight-coalesced requests across all reported servers.
+    pub total_coalesced: u64,
+    /// Aggregated cache bypasses across all reported servers.
+    pub total_bypasses: u64,
 }
 
 /// Aggregated health, traffic, security & circuit-breaker counters across all configured servers.
@@ -110,6 +140,25 @@ pub struct AdminServerPkiStatus {
     pub crl_revoked_certs_count: usize,
 }
 
+/// Per-server HTTP response cache configuration and request outcome counters.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct AdminServerCacheStatus {
+    /// Whether caching is active for this server (both global cache and `"Cache"` layer enabled).
+    pub enabled: bool,
+    /// Effective cache namespace for this server (`None` when `"Cache"` layer is not enabled).
+    pub namespace: Option<String>,
+    /// Number of configured rules under `[Server.Layers.Cache.rules]`.
+    pub rules_count: usize,
+    /// Total cache hits recorded for this server.
+    pub hits: u64,
+    /// Total cache misses recorded for this server.
+    pub misses: u64,
+    /// Total Singleflight-coalesced requests recorded for this server.
+    pub coalesced: u64,
+    /// Total cache bypasses recorded for this server.
+    pub bypasses: u64,
+}
+
 /// Per-server configuration and runtime routing status.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminServerStatus {
@@ -120,6 +169,7 @@ pub struct AdminServerStatus {
     pub listen: String,
     pub enabled_layers: Vec<String>,
     pub traffic_and_security: AdminServerTrafficSecurity,
+    pub cache: AdminServerCacheStatus,
     pub pki: AdminServerPkiStatus,
     pub routes: Vec<AdminRouteStatus>,
 }
@@ -178,6 +228,12 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
     };
 
     let revoked_jwt_tokens = crate::middleware::jwt::get_jwt_revocation_store().len();
+    let shared_cache = crate::middleware::cache::global_response_cache();
+    let shared_cache_cfg = shared_cache.config();
+    let mut total_cache_hits: u64 = 0;
+    let mut total_cache_misses: u64 = 0;
+    let mut total_cache_coalesced: u64 = 0;
+    let mut total_cache_bypasses: u64 = 0;
 
     let mut summary = AdminSummary {
         total_servers: servers_refs.len(),
@@ -219,6 +275,34 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
         let srv_resp_5xx = srv_metrics.responses_5xx.load(ord);
         let srv_last_ms = srv_metrics.last_response_ms.load(ord);
         let srv_ema_ms = srv_metrics.ema_response_ms.load(ord);
+        let srv_cache_hits = srv_metrics.cache_hits.load(ord);
+        let srv_cache_misses = srv_metrics.cache_misses.load(ord);
+        let srv_cache_coalesced = srv_metrics.cache_coalesced.load(ord);
+        let srv_cache_bypasses = srv_metrics.cache_bypasses.load(ord);
+
+        total_cache_hits += srv_cache_hits;
+        total_cache_misses += srv_cache_misses;
+        total_cache_coalesced += srv_cache_coalesced;
+        total_cache_bypasses += srv_cache_bypasses;
+
+        let layer_cache_enabled = srv.layers.enabled.iter().any(|l| l == "Cache");
+        let srv_cache = AdminServerCacheStatus {
+            enabled: shared_cache_cfg.enabled && layer_cache_enabled,
+            namespace: if layer_cache_enabled {
+                srv.layers
+                    .cache_config
+                    .as_ref()
+                    .and_then(|c| c.namespace.clone())
+                    .or_else(|| Some(srv.name.clone()))
+            } else {
+                None
+            },
+            rules_count: srv.layers.cache_config.as_ref().map_or(0, |c| c.rules.len()),
+            hits: srv_cache_hits,
+            misses: srv_cache_misses,
+            coalesced: srv_cache_coalesced,
+            bypasses: srv_cache_bypasses,
+        };
 
         summary.total_requests += srv_total_reqs;
         summary.active_server_connections += srv_active_conns;
@@ -304,16 +388,33 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
             listen,
             enabled_layers: srv.layers.enabled.clone(),
             traffic_and_security,
+            cache: srv_cache,
             pki,
             routes,
         });
     }
+
+    let cache = AdminCacheStatus {
+        enabled: shared_cache_cfg.enabled,
+        entries: shared_cache.entry_count(),
+        bytes_used: shared_cache.weighted_size(),
+        max_bytes: shared_cache_cfg.max_bytes,
+        default_ttl_seconds: shared_cache_cfg.default_ttl_seconds,
+        max_entry_bytes: shared_cache_cfg.max_entry_bytes,
+        respect_cache_control: shared_cache_cfg.respect_cache_control,
+        expose_cache_header: shared_cache_cfg.expose_cache_header,
+        total_hits: total_cache_hits,
+        total_misses: total_cache_misses,
+        total_coalesced: total_cache_coalesced,
+        total_bypasses: total_cache_bypasses,
+    };
 
     AdminStatusResponse {
         status: "ok",
         uptime_seconds: uptime_seconds(),
         timestamp_unix: now_unix,
         summary,
+        cache,
         servers,
     }
 }
@@ -606,32 +707,29 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
     }
     out.push('\n');
 
-    let shared_cache = crate::middleware::cache::global_response_cache();
     out.push_str("# HELP praeco_cache_entries Approximate number of entries in the shared W-TinyLFU response cache.\n");
     out.push_str("# TYPE praeco_cache_entries gauge\n");
     out.push_str(&format!(
         "praeco_cache_entries {}\n\n",
-        shared_cache.entry_count()
+        status.cache.entries
     ));
 
     out.push_str("# HELP praeco_cache_bytes_used Approximate byte weight currently held by the shared W-TinyLFU response cache.\n");
     out.push_str("# TYPE praeco_cache_bytes_used gauge\n");
     out.push_str(&format!(
         "praeco_cache_bytes_used {}\n\n",
-        shared_cache.weighted_size()
+        status.cache.bytes_used
     ));
 
     out.push_str("# HELP praeco_server_cache_requests_total Cacheable GET/HEAD outcomes per server.\n");
     out.push_str("# TYPE praeco_server_cache_requests_total counter\n");
-    let ord = std::sync::atomic::Ordering::Relaxed;
     for srv in &status.servers {
         let srv_name = escape_prometheus_label(&srv.name);
-        let srv_metrics = crate::configuration::ServerMetrics::for_server(&srv.name);
         for (outcome, count) in [
-            ("hit", srv_metrics.cache_hits.load(ord)),
-            ("miss", srv_metrics.cache_misses.load(ord)),
-            ("coalesced", srv_metrics.cache_coalesced.load(ord)),
-            ("bypass", srv_metrics.cache_bypasses.load(ord)),
+            ("hit", srv.cache.hits),
+            ("miss", srv.cache.misses),
+            ("coalesced", srv.cache.coalesced),
+            ("bypass", srv.cache.bypasses),
         ] {
             out.push_str(&format!(
                 "praeco_server_cache_requests_total{{server=\"{}\",outcome=\"{}\"}} {}\n",
@@ -1612,6 +1710,115 @@ mod tests {
             Some("/api/GetPraecoStatus"),
         );
         assert_eq!(purge_resp.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    #[test]
+    fn test_admin_status_includes_global_and_per_server_cache_metrics() -> Result<(), Box<dyn std::error::Error>> {
+        let rt = tokio::runtime::Runtime::new()?;
+
+        let enabled_toml = r#"
+            name = "cache_status_enabled_srv"
+            enabled = true
+            protocol = "http"
+            service = "Router"
+            ip = "127.0.0.1"
+            port = 8080
+
+            [RouterParams]
+            protocol = "http"
+
+            [Layers]
+            enabled = ["Cache"]
+
+            [Layers.Cache]
+            namespace = "shared_ui"
+
+            [Layers.Cache.rules."/admin*"]
+            ttl_seconds = 300
+            scope = "per_role"
+
+            [Layers.Cache.rules."/favicon.ico"]
+            ttl_seconds = 3600
+            scope = "public"
+        "#;
+        let mut enabled_srv: ServerConfig = toml::from_str(enabled_toml)?;
+        enabled_srv.finalize()?;
+
+        crate::configuration::ServerMetrics::inc_cache_hit("cache_status_enabled_srv");
+        crate::configuration::ServerMetrics::inc_cache_hit("cache_status_enabled_srv");
+        crate::configuration::ServerMetrics::inc_cache_miss("cache_status_enabled_srv");
+        crate::configuration::ServerMetrics::inc_cache_coalesced("cache_status_enabled_srv");
+        crate::configuration::ServerMetrics::inc_cache_bypass("cache_status_enabled_srv");
+
+        let status_uri: Uri = "http://127.0.0.1:9090/status".parse()?;
+        let resp = handle_admin_request(&status_uri, &Method::GET, &HeaderMap::new(), Some(&enabled_srv));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = rt.block_on(async { resp.into_body().collect().await.unwrap().to_bytes() });
+        let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+        let shared_cache_cfg = crate::middleware::cache::global_response_cache()
+            .config()
+            .clone();
+        assert_eq!(json["cache"]["enabled"], shared_cache_cfg.enabled);
+        assert_eq!(json["cache"]["max_bytes"], shared_cache_cfg.max_bytes);
+        assert_eq!(
+            json["cache"]["default_ttl_seconds"],
+            shared_cache_cfg.default_ttl_seconds
+        );
+        assert_eq!(
+            json["cache"]["max_entry_bytes"],
+            shared_cache_cfg.max_entry_bytes
+        );
+        assert_eq!(
+            json["cache"]["respect_cache_control"],
+            shared_cache_cfg.respect_cache_control
+        );
+        assert_eq!(
+            json["cache"]["expose_cache_header"],
+            shared_cache_cfg.expose_cache_header
+        );
+        assert!(json["cache"]["entries"].is_u64());
+        assert!(json["cache"]["bytes_used"].is_u64());
+        assert!(json["cache"]["total_hits"].as_u64().unwrap_or(0) >= 2);
+        assert!(json["cache"]["total_misses"].as_u64().unwrap_or(0) >= 1);
+        assert!(json["cache"]["total_coalesced"].as_u64().unwrap_or(0) >= 1);
+        assert!(json["cache"]["total_bypasses"].as_u64().unwrap_or(0) >= 1);
+
+        let srv_cache = &json["servers"][0]["cache"];
+        assert_eq!(srv_cache["enabled"], shared_cache_cfg.enabled);
+        assert_eq!(srv_cache["namespace"], "shared_ui");
+        assert_eq!(srv_cache["rules_count"], 2);
+        assert_eq!(srv_cache["hits"], 2);
+        assert_eq!(srv_cache["misses"], 1);
+        assert_eq!(srv_cache["coalesced"], 1);
+        assert_eq!(srv_cache["bypasses"], 1);
+
+        // Server without Cache layer reports disabled state, null namespace, and zero rules
+        let mut disabled_srv = ServerConfig {
+            name: "cache_status_disabled_srv".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8081),
+            service: crate::configuration::ServiceType::Router,
+            ..Default::default()
+        };
+        disabled_srv.finalize()?;
+
+        let disabled_resp =
+            handle_admin_request(&status_uri, &Method::GET, &HeaderMap::new(), Some(&disabled_srv));
+        assert_eq!(disabled_resp.status(), StatusCode::OK);
+        let disabled_body =
+            rt.block_on(async { disabled_resp.into_body().collect().await.unwrap().to_bytes() });
+        let disabled_json: serde_json::Value = serde_json::from_slice(&disabled_body)?;
+        let disabled_cache = &disabled_json["servers"][0]["cache"];
+        assert_eq!(disabled_cache["enabled"], false);
+        assert!(disabled_cache["namespace"].is_null());
+        assert_eq!(disabled_cache["rules_count"], 0);
+        assert_eq!(disabled_cache["hits"], 0);
+        assert_eq!(disabled_cache["misses"], 0);
+        assert_eq!(disabled_cache["coalesced"], 0);
+        assert_eq!(disabled_cache["bypasses"], 0);
+
         Ok(())
     }
 }
