@@ -49,7 +49,8 @@ Every parameter includes:
    - [HTTP/2 Upstream Connection Pool & Keep-Alive Mechanics](#http2-upstream-connection-pool--keep-alive-mechanics)
    - [HTTP/2 Trailers Preservation & Compression Layer Bypass](#http2-trailers-preservation--compression-layer-bypass)
    - [gRPC Error Propagation & Gateway Status Codes](#grpc-error-propagation--gateway-status-codes)
-7. [Granular Path-Level RBAC (`[Server.rbac]`)](#granular-path-level-rbac-serverrbac)
+7. [Granular Path-Level RBAC (`[Server.rbac]`, `"Rbac"` Layer)](#granular-path-level-rbac-serverrbac-rbac-layer)
+   - [Migrating from `0.7.x` to `0.8.0`](#migrating-from-07x-to-080)
 8. [Lightweight WAF / Inspection Layer (`[Server.AllowedPathes]`)](#lightweight-waf--inspection-layer-serverallowedpathes)
 9. [Middleware Layer Pipeline (`[Server.Layers]`)](#middleware-layer-pipeline-serverlayers)
    - [Ordering Constraints & Execution Model](#ordering-constraints--execution-model)
@@ -970,6 +971,46 @@ Enforces **fail-closed** method- and path-level Role-Based Access Control via `R
 3. **Longest Prefix Across `"METHOD /prefix*"` & `"/prefix*"`:** Evaluates keys ending with `*` in descending order of prefix length across both method-specific and method-agnostic prefixes (method-specific rules win ties at equal prefix length).
 4. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
 5. **Unmatched Paths = Fail-Closed (`403 Forbidden`):** If no rule in `[Server.rbac]` matches, `RbacLayer` rejects the request with `403 Forbidden`. Public endpoints (such as `"/health"`) must be explicitly allowed via `["*"]`.
+
+### Migrating from `0.7.x` to `0.8.0`
+
+In `0.8.0`, RBAC was decoupled from `RouterService` into the standalone fail-closed `RbacLayer` middleware (`"Rbac"`), and `allowed_roles` was removed from `[Server.ReverseRoutes.*]`. Existing `0.7.x` configurations require four straightforward updates:
+
+1. **Remove `allowed_roles` from every `[Server.ReverseRoutes.*]` block:** Because `RouteConfig` uses `#[serde(deny_unknown_fields)]`, leftover `allowed_roles` entries are rejected at startup/reload.
+2. **Add `"Rbac"` to `[Server.Layers].enabled`:** Whenever `[Server.rbac]` is configured, `"Rbac"` **must** be enabled in `[Server.Layers].enabled` (and placed **after** `"JwtAuth"` / `"JWT"` if JWT authentication is active). Conversely, enabling `"Rbac"` without a non-empty `[Server.rbac]` table fails closed at startup.
+3. **Move route-level roles into `[Server.rbac]`:** Translate previous route `allowed_roles` into prefix or exact keys under `[Server.rbac]` (e.g., `allowed_roles = ["Admin", "Seller"]` on `"/"` becomes `"/*" = ["Admin", "Seller"]`). Longer prefixes (such as `"/api/*"`) and exact paths automatically take precedence over `"/*"`.
+4. **Explicitly allow public paths with `["*"]`:** Because `RbacLayer` is strictly fail-closed, unauthenticated endpoints such as `"/health"` must be listed explicitly as `"/health" = ["*"]`. For mixed public + JWT-protected servers, use `authentication = "OptionalJwt"` (or `optional = true` under `[Server.Layers.JWT]`) so missing tokens pass through as `Guest` while invalid/expired/revoked tokens are still rejected with `401 Unauthorized`.
+
+> **Key Syntax Check (Fail-Closed):** Every key in `[Server.rbac]` must either start with `'/'` or use `"METHOD /path"` with a valid uppercase/case-insensitive HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`). Wildcard `'*'` is only permitted as a trailing prefix suffix (mid-path wildcards like `"/users/*/orders"` and matrix parameters `;` / `%3b` are rejected at startup).
+
+#### Before (`0.7.x`)
+```toml
+[Server.Layers]
+enabled = ["TraceId", "Inspection", "JwtAuth"]
+
+[Server.rbac]
+"/api/*"        = ["Admin"]
+"/api/WhoAmI"   = ["Admin", "Seller"]
+
+[Server.ReverseRoutes."/"]
+upstreams     = ["https://127.0.0.1:50053"]
+allowed_roles = ["Admin", "Seller"]
+```
+
+#### After (`0.8.0`)
+```toml
+[Server.Layers]
+enabled = ["TraceId", "Inspection", "JwtAuth", "Rbac"]
+
+[Server.rbac]
+"/*"            = ["Admin", "Seller"]   # Replaces ReverseRoutes."/".allowed_roles
+"/health"       = ["*"]                 # Explicit public health probe (fail-closed default)
+"/api/*"        = ["Admin"]             # Longer prefix overrides "/*"
+"/api/WhoAmI"   = ["Admin", "Seller"]   # Exact match overrides "/api/*"
+
+[Server.ReverseRoutes."/"]
+upstreams     = ["https://127.0.0.1:50053"]
+```
 
 ---
 
