@@ -287,6 +287,9 @@ pub struct JwtAuthLayer {
     revoke_on_paths: Arc<Vec<String>>,
     /// Verification policy options (`require_jti`, `max_token_lifetime_secs`).
     verify_options: JwtVerifyOptions,
+    /// When `true`, requests without a token pass through unauthenticated so downstream
+    /// layers (e.g. `RbacLayer`) can allow public routes while rejecting protected ones.
+    optional: bool,
 }
 
 impl JwtAuthLayer {
@@ -328,6 +331,7 @@ impl JwtAuthLayer {
             expected_audience,
             revoke_on_paths: Arc::new(Vec::new()),
             verify_options: JwtVerifyOptions::default(),
+            optional: false,
         })
     }
 
@@ -350,6 +354,14 @@ impl JwtAuthLayer {
         self.verify_options.max_token_lifetime_secs = max_lifetime_secs;
         self
     }
+
+    /// Configures whether missing tokens are permitted to pass through unauthenticated
+    /// (`AuthenticationMethod::OptionalJwt`). Invalid, expired, or revoked tokens are
+    /// still rejected with `401 Unauthorized`.
+    pub fn with_optional(mut self, optional: bool) -> Self {
+        self.optional = optional;
+        self
+    }
 }
 
 impl<S> Layer<S> for JwtAuthLayer {
@@ -367,6 +379,7 @@ impl<S> Layer<S> for JwtAuthLayer {
             expected_audience: self.expected_audience.clone(),
             revoke_on_paths: Arc::clone(&self.revoke_on_paths),
             verify_options: self.verify_options,
+            optional: self.optional,
         }
     }
 }
@@ -400,6 +413,9 @@ pub struct JwtAuthService<S> {
     revoke_on_paths: Arc<Vec<String>>,
     /// Verification policy options (`require_jti`, `max_token_lifetime_secs`).
     verify_options: JwtVerifyOptions,
+    /// When `true`, requests without a token pass through unauthenticated so downstream
+    /// layers (e.g. `RbacLayer`) can allow public routes while rejecting protected ones.
+    optional: bool,
 }
 
 /// Case-insensitively strips the RFC 7235 `"Bearer "` authorization scheme prefix.
@@ -518,6 +534,22 @@ where
         }
 
         let Some(token_str) = token else {
+            if self.optional {
+                tracing::trace!(
+                    "{}: No JWT presented on optional-auth route '{}'; passing through unauthenticated",
+                    server_name,
+                    req.uri().path()
+                );
+                if crate::middleware::rbac::extract_user_roles_from_extensions(req.extensions())
+                    .is_none()
+                {
+                    let mut roles = crate::configuration::RoleVec::<6>::new();
+                    roles.push(crate::configuration::UserRole::guest());
+                    req.extensions_mut().insert(Arc::new(roles));
+                }
+                let fut = self.inner.call(req);
+                return JwtAuthFuture::Inner { inner_fut: fut };
+            }
             crate::configuration::ServerMetrics::inc_blocked_jwt_auth(server_name);
             tracing::debug!("{}: Missing Authorization header or cookie", server_name);
             return JwtAuthFuture::Unauthorized {
@@ -842,6 +874,7 @@ mod tests {
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(Vec::new()),
             verify_options: JwtVerifyOptions::default(),
+            optional: false,
         };
 
         // First request: token is NOT revoked -> should succeed (200 OK)
@@ -911,6 +944,7 @@ mod tests {
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(vec!["/api/Logout".to_string()]),
             verify_options: JwtVerifyOptions::default(),
+            optional: false,
         };
 
         // 1. Regular API call (/api/WhoAmI) succeeds and does NOT revoke the JTI
@@ -1011,6 +1045,7 @@ mod tests {
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(Vec::new()),
             verify_options: JwtVerifyOptions::default(),
+            optional: false,
         };
 
         // 1. Unauthenticated attacker sends 10 requests without token
@@ -1112,6 +1147,7 @@ mod tests {
             expected_audience: "test-aud".to_string(),
             revoke_on_paths: Arc::new(vec!["/logout".to_string()]),
             verify_options: JwtVerifyOptions::default(),
+            optional: false,
         };
 
         // First call to /logout succeeds and revokes the jti until exp + JWT_EXP_LEEWAY_SECS.
@@ -1188,6 +1224,7 @@ mod tests {
                 require_jti: true,
                 max_token_lifetime_secs: Some(600),
             },
+            optional: false,
         };
 
         // 1. Lowercase "bearer " and uppercase "BEARER " schemes are accepted (RFC 7235)
@@ -1218,6 +1255,177 @@ mod tests {
             .unwrap();
         let resp_long = svc.ready().await.unwrap().call(req_long).await.unwrap();
         assert_eq!(resp_long.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_jwtauth_optional_mode_allows_missing_token_but_rejects_invalid_or_revoked() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let valid_claims = Claims {
+            sub: "opt-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: (now + 300) as usize,
+            oids: vec!["1".to_string()],
+            jti: Some("opt-jti-1".to_string()),
+        };
+        let valid_token = common::sign_jwt(&valid_claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|req: Request<Full<Bytes>>| async move {
+            let has_claims = req.extensions().get::<Claims>().is_some();
+            let marker = if has_claims { "auth" } else { "anon" };
+            let body: ServiceRespBody = Full::new(Bytes::from(marker))
+                .map_err(SrvError::from)
+                .boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-optional-jwt-server",
+            oid_mapping: Arc::new(vec![(
+                "1".to_string(),
+                crate::configuration::UserRole("Admin".to_string()),
+            )]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions::default(),
+            optional: true,
+        };
+
+        // 1. Missing token passes through with Guest fallback role and no Claims
+        let req_anon = Request::builder()
+            .uri("/healthz")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_anon = svc.ready().await.unwrap().call(req_anon).await.unwrap();
+        assert_eq!(resp_anon.status(), StatusCode::OK);
+
+        // 2. Valid token injects Claims & roles
+        let req_auth = Request::builder()
+            .uri("/admin")
+            .header("Authorization", format!("Bearer {valid_token}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_auth = svc.ready().await.unwrap().call(req_auth).await.unwrap();
+        assert_eq!(resp_auth.status(), StatusCode::OK);
+
+        // 3. Invalid token still fails with 401
+        let req_bad = Request::builder()
+            .uri("/healthz")
+            .header("Authorization", "Bearer not.a.valid.jwt")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_bad = svc.ready().await.unwrap().call(req_bad).await.unwrap();
+        assert_eq!(resp_bad.status(), StatusCode::UNAUTHORIZED);
+
+        // 4. Revoked token still fails with 401
+        get_jwt_revocation_store().revoke("opt-jti-1", now + 3600);
+        let req_revoked = Request::builder()
+            .uri("/admin")
+            .header("Authorization", format!("Bearer {valid_token}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_revoked = svc.ready().await.unwrap().call(req_revoked).await.unwrap();
+        assert_eq!(resp_revoked.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_jwt_optional_mode_passes_missing_token_with_guest_and_rejects_invalid() {
+        use tower::service_fn;
+
+        let enc_key = jsonwebtoken::EncodingKey::from_ed_pem(TEST_PRIV_KEY.as_bytes()).unwrap();
+        let dec_key = jsonwebtoken::DecodingKey::from_ed_pem(TEST_PUB_KEY.as_bytes()).unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let valid_claims = Claims {
+            sub: "opt-guest-user".to_string(),
+            iss: "test-issuer".to_string(),
+            aud: Some("test-aud".to_string()),
+            exp: (now + 300) as usize,
+            oids: vec!["1".to_string()],
+            jti: Some("opt-guest-jti-1".to_string()),
+        };
+        let valid_token = common::sign_jwt(&valid_claims, &enc_key).unwrap();
+
+        let inner_svc = service_fn(|req: Request<Full<Bytes>>| async move {
+            let roles = crate::middleware::rbac::extract_user_roles_from_extensions(req.extensions())
+                .map(|r| r.iter().map(|role| role.0.clone()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let sub = req
+                .extensions()
+                .get::<Claims>()
+                .map(|c| c.sub.clone())
+                .unwrap_or_default();
+            let payload = format!("{}:{}", roles.join(","), sub);
+            let body: ServiceRespBody = Full::new(Bytes::from(payload))
+                .map_err(SrvError::from)
+                .boxed();
+            Ok::<Response<ServiceRespBody>, std::convert::Infallible>(Response::new(body))
+        });
+
+        let mut svc = JwtAuthService {
+            inner: inner_svc,
+            decoding_keys: Arc::new(vec![dec_key]),
+            server_name: "test-optional-jwt-guest-server",
+            oid_mapping: Arc::new(vec![(
+                "1".to_string(),
+                crate::configuration::UserRole("Admin".to_string()),
+            )]),
+            cookie_fallback: None,
+            redirect_on_failure: None,
+            expected_issuer: "test-issuer".to_string(),
+            expected_audience: "test-aud".to_string(),
+            revoke_on_paths: Arc::new(Vec::new()),
+            verify_options: JwtVerifyOptions::default(),
+            optional: true,
+        };
+
+        // 1. Missing token -> 200 OK and inner service receives [UserRole("Guest")]
+        let req_missing = Request::builder()
+            .uri("/whoami")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_missing = svc.ready().await.unwrap().call(req_missing).await.unwrap();
+        assert_eq!(resp_missing.status(), StatusCode::OK);
+        let body_missing = resp_missing.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body_missing, Bytes::from_static(b"Guest:"));
+
+        // 2. Malformed/invalid token -> 401 Unauthorized
+        let req_bad = Request::builder()
+            .uri("/whoami")
+            .header("Authorization", "Bearer invalid.jwt.token")
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_bad = svc.ready().await.unwrap().call(req_bad).await.unwrap();
+        assert_eq!(resp_bad.status(), StatusCode::UNAUTHORIZED);
+
+        // 3. Valid token -> 200 OK with Claims and mapped Admin role
+        let req_valid = Request::builder()
+            .uri("/whoami")
+            .header("Authorization", format!("Bearer {valid_token}"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let resp_valid = svc.ready().await.unwrap().call(req_valid).await.unwrap();
+        assert_eq!(resp_valid.status(), StatusCode::OK);
+        let body_valid = resp_valid.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body_valid, Bytes::from_static(b"Admin:opt-guest-user"));
     }
 }
 

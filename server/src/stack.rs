@@ -33,14 +33,14 @@ use crate::{
     BoxCloneSyncService, BoxCloneSyncServiceExt, BoxedCloneService, ConnectionHandler, SrvBody,
     SrvError,
     configuration::{
-        AuthenticationMethod, CompiledAllowedPathes, MiddlewareLayer, RateLimiter,
+        AuthenticationMethod, CompiledAllowedPathes, CompiledRbac, MiddlewareLayer, RateLimiter,
         RouteBackendType, ServerConfig, ServerMetrics, ServiceType, TunnelConfig, UserRole,
     },
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::{
         AdminService, ConcurrencyLimitLayer, CountingLayer, DelayLayer, EchoService,
         InspectionLayer, IpFilterLayer, JwtAuthLayer, LoggerLayer, MaxPayloadLayer,
-        PathSanitizerLayer, RouterService, SecurityHeadersLayer, SimpleRateLimiterLayer,
+        PathSanitizerLayer, RbacLayer, RouterService, SecurityHeadersLayer, SimpleRateLimiterLayer,
         TimingLayer, TokenBucketRateLimiterLayer, TraceIdLayer,
         alt_svc::AltSvcLayer,
         compression::{SrvCompressionLayer, SrvDecompressionLayer},
@@ -246,6 +246,8 @@ fn build_service_stack_internal(
         server_config.port.unwrap_or(0),
         Arc::new(server_config.oid_mapping.clone()),
         &grpc_stream_policy,
+        server_config.compiled_rbac.clone(),
+        matches!(server_config.authentication, AuthenticationMethod::OptionalJwt),
     )?;
 
     // Security: Enforce RFC 3986 path canonicalization and reject traversal/illegal encodings
@@ -412,17 +414,20 @@ pub fn build_service_stack(server_config: &Arc<ServerConfig>) -> Result<BoxedClo
 ///
 /// Layers are applied in reverse order (outside-in execution flow), so the first
 /// layer in `layers` becomes the outermost wrapper around `service`.
+/// Pass `compiled_rbac` when `MiddlewareLayer::Rbac` is included in `layers`.
 ///
 /// # Errors
 ///
 /// Returns [`SrvError::Other`] if any layer has invalid parameters (such as zero
-/// rate-limit rates or invalid CIDR blocks).
+/// rate-limit rates or invalid CIDR blocks), or if `MiddlewareLayer::Rbac` is enabled
+/// without `compiled_rbac`.
 #[tracing::instrument(skip_all, fields(server = %server_name), err)]
 pub fn apply_layers(
     service: BoxedCloneService,
     layers: Vec<MiddlewareLayer>,
     server_name: &'static str,
     compiled_allowed_pathes: Arc<CompiledAllowedPathes>,
+    compiled_rbac: Option<Arc<CompiledRbac>>,
     server_port: u16,
     oid_mapping: Arc<HashMap<String, UserRole>>,
 ) -> Result<BoxedCloneService, SrvError> {
@@ -434,9 +439,12 @@ pub fn apply_layers(
         server_port,
         oid_mapping,
         &GrpcStreamPolicy::AllowAnyGrpcContentType,
+        compiled_rbac,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_layers_internal(
     service: BoxedCloneService,
     layers: Vec<MiddlewareLayer>,
@@ -445,6 +453,8 @@ fn apply_layers_internal(
     server_port: u16,
     oid_mapping: Arc<HashMap<String, UserRole>>,
     grpc_stream_policy: &GrpcStreamPolicy,
+    compiled_rbac: Option<Arc<CompiledRbac>>,
+    optional_jwt: bool,
 ) -> Result<BoxedCloneService, SrvError> {
     let mut svc = service;
     for layer in layers.into_iter().rev() {
@@ -458,6 +468,16 @@ fn apply_layers_internal(
                 .boxed_clone_sync(),
             MiddlewareLayer::Inspection => {
                 InspectionLayer::new(compiled_allowed_pathes.clone(), server_name)
+                    .layer(svc)
+                    .boxed_clone_sync()
+            }
+            MiddlewareLayer::Rbac => {
+                let rules = compiled_rbac.clone().ok_or_else(|| {
+                    SrvError::Other(format!(
+                        "{server_name}: Layer 'Rbac' enabled, but compiled_rbac is missing (did you call ServerConfig::finalize with [Server.rbac]?)"
+                    ))
+                })?;
+                RbacLayer::new(rules, server_name)
                     .layer(svc)
                     .boxed_clone_sync()
             }
@@ -481,7 +501,8 @@ fn apply_layers_internal(
                 .with_require_jti(cfg.require_jti)
                 .with_max_token_lifetime_seconds(
                     (cfg.max_token_lifetime_seconds > 0).then_some(cfg.max_token_lifetime_seconds),
-                );
+                )
+                .with_optional(optional_jwt || cfg.optional);
                 layer.layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::RateLimiter(RateLimiter::Simple(cfg)) => {
@@ -1420,6 +1441,7 @@ mod tunnel_peer_tests {
                 revoke_on_paths: vec![],
                 require_jti: true,
                 max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
+                optional: false,
             }),
             MiddlewareLayer::PathSanitizer,
         ]));

@@ -102,6 +102,10 @@ pub enum AuthenticationMethod {
     /// JWT bearer-token authentication.
     #[serde(alias = "JWT")]
     Jwt,
+    /// Optional JWT bearer-token authentication — missing tokens pass through unauthenticated,
+    /// while invalid, expired, or revoked tokens are still rejected with 401.
+    #[serde(alias = "OptionalJWT")]
+    OptionalJwt,
     /// Mutual TLS (mTLS) — client must present a valid certificate.
     #[serde(alias = "ClientCert", alias = "mTLS")]
     ClientCert,
@@ -256,11 +260,11 @@ pub struct ServerConfig {
     #[serde(rename = "ReverseRoutes")]
     pub rev_routes: Option<HashMap<String, RouteConfig>>,
 
-    /// Granular path-based Role-Based Access Control (RBAC) rules.
+    /// Granular path- and method-based Role-Based Access Control (RBAC) rules.
     ///
-    /// Maps paths (exact or prefix wildcards ending with `*`) to required roles.
-    /// An empty list `[]` acts as an explicit Deny-All rule.
-    /// Wildcard `"*"` in the roles list permits any caller.
+    /// Maps patterns (`"/api/*"`, `"GET /users/*"`, exact paths, or prefix wildcards ending with `*`)
+    /// to required roles. An empty list `[]` acts as an explicit Deny-All rule, and `["*"]` permits
+    /// any caller. Enforced fail-closed by the `"Rbac"` middleware layer.
     #[serde(default, rename = "Rbac", alias = "rbac")]
     pub rbac: Option<HashMap<String, Vec<UserRole>>>,
 
@@ -555,9 +559,6 @@ pub struct RouteConfig {
     /// The load balancing strategy to use for this route.
     #[serde(default)]
     pub strategy: LbStrategy,
-    /// Roles permitted to access this route. Empty means unrestricted.
-    #[serde(default)]
-    pub allowed_roles: Vec<UserRole>,
     /// How many seconds a node stays dead after a connection failure. Defaults to 10.
     pub cooldown_seconds: Option<u64>,
     /// Maximum number of automatic retries on another node. Defaults to 2.
@@ -777,8 +778,6 @@ pub struct ParsedRoute {
     pub prefix: String,
     /// The load-balanced target composed of upstreams and a strategy.
     pub target: Arc<RouteTarget>,
-    /// Roles permitted to access this route.
-    pub allowed_roles: Vec<UserRole>,
     /// The type of backend (rest, grpc, admin, or aggregate).
     pub backend_type: RouteBackendType,
     /// Fan-out sub-targets populated when `backend_type == RouteBackendType::Aggregate`.
@@ -865,6 +864,8 @@ pub enum MiddlewareLayer {
     PathSanitizer,
     /// Enforces IPv4 / IPv6 CIDR allowlist and blocklist rules.
     IpFilter(IpFilterConfig),
+    /// Enforces fail-closed path- and method-based Role-Based Access Control (RBAC).
+    Rbac,
 }
 
 /// Rate limiter algorithm selection.
@@ -1390,6 +1391,11 @@ pub struct JwtAuthConfig {
     /// Set to `0` to disable the upper lifetime bound.
     #[serde(default = "default_max_token_lifetime_seconds")]
     pub max_token_lifetime_seconds: u64,
+    /// When `true`, requests without a token pass through unauthenticated (with `Guest` role)
+    /// so downstream `RbacLayer` rules can allow public `["*"]` routes while rejecting invalid,
+    /// expired, or revoked tokens with `401 Unauthorized` (default: `false`).
+    #[serde(default)]
+    pub optional: bool,
 }
 
 fn default_max_connections() -> usize {
@@ -1943,20 +1949,20 @@ impl ServerConfig {
                     )));
                 }
             }
-            AuthenticationMethod::Jwt => {
+            AuthenticationMethod::Jwt | AuthenticationMethod::OptionalJwt => {
                 // A. Check if the Config Block exists
                 let jwt_cfg = self.layers.jwt_config.as_ref().ok_or_else(|| {
                     Error::msg(format!(
-                        "Configuration error in Server '{}': Authentication is 'JWT', but [Server.Layers.JWT] config section is missing.",
-                        self.name
+                        "Configuration error in Server '{}': Authentication is '{:?}', but [Server.Layers.JWT] config section is missing.",
+                        self.name, self.authentication
                     ))
                 })?;
 
                 // B. Check if keys are actually provided
                 if jwt_cfg.jwt_public_keys.is_empty() {
                     return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Authentication is 'JWT', but 'jwt_public_keys' list is empty.",
-                        self.name
+                        "Configuration error in Server '{}': Authentication is '{:?}', but 'jwt_public_keys' list is empty.",
+                        self.name, self.authentication
                     )));
                 }
 
@@ -1969,8 +1975,8 @@ impl ServerConfig {
 
                 if !layer_enabled {
                     return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Authentication is 'JWT', but the 'JwtAuth' layer is NOT in [Server.Layers.enabled]. You must enable the layer to perform the check.",
-                        self.name
+                        "Configuration error in Server '{}': Authentication is '{:?}', but the 'JwtAuth' layer is NOT in [Server.Layers.enabled]. You must enable the layer to perform the check.",
+                        self.name, self.authentication
                     )));
                 }
             }
@@ -1979,6 +1985,32 @@ impl ServerConfig {
                 // No specific config required for None
             }
         }
+
+        // 4.5 Validate Fail-Closed RBAC Layer Consistency
+        let has_rbac_layer = self
+            .layers
+            .enabled
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case("Rbac"));
+        if has_rbac_layer && self.rbac.as_ref().is_none_or(HashMap::is_empty) {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': Layer 'Rbac' is enabled in [Server.Layers.enabled], but [Server.rbac] is missing or empty.",
+                self.name
+            )));
+        }
+        if !has_rbac_layer && self.rbac.is_some() {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': [Server.rbac] is configured, but 'Rbac' is NOT in [Server.Layers.enabled]. Enable the 'Rbac' layer to enforce these rules.",
+                self.name
+            )));
+        }
+
+        let has_jwt_layer = self.layers.enabled.iter().any(|l| {
+            l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+        });
+        let has_strict_jwt_layer = has_jwt_layer
+            && self.authentication != AuthenticationMethod::OptionalJwt
+            && !self.layers.jwt_config.as_ref().is_some_and(|c| c.optional);
 
         // 5. Validate Service Requirements
         if self.service == ServiceType::Idp {
@@ -2028,44 +2060,43 @@ impl ServerConfig {
                 );
             }
         } else if self.service == ServiceType::Admin
-            && self.authentication == AuthenticationMethod::None
+            && matches!(
+                self.authentication,
+                AuthenticationMethod::None | AuthenticationMethod::OptionalJwt
+            )
+            && !has_strict_jwt_layer
+            && !has_rbac_layer
         {
-            let has_jwt_layer = self.layers.enabled.iter().any(|l| {
-                l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+            if self.tunnel.is_some() {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{}': Service 'Admin' without authentication cannot be exposed over a tunnel.",
+                    self.name
+                )));
+            }
+            let is_loopback = self.ip.as_deref().is_some_and(|ip| {
+                ip.eq_ignore_ascii_case("localhost")
+                    || ip.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback())
             });
-            if !has_jwt_layer {
-                if self.tunnel.is_some() {
-                    return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Service 'Admin' without authentication cannot be exposed over a tunnel.",
-                        self.name
-                    )));
-                }
-                let is_loopback = self.ip.as_deref().is_some_and(|ip| {
-                    ip.eq_ignore_ascii_case("localhost")
-                        || ip.parse::<std::net::IpAddr>().is_ok_and(|a| a.is_loopback())
-                });
-                if !is_loopback {
-                    return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Service 'Admin' without authentication must bind to a loopback address (127.0.0.1 or ::1).",
-                        self.name
-                    )));
-                }
+            if !is_loopback {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{}': Service 'Admin' without authentication must bind to a loopback address (127.0.0.1 or ::1).",
+                    self.name
+                )));
             }
         }
 
         if self.service == ServiceType::Router {
-            let has_jwt_layer = self.layers.enabled.iter().any(|l| {
-                l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
-            });
             for route in &self.parsed_routes {
                 if route.backend_type == RouteBackendType::Admin
-                    && self.authentication == AuthenticationMethod::None
-                    && !has_jwt_layer
-                    && route.allowed_roles.is_empty()
-                    && self.rbac.is_none()
+                    && matches!(
+                        self.authentication,
+                        AuthenticationMethod::None | AuthenticationMethod::OptionalJwt
+                    )
+                    && !has_strict_jwt_layer
+                    && !has_rbac_layer
                 {
                     return Err(Error::msg(format!(
-                        "Configuration error in Server '{}': Route '{}' with backend_type 'admin' requires authentication, non-empty 'allowed_roles', or [Server.Rbac].",
+                        "Configuration error in Server '{}': Route '{}' with backend_type 'admin' requires authentication or an active 'Rbac' layer with [Server.rbac].",
                         self.name, route.prefix
                     )));
                 }
@@ -2488,7 +2519,6 @@ impl ServerConfig {
                     rules.push(ParsedRoute {
                         prefix: prefix.clone(),
                         target: Arc::new(empty_target),
-                        allowed_roles: cfg.allowed_roles.clone(),
                         backend_type: cfg.backend_type.clone(),
                         aggregate_targets,
                         aggregate_payload_mode: cfg.payload_mode,
@@ -2532,7 +2562,6 @@ impl ServerConfig {
                 rules.push(ParsedRoute {
                     prefix: prefix.clone(),
                     target: Arc::new(target),
-                    allowed_roles: cfg.allowed_roles.clone(),
                     backend_type: cfg.backend_type.clone(),
                     aggregate_targets: Vec::new(),
                     aggregate_payload_mode: AggregatePayloadMode::default(),
@@ -2562,8 +2591,15 @@ impl ServerConfig {
     }
 
     /// Compiles fine-grained RBAC rules into [`CompiledRbac`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any pattern in `[Server.rbac]` has invalid syntax.
     pub fn init_compiled_rbac(&mut self) -> Result<(), Error> {
-        self.compiled_rbac = self.rbac.as_ref().map(|raw| Arc::new(CompiledRbac::from_raw(raw)));
+        self.compiled_rbac = match &self.rbac {
+            Some(raw) => Some(Arc::new(CompiledRbac::from_raw(raw)?)),
+            None => None,
+        };
         Ok(())
     }
 }
@@ -2651,14 +2687,18 @@ impl CompiledAllowedPathes {
 
 /// Pre-compiled granular Role-Based Access Control lookup structure.
 ///
-/// Supports exact path matching (O(1) lookup) and wildcard prefix matching
-/// (longest prefix first).
+/// Supports method-specific and method-agnostic exact path matching (O(1) lookup)
+/// as well as longest-prefix wildcard matching (`*` suffix).
 #[derive(Debug, Clone, Default)]
 pub struct CompiledRbac {
-    /// Exact path matches: path -> required_roles
+    /// Method-agnostic exact path matches: path -> required_roles
     pub exact: HashMap<String, Vec<UserRole>>,
-    /// Wildcard / prefix matches: (prefix, required_roles) sorted by descending prefix length
+    /// Method-agnostic wildcard / prefix matches: (prefix, required_roles) sorted by descending prefix length
     pub prefix: Vec<(String, Vec<UserRole>)>,
+    /// Method-specific exact path matches: HTTP method (uppercase) -> (path -> required_roles)
+    pub method_exact: HashMap<String, HashMap<String, Vec<UserRole>>>,
+    /// Method-specific wildcard / prefix matches: HTTP method (uppercase) -> sorted (prefix, required_roles)
+    pub method_prefix: HashMap<String, Vec<(String, Vec<UserRole>)>>,
 }
 
 impl CompiledRbac {
@@ -2674,31 +2714,180 @@ impl CompiledRbac {
         }
     }
 
+    /// Splits and validates an optional `"METHOD /path"` key into `(Some("METHOD"), "/path")`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty keys, unsupported HTTP methods, paths not starting with `'/'`,
+    /// semicolon matrix parameters (`;` / `%3b`), and mid-path `*` wildcards.
+    fn parse_rbac_key(pattern: &str) -> Result<(Option<String>, &str), Error> {
+        if pattern.is_empty() {
+            return Err(Error::msg("Invalid RBAC pattern '': pattern must not be empty"));
+        }
+
+        let (method_opt, path_pattern) = if pattern.contains(char::is_whitespace) {
+            let Some((method, rest)) = pattern.split_once(' ') else {
+                return Err(Error::msg(format!(
+                    "Invalid RBAC pattern '{pattern}': expected 'METHOD /path'"
+                )));
+            };
+            if rest.is_empty() || rest.contains(char::is_whitespace) {
+                return Err(Error::msg(format!(
+                    "Invalid RBAC pattern '{pattern}': unexpected whitespace in path"
+                )));
+            }
+            let upper = method.to_ascii_uppercase();
+            if !matches!(
+                upper.as_str(),
+                "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS"
+            ) {
+                return Err(Error::msg(format!(
+                    "Invalid RBAC pattern '{pattern}': unsupported HTTP method '{method}'"
+                )));
+            }
+            (Some(upper), rest)
+        } else {
+            (None, pattern)
+        };
+
+        if !path_pattern.starts_with('/') {
+            return Err(Error::msg(format!(
+                "Invalid RBAC pattern '{pattern}': path must start with '/'"
+            )));
+        }
+        if path_pattern.contains(';')
+            || path_pattern
+                .as_bytes()
+                .windows(3)
+                .any(|w| w.eq_ignore_ascii_case(b"%3b"))
+        {
+            return Err(Error::msg(format!(
+                "Invalid RBAC pattern '{pattern}': matrix parameter ';' is not permitted"
+            )));
+        }
+        if path_pattern[..path_pattern.len().saturating_sub(1)].contains('*') {
+            return Err(Error::msg(format!(
+                "Invalid RBAC pattern '{pattern}': wildcard '*' is only permitted as a trailing suffix"
+            )));
+        }
+
+        Ok((method_opt, path_pattern))
+    }
+
     /// Compiles raw string patterns from the `[Server.rbac]` table.
     ///
-    /// Keys ending with `*` are treated as prefix matches (e.g. `"/api/Admin*"` or `"/api/admin/*"`).
-    /// Other keys are treated as exact path matches (normalized without trailing slashes).
-    pub fn from_raw(raw: &HashMap<String, Vec<UserRole>>) -> Self {
+    /// Keys may optionally carry an HTTP method prefix (e.g. `"GET /users/*"` or
+    /// `"DELETE /users/*"`). Keys whose path ends with `*` are treated as prefix
+    /// matches; other keys are treated as exact path matches (trailing-slash normalized).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any RBAC pattern is empty, uses an unsupported HTTP method,
+    /// does not start with `'/'`, contains matrix parameters (`;` / `%3b`), or places
+    /// `*` anywhere other than the trailing suffix.
+    pub fn from_raw(raw: &HashMap<String, Vec<UserRole>>) -> Result<Self, Error> {
         let mut exact = HashMap::new();
         let mut prefix = Vec::new();
+        let mut method_exact: HashMap<String, HashMap<String, Vec<UserRole>>> = HashMap::new();
+        let mut method_prefix: HashMap<String, Vec<(String, Vec<UserRole>)>> = HashMap::new();
 
         for (pattern, roles) in raw {
-            if pattern.ends_with('*') {
-                let pfx = &pattern[..pattern.len() - 1];
-                prefix.push((pfx.to_string(), roles.clone()));
-            } else {
-                let normalized = Self::normalize_exact_key(pattern).to_string();
-                exact.insert(normalized, roles.clone());
+            let (method_opt, path_pattern) = Self::parse_rbac_key(pattern)?;
+            match (method_opt, path_pattern.ends_with('*')) {
+                (Some(method), true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    method_prefix
+                        .entry(method)
+                        .or_default()
+                        .push((pfx.to_string(), roles.clone()));
+                }
+                (Some(method), false) => {
+                    let normalized = Self::normalize_exact_key(path_pattern).to_string();
+                    method_exact
+                        .entry(method)
+                        .or_default()
+                        .insert(normalized, roles.clone());
+                }
+                (None, true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    prefix.push((pfx.to_string(), roles.clone()));
+                }
+                (None, false) => {
+                    let normalized = Self::normalize_exact_key(path_pattern).to_string();
+                    exact.insert(normalized, roles.clone());
+                }
             }
         }
 
         // Sort descending by prefix length: most specific prefix wins
         prefix.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        for list in method_prefix.values_mut() {
+            list.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        }
 
-        Self { exact, prefix }
+        Ok(Self {
+            exact,
+            prefix,
+            method_exact,
+            method_prefix,
+        })
     }
 
-    /// Matches a request path against exact and prefix RBAC rules.
+    /// Returns `true` if no RBAC rules are compiled.
+    pub fn is_empty(&self) -> bool {
+        self.exact.is_empty()
+            && self.prefix.is_empty()
+            && self.method_exact.is_empty()
+            && self.method_prefix.is_empty()
+    }
+
+    /// Matches an HTTP `(method, path)` pair against compiled RBAC rules.
+    ///
+    /// Precedence:
+    /// 1. Method-specific exact match (`"GET /users"`).
+    /// 2. Method-agnostic exact match (`"/users"`).
+    /// 3. Longest prefix match across `"METHOD /prefix*"` and `"/prefix*"`
+    ///    (with method-specific rules breaking ties at equal prefix length).
+    ///
+    /// Returns `None` if no rule matched (callers enforce fail-closed `403`).
+    pub fn match_request<'a>(&'a self, method: &str, path: &str) -> Option<&'a [UserRole]> {
+        let exact_key = Self::normalize_exact_key(path);
+        if let Some(method_map) = self.method_exact.get(method)
+            && let Some(roles) = method_map.get(exact_key)
+        {
+            return Some(roles.as_slice());
+        }
+        if let Some(roles) = self.exact.get(exact_key) {
+            return Some(roles.as_slice());
+        }
+
+        let method_match = self.method_prefix.get(method).and_then(|prefixes| {
+            prefixes
+                .iter()
+                .find(|(pfx, _)| path.starts_with(pfx))
+                .map(|(pfx, roles)| (pfx.len(), roles.as_slice()))
+        });
+        let global_match = self
+            .prefix
+            .iter()
+            .find(|(pfx, _)| path.starts_with(pfx))
+            .map(|(pfx, roles)| (pfx.len(), roles.as_slice()));
+
+        match (method_match, global_match) {
+            (Some((m_len, m_roles)), Some((g_len, g_roles))) => {
+                if m_len >= g_len {
+                    Some(m_roles)
+                } else {
+                    Some(g_roles)
+                }
+            }
+            (Some((_, m_roles)), None) => Some(m_roles),
+            (None, Some((_, g_roles))) => Some(g_roles),
+            (None, None) => None,
+        }
+    }
+
+    /// Matches a request path against method-agnostic exact and prefix RBAC rules.
     ///
     /// Exact matches take precedence over prefix matches. Trailing slashes on
     /// exact paths are normalized (so `/api/Admin/` matches `/api/Admin`).
@@ -2740,6 +2929,19 @@ impl Layers {
                     ));
                 }
 
+        // Rule 3: Rbac (if present alongside JwtAuth/JWT) must come AFTER JwtAuth so roles are populated
+        if let Some(rbac_idx) = self.enabled.iter().position(|l| l.eq_ignore_ascii_case("Rbac"))
+            && let Some(jwt_idx) = self
+                .enabled
+                .iter()
+                .position(|l| l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT"))
+            && rbac_idx < jwt_idx
+        {
+            return Err(Error::msg(format!(
+                "Rbac (at index {rbac_idx}) must come AFTER JwtAuth (at index {jwt_idx}) so JWT claims are verified before role enforcement."
+            )));
+        }
+
         Ok(())
     }
 
@@ -2772,6 +2974,7 @@ impl Layers {
                 "Logger" => Ok(MiddlewareLayer::Logger),
                 "PathSanitizer" | "NormalizePath" => Ok(MiddlewareLayer::PathSanitizer),
                 "Inspection" => Ok(MiddlewareLayer::Inspection),
+                "Rbac" | "RBAC" => Ok(MiddlewareLayer::Rbac),
                 "Compression" => Ok(MiddlewareLayer::Compression),
                 "Decompression" => self
                     .decompression_config

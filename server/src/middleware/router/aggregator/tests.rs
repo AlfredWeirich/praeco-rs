@@ -338,7 +338,6 @@
         ParsedRoute {
             prefix: "/api/dashboard".to_string(),
             target: empty_target,
-            allowed_roles: Vec::new(),
             backend_type: RouteBackendType::Aggregate,
             aggregate_targets: targets.into_iter().map(Arc::new).collect(),
             aggregate_payload_mode: AggregatePayloadMode::Keyed,

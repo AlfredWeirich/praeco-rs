@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-11-25
+
+Major SemVer-breaking security & architecture release decoupling Role-Based Access Control into a standalone fail-closed Tower middleware (`RbacLayer`), adding `OptionalJwt` symmetry, and bringing first-class RBAC & auth extractors to `praeco_rs::web`.
+
+### Breaking Changes
+* **Standalone Fail-Closed `RbacLayer` & Removal of Router-Embedded RBAC (`src/middleware/rbac.rs`, `src/middleware/router/mod.rs`, `src/configuration/mod.rs`):**
+  * Removed `RouteConfig::allowed_roles` and `ParsedRoute::allowed_roles` as well as router-internal `enforce_rbac()` (`src/middleware/router/rbac.rs` deleted); `[Server.rbac]` enforced by `"Rbac"` (`MiddlewareLayer::Rbac`) in `[Server.Layers].enabled` is now the single source of truth across all services (`Router`, `WebRouter`, `StaticFiles`, `Admin`, and Tonic gRPC).
+  * `RbacLayer` enforces strict fail-closed semantics (`403 Forbidden` on unmatched paths, empty `[]` rules, or matrix parameters `;` / `%3b`; explicit `["*"]` required for public paths such as `"/health"`).
+  * `ServerConfig::finalize()` validates `[Server.rbac]` ↔ `"Rbac"` layer consistency, requires `"Rbac"` to appear after `"JwtAuth"`/`"JWT"` when both are enabled, and updates `ServiceType::Admin` / `RouteBackendType::Admin` guardrails so `OptionalJwt` without `"Rbac"` is not treated as strict authentication.
+  * Changed `CompiledRbac::from_raw(...)` to return `Result<Self, anyhow::Error>`, rejecting empty keys, unsupported HTTP methods, paths without leading `/`, matrix parameters, and mid-path `*` wildcards at config load/finalize time.
+* **Updated `apply_layers` Signature (`src/stack.rs`):**
+  * Added `compiled_rbac: Option<Arc<CompiledRbac>>` parameter to `praeco_rs::apply_layers` (after `compiled_allowed_pathes`).
+* **`JwtAuthConfig.optional` Field (`src/configuration/mod.rs`):**
+  * Added `pub optional: bool` (`#[serde(default)]`) to `JwtAuthConfig` (TOML-compatible; SemVer-breaking for struct literals without `..Default::default()`).
+
+### Added
+* **Method-Aware `CompiledRbac` (`src/configuration/mod.rs`, `src/middleware/rbac.rs`):**
+  * Supports optional HTTP method prefixes (e.g. `"GET /users/*"`, `"DELETE /users/*"`), matching `"METHOD /exact"` → `"/exact"` → longest prefix across `"METHOD /prefix*"` and `"/prefix*"` (method-specific rules win ties at equal prefix length).
+* **`AuthenticationMethod::OptionalJwt` (`src/configuration/mod.rs`, `src/middleware/jwt.rs`, `src/stack.rs`):**
+  * Missing tokens pass through with `UserRole::guest()` fallback (preserving pre-existing mTLS roles), while invalid, expired, or revoked tokens still fail with `401 Unauthorized`.
+* **Embedded `WebRouter` Auth Extractors & Declarative RBAC (`src/web.rs`, `examples/https_web_server`):**
+  * Added `UserRoles`, `ClientOids`, `ClientSan`, and `JwtClaims` extractors plus `*_with_roles` / `*_with_waf_and_roles` route builders and `WebRouter::rbac_rules()` for single-source-of-truth WAF & RBAC derivation.
+  * Updated `examples/https_web_server` to `0.2.0`, demonstrating `RbacLayer`, `OptionalClientCert`, `OptionalJwt`, `/whoami`, and `/admin/stats`.
+
+---
+
 ## [0.7.1] - 2026-11-23
 
 ### Security & Dependencies

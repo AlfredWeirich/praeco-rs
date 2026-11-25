@@ -3,9 +3,9 @@
 Eigenständiges Beispiel-Crate, das `praeco-rs` mit `default-features = false, features = ["web"]` und **ohne `Config.toml`** einbindet:
 
 - **Dual-Stack HTTPS:** HTTP/1.1 + HTTP/2 (TCP) und HTTP/3 (QUIC/UDP) auf Port `8443` (konfigurierbar via `PORT`).
-- **Universeller Router & Extractors (`praeco_rs::web`):** Endpunkte sind schlanke `async fn`s mit typisierten Extractors (`Query<T>`, `Path<T>`, `Json<T>`, `TraceId`), `IntoResponse` und automatischer `AllowedPathes`-Ableitung für die WAF.
+- **Universeller Router & Extractors (`praeco_rs::web`):** Endpunkte sind schlanke `async fn`s mit typisierten Extractors (`Query<T>`, `Path<T>`, `Json<T>`, `TraceId`, `UserRoles`, `ClientOids`, `ClientSan`, `JwtClaims`), `IntoResponse` und automatischer `AllowedPathes`- & `Rbac`-Ableitung für WAF und RBAC-Middleware.
 - **Saubere Trennung:** `src/main.rs` verdrahtet nur noch die Routen und startet den Server; Endpunkte & DTOs liegen in `src/endpoints.rs`, Server-Konfiguration und Shutdown in `src/bootstrap.rs`.
-- **Sicherheitslayer:** `TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter` (`127.0.0.1/32`, `::1/128`), `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression` und `Inspection` (`AllowedPathes`).
+- **Sicherheitslayer & OID-RBAC:** `TraceId`, `SecurityHeaders`, `AltSvc`, `IpFilter` (`127.0.0.1/32`, `::1/128`), `RateLimiter:TokenBucket`, `ConcurrencyLimit`, `MaxPayload`, `Decompression`, `Inspection` (`AllowedPathes`), optional `JwtAuth` (`OptionalJwt` via `PRAECO_JWT_PUBLIC_KEY`) sowie fail-closed `Rbac` (`RbacLayer` + `OptionalClientCert` via `PRAECO_CLIENT_CA`).
 
 ## Starten & Testen
 
@@ -15,7 +15,7 @@ Vom Workspace-Root aus (der Stack-Test nutzt automatisch eine ephemere `TestPki`
 cargo test -p https_web_server
 ```
 
-Für `cargo run` werden Zertifikate über `PRAECO_TLS_CERT` / `PRAECO_TLS_KEY` oder unter `server_certs/self_signed/praeco_public.{pem,key}` erwartet:
+Für `cargo run` werden Zertifikate über `PRAECO_TLS_CERT` / `PRAECO_TLS_KEY` oder unter `server_certs/self_signed/praeco_public.{pem,key}` erwartet. Optional lassen sich mTLS-OID-RBAC (`PRAECO_CLIENT_CA`) oder optionales JWT (`PRAECO_JWT_PUBLIC_KEY`, `PRAECO_JWT_ISSUER`, `PRAECO_JWT_AUDIENCE`) aktivieren:
 
 ```bash
 cargo run -p https_web_server
@@ -42,6 +42,22 @@ curl -v --http2 --cacert server_certs/self_signed/public_ca.pem \
 
 # WAF-Block durch Inspection-Layer (erwartet: 403 Forbidden)
 curl -i --http2 --cacert server_certs/self_signed/public_ca.pem https://127.0.0.1:8443/admin
+
+# Identität & aufgelöste Rollen prüfen (öffentlich via ["*"])
+curl -v --http2 --cacert server_certs/self_signed/public_ca.pem https://127.0.0.1:8443/whoami
+
+# RBAC-geschützter Admin-Endpunkt ohne Admin-Rolle (erwartet: 403 Forbidden)
+curl -i --http2 --cacert server_certs/self_signed/public_ca.pem https://127.0.0.1:8443/admin/stats
+
+# mTLS mit Client-Zertifikat (OID 1.3.6.1.4.1.65111.1 -> Admin, erfordert PRAECO_CLIENT_CA)
+curl -v --http2 --cacert server_certs/self_signed/public_ca.pem \
+  --cert client_certs/admin_client.pem --key client_certs/admin_client.key \
+  https://127.0.0.1:8443/admin/stats
+
+# Optionales JWT mit Admin-OID "1" (erfordert PRAECO_JWT_PUBLIC_KEY)
+curl -v --http2 --cacert server_certs/self_signed/public_ca.pem \
+  -H "Authorization: Bearer <JWT_TOKEN>" \
+  https://127.0.0.1:8443/admin/stats
 ```
 
 ## HTTP/3 (QUIC) testen

@@ -996,18 +996,21 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "https_web_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
  "bytes",
  "http-body-util",
  "hyper",
+ "jsonwebtoken",
  "praeco-common",
  "praeco-rs",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tower",
@@ -2005,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "praeco-rs"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "arc-swap",

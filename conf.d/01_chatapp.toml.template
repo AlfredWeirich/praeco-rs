@@ -232,7 +232,7 @@
         "2" = "Seller"
     
     [Server.Layers]
-        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
         allow_cidrs = []
@@ -313,6 +313,9 @@
         "/api/GetChatStatus" = ["^/api/GetChatStatus$"]
 
     [Server.rbac]
+        # Default für Dashboard-/Static-Pfade (längeres "/api/*"-Präfix überschreibt dies):
+        "/*"                             = ["Admin", "Seller"]
+
         # Default-Deny für Nicht-Admins auf allen /api/*-Routen (Fail-Closed):
         "/api/*"                         = ["Admin"]
 
@@ -358,20 +361,16 @@
     [Server.ReverseRoutes."/api/GetPraecoStatus"]
         # Interner Praeco Admin- & Telemetrie-Endpunkt (Circuit Breaker, Upstreams, Uptime)
         backend_type = "admin"
-        allowed_roles = ["Admin"]
 
     [Server.ReverseRoutes."/favicon.ico"]
         upstreams = ["https://127.0.0.1:50053/favicon.ico"]
-        allowed_roles = ["Admin", "Seller"]
 
     [Server.ReverseRoutes."/apple-touch-icon"]
         upstreams = ["https://127.0.0.1:50053/apple-touch-icon"]
-        allowed_roles = ["Admin", "Seller"]
 
     [Server.ReverseRoutes."/"]
         upstreams = ["https://127.0.0.1:50053"]
         backend_type = "grpc_passthrough"
-        allowed_roles = ["Admin", "Seller"]
         # Das mTLS-angebundene ChatApp-Admin-Backend verifiziert admin-jwt eigenständig per JWKS:
         strip_cookies = false
         # --- 3-State Circuit Breaker & Outlier-Detection (Defaults) ---

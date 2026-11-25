@@ -269,7 +269,7 @@
             port = 8080
 
             [Layers]
-            enabled = []
+            enabled = ["Rbac"]
 
             [rbac]
             "/api/Admin*" = ["Admin"]
@@ -277,6 +277,10 @@
             "/api/GetDatabaseTables" = ["Admin"]
             "/api/Public*" = ["*"]
             "/api/Blocked" = []
+            "GET /items/*" = ["Viewer", "Admin"]
+            "DELETE /items/*" = ["Admin"]
+            "GET /*" = ["*"]
+            "/admin/*" = ["Admin"]
         "#;
         let mut server: ServerConfig = toml::from_str(toml_str).unwrap();
         assert!(server.finalize().is_ok());
@@ -305,6 +309,105 @@
 
         // Unmatched path
         assert!(compiled.match_path("/other/path").is_none());
+
+        // Method-aware match_request precedence
+        assert_eq!(
+            compiled.match_request("GET", "/items/42").unwrap(),
+            &[UserRole("Viewer".to_string()), UserRole("Admin".to_string())]
+        );
+        assert_eq!(
+            compiled.match_request("DELETE", "/items/42").unwrap(),
+            &[UserRole("Admin".to_string())]
+        );
+        assert!(compiled.match_request("POST", "/items/42").is_none());
+
+        // Longer global prefix "/admin/*" overrides shorter method-specific "GET /*"
+        assert_eq!(
+            compiled.match_request("GET", "/admin/secret").unwrap(),
+            &[UserRole("Admin".to_string())]
+        );
+        assert_eq!(
+            compiled.match_request("GET", "/public/page").unwrap(),
+            &[UserRole("*".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_rbac_layer_config_consistency_and_ordering_validation() {
+        // 1. [rbac] configured without "Rbac" in Layers.enabled -> error
+        let missing_layer = r#"
+            name = "rbac_no_layer"
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+            [Layers]
+            enabled = []
+            [rbac]
+            "/*" = ["*"]
+        "#;
+        let mut srv1: ServerConfig = toml::from_str(missing_layer).unwrap();
+        assert!(srv1.finalize().is_err());
+
+        // 2. "Rbac" in Layers.enabled without [rbac] -> error (fail-closed)
+        let missing_table = r#"
+            name = "rbac_no_table"
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+            [Layers]
+            enabled = ["Rbac"]
+        "#;
+        let mut srv2: ServerConfig = toml::from_str(missing_table).unwrap();
+        assert!(srv2.finalize().is_err());
+
+        // 3. "Rbac" placed BEFORE "JwtAuth" -> error
+        let wrong_order = r#"
+            name = "rbac_before_jwt"
+            protocol = "http"
+            service = "Echo"
+            ip = "127.0.0.1"
+            port = 8080
+            [Layers]
+            enabled = ["Rbac", "JwtAuth"]
+            [Layers.JWT]
+            jwt_public_keys = ["../jwt_creator/public.pem"]
+            expected_issuer = "iss"
+            expected_audience = "aud"
+            [rbac]
+            "/*" = ["Admin"]
+        "#;
+        let mut srv3: ServerConfig = toml::from_str(wrong_order).unwrap();
+        let err = srv3.finalize().unwrap_err();
+        assert!(format!("{err:#}").contains("must come AFTER JwtAuth"));
+
+        // 4. Malformed RBAC keys must fail closed during finalize()
+        for bad_key in [
+            "DELTE /users/*",
+            "users/*",
+            "/users/*/orders",
+            "/api;v=1",
+        ] {
+            let invalid_pattern_toml = format!(
+                r#"
+                name = "rbac_bad_key"
+                protocol = "http"
+                service = "Echo"
+                ip = "127.0.0.1"
+                port = 8080
+                [Layers]
+                enabled = ["Rbac"]
+                [rbac]
+                "{bad_key}" = ["Admin"]
+                "#
+            );
+            let mut srv_bad: ServerConfig = toml::from_str(&invalid_pattern_toml).unwrap();
+            assert!(
+                srv_bad.finalize().is_err(),
+                "Malformed RBAC key '{bad_key}' must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -470,7 +573,7 @@
                 .iter()
                 .find(|s| s.name == "wurzelwerk_admin")
                 .expect("wurzelwerk_admin missing");
-            let rbac = CompiledRbac::from_raw(admin_srv.rbac.as_ref().unwrap());
+            let rbac = CompiledRbac::from_raw(admin_srv.rbac.as_ref().unwrap()).unwrap();
 
             let seller_allowed = [
                 "/api/Logout",
@@ -592,11 +695,13 @@
             authentication = "None"
 
             [Layers]
-            enabled = []
+            enabled = ["Rbac"]
+
+            [rbac]
+            "/api/dashboard" = ["Admin"]
 
             [ReverseRoutes."/api/dashboard"]
             backend_type = "aggregate"
-            allowed_roles = ["Admin"]
 
             [[ReverseRoutes."/api/dashboard".targets]]
             key = "user"
@@ -863,6 +968,7 @@ enabled = []
                 revoke_on_paths: vec![],
                 require_jti: true,
                 max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
+                optional: false,
             }),
             ..Default::default()
         };
@@ -881,6 +987,7 @@ enabled = []
                 revoke_on_paths: vec![],
                 require_jti: true,
                 max_token_lifetime_seconds: common::DEFAULT_MAX_JWT_LIFETIME_SECS,
+                optional: false,
             }),
             ..Default::default()
         };
@@ -888,7 +995,7 @@ enabled = []
             .build_middleware_layers("jwt_aud_test")
             .is_err());
 
-        // Verify TOML defaults and explicit overrides for require_jti and max_token_lifetime_seconds
+        // Verify TOML defaults and explicit overrides for require_jti, max_token_lifetime_seconds, and optional
         let default_jwt_cfg: JwtAuthConfig = toml::from_str(
             r#"
             jwt_public_keys = ["k.pem"]
@@ -898,6 +1005,7 @@ enabled = []
         )
         .expect("default JwtAuthConfig TOML must parse");
         assert!(default_jwt_cfg.require_jti);
+        assert!(!default_jwt_cfg.optional);
         assert_eq!(
             default_jwt_cfg.max_token_lifetime_seconds,
             common::DEFAULT_MAX_JWT_LIFETIME_SECS
@@ -910,10 +1018,12 @@ enabled = []
             expected_audience = "api"
             require_jti = false
             max_token_lifetime_seconds = 0
+            optional = true
             "#,
         )
         .expect("custom JwtAuthConfig TOML must parse");
         assert!(!custom_jwt_cfg.require_jti);
+        assert!(custom_jwt_cfg.optional);
         assert_eq!(custom_jwt_cfg.max_token_lifetime_seconds, 0);
     }
 
@@ -1060,7 +1170,29 @@ enabled = []
         let mut bad_router: ServerConfig = toml::from_str(unprotected_admin_route_toml).unwrap();
         assert!(
             bad_router.finalize().is_err(),
-            "Route backend_type='admin' without auth/roles/rbac must be rejected"
+            "Route backend_type='admin' without auth or Rbac layer must be rejected"
+        );
+
+        let optional_jwt_admin_route_toml = r#"
+            name = "optional_jwt_admin_route"
+            ip = "127.0.0.1"
+            port = 8080
+            service = "Router"
+            authentication = "OptionalJwt"
+            [Layers]
+            enabled = ["JwtAuth"]
+            [Layers.JWT]
+            jwt_public_keys = ["../jwt_creator/public.pem"]
+            expected_issuer = "iss"
+            expected_audience = "aud"
+            [ReverseRoutes."/admin"]
+            backend_type = "admin"
+        "#;
+        let mut bad_optional_router: ServerConfig =
+            toml::from_str(optional_jwt_admin_route_toml).unwrap();
+        assert!(
+            bad_optional_router.finalize().is_err(),
+            "Route backend_type='admin' with OptionalJwt and without Rbac layer must be rejected"
         );
     }
 

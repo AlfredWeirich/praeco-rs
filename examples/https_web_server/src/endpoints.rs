@@ -3,7 +3,7 @@
 use hyper::Request;
 use praeco_rs::{
     SrvBody,
-    web::{Json, Path, Query, TraceId},
+    web::{ClientOids, ClientSan, Json, JwtClaims, Path, Query, TraceId, UserRoles},
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,23 @@ pub struct GreetPayload {
 #[derive(Serialize)]
 pub struct EchoPayload {
     pub body: serde_json::Value,
+    pub trace_id: Option<String>,
+}
+
+/// Response payload for `GET /whoami` exposing caller identity and mapped OID roles.
+#[derive(Serialize)]
+pub struct WhoAmIPayload {
+    pub roles: Vec<String>,
+    pub oids: Vec<String>,
+    pub san: Option<String>,
+    pub jwt_sub: Option<String>,
+}
+
+/// Response payload for `GET /admin/stats` (restricted to the `"Admin"` role via `RbacLayer`).
+#[derive(Serialize)]
+pub struct AdminStatsPayload {
+    pub status: &'static str,
+    pub roles: Vec<String>,
     pub trace_id: Option<String>,
 }
 
@@ -99,4 +116,28 @@ pub async fn echo_json(
     Json(body): Json<serde_json::Value>,
 ) -> Json<EchoPayload> {
     Json(EchoPayload { body, trace_id })
+}
+
+/// `GET /whoami` — Returns resolved roles, OID suffixes, mTLS SAN, and JWT subject (if any).
+pub async fn whoami(
+    UserRoles(roles): UserRoles,
+    ClientOids(oids): ClientOids,
+    ClientSan(san): ClientSan,
+    JwtClaims(claims): JwtClaims,
+) -> Json<WhoAmIPayload> {
+    Json(WhoAmIPayload {
+        roles: roles.into_iter().map(|r| r.0).collect(),
+        oids,
+        san,
+        jwt_sub: claims.map(|c| c.sub),
+    })
+}
+
+/// `GET /admin/stats` — Protected endpoint requiring `"Admin"` role via `RbacLayer`.
+pub async fn admin_stats(UserRoles(roles): UserRoles, TraceId(trace_id): TraceId) -> Json<AdminStatsPayload> {
+    Json(AdminStatsPayload {
+        status: "admin-ok",
+        roles: roles.into_iter().map(|r| r.0).collect(),
+        trace_id,
+    })
 }

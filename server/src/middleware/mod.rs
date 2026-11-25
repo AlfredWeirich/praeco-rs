@@ -25,6 +25,7 @@
 //! | [`logger`] | [`LoggerLayer`] | Request/response logging with client IP and role info. |
 //! | [`path_sanitizer`] | [`PathSanitizerLayer`] | RFC 3986 path canonicalization and directory traversal protection. |
 //! | [`rate_limiter`] | [`SimpleRateLimiterLayer`] / [`TokenBucketRateLimiterLayer`] | Fixed-window and token-bucket rate limiting. |
+//! | [`rbac`] | [`RbacLayer`] | Fail-closed path- and method-based Role-Based Access Control. |
 //! | [`router`] | — | Reverse-proxy routing service (no layer; used as a base service). |
 //! | [`timing`] | [`TimingLayer`] | Request duration measurement and logging. |
 
@@ -57,7 +58,9 @@ pub mod limit;
 pub mod logger;
 /// Rate limiting (simple fixed-window and token-bucket algorithms).
 pub mod rate_limiter;
-/// Reverse-proxy routing service with RBAC and URI rewriting.
+/// Fail-closed path- and method-based Role-Based Access Control middleware.
+pub mod rbac;
+/// Reverse-proxy routing service with URI rewriting and upstream pooling.
 pub mod router;
 /// Security Headers injection layer.
 pub mod security_headers;
@@ -82,6 +85,7 @@ pub use limit::{ConcurrencyLimitLayer, MaxPayloadLayer};
 pub use logger::LoggerLayer;
 pub use path_sanitizer::PathSanitizerLayer;
 pub use rate_limiter::{RateLimitKey, RateLimitKeyStrategy, SimpleRateLimiterLayer, TokenBucketRateLimiterLayer};
+pub use rbac::RbacLayer;
 pub use router::RouterService;
 pub use security_headers::SecurityHeadersLayer;
 pub use timing::TimingLayer;

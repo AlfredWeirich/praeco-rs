@@ -4,6 +4,7 @@
 //! encapsulating tracing setup, TLS certificate paths, hardened middleware
 //! defaults, and graceful `Ctrl+C` shutdown.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -11,9 +12,10 @@ use arc_swap::ArcSwap;
 use praeco_rs::{
     build_service_stack_with_base,
     configuration::{
-        AllowedPathes, ConcurrencyLimitConfig, ConnectionLimitsConfig, DecompressionConfig,
-        IpFilterConfig, Layers, MaxPayloadConfig, Protocol, RateLimitKeyStrategy, ServerCertConfig,
-        ServerConfig, TokenBucketRateLimiterConfig,
+        AllowedPathes, AuthenticationMethod, ClientCertConfig, ConcurrencyLimitConfig,
+        ConnectionLimitsConfig, DecompressionConfig, IpFilterConfig, JwtAuthConfig, Layers,
+        MaxPayloadConfig, Protocol, RateLimitKeyStrategy, ServerCertConfig, ServerConfig,
+        TokenBucketRateLimiterConfig, UserRole,
     },
     start_single_server,
     web::WebRouter,
@@ -39,11 +41,12 @@ fn resolve_workspace_path(env_key: &str, relative_from_root: &str) -> String {
 }
 
 /// Builds a hardened HTTPS + HTTP/3 [`ServerConfig`] purely in Rust, deriving the
-/// `Inspection` WAF allowlist directly from `allowed_pathes` and loading certificates
-/// from `PRAECO_TLS_CERT`/`PRAECO_TLS_KEY` or the default workspace paths.
+/// `Inspection` WAF allowlist and `Rbac` rules directly from the router, and loading
+/// TLS/mTLS/JWT credentials from environment variables or workspace defaults.
 pub fn build_server_config(
     port: u16,
     allowed_pathes: AllowedPathes,
+    rbac_rules: HashMap<String, Vec<UserRole>>,
 ) -> anyhow::Result<Arc<ServerConfig>> {
     let cert_path = resolve_workspace_path(
         "PRAECO_TLS_CERT",
@@ -53,46 +56,98 @@ pub fn build_server_config(
         "PRAECO_TLS_KEY",
         "server_certs/self_signed/praeco_public.key",
     );
-    build_server_config_with_certs(port, allowed_pathes, cert_path, key_path)
+    let client_ca_path = std::env::var("PRAECO_CLIENT_CA").ok();
+    let jwt_pub_key_path = std::env::var("PRAECO_JWT_PUBLIC_KEY").ok();
+    let jwt_config = jwt_pub_key_path.map(|pub_key| JwtAuthConfig {
+        jwt_public_keys: vec![pub_key],
+        cookie_fallback: None,
+        redirect_on_failure: None,
+        expected_issuer: std::env::var("PRAECO_JWT_ISSUER")
+            .unwrap_or_else(|_| "praeco-idp".to_string()),
+        expected_audience: std::env::var("PRAECO_JWT_AUDIENCE")
+            .unwrap_or_else(|_| "https-web-server".to_string()),
+        revoke_on_paths: Vec::new(),
+        require_jti: true,
+        max_token_lifetime_seconds: 86_400,
+        optional: true,
+    });
+    build_server_config_with_options(
+        port,
+        allowed_pathes,
+        rbac_rules,
+        cert_path,
+        key_path,
+        client_ca_path,
+        jwt_config,
+    )
 }
 
 /// Builds a hardened HTTPS + HTTP/3 [`ServerConfig`] with explicit TLS certificate
-/// and private-key paths.
-pub fn build_server_config_with_certs(
+/// paths and optional mTLS client CA (`OptionalClientCert`) or `OptionalJwt` config.
+pub fn build_server_config_with_options(
     port: u16,
     allowed_pathes: AllowedPathes,
+    rbac_rules: HashMap<String, Vec<UserRole>>,
     cert_path: String,
     key_path: String,
+    client_ca_path: Option<String>,
+    jwt_config: Option<JwtAuthConfig>,
 ) -> anyhow::Result<Arc<ServerConfig>> {
+    let (authentication, client_certs) = match (client_ca_path, jwt_config.is_some()) {
+        (Some(ca_path), _) => (
+            AuthenticationMethod::OptionalClientCert,
+            Some(vec![ClientCertConfig {
+                ssl_client_ca: ca_path,
+                ssl_client_crl: None,
+                strict_crl: true,
+            }]),
+        ),
+        (None, true) => (AuthenticationMethod::OptionalJwt, None),
+        (None, false) => (AuthenticationMethod::None, None),
+    };
+
+    let mut enabled_layers = vec![
+        "TraceId".into(),
+        "SecurityHeaders".into(),
+        "AltSvc".into(),
+        "IpFilter".into(),
+        "RateLimiter:TokenBucket".into(),
+        "ConcurrencyLimit".into(),
+        "MaxPayload".into(),
+        "Decompression".into(),
+        "Inspection".into(),
+    ];
+    if jwt_config.is_some() {
+        enabled_layers.push("JwtAuth".into());
+    }
+    enabled_layers.push("Rbac".into());
 
     let mut cfg = ServerConfig {
         name: "https_web_example".into(),
         ip: Some("127.0.0.1".into()),
         port: Some(port),
         protocol: Protocol::Https,
+        authentication,
+        pki_base_oid: Some("1.3.6.1.4.1.65111".into()),
+        oid_mapping: HashMap::from([
+            ("1".into(), UserRole("Admin".into())),
+            ("2".into(), UserRole("Viewer".into())),
+        ]),
         server_certs: Some(ServerCertConfig {
             ssl_certificate: cert_path,
             ssl_certificate_key: key_path,
             ..Default::default()
         }),
+        client_certs,
         connection_limits: ConnectionLimitsConfig {
             max_connections: 1024,
             max_connections_per_ip: 64,
         },
         layers: Layers {
-            // Note: `TraceId` must be first; `Inspection` must come after `Decompression`.
-            enabled: vec![
-                "TraceId".into(),
-                "SecurityHeaders".into(),
-                "AltSvc".into(),
-                "IpFilter".into(),
-                "RateLimiter:TokenBucket".into(),
-                "ConcurrencyLimit".into(),
-                "MaxPayload".into(),
-                "Decompression".into(),
-                "Inspection".into(),
-            ],
+            // Note: `TraceId` must be first; `Inspection` after `Decompression`; `Rbac` after `JwtAuth`.
+            enabled: enabled_layers,
             security_headers_config: Some(Default::default()),
+            jwt_config,
             ip_filter_config: Some(IpFilterConfig {
                 allow_cidrs: vec!["127.0.0.1/32".into(), "::1/128".into()],
                 deny_cidrs: vec![],
@@ -123,6 +178,7 @@ pub fn build_server_config_with_certs(
             ..Default::default()
         },
         allowed_pathes: Some(allowed_pathes),
+        rbac: Some(rbac_rules),
         ..Default::default()
     };
 
@@ -147,7 +203,7 @@ pub async fn run_https_server(router: WebRouter) -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8443);
 
-    let server_cfg = build_server_config(port, router.allowed_pathes())?;
+    let server_cfg = build_server_config(port, router.allowed_pathes(), router.rbac_rules())?;
     let hardened_stack = build_service_stack_with_base(&server_cfg, router.into_service())?;
     let dynamic_stack = Arc::new(ArcSwap::from_pointee(hardened_stack));
 

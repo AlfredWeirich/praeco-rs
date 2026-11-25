@@ -6,12 +6,14 @@
 //! ## Highlights
 //!
 //! - **Composable handlers:** Write plain `async fn`s accepting 0–4 extractors
-//!   ([`Query<T>`], [`Path<T>`], [`PathParams`], [`Json<T>`], [`TraceId`], or raw
+//!   ([`Query<T>`], [`Path<T>`], [`PathParams`], [`Json<T>`], [`TraceId`],
+//!   [`UserRoles`], [`ClientOids`], [`ClientSan`], [`JwtClaims`], or raw
 //!   `Request<SrvBody>`) and returning any [`IntoResponse`] value (`Json<T>`,
 //!   `String`, `&'static str`, `(StatusCode, T)`, `Result<T, E>`, ...).
-//! - **Single source of truth for WAF rules:** Every registered route records its
-//!   `Inspection`-layer allowlist rule automatically (or via `*_with_waf`), and
-//!   [`WebRouter::allowed_pathes`] produces the matching [`AllowedPathes`] config.
+//! - **Single source of truth for WAF & RBAC rules:** Every registered route records
+//!   its `Inspection`-layer allowlist rule automatically (or via `*_with_waf`), and
+//!   routes registered with `*_with_roles` populate [`WebRouter::rbac_rules`] for the
+//!   `Rbac` middleware layer.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -25,8 +27,11 @@ use http_body_util::{BodyExt, Empty, Full};
 use hyper::{Method, Request, Response, StatusCode, header};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::configuration::AllowedPathes;
-use crate::{BoxCloneSyncServiceExt, BoxedCloneService, ServiceRespBody, SrvBody, SrvError};
+use crate::configuration::{AllowedPathes, UserRole};
+use crate::{
+    BoxCloneSyncServiceExt, BoxedCloneService, Claims, OidCertExtension, SanCertExtension,
+    ServiceRespBody, SrvBody, SrvError,
+};
 
 type BoxHandlerFuture =
     Pin<Box<dyn Future<Output = Result<Response<ServiceRespBody>, SrvError>> + Send>>;
@@ -399,6 +404,109 @@ impl FromRequest for TraceId {
     }
 }
 
+/// Extractor for resolved [`UserRole`]s injected by mTLS (`ConnectionHandler`) or
+/// JWT (`JwtAuthLayer`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UserRoles(pub Vec<UserRole>);
+
+impl UserRoles {
+    /// Returns the extracted roles as a slice.
+    pub fn as_slice(&self) -> &[UserRole] {
+        &self.0
+    }
+
+    /// Returns `true` if the caller holds the specified role name.
+    pub fn has_role(&self, role: &str) -> bool {
+        self.0.iter().any(|r| r.0 == role)
+    }
+}
+
+impl FromRequestParts for UserRoles {
+    fn from_request_parts(req: &Request<SrvBody>) -> Result<Self, Rejection> {
+        let roles = crate::middleware::rbac::extract_user_roles_from_extensions(req.extensions())
+            .map(<[UserRole]>::to_vec)
+            .unwrap_or_default();
+        Ok(Self(roles))
+    }
+}
+
+impl FromRequest for UserRoles {
+    fn from_request(req: Request<SrvBody>) -> BoxExtractFuture<Self> {
+        Box::pin(std::future::ready(
+            Self::from_request_parts(&req).map_err(ExtractError::from),
+        ))
+    }
+}
+
+/// Extractor for raw OID suffixes from either an mTLS client certificate
+/// ([`OidCertExtension`]) or verified JWT [`Claims`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientOids(pub Vec<String>);
+
+impl FromRequestParts for ClientOids {
+    fn from_request_parts(req: &Request<SrvBody>) -> Result<Self, Rejection> {
+        let oids = req
+            .extensions()
+            .get::<OidCertExtension>()
+            .map(|ext| ext.0.as_ref().clone())
+            .or_else(|| {
+                req.extensions()
+                    .get::<Claims>()
+                    .map(|claims| claims.oids.clone())
+            })
+            .unwrap_or_default();
+        Ok(Self(oids))
+    }
+}
+
+impl FromRequest for ClientOids {
+    fn from_request(req: Request<SrvBody>) -> BoxExtractFuture<Self> {
+        Box::pin(std::future::ready(
+            Self::from_request_parts(&req).map_err(ExtractError::from),
+        ))
+    }
+}
+
+/// Extractor for the client certificate's Subject Alternative Name (SAN) injected on mTLS connections.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientSan(pub Option<String>);
+
+impl FromRequestParts for ClientSan {
+    fn from_request_parts(req: &Request<SrvBody>) -> Result<Self, Rejection> {
+        let san = req
+            .extensions()
+            .get::<SanCertExtension>()
+            .map(|ext| ext.as_ref().to_owned());
+        Ok(Self(san))
+    }
+}
+
+impl FromRequest for ClientSan {
+    fn from_request(req: Request<SrvBody>) -> BoxExtractFuture<Self> {
+        Box::pin(std::future::ready(
+            Self::from_request_parts(&req).map_err(ExtractError::from),
+        ))
+    }
+}
+
+/// Extractor for verified JWT [`Claims`] injected by [`JwtAuthLayer`](crate::middleware::JwtAuthLayer).
+#[derive(Clone, Debug, Default)]
+pub struct JwtClaims(pub Option<Claims>);
+
+impl FromRequestParts for JwtClaims {
+    fn from_request_parts(req: &Request<SrvBody>) -> Result<Self, Rejection> {
+        Ok(Self(req.extensions().get::<Claims>().cloned()))
+    }
+}
+
+impl FromRequest for JwtClaims {
+    fn from_request(req: Request<SrvBody>) -> BoxExtractFuture<Self> {
+        Box::pin(std::future::ready(
+            Self::from_request_parts(&req).map_err(ExtractError::from),
+        ))
+    }
+}
+
 /// JSON wrapper serving as both a **request body extractor** ([`FromRequest`])
 /// and a **response type** ([`IntoResponse`]).
 ///
@@ -496,6 +604,7 @@ impl_handler!([T1: t1, T2: t2, T3: t3], T4: t4);
 pub struct WebRouter {
     routes: HashMap<Method, matchit::Router<BoxedHandler>>,
     waf_rules: HashMap<Method, HashMap<String, Vec<String>>>,
+    rbac_rules: HashMap<String, Vec<UserRole>>,
 }
 
 impl WebRouter {
@@ -527,11 +636,59 @@ impl WebRouter {
     /// Registers a handler for `method` and `path` together with an explicit
     /// `Inspection`-layer WAF allowlist entry (`waf_key` -> `waf_regex`).
     pub fn route_with_waf<H, T>(
+        self,
+        method: Method,
+        path: &str,
+        waf_key: &str,
+        waf_regex: &str,
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.register_route(method, path, waf_key, waf_regex, None, handler)
+    }
+
+    /// Registers a handler for `method` and `path` with an auto-derived WAF rule
+    /// and a declarative RBAC rule (`roles`, e.g. `&["Admin"]` or `&["*"]`) for [`Self::rbac_rules`].
+    pub fn route_with_roles<H, T>(
+        self,
+        method: Method,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        let (waf_key, waf_regex) = derive_default_waf_rule(path);
+        self.register_route(method, path, &waf_key, &waf_regex, Some(roles), handler)
+    }
+
+    /// Registers a handler for `method` and `path` with an explicit WAF allowlist entry
+    /// and declarative RBAC roles (`roles`) for [`Self::rbac_rules`].
+    pub fn route_with_waf_and_roles<H, T>(
+        self,
+        method: Method,
+        path: &str,
+        waf_key: &str,
+        waf_regex: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.register_route(method, path, waf_key, waf_regex, Some(roles), handler)
+    }
+
+    fn register_route<H, T>(
         mut self,
         method: Method,
         path: &str,
         waf_key: &str,
         waf_regex: &str,
+        roles: Option<&[&str]>,
         handler: H,
     ) -> Result<Self, WebRouterError>
     where
@@ -548,11 +705,17 @@ impl WebRouter {
             })?;
 
         self.waf_rules
-            .entry(method)
+            .entry(method.clone())
             .or_default()
             .entry(waf_key.to_owned())
             .or_default()
             .push(waf_regex.to_owned());
+
+        if let Some(allowed) = roles {
+            let rbac_key = derive_rbac_key(&method, path);
+            let mapped = allowed.iter().map(|r| UserRole((*r).to_owned())).collect();
+            self.rbac_rules.insert(rbac_key, mapped);
+        }
 
         Ok(self)
     }
@@ -579,6 +742,34 @@ impl WebRouter {
         self.route_with_waf(Method::GET, path, waf_key, waf_regex, handler)
     }
 
+    /// Shorthand for registering a `GET` route with an auto-derived WAF rule and RBAC roles.
+    pub fn get_with_roles<H, T>(
+        self,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_roles(Method::GET, path, roles, handler)
+    }
+
+    /// Shorthand for registering a `GET` route with an explicit WAF rule and RBAC roles.
+    pub fn get_with_waf_and_roles<H, T>(
+        self,
+        path: &str,
+        waf_key: &str,
+        waf_regex: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_waf_and_roles(Method::GET, path, waf_key, waf_regex, roles, handler)
+    }
+
     /// Shorthand for registering a `POST` route with an auto-derived WAF rule.
     pub fn post<H, T>(self, path: &str, handler: H) -> Result<Self, WebRouterError>
     where
@@ -601,12 +792,53 @@ impl WebRouter {
         self.route_with_waf(Method::POST, path, waf_key, waf_regex, handler)
     }
 
+    /// Shorthand for registering a `POST` route with an auto-derived WAF rule and RBAC roles.
+    pub fn post_with_roles<H, T>(
+        self,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_roles(Method::POST, path, roles, handler)
+    }
+
+    /// Shorthand for registering a `POST` route with an explicit WAF rule and RBAC roles.
+    pub fn post_with_waf_and_roles<H, T>(
+        self,
+        path: &str,
+        waf_key: &str,
+        waf_regex: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_waf_and_roles(Method::POST, path, waf_key, waf_regex, roles, handler)
+    }
+
     /// Shorthand for registering a `PUT` route with an auto-derived WAF rule.
     pub fn put<H, T>(self, path: &str, handler: H) -> Result<Self, WebRouterError>
     where
         H: Handler<T>,
     {
         self.route(Method::PUT, path, handler)
+    }
+
+    /// Shorthand for registering a `PUT` route with an auto-derived WAF rule and RBAC roles.
+    pub fn put_with_roles<H, T>(
+        self,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_roles(Method::PUT, path, roles, handler)
     }
 
     /// Shorthand for registering a `DELETE` route with an auto-derived WAF rule.
@@ -617,12 +849,38 @@ impl WebRouter {
         self.route(Method::DELETE, path, handler)
     }
 
+    /// Shorthand for registering a `DELETE` route with an auto-derived WAF rule and RBAC roles.
+    pub fn delete_with_roles<H, T>(
+        self,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_roles(Method::DELETE, path, roles, handler)
+    }
+
     /// Shorthand for registering a `PATCH` route with an auto-derived WAF rule.
     pub fn patch<H, T>(self, path: &str, handler: H) -> Result<Self, WebRouterError>
     where
         H: Handler<T>,
     {
         self.route(Method::PATCH, path, handler)
+    }
+
+    /// Shorthand for registering a `PATCH` route with an auto-derived WAF rule and RBAC roles.
+    pub fn patch_with_roles<H, T>(
+        self,
+        path: &str,
+        roles: &[&str],
+        handler: H,
+    ) -> Result<Self, WebRouterError>
+    where
+        H: Handler<T>,
+    {
+        self.route_with_roles(Method::PATCH, path, roles, handler)
     }
 
     /// Builds an [`AllowedPathes`] WAF allowlist covering all routes registered
@@ -636,6 +894,13 @@ impl WebRouter {
             patch: self.waf_rules.get(&Method::PATCH).cloned(),
             head: self.waf_rules.get(&Method::HEAD).cloned(),
         }
+    }
+
+    /// Builds a method-aware RBAC rule map (`"METHOD /path"` -> `Vec<UserRole>`) from all
+    /// routes registered via `*_with_roles`, ready to attach to `ServerConfig::rbac` when
+    /// the `"Rbac"` layer is enabled (fail-closed for any route without an RBAC entry).
+    pub fn rbac_rules(&self) -> HashMap<String, Vec<UserRole>> {
+        self.rbac_rules.clone()
     }
 
     /// Converts this router into a [`BoxedCloneService`] compatible with
@@ -686,6 +951,14 @@ impl WebRouter {
             }
         })
         .boxed_clone_sync()
+    }
+}
+
+/// Derives a method-scoped RBAC key (e.g. `"GET /healthz"` or `"DELETE /users/*"`) from a `matchit` route.
+fn derive_rbac_key(method: &Method, path: &str) -> String {
+    match path.find('{') {
+        Some(first_brace) => format!("{} {}*", method.as_str(), &path[..first_brace]),
+        None => format!("{} {}", method.as_str(), path),
     }
 }
 
@@ -823,6 +1096,75 @@ mod tests {
             .oneshot(make_req(Method::GET, "/missing", None))
             .await?;
         assert_eq!(res_404.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_auth_extractors_and_rbac_rules_generation() -> Result<(), Box<dyn std::error::Error>>
+    {
+        async fn whoami(
+            UserRoles(roles): UserRoles,
+            ClientOids(oids): ClientOids,
+            ClientSan(san): ClientSan,
+            JwtClaims(claims): JwtClaims,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "roles": roles.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+                "oids": oids,
+                "san": san,
+                "sub": claims.map(|c| c.sub),
+            }))
+        }
+
+        async fn delete_user(Path(id): Path<String>) -> String {
+            format!("deleted {id}")
+        }
+
+        let router = WebRouter::new()
+            .get_with_roles("/whoami", &["*"], whoami)?
+            .get_with_roles("/users/{id}", &["Viewer", "Admin"], whoami)?
+            .delete_with_roles("/users/{id}", &["Admin"], delete_user)?;
+
+        let rules = router.rbac_rules();
+        assert_eq!(rules.get("GET /whoami"), Some(&vec![UserRole("*".to_string())]));
+        assert_eq!(
+            rules.get("GET /users/*"),
+            Some(&vec![
+                UserRole("Viewer".to_string()),
+                UserRole("Admin".to_string())
+            ])
+        );
+        assert_eq!(
+            rules.get("DELETE /users/*"),
+            Some(&vec![UserRole("Admin".to_string())])
+        );
+
+        let svc = router.into_service();
+        let mut req = make_req(Method::GET, "/whoami", None);
+        let mut role_vec = crate::configuration::RoleVec::<6>::new();
+        role_vec.push(UserRole("Admin".to_string()));
+        req.extensions_mut().insert(Arc::new(role_vec));
+        req.extensions_mut()
+            .insert(OidCertExtension::from(vec!["1".to_string()]));
+        req.extensions_mut()
+            .insert(SanCertExtension::from("alice.example.com".to_string()));
+        req.extensions_mut().insert(Claims {
+            sub: "alice".to_string(),
+            iss: "idp".to_string(),
+            aud: Some("web".to_string()),
+            exp: 9_999_999_999,
+            oids: vec!["1".to_string()],
+            jti: Some("jti-1".to_string()),
+        });
+
+        let res = svc.oneshot(req).await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&res.collect().await?.to_bytes())?;
+        assert_eq!(json["roles"], serde_json::json!(["Admin"]));
+        assert_eq!(json["oids"], serde_json::json!(["1"]));
+        assert_eq!(json["san"], "alice.example.com");
+        assert_eq!(json["sub"], "alice");
 
         Ok(())
     }

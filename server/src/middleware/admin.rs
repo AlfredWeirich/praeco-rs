@@ -917,11 +917,23 @@ pub fn handle_admin_request_with_prefix(
     if *method == Method::POST && !query.is_empty() {
         let is_unauthenticated_standalone = mount_prefix.is_none()
             && fallback_server.is_some_and(|srv| {
+                let has_strict_jwt = srv.layers.enabled.iter().any(|l| {
+                    l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
+                }) && srv.authentication != crate::configuration::AuthenticationMethod::OptionalJwt
+                    && !srv.layers.jwt_config.as_ref().is_some_and(|c| c.optional);
+                let has_rbac = srv
+                    .layers
+                    .enabled
+                    .iter()
+                    .any(|l| l.eq_ignore_ascii_case("Rbac"));
                 srv.service == crate::configuration::ServiceType::Admin
-                    && srv.authentication == crate::configuration::AuthenticationMethod::None
-                    && !srv.layers.enabled.iter().any(|l| {
-                        l.eq_ignore_ascii_case("JwtAuth") || l.eq_ignore_ascii_case("JWT")
-                    })
+                    && matches!(
+                        srv.authentication,
+                        crate::configuration::AuthenticationMethod::None
+                            | crate::configuration::AuthenticationMethod::OptionalJwt
+                    )
+                    && !has_strict_jwt
+                    && !has_rbac
             });
 
         if is_unauthenticated_standalone {
@@ -1048,7 +1060,6 @@ mod tests {
         let route = ParsedRoute {
             prefix: "/".to_string(),
             target,
-            allowed_roles: Vec::new(),
             backend_type: RouteBackendType::GrpcPassthrough,
             aggregate_targets: Vec::new(),
             aggregate_payload_mode: crate::configuration::AggregatePayloadMode::default(),

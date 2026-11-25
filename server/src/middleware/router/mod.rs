@@ -32,7 +32,6 @@ pub(crate) mod grpc_passthrough;
 pub(crate) mod grpc_web;
 pub(crate) mod headers;
 pub(crate) mod http_proxy;
-pub(crate) mod rbac;
 pub(crate) mod upstreams;
 
 pub use grpc_web::build_grpc_pool;
@@ -449,15 +448,6 @@ impl Service<Request<SrvBody>> for RouterService {
                 }
             };
             let route_info = matched.value;
-
-            if let Err(forbidden_response) = rbac::enforce_rbac(
-                &parts,
-                route_info,
-                self_clone.config.compiled_rbac.as_deref(),
-                server_name,
-            ) {
-                return Ok(*forbidden_response);
-            }
 
             // Internal Admin / Telemetry route (`backend_type = "admin"`) is answered directly in-memory
             if route_info.backend_type == RouteBackendType::Admin {

@@ -1237,7 +1237,7 @@ async fn test_run_dual_stack_http2_and_http3_quic_end_to_end() {
 /// End-to-End Integration Test for `RouteBackendType::Aggregate` through `build_service_stack`
 /// and `RouterService`:
 /// - `GET /health` reports `200 OK` when aggregate sub-target upstreams are available.
-/// - Route-level RBAC (`allowed_roles = ["Admin"]`) rejects unprivileged callers (`403 Forbidden`)
+/// - `RbacLayer` (`[Server.rbac]`) rejects unprivileged callers (`403 Forbidden`)
 ///   before fanning out.
 /// - Authorized callers trigger parallel fan-out across mixed REST targets and receive the merged
 ///   JSON response with Praeco's hardened response headers.
@@ -1293,8 +1293,11 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
 
         [Server.ReverseRoutes."/api/dashboard"]
         backend_type = "aggregate"
-        allowed_roles = ["Admin"]
         max_request_bytes = 64
+
+        [Server.rbac]
+        "/health" = ["*"]
+        "/api/dashboard" = ["Admin"]
 
         [[Server.ReverseRoutes."/api/dashboard".targets]]
         key = "profile"
@@ -1313,7 +1316,7 @@ async fn test_router_service_aggregate_route_end_to_end_with_rbac_and_health() {
         required = true
 
         [Server.Layers]
-        enabled = ["TraceId", "SecurityHeaders"]
+        enabled = ["TraceId", "SecurityHeaders", "Rbac"]
 
         [Server.Layers.SecurityHeaders]
         content_security_policy = "default-src 'self'"

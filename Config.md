@@ -453,7 +453,7 @@ Can be mounted in two ways:
 1. **Standalone Server (`service = "Admin"`):** Dedicated internal listener (e.g. `127.0.0.1:9090`) strictly serving `/status`, `/upstreams`, `/metrics` (Prometheus exposition format), `/healthz`, and `/health`. Any unrecognized path returns `404 Not Found` (`{"error":"Not Found"}`).
    - **Security Guardrail (Unauthenticated Standalone Admin):** When `authentication = "None"`, `ServerConfig::finalize()` requires `ip` to be a loopback address (`127.0.0.1` or `::1`), disallows `[Server.tunnel]`, and enforces **strict read-only mode** (`POST ?action=...` returns `403 Forbidden`).
 2. **Internal Router Route (`backend_type = "admin"`):** Mounted under any custom path inside an existing `service = "Router"` server (e.g. `[Server.ReverseRoutes."/api/GetPraecoStatus"]`, `upstreams` may be omitted or `[]`), inheriting that server's SNI tunnel, TLS, JWT/mTLS authentication, and RBAC rules. Accepts the mounted prefix itself (`/`), `/status`, `/upstreams`, `/metrics`, `/healthz`, and `/health` relative to the route prefix (`404 Not Found` for unknown sub-paths). Supports optional `POST` circuit control queries (`?action=mark_dead&upstream=<uri>` or `?action=mark_alive&upstream=<uri>`).
-   - **Security Guardrail (Auth & Anti-CSRF / Audit):** Mounted `backend_type = "admin"` routes **require** authentication (`ClientCert`, `OptionalClientCert`, or active `"JWT"` layer) or explicit non-wildcard RBAC (`allowed_roles` / `[Server.rbac]`). `POST` control actions reject cross-site browser requests (`Sec-Fetch-Site` other than `same-origin`/`none`) and emit `admin::audit` warning logs.
+   - **Security Guardrail (Auth & Anti-CSRF / Audit):** Mounted `backend_type = "admin"` routes **require** authentication (`ClientCert`, `OptionalClientCert`, or active `"JWT"` layer) or an active `"Rbac"` layer with `[Server.rbac]`. `POST` control actions reject cross-site browser requests (`Sec-Fetch-Site` other than `same-origin`/`none`) and emit `admin::audit` warning logs.
 
 #### Exposed Prometheus Metrics (`/metrics`)
 - **Process & Auth:** `praeco_uptime_seconds`, `praeco_revoked_jwt_tokens`
@@ -526,7 +526,6 @@ Routes are matched using **longest prefix first**. The matched prefix is strippe
 | `strategy` | String | Optional | `"RoundRobin"` | Load balancing strategy: `"RoundRobin"`, `"LeastConnections"`, `"Random"`, `"Sticky"` (client IP hash), or `"HighestScore"` (routes to upstream reporting highest score in active health checks). |
 | `backend_type` | String | Optional | `"rest"` | Upstream protocol handler: `"rest"`, `"grpc_passthrough"` (transparent HTTP/2 gRPC framing), `"grpc"` / `"grpc_transcoding"` (JSON-to-Protobuf transcoding via gRPC reflection; bounded by `max_response_bytes` and the 256 MiB global response buffer budget), `"admin"` (internal Praeco telemetry & circuit-breaker status endpoint), or `"aggregate"` / `"fanout"` (parallel fan-out aggregator across REST and gRPC-transcoding sub-targets). |
 | `targets` | Array of Tables | **Mandatory** for `aggregate` | `[]` | Sub-target definitions (`[[Server.ReverseRoutes."/path".targets]]`) when `backend_type = "aggregate"`. Each target specifies `key`, `backend_type` (`"rest"` or `"grpc_transcoding"`), `upstreams`, `path`, optional `method`, and `required` (default `true`). |
-| `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC. Empty `[]` means unrestricted public access. If roles are listed (e.g. `["Admin", "Seller"]`), caller must hold at least one matching role. |
 | `cooldown_seconds` | Integer | Optional | `10` | Seconds a dead (`CircuitState::Open`) upstream is benched before a single probe request is allowed in `HalfOpen` state. |
 | `max_retries` | Integer | Optional | `2` | Automatic retries on alternate healthy nodes (on TCP/timeout errors or `502`/`503`/`504` outlier responses) before returning to client. |
 | `failure_threshold` | Integer | Optional | `3` | Consecutive upstream `502`/`503`/`504` (or gRPC `14 UNAVAILABLE`) responses before the 3-State Circuit Breaker trips to `Open`. Hard TCP/timeout failures trip immediately; a single failure in `HalfOpen` re-opens immediately. |
@@ -628,7 +627,6 @@ When proxying gRPC streams, failures can originate either from the backend or th
 upstreams = ["https://10.0.0.1:50051", "https://10.0.0.2:50051"]
 strategy = "LeastConnections"
 backend_type = "grpc_passthrough"
-allowed_roles = ["Admin", "Customer"]
 cooldown_seconds = 10
 max_retries = 2
 active_health_check_interval = 30
@@ -685,7 +683,6 @@ Client (Browser)                      Praeco Router                      Backend
 upstreams = ["https://10.0.0.1:50051"]
 strategy = "RoundRobin"
 backend_type = "grpc" # Enables dynamic transcoding
-allowed_roles = ["Admin", "Seller"]
 ```
 
 #### Parallel Fan-Out Aggregator (`backend_type = "aggregate"`)
@@ -706,7 +703,6 @@ An `aggregate` route accepts a single client `GET` or `POST` request (other HTTP
 | `deadline_ms` | Integer | Optional | `None` | Overall route-wide deadline in milliseconds capping all concurrent sub-requests. When exceeded, unfinished `required = true` targets abort the route with `504 Gateway Timeout`; unfinished `required = false` targets degrade to `null` + `504` in `_errors`. |
 | `max_request_bytes` | Integer | Optional | `4194304` (4 MiB) | Maximum incoming request body size buffered in RAM (`> 0`). Oversized payloads are rejected early with `413 Payload Too Large`. |
 | `max_response_bytes` | Integer | Optional | `4194304` (4 MiB) | Cumulative response memory cap across all sub-targets (`> 0`, returning `502 Bad Gateway` if exceeded). Additionally bounded by the process-wide 256 MiB `BufferBudget` (`503 Service Unavailable` when exhausted), with incremental RAII memory release as `ChunkedBytesBody` streams frames to Hyper. |
-| `allowed_roles` | Array of Strings | Optional | `[]` (Public) | Route-level RBAC enforced before fan-out (`403 Forbidden` if caller lacks a matching mTLS OID or JWT role). |
 
 ##### Sub-Target Parameters (`[[Server.ReverseRoutes."/path".targets]]`)
 
@@ -740,7 +736,6 @@ expose_upstream_errors = false  # default: sanitized HTTP reason phrases only
 deadline_ms = 2000              # optional route-wide deadline
 max_request_bytes = 1048576     # optional request cap (default: 4 MiB)
 max_response_bytes = 8388608    # optional cumulative response cap (default: 4 MiB)
-allowed_roles = ["Admin", "Seller"]
 
 [[Server.ReverseRoutes."/api/dashboard".targets]]
 key = "user"
@@ -942,13 +937,17 @@ When errors occur during gRPC proxying, Praeco maps them consistently to standar
 
 ---
 
-## Granular Path-Level RBAC (`[Server.rbac]`)
+## Granular Path-Level RBAC (`[Server.rbac]`, `"Rbac"` Layer)
 
-Enforces method- and path-level privilege separation within the same route prefix:
+Enforces **fail-closed** method- and path-level Role-Based Access Control via `RbacLayer` across any base service (`Router`, `WebRouter`, `StaticFiles`, `Admin`, or embedded Tonic gRPC). Requires `"Rbac"` in `[Server.Layers].enabled` (placed **after** `"JwtAuth"` when JWT auth is enabled).
 
 ```toml
 [Server.rbac]
-# Exact match (O(1) lookup)
+# Method-specific exact or wildcard prefix rules (e.g. "GET /users/*", "DELETE /users/*")
+"GET /users/*"                        = ["Viewer", "Admin"]
+"DELETE /users/*"                     = ["Admin"]
+
+# Method-agnostic exact match (O(1) lookup)
 "/chat.ChatService/AdminDeleteUser"   = ["Admin"]
 
 # Wildcard prefix match (ends with '*')
@@ -961,15 +960,16 @@ Enforces method- and path-level privilege separation within the same route prefi
 "/chat.ChatService/InternalSecret"    = []
 
 # Public override (wildcard '*' permits all callers)
+"/health"                             = ["*"]
 "/chat.ChatService/PublicPing"        = ["*"]
 ```
 
 ### Precedence:
-1. **Matrix Parameter Rejection:** Request paths containing semicolon matrix parameters (`;` / `%3b`) are rejected fail-closed (`400 Bad Request` by `PathSanitizerLayer`, `403 Forbidden` inside `enforce_rbac`).
-2. **Exact Path Match (Trailing-Slash Normalized):** Exact non-root keys normalize trailing slashes (so an exact rule for `"/api/Admin"` also matches `"/api/Admin/"`) and are enforced first.
-3. **Longest Prefix Wildcard Match:** Evaluates keys ending with `*` in descending order of prefix length.
+1. **Matrix Parameter Rejection:** Request paths containing semicolon matrix parameters (`;` / `%3b`) are rejected fail-closed (`400 Bad Request` by `PathSanitizerLayer`, `403 Forbidden` inside `RbacLayer`).
+2. **Method-Specific Exact Match → Method-Agnostic Exact Match (Trailing-Slash Normalized):** Exact non-root keys normalize trailing slashes (so `"/api/Admin"` also matches `"/api/Admin/"`).
+3. **Longest Prefix Across `"METHOD /prefix*"` & `"/prefix*"`:** Evaluates keys ending with `*` in descending order of prefix length across both method-specific and method-agnostic prefixes (method-specific rules win ties at equal prefix length).
 4. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
-5. **Fallback to Route `allowed_roles`:** If no rule in `[Server.rbac]` matches, falls back to the enclosing route's `allowed_roles`.
+5. **Unmatched Paths = Fail-Closed (`403 Forbidden`):** If no rule in `[Server.rbac]` matches, `RbacLayer` rejects the request with `403 Forbidden`. Public endpoints (such as `"/health"`) must be explicitly allowed via `["*"]`.
 
 ---
 
@@ -1005,7 +1005,8 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 ### Ordering Constraints & Execution Model
 1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0). It extracts an incoming W3C `traceparent` (or `x-trace-id`) header—or synthesizes a fresh `00-{trace-id}-{span-id}-01` identifier—and links the OpenTelemetry parent context to the request span before downstream layers run.
 2. **`Inspection` After `Decompression`:** If both are enabled, `"Inspection"` must appear after `"Decompression"`. Otherwise, the WAF inspects compressed bytes.
-3. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
+3. **`Rbac` After `JwtAuth`:** If both `"Rbac"` and `"JwtAuth"` (or `"JWT"`) are enabled, `"Rbac"` must appear after `"JwtAuth"` so JWT claims and mapped `UserRole`s are populated before role enforcement.
+4. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
 
 ---
 
@@ -1061,6 +1062,7 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 | `revoke_on_paths` | Array of Strings | Optional | `[]` | Request paths (e.g. `["/api/Logout"]`) on which a validated JWT's `jti` is automatically added to the global `JwtRevocationStore`. |
 | `require_jti` | Boolean | Optional | `true` | Requires every incoming JWT to carry a non-empty `jti` claim (`<= 256` bytes) so tokens cannot bypass `JwtRevocationStore` revocation. |
 | `max_token_lifetime_seconds` | Integer (`u64`) | Optional | `2592000` (30 days) | Maximum allowed remaining token lifetime (`exp - now`) in seconds. Rejects tokens with excessively far-future `exp` timestamps. Set to `0` to disable the upper bound. |
+| `optional` | Boolean | Optional | `false` | When `true` (or `authentication = "OptionalJwt"`), requests without a token pass through as `Guest` so downstream `RbacLayer` rules can allow public `["*"]` endpoints while invalid, expired, or revoked tokens still fail with `401 Unauthorized`. |
 
 #### `[Server.Layers.RateLimiter]` (Simple Fixed-Window)
 | Parameter | Data Type | Requirement | Default Value | Description |
@@ -1293,7 +1295,6 @@ key_by = "identity"
 upstreams = ["https://127.0.0.1:50051"]
 strategy = "RoundRobin"
 backend_type = "grpc_passthrough"
-allowed_roles = ["Admin", "Seller", "Viewer"]
 active_health_check_interval = 60
 
 [Server.RouterParams]
