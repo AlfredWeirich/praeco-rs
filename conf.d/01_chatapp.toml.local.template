@@ -21,7 +21,7 @@
     pki_base_oid = "1.3.6.1.4.1.65111"
 
     [Server.Layers]
-    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
 
     [Server.Layers.IpFilter]
     allow_cidrs = []
@@ -132,6 +132,62 @@
     max_capacity = 1000     
     refill = 50           
     duration_micros = 10000 
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/SearchPublic"]
+    ttl_seconds = 60
+    scope = "public"
+    namespace = "chatapp_discovery"
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/SearchRides"]
+    ttl_seconds = 30
+    scope = "public"
+    namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/GetRide"]
+    ttl_seconds = 30
+    scope = "public"
+    namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/SearchRideRequests"]
+    ttl_seconds = 30
+    scope = "public"
+    namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/FetchRideRequest"]
+    ttl_seconds = 30
+    scope = "public"
+    namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /chat.ChatService/GetRoomProducts"]
+    ttl_seconds = 20
+    scope = "per_subject"
+    namespace = "chatapp_shop_products"
+
+    [Server.Layers.Cache.invalidations]
+    "POST /chat.ChatService/CreateConversation" = ["chatapp_discovery"]
+    "POST /chat.ChatService/DeleteConversation" = ["chatapp_discovery", "chatapp_shop_products"]
+    "POST /chat.ChatService/JoinConversation" = ["chatapp_discovery"]
+    "POST /chat.ChatService/AddMember" = ["chatapp_discovery"]
+    "POST /chat.ChatService/RemoveMember" = ["chatapp_discovery", "chatapp_shop_products"]
+    "POST /chat.ChatService/CreateRide" = ["chatapp_rides"]
+    "POST /chat.ChatService/UpdateRide" = ["chatapp_rides"]
+    "POST /chat.ChatService/CancelRide" = ["chatapp_rides"]
+    "POST /chat.ChatService/HardDeleteRide" = ["chatapp_rides"]
+    "POST /chat.ChatService/BookRide" = ["chatapp_rides"]
+    "POST /chat.ChatService/UpdateBookingStatus" = ["chatapp_rides"]
+    "POST /chat.ChatService/SubmitRideRequest" = ["chatapp_rides"]
+    "POST /chat.ChatService/UpdateRideRequest" = ["chatapp_rides"]
+    "POST /chat.ChatService/DeleteRideRequest" = ["chatapp_rides"]
+    "POST /chat.ChatService/HardDeleteRideRequest" = ["chatapp_rides"]
+    "POST /chat.ChatService/MatchRideRequest" = ["chatapp_rides"]
+    "POST /chat.ChatService/CreateRoomProduct" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/UpdateRoomProduct" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/DeleteRoomProduct" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/AddToCart" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/RemoveFromCart" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/CheckoutCart" = ["chatapp_shop_products"]
+    "POST /chat.ChatService/BlockDevice" = ["chatapp_discovery", "chatapp_rides", "chatapp_shop_products"]
+    "POST /chat.ChatService/RemoveDevice" = ["chatapp_discovery", "chatapp_rides", "chatapp_shop_products"]
 
 [[Server]]
 # =============================================================================
@@ -261,6 +317,38 @@
     [Server.Layers.Cache.rules."/apple-touch-icon*"]
         ttl_seconds = 3600
         scope = "public"
+
+    [Server.Layers.Cache.rules."POST /api/AdminGetRides"]
+        ttl_seconds = 30
+        scope = "per_subject"
+        namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /api/AdminGetRideRequests"]
+        ttl_seconds = 30
+        scope = "per_subject"
+        namespace = "chatapp_rides"
+
+    [Server.Layers.Cache.rules."POST /api/AdminGetProducts"]
+        ttl_seconds = 20
+        scope = "per_subject"
+        namespace = "chatapp_shop_products"
+
+    [Server.Layers.Cache.invalidations]
+        "POST /api/AdminCreateRoom" = ["chatapp_discovery"]
+        "POST /api/AdminCreateChannel" = ["chatapp_discovery"]
+        "POST /api/AdminDeleteRoom" = ["chatapp_discovery", "chatapp_shop_products"]
+        "POST /api/AdminAddMember" = ["chatapp_discovery"]
+        "POST /api/AdminRemoveMember" = ["chatapp_discovery", "chatapp_shop_products"]
+        "POST /api/AdminAddSellerToRoom" = ["chatapp_discovery"]
+        "POST /api/AdminRemoveSellerFromRoom" = ["chatapp_discovery", "chatapp_shop_products"]
+        "POST /api/AdminDeleteRide" = ["chatapp_rides"]
+        "POST /api/AdminDeleteRideReq" = ["chatapp_rides"]
+        "POST /api/AdminAddProduct" = ["chatapp_shop_products"]
+        "POST /api/AdminDeleteProduct" = ["chatapp_shop_products"]
+        "POST /api/AdminUpdateProductCreator" = ["chatapp_shop_products"]
+        "POST /api/AdminBlockDevice" = ["chatapp_discovery", "chatapp_rides", "chatapp_shop_products"]
+        "POST /api/AdminRemoveDevice" = ["chatapp_discovery", "chatapp_rides", "chatapp_shop_products"]
+        "POST /api/AdminDeleteUser" = ["chatapp_discovery", "chatapp_rides", "chatapp_shop_products"]
     
     [Server.AllowedPathes.GET]
         "/admin" = ["^/admin$"]
