@@ -27,7 +27,7 @@ use tokio::task::JoinSet;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::sync::CancellationToken;
 use tower::Layer;
-use tracing::{ Instrument, Level, error, info, info_span, trace, warn};
+use tracing::{Instrument, Level, debug, error, info, info_span, trace, warn};
 
 use crate::{
     BoxCloneSyncService, BoxCloneSyncServiceExt, BoxedCloneService, ConnectionHandler, SrvBody,
@@ -865,6 +865,26 @@ pub async fn serve_http_connection<S>(
     }
 }
 
+/// Returns `true` for benign peer disconnects before TLS handshake completion
+/// (for example speculative browser preconnects or HTTP/2 connection pooling drops).
+fn is_benign_tls_handshake_disconnect(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Logs TLS handshake failures at `debug` for benign peer disconnects and `warn` otherwise.
+fn log_tls_handshake_error(server_name: &str, peer_addr: SocketAddr, err: &std::io::Error) {
+    if is_benign_tls_handshake_disconnect(err) {
+        debug!("{}: TLS handshake closed by peer ({}): {}", server_name, peer_addr, err);
+    } else {
+        warn!("{}: TLS handshake failed ({}): {}", server_name, peer_addr, err);
+    }
+}
+
 /// Performs a bounded TLS handshake on `stream`, extracts client X.509 metadata
 /// (OIDs, PEM, SAN), constructs a [`ConnectionHandler`] from the latest
 /// [`ArcSwap`] service stack, and serves HTTP/1.1 or HTTP/2 traffic.
@@ -940,7 +960,7 @@ where
             Ok(())
         }
         Ok(Err(e)) => {
-            warn!("{}: TLS handshake failed: {}", server_name, e);
+            log_tls_handshake_error(server_name, peer_addr, &e);
             Err(SrvError::Other(format!("TLS handshake failed: {e}")))
         }
         Err(_) => {
@@ -988,7 +1008,7 @@ where
             Ok(())
         }
         Ok(Err(e)) => {
-            warn!("{}: TLS handshake failed: {}", server_name, e);
+            log_tls_handshake_error(server_name, peer_addr, &e);
             Err(SrvError::Other(format!("TLS handshake failed: {e}")))
         }
         Err(_) => {
@@ -1542,5 +1562,34 @@ mod tunnel_peer_tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_is_benign_tls_handshake_disconnect_classification() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let err = std::io::Error::new(kind, "peer closed during handshake");
+            assert!(
+                super::is_benign_tls_handshake_disconnect(&err),
+                "expected {:?} to be classified as benign disconnect",
+                kind
+            );
+        }
+
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            let err = std::io::Error::new(kind, "tls protocol or cert failure");
+            assert!(
+                !super::is_benign_tls_handshake_disconnect(&err),
+                "expected {:?} not to be classified as benign disconnect",
+                kind
+            );
+        }
     }
 }
