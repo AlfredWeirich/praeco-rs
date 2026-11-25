@@ -70,6 +70,8 @@ pub struct AdminCacheStatus {
     pub default_ttl_seconds: u64,
     /// Configured global maximum body size in bytes eligible for caching.
     pub max_entry_bytes: usize,
+    /// Configured global maximum request body size in bytes hashed for `POST` RPC caching.
+    pub max_request_body_bytes: usize,
     /// Whether `Cache-Control` / `Pragma` directives are honored by default.
     pub respect_cache_control: bool,
     /// Whether `x-praeco-cache` and `age` response headers are attached by default.
@@ -82,6 +84,8 @@ pub struct AdminCacheStatus {
     pub total_coalesced: u64,
     /// Aggregated cache bypasses across all reported servers.
     pub total_bypasses: u64,
+    /// Aggregated declarative cache namespace invalidations triggered across all reported servers.
+    pub total_invalidations: u64,
 }
 
 /// Aggregated health, traffic, security & circuit-breaker counters across all configured servers.
@@ -149,6 +153,8 @@ pub struct AdminServerCacheStatus {
     pub namespace: Option<String>,
     /// Number of configured rules under `[Server.Layers.Cache.rules]`.
     pub rules_count: usize,
+    /// Number of configured mutation invalidation rules under `[Server.Layers.Cache.invalidations]`.
+    pub invalidations_rules_count: usize,
     /// Total cache hits recorded for this server.
     pub hits: u64,
     /// Total cache misses recorded for this server.
@@ -157,6 +163,8 @@ pub struct AdminServerCacheStatus {
     pub coalesced: u64,
     /// Total cache bypasses recorded for this server.
     pub bypasses: u64,
+    /// Total declarative cache namespace invalidation events triggered on this server.
+    pub invalidations: u64,
 }
 
 /// Per-server configuration and runtime routing status.
@@ -234,6 +242,7 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
     let mut total_cache_misses: u64 = 0;
     let mut total_cache_coalesced: u64 = 0;
     let mut total_cache_bypasses: u64 = 0;
+    let mut total_cache_invalidations: u64 = 0;
 
     let mut summary = AdminSummary {
         total_servers: servers_refs.len(),
@@ -279,11 +288,13 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
         let srv_cache_misses = srv_metrics.cache_misses.load(ord);
         let srv_cache_coalesced = srv_metrics.cache_coalesced.load(ord);
         let srv_cache_bypasses = srv_metrics.cache_bypasses.load(ord);
+        let srv_cache_invalidations = srv_metrics.cache_invalidations.load(ord);
 
         total_cache_hits += srv_cache_hits;
         total_cache_misses += srv_cache_misses;
         total_cache_coalesced += srv_cache_coalesced;
         total_cache_bypasses += srv_cache_bypasses;
+        total_cache_invalidations += srv_cache_invalidations;
 
         let layer_cache_enabled = srv.layers.enabled.iter().any(|l| l == "Cache");
         let srv_cache = AdminServerCacheStatus {
@@ -298,10 +309,16 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
                 None
             },
             rules_count: srv.layers.cache_config.as_ref().map_or(0, |c| c.rules.len()),
+            invalidations_rules_count: srv
+                .layers
+                .cache_config
+                .as_ref()
+                .map_or(0, |c| c.invalidations.len()),
             hits: srv_cache_hits,
             misses: srv_cache_misses,
             coalesced: srv_cache_coalesced,
             bypasses: srv_cache_bypasses,
+            invalidations: srv_cache_invalidations,
         };
 
         summary.total_requests += srv_total_reqs;
@@ -401,12 +418,14 @@ pub fn collect_admin_status(fallback_server: Option<&ServerConfig>) -> AdminStat
         max_bytes: shared_cache_cfg.max_bytes,
         default_ttl_seconds: shared_cache_cfg.default_ttl_seconds,
         max_entry_bytes: shared_cache_cfg.max_entry_bytes,
+        max_request_body_bytes: shared_cache_cfg.max_request_body_bytes,
         respect_cache_control: shared_cache_cfg.respect_cache_control,
         expose_cache_header: shared_cache_cfg.expose_cache_header,
         total_hits: total_cache_hits,
         total_misses: total_cache_misses,
         total_coalesced: total_cache_coalesced,
         total_bypasses: total_cache_bypasses,
+        total_invalidations: total_cache_invalidations,
     };
 
     AdminStatusResponse {
@@ -721,7 +740,7 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
         status.cache.bytes_used
     ));
 
-    out.push_str("# HELP praeco_server_cache_requests_total Cacheable GET/HEAD outcomes per server.\n");
+    out.push_str("# HELP praeco_server_cache_requests_total Cacheable GET/HEAD/POST outcomes per server.\n");
     out.push_str("# TYPE praeco_server_cache_requests_total counter\n");
     for srv in &status.servers {
         let srv_name = escape_prometheus_label(&srv.name);
@@ -736,6 +755,15 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
                 srv_name, outcome, count
             ));
         }
+    }
+    out.push_str("\n# HELP praeco_server_cache_invalidations_total Declarative cache namespace invalidations triggered per server.\n");
+    out.push_str("# TYPE praeco_server_cache_invalidations_total counter\n");
+    for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
+        out.push_str(&format!(
+            "praeco_server_cache_invalidations_total{{server=\"{}\"}} {}\n",
+            srv_name, srv.cache.invalidations
+        ));
     }
     out
 }
@@ -1688,6 +1716,9 @@ mod tests {
         assert!(text.contains(
             "praeco_server_cache_requests_total{server=\"cache_admin_test\",outcome=\"hit\"}"
         ));
+        assert!(text.contains(
+            "praeco_server_cache_invalidations_total{server=\"cache_admin_test\"}"
+        ));
 
         // Same-origin POST purge_cache succeeds
         let purge_uri: Uri =
@@ -1741,6 +1772,9 @@ mod tests {
             [Layers.Cache.rules."/favicon.ico"]
             ttl_seconds = 3600
             scope = "public"
+
+            [Layers.Cache.invalidations]
+            "POST /api/UpdateUi" = ["shared_ui"]
         "#;
         let mut enabled_srv: ServerConfig = toml::from_str(enabled_toml)?;
         enabled_srv.finalize()?;
@@ -1750,6 +1784,7 @@ mod tests {
         crate::configuration::ServerMetrics::inc_cache_miss("cache_status_enabled_srv");
         crate::configuration::ServerMetrics::inc_cache_coalesced("cache_status_enabled_srv");
         crate::configuration::ServerMetrics::inc_cache_bypass("cache_status_enabled_srv");
+        crate::configuration::ServerMetrics::inc_cache_invalidation("cache_status_enabled_srv");
 
         let status_uri: Uri = "http://127.0.0.1:9090/status".parse()?;
         let resp = handle_admin_request(&status_uri, &Method::GET, &HeaderMap::new(), Some(&enabled_srv));
@@ -1771,6 +1806,10 @@ mod tests {
             shared_cache_cfg.max_entry_bytes
         );
         assert_eq!(
+            json["cache"]["max_request_body_bytes"],
+            shared_cache_cfg.max_request_body_bytes
+        );
+        assert_eq!(
             json["cache"]["respect_cache_control"],
             shared_cache_cfg.respect_cache_control
         );
@@ -1784,15 +1823,18 @@ mod tests {
         assert!(json["cache"]["total_misses"].as_u64().unwrap_or(0) >= 1);
         assert!(json["cache"]["total_coalesced"].as_u64().unwrap_or(0) >= 1);
         assert!(json["cache"]["total_bypasses"].as_u64().unwrap_or(0) >= 1);
+        assert!(json["cache"]["total_invalidations"].as_u64().unwrap_or(0) >= 1);
 
         let srv_cache = &json["servers"][0]["cache"];
         assert_eq!(srv_cache["enabled"], shared_cache_cfg.enabled);
         assert_eq!(srv_cache["namespace"], "shared_ui");
         assert_eq!(srv_cache["rules_count"], 2);
+        assert_eq!(srv_cache["invalidations_rules_count"], 1);
         assert_eq!(srv_cache["hits"], 2);
         assert_eq!(srv_cache["misses"], 1);
         assert_eq!(srv_cache["coalesced"], 1);
         assert_eq!(srv_cache["bypasses"], 1);
+        assert_eq!(srv_cache["invalidations"], 1);
 
         // Server without Cache layer reports disabled state, null namespace, and zero rules
         let mut disabled_srv = ServerConfig {
@@ -1814,10 +1856,12 @@ mod tests {
         assert_eq!(disabled_cache["enabled"], false);
         assert!(disabled_cache["namespace"].is_null());
         assert_eq!(disabled_cache["rules_count"], 0);
+        assert_eq!(disabled_cache["invalidations_rules_count"], 0);
         assert_eq!(disabled_cache["hits"], 0);
         assert_eq!(disabled_cache["misses"], 0);
         assert_eq!(disabled_cache["coalesced"], 0);
         assert_eq!(disabled_cache["bypasses"], 0);
+        assert_eq!(disabled_cache["invalidations"], 0);
 
         Ok(())
     }

@@ -68,6 +68,7 @@ asn1-rs = "0.7"
 tls-parser = "0.12"
 jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 base64 = "0.23"
+sha2 = "0.10"
 
 # Observability & Tracing (OpenTelemetry 0.32 stack)
 tracing = "0.1"

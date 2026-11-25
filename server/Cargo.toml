@@ -75,6 +75,7 @@ x509-parser = { workspace = true }
 asn1-rs = { workspace = true, features = ["bigint"] }
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
+sha2 = { workspace = true }
 
 # --- OpenTelemetry, Tracing & Logging ---
 tracing = { workspace = true }

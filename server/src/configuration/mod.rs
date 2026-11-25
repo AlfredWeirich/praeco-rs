@@ -414,6 +414,8 @@ pub struct ServerMetrics {
     pub cache_coalesced: std::sync::atomic::AtomicU64,
     /// Requests that bypassed caching (uncacheable headers, streaming, or missing subject).
     pub cache_bypasses: std::sync::atomic::AtomicU64,
+    /// Declarative cache namespace invalidation events triggered by successful mutations on this server.
+    pub cache_invalidations: std::sync::atomic::AtomicU64,
     /// Packed microsecond EMA state distinguishing uninitialized from 0 ms (`Q2-08`).
     ema_state: EmaState,
 }
@@ -526,6 +528,14 @@ impl ServerMetrics {
     pub fn inc_cache_bypass(server_name: &str) {
         Self::for_server(server_name)
             .cache_bypasses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the declarative cache invalidation counter for `server_name`.
+    #[inline]
+    pub fn inc_cache_invalidation(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_invalidations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1566,6 +1576,10 @@ fn default_cache_max_entry_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_cache_max_request_body_bytes() -> usize {
+    64 * 1024
+}
+
 /// Process-wide configuration for the shared W-TinyLFU HTTP response cache (`[cache]`).
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1583,6 +1597,9 @@ pub struct GlobalCacheConfig {
     /// Maximum response body size in bytes eligible for caching (default: 1 MiB).
     #[serde(default = "default_cache_max_entry_bytes")]
     pub max_entry_bytes: usize,
+    /// Maximum request body size in bytes eligible for `POST` cache key hashing (default: 64 KiB).
+    #[serde(default = "default_cache_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
     /// Whether to honor `Cache-Control` / `Pragma` directives on requests and responses (default: `true`).
     #[serde(default = "default_true")]
     pub respect_cache_control: bool,
@@ -1598,6 +1615,7 @@ impl Default for GlobalCacheConfig {
             max_bytes: default_cache_max_bytes(),
             default_ttl_seconds: default_cache_ttl_seconds(),
             max_entry_bytes: default_cache_max_entry_bytes(),
+            max_request_body_bytes: default_cache_max_request_body_bytes(),
             respect_cache_control: true,
             expose_cache_header: false,
         }
@@ -1609,8 +1627,8 @@ impl GlobalCacheConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error if `max_bytes`, `default_ttl_seconds`, or `max_entry_bytes` is `0`,
-    /// or if `max_entry_bytes > max_bytes`.
+    /// Returns an error if `max_bytes`, `default_ttl_seconds`, `max_entry_bytes`, or
+    /// `max_request_body_bytes` is `0`, or if `max_entry_bytes > max_bytes`.
     pub fn validate(&self) -> Result<(), Error> {
         if self.max_bytes == 0 {
             return Err(Error::msg(
@@ -1625,6 +1643,11 @@ impl GlobalCacheConfig {
         if self.max_entry_bytes == 0 {
             return Err(Error::msg(
                 "Configuration error in [cache]: 'max_entry_bytes' must be greater than 0.",
+            ));
+        }
+        if self.max_request_body_bytes == 0 {
+            return Err(Error::msg(
+                "Configuration error in [cache]: 'max_request_body_bytes' must be greater than 0.",
             ));
         }
         if (self.max_entry_bytes as u64) > self.max_bytes {
@@ -1668,6 +1691,8 @@ pub struct CacheRuleConfig {
     pub vary_headers: Vec<String>,
     /// Optional per-rule maximum cacheable body size in bytes (bounded by global `max_entry_bytes`).
     pub max_entry_bytes: Option<usize>,
+    /// Optional per-rule maximum request body size in bytes for `POST` cache key hashing (bounded by global `max_request_body_bytes`).
+    pub max_request_body_bytes: Option<usize>,
     /// Optional per-rule override for `Cache-Control` / `Pragma` handling.
     pub respect_cache_control: Option<bool>,
     /// Optional per-rule override for `x-praeco-cache` response header emission.
@@ -1681,9 +1706,13 @@ pub struct CacheRuleConfig {
 pub struct CacheLayerConfig {
     /// Optional default shared namespace for all rules on this server (defaults to the server name).
     pub namespace: Option<String>,
-    /// Opt-in caching rules keyed by `"/exact"`, `"/prefix*"`, `"GET /..."`, or `"HEAD /..."`.
+    /// Opt-in caching rules keyed by `"/exact"`, `"/prefix*"`, `"GET /..."`, `"HEAD /..."`, or exact `"POST /path"`.
     #[serde(default)]
     pub rules: HashMap<String, CacheRuleConfig>,
+    /// Declarative mutation invalidation rules mapping `"POST /path"`, `"PUT /..."`, `"PATCH /..."`,
+    /// `"DELETE /..."` (or unprefixed `"/path"` / `"/prefix*"` matching mutating methods) to target namespaces.
+    #[serde(default)]
+    pub invalidations: HashMap<String, Vec<String>>,
 }
 
 /// Pre-compiled per-path cache rule ready for runtime lookup.
@@ -1695,11 +1724,12 @@ pub struct CompiledCacheRule {
     pub namespace: Option<String>,
     pub vary_headers: Vec<String>,
     pub max_entry_bytes: Option<usize>,
+    pub max_request_body_bytes: Option<usize>,
     pub respect_cache_control: Option<bool>,
     pub expose_cache_header: Option<bool>,
 }
 
-/// Pre-compiled `[Server.Layers.Cache]` rule table.
+/// Pre-compiled `[Server.Layers.Cache]` rule and mutation invalidation tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CompiledCacheConfig {
@@ -1708,9 +1738,37 @@ pub struct CompiledCacheConfig {
     pub prefix: Vec<(String, CompiledCacheRule)>,
     pub method_exact: HashMap<String, HashMap<String, CompiledCacheRule>>,
     pub method_prefix: HashMap<String, Vec<(String, CompiledCacheRule)>>,
+    pub invalidation_exact: HashMap<String, Vec<String>>,
+    pub invalidation_prefix: Vec<(String, Vec<String>)>,
+    pub invalidation_method_exact: HashMap<String, HashMap<String, Vec<String>>>,
+    pub invalidation_method_prefix: HashMap<String, Vec<(String, Vec<String>)>>,
 }
 
 impl CompiledCacheConfig {
+    fn validate_path_pattern<'a>(pattern: &'a str, path_pattern: &'a str, label: &str) -> Result<&'a str, Error> {
+        if !path_pattern.starts_with('/') {
+            return Err(Error::msg(format!(
+                "Invalid {label} pattern '{pattern}': path must start with '/'"
+            )));
+        }
+        if path_pattern.contains(';')
+            || path_pattern
+                .as_bytes()
+                .windows(3)
+                .any(|w| w.eq_ignore_ascii_case(b"%3b"))
+        {
+            return Err(Error::msg(format!(
+                "Invalid {label} pattern '{pattern}': matrix parameter ';' is not permitted"
+            )));
+        }
+        if path_pattern[..path_pattern.len().saturating_sub(1)].contains('*') {
+            return Err(Error::msg(format!(
+                "Invalid {label} pattern '{pattern}': wildcard '*' is only permitted as a trailing suffix"
+            )));
+        }
+        Ok(path_pattern)
+    }
+
     fn parse_cache_key(pattern: &str) -> Result<(Option<String>, &str), Error> {
         if pattern.is_empty() {
             return Err(Error::msg("Invalid Cache pattern '': pattern must not be empty"));
@@ -1728,9 +1786,14 @@ impl CompiledCacheConfig {
                 )));
             }
             let upper = method.to_ascii_uppercase();
-            if !matches!(upper.as_str(), "GET" | "HEAD") {
+            if !matches!(upper.as_str(), "GET" | "HEAD" | "POST") {
                 return Err(Error::msg(format!(
-                    "Invalid Cache pattern '{pattern}': only GET and HEAD methods are supported for HTTP response caching"
+                    "Invalid Cache pattern '{pattern}': only GET, HEAD, and exact POST methods are supported for response caching"
+                )));
+            }
+            if upper == "POST" && rest.ends_with('*') {
+                return Err(Error::msg(format!(
+                    "Invalid Cache pattern '{pattern}': wildcard '*' is not permitted on POST cache rules; specify an exact path (e.g. 'POST /pkg.Service/Method')"
                 )));
             }
             (Some(upper), rest)
@@ -1738,41 +1801,55 @@ impl CompiledCacheConfig {
             (None, pattern)
         };
 
-        if !path_pattern.starts_with('/') {
-            return Err(Error::msg(format!(
-                "Invalid Cache pattern '{pattern}': path must start with '/'"
-            )));
-        }
-        if path_pattern.contains(';')
-            || path_pattern
-                .as_bytes()
-                .windows(3)
-                .any(|w| w.eq_ignore_ascii_case(b"%3b"))
-        {
-            return Err(Error::msg(format!(
-                "Invalid Cache pattern '{pattern}': matrix parameter ';' is not permitted"
-            )));
-        }
-        if path_pattern[..path_pattern.len().saturating_sub(1)].contains('*') {
-            return Err(Error::msg(format!(
-                "Invalid Cache pattern '{pattern}': wildcard '*' is only permitted as a trailing suffix"
-            )));
-        }
-
-        Ok((method_opt, path_pattern))
+        let validated = Self::validate_path_pattern(pattern, path_pattern, "Cache")?;
+        Ok((method_opt, validated))
     }
 
-    /// Compiles and validates `[Server.Layers.Cache]` rules.
+    fn parse_invalidation_key(pattern: &str) -> Result<(Option<String>, &str), Error> {
+        if pattern.is_empty() {
+            return Err(Error::msg(
+                "Invalid Cache invalidation pattern '': pattern must not be empty",
+            ));
+        }
+
+        let (method_opt, path_pattern) = if pattern.contains(char::is_whitespace) {
+            let Some((method, rest)) = pattern.split_once(' ') else {
+                return Err(Error::msg(format!(
+                    "Invalid Cache invalidation pattern '{pattern}': expected 'METHOD /path'"
+                )));
+            };
+            if rest.is_empty() || rest.contains(char::is_whitespace) {
+                return Err(Error::msg(format!(
+                    "Invalid Cache invalidation pattern '{pattern}': unexpected whitespace in path"
+                )));
+            }
+            let upper = method.to_ascii_uppercase();
+            if !matches!(upper.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+                return Err(Error::msg(format!(
+                    "Invalid Cache invalidation pattern '{pattern}': only POST, PUT, PATCH, and DELETE methods may trigger invalidations"
+                )));
+            }
+            (Some(upper), rest)
+        } else {
+            (None, pattern)
+        };
+
+        let validated = Self::validate_path_pattern(pattern, path_pattern, "Cache invalidation")?;
+        Ok((method_opt, validated))
+    }
+
+    /// Compiles and validates `[Server.Layers.Cache]` rules and mutation invalidations.
     ///
     /// # Errors
     ///
-    /// Returns an error if `rules` is empty, any pattern is invalid or targets an
-    /// unsupported HTTP method, any TTL/size is `0`, any `namespace` is blank, or any
-    /// `vary_headers` entry is not a valid HTTP header name.
+    /// Returns an error if both `rules` and `invalidations` are empty, any pattern is invalid
+    /// or uses a wildcard on `POST` caching, a `POST` cache rule conflicts with an invalidation
+    /// rule, any TTL/size is `0`, any `namespace` or invalidation namespace list is blank/empty,
+    /// or any `vary_headers` entry is not a valid HTTP header name.
     pub fn from_raw(raw: &CacheLayerConfig, server_name: &str) -> Result<Self, Error> {
-        if raw.rules.is_empty() {
+        if raw.rules.is_empty() && raw.invalidations.is_empty() {
             return Err(Error::msg(format!(
-                "Configuration error in Server '{server_name}': Layer 'Cache' is enabled, but [Server.Layers.Cache.rules] is empty."
+                "Configuration error in Server '{server_name}': Layer 'Cache' is enabled, but both [Server.Layers.Cache.rules] and [Server.Layers.Cache.invalidations] are empty."
             )));
         }
 
@@ -1805,6 +1882,11 @@ impl CompiledCacheConfig {
             if rule_cfg.max_entry_bytes == Some(0) {
                 return Err(Error::msg(format!(
                     "Configuration error in Server '{server_name}': Cache rule '{pattern}' max_entry_bytes must be greater than 0."
+                )));
+            }
+            if rule_cfg.max_request_body_bytes == Some(0) {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{server_name}': Cache rule '{pattern}' max_request_body_bytes must be greater than 0."
                 )));
             }
 
@@ -1842,6 +1924,7 @@ impl CompiledCacheConfig {
                 namespace: rule_namespace,
                 vary_headers,
                 max_entry_bytes: rule_cfg.max_entry_bytes,
+                max_request_body_bytes: rule_cfg.max_request_body_bytes,
                 respect_cache_control: rule_cfg.respect_cache_control,
                 expose_cache_header: rule_cfg.expose_cache_header,
             };
@@ -1877,19 +1960,107 @@ impl CompiledCacheConfig {
             list.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
         }
 
-        Ok(Self {
+        let mut invalidation_exact = HashMap::new();
+        let mut invalidation_prefix = Vec::new();
+        let mut invalidation_method_exact: HashMap<String, HashMap<String, Vec<String>>> =
+            HashMap::new();
+        let mut invalidation_method_prefix: HashMap<String, Vec<(String, Vec<String>)>> =
+            HashMap::new();
+
+        for (pattern, raw_namespaces) in &raw.invalidations {
+            let (method_opt, path_pattern) = Self::parse_invalidation_key(pattern)?;
+            if raw_namespaces.is_empty() {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{server_name}': Cache invalidation rule '{pattern}' must specify at least one target namespace."
+                )));
+            }
+            let mut namespaces = Vec::with_capacity(raw_namespaces.len());
+            for ns in raw_namespaces {
+                let trimmed = ns.trim();
+                if trimmed.is_empty() {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{server_name}': Cache invalidation rule '{pattern}' contains an empty namespace name."
+                    )));
+                }
+                namespaces.push(trimmed.to_string());
+            }
+            namespaces.sort();
+            namespaces.dedup();
+
+            match (method_opt, path_pattern.ends_with('*')) {
+                (Some(method), true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    invalidation_method_prefix
+                        .entry(method)
+                        .or_default()
+                        .push((pfx.to_string(), namespaces));
+                }
+                (Some(method), false) => {
+                    let normalized = CompiledRbac::normalize_exact_key(path_pattern).to_string();
+                    invalidation_method_exact
+                        .entry(method)
+                        .or_default()
+                        .insert(normalized, namespaces);
+                }
+                (None, true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    invalidation_prefix.push((pfx.to_string(), namespaces));
+                }
+                (None, false) => {
+                    let normalized = CompiledRbac::normalize_exact_key(path_pattern).to_string();
+                    invalidation_exact.insert(normalized, namespaces);
+                }
+            }
+        }
+
+        invalidation_prefix.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        for list in invalidation_method_prefix.values_mut() {
+            list.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        }
+
+        let compiled = Self {
             default_namespace,
             exact,
             prefix,
             method_exact,
             method_prefix,
-        })
+            invalidation_exact,
+            invalidation_prefix,
+            invalidation_method_exact,
+            invalidation_method_prefix,
+        };
+
+        if let Some(post_rules) = compiled.method_exact.get("POST") {
+            for post_path in post_rules.keys() {
+                if compiled.match_invalidations("POST", post_path).is_some() {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{server_name}': 'POST {post_path}' matches both [Server.Layers.Cache.rules] and [Server.Layers.Cache.invalidations]."
+                    )));
+                }
+            }
+        }
+
+        Ok(compiled)
     }
 
-    /// Matches an HTTP `(method, path)` pair against compiled cache rules using
-    /// exact-first and longest-prefix-wins precedence.
+    /// Matches an HTTP `(method, path)` pair against compiled cache rules.
+    ///
+    /// - `"POST"` requests match **exclusively** exact `"POST /path"` rules (`self.method_exact`);
+    ///   unprefixed rules (`"/..."` or `"/prefix*"`) never match `POST`.
+    /// - `"GET"` and `"HEAD"` requests match using exact-first (`method_exact` -> `exact`), then
+    ///   longest-prefix-wins (`method_prefix` vs `prefix`).
     pub fn match_request<'a>(&'a self, method: &str, path: &str) -> Option<&'a CompiledCacheRule> {
         let exact_key = CompiledRbac::normalize_exact_key(path);
+        if method == "POST" {
+            return self
+                .method_exact
+                .get("POST")
+                .and_then(|method_map| method_map.get(exact_key));
+        }
+        if !matches!(method, "GET" | "HEAD") {
+            return None;
+        }
+
         if let Some(method_map) = self.method_exact.get(method)
             && let Some(rule) = method_map.get(exact_key)
         {
@@ -1921,6 +2092,49 @@ impl CompiledCacheConfig {
             }
             (Some((_, m_rule)), None) => Some(m_rule),
             (None, Some((_, g_rule))) => Some(g_rule),
+            (None, None) => None,
+        }
+    }
+
+    /// Matches a mutating HTTP `(method, path)` pair against declarative invalidation rules.
+    ///
+    /// Only `"POST"`, `"PUT"`, `"PATCH"`, and `"DELETE"` requests can trigger invalidations.
+    pub fn match_invalidations<'a>(&'a self, method: &str, path: &str) -> Option<&'a [String]> {
+        if !matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") {
+            return None;
+        }
+        let exact_key = CompiledRbac::normalize_exact_key(path);
+        if let Some(method_map) = self.invalidation_method_exact.get(method)
+            && let Some(namespaces) = method_map.get(exact_key)
+        {
+            return Some(namespaces.as_slice());
+        }
+        if let Some(namespaces) = self.invalidation_exact.get(exact_key) {
+            return Some(namespaces.as_slice());
+        }
+
+        let method_match = self.invalidation_method_prefix.get(method).and_then(|prefixes| {
+            prefixes
+                .iter()
+                .find(|(pfx, _)| path.starts_with(pfx))
+                .map(|(pfx, ns)| (pfx.len(), ns.as_slice()))
+        });
+        let global_match = self
+            .invalidation_prefix
+            .iter()
+            .find(|(pfx, _)| path.starts_with(pfx))
+            .map(|(pfx, ns)| (pfx.len(), ns.as_slice()));
+
+        match (method_match, global_match) {
+            (Some((m_len, m_ns)), Some((g_len, g_ns))) => {
+                if m_len >= g_len {
+                    Some(m_ns)
+                } else {
+                    Some(g_ns)
+                }
+            }
+            (Some((_, m_ns)), None) => Some(m_ns),
+            (None, Some((_, g_ns))) => Some(g_ns),
             (None, None) => None,
         }
     }

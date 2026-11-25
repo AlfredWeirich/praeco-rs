@@ -1773,6 +1773,7 @@ enabled = []
                 cache_config: Some(CacheLayerConfig {
                     namespace: None,
                     rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
@@ -1801,6 +1802,7 @@ enabled = []
                 cache_config: Some(CacheLayerConfig {
                     namespace: None,
                     rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1820,6 +1822,7 @@ enabled = []
                     cache_config: Some(CacheLayerConfig {
                         namespace: None,
                         rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 },
@@ -1828,16 +1831,94 @@ enabled = []
             assert!(disallowed.finalize().is_err());
         }
 
-        // 5. Unsupported method or empty rules in CacheLayerConfig fails
+        // 5. Unsupported method, wildcard on POST, or empty rules+invalidations in CacheLayerConfig fails
         let bad_method = CacheLayerConfig {
             namespace: None,
-            rules: HashMap::from([("POST /api/*".into(), CacheRuleConfig::default())]),
+            rules: HashMap::from([("PUT /api/*".into(), CacheRuleConfig::default())]),
+            ..Default::default()
         };
         assert!(CompiledCacheConfig::from_raw(&bad_method, "srv").is_err());
+
+        let wildcard_post = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([("POST /api/*".into(), CacheRuleConfig::default())]),
+            ..Default::default()
+        };
+        assert!(CompiledCacheConfig::from_raw(&wildcard_post, "srv").is_err());
+        assert!(CompiledCacheConfig::from_raw(
+            &CacheLayerConfig {
+                rules: HashMap::from([("POST /*".into(), CacheRuleConfig::default())]),
+                ..Default::default()
+            },
+            "srv"
+        )
+        .is_err());
 
         let empty_rules = CacheLayerConfig {
             namespace: None,
             rules: HashMap::new(),
+            ..Default::default()
         };
         assert!(CompiledCacheConfig::from_raw(&empty_rules, "srv").is_err());
+
+        // 6. Exact POST rule compiles and unprefixed rules must NOT match POST
+        let mixed_cfg = CacheLayerConfig {
+            namespace: Some("shared".into()),
+            rules: HashMap::from([
+                ("/api/*".into(), CacheRuleConfig::default()),
+                ("POST /api/GetUsers".into(), CacheRuleConfig::default()),
+            ]),
+            invalidations: HashMap::from([
+                ("POST /api/UpdateUser".into(), vec!["shared".into()]),
+                ("DELETE /api/users/*".into(), vec!["shared".into()]),
+            ]),
+        };
+        let compiled_mixed = CompiledCacheConfig::from_raw(&mixed_cfg, "srv").unwrap();
+        assert!(compiled_mixed.match_request("GET", "/api/Other").is_some());
+        assert!(compiled_mixed.match_request("HEAD", "/api/Other").is_some());
+        assert!(compiled_mixed.match_request("POST", "/api/Other").is_none());
+        assert!(compiled_mixed.match_request("POST", "/api/GetUsers").is_some());
+        assert_eq!(
+            compiled_mixed.match_invalidations("POST", "/api/UpdateUser"),
+            Some(["shared".to_string()].as_slice())
+        );
+        assert_eq!(
+            compiled_mixed.match_invalidations("DELETE", "/api/users/42"),
+            Some(["shared".to_string()].as_slice())
+        );
+        assert!(compiled_mixed.match_invalidations("GET", "/api/UpdateUser").is_none());
+
+        // 7. Invalidations-only layer compiles; GET invalidation, empty namespaces, or self-invalidation conflict fail
+        let inv_only = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::new(),
+            invalidations: HashMap::from([("POST /chat.Svc/Mutate".into(), vec!["ns_a".into()])]),
+        };
+        assert!(CompiledCacheConfig::from_raw(&inv_only, "writer_srv").is_ok());
+
+        let get_inv = CacheLayerConfig {
+            invalidations: HashMap::from([("GET /api/GetUsers".into(), vec!["ns_a".into()])]),
+            ..Default::default()
+        };
+        assert!(CompiledCacheConfig::from_raw(&get_inv, "srv").is_err());
+
+        let empty_ns_inv = CacheLayerConfig {
+            invalidations: HashMap::from([("POST /api/Mutate".into(), vec![])]),
+            ..Default::default()
+        };
+        assert!(CompiledCacheConfig::from_raw(&empty_ns_inv, "srv").is_err());
+
+        let self_conflict = CacheLayerConfig {
+            rules: HashMap::from([("POST /api/GetUsers".into(), CacheRuleConfig::default())]),
+            invalidations: HashMap::from([("POST /api/GetUsers".into(), vec!["shared".into()])]),
+            ..Default::default()
+        };
+        assert!(CompiledCacheConfig::from_raw(&self_conflict, "srv").is_err());
+
+        // 8. GlobalCacheConfig validates max_request_body_bytes > 0
+        let bad_global = GlobalCacheConfig {
+            max_request_body_bytes: 0,
+            ..Default::default()
+        };
+        assert!(bad_global.validate().is_err());
     }

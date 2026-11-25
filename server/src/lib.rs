@@ -913,7 +913,7 @@ impl ConnectionHandler {
 /// Returns `true` if `content_type` designates a native gRPC-over-HTTP/2 stream
 /// (`application/grpc` or `application/grpc+<subtype>`, ignoring optional `; params`).
 #[inline]
-fn is_grpc_content_type(content_type: &str) -> bool {
+pub(crate) fn is_grpc_content_type(content_type: &str) -> bool {
     let media_type = content_type
         .split(';')
         .next()

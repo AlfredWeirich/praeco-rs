@@ -35,5 +35,6 @@ enabled = true
 max_bytes = 268435456       # 256 MiB total cache memory budget
 default_ttl_seconds = 60
 max_entry_bytes = 1048576   # 1 MiB max per cached response
+max_request_body_bytes = 65536 # 64 KiB max POST body hashed for RPC caching
 respect_cache_control = true
 expose_cache_header = false

@@ -222,15 +222,17 @@ Configures the process-wide W-TinyLFU (`moka`) HTTP response cache shared across
 | `max_bytes` | Integer (`u64`) | Optional | `268435456` (`256 MiB`) | Total RAM byte budget across all cached responses and servers (`> 0`). Preserved across `SIGHUP` reloads when unchanged. |
 | `default_ttl_seconds` | Integer (`u64`) | Optional | `60` | Fallback TTL in seconds when a path rule does not specify `ttl_seconds` (`> 0`). |
 | `max_entry_bytes` | Integer (`usize`) | Optional | `1048576` (`1 MiB`) | Maximum response body size in bytes eligible for caching (`> 0`, `<= max_bytes`). Larger responses stream directly as `BYPASS`. |
+| `max_request_body_bytes` | Integer (`usize`) | Optional | `65536` (`64 KiB`) | Maximum request body size in bytes eligible for SHA-256 hashing on opt-in `"POST /exact/path"` cache rules (`> 0`). Larger requests stream directly as `BYPASS`. |
 | `respect_cache_control` | Boolean | Optional | `true` | Honors request `Cache-Control: no-store`/`no-cache` and `Pragma: no-cache`, as well as response `no-store`, `no-cache`, `private` (for `scope = "public"`), `s-maxage`, and `max-age`. |
 | `expose_cache_header` | Boolean | Optional | `false` | When `true`, attaches `x-praeco-cache: HIT\|MISS\|COALESCED\|BYPASS` (and `age` on hits) to responses. |
 
 ```toml
 [cache]
 enabled = true
-max_bytes = 268435456          # 256 MiB across all [[Server]] instances
+max_bytes = 268435456            # 256 MiB across all [[Server]] instances
 default_ttl_seconds = 60
-max_entry_bytes = 1048576      # 1 MiB max per cached response
+max_entry_bytes = 1048576        # 1 MiB max per cached response
+max_request_body_bytes = 65536   # 64 KiB max POST body hashed for RPC caching
 respect_cache_control = true
 expose_cache_header = false
 ```
@@ -1199,12 +1201,13 @@ trust_forwarded_headers = false
 ```
 
 #### `[Server.Layers.Cache]` (Opt-In W-TinyLFU Response Cache & Singleflight)
-Enables process-wide W-TinyLFU HTTP response caching with cancellation-safe `Singleflight` request coalescing for `GET` and `HEAD` requests matching `[Server.Layers.Cache.rules]`. Unmatched paths and non-`GET`/`HEAD` requests pass through untouched.
+Enables process-wide W-TinyLFU HTTP & gRPC response caching with cancellation-safe `Singleflight` request coalescing for requests matching `[Server.Layers.Cache.rules]`, as well as declarative cross-server cache invalidations under `[Server.Layers.Cache.invalidations]`. Unprefixed rules (`"/exact"`, `"/prefix*"`) match **only** `GET` and `HEAD`; `POST` RPC caching (JSON-over-POST, gRPC-Web, and native HTTP/2 Unary gRPC with `grpc-status: 0` trailer preservation) requires an **exact** `"POST /path"` rule (wildcards on `POST` rules are rejected at startup). Streaming requests/responses and any gRPC response with `grpc-status != 0` bypass automatically.
 
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `namespace` | String | Optional | Server `name` | Default cache namespace for all rules on this server. Set identical `namespace` values across multiple `[[Server]]` instances to share cached responses between listeners. |
-| `rules` | Table (`Map<Pattern, Rule>`) | **Mandatory** | *None* | Non-empty map of path patterns (`"/exact"`, `"/prefix*"`, `"GET /..."`, `"HEAD /..."`) to caching policies. |
+| `rules` | Table (`Map<Pattern, Rule>`) | Conditional | `{}` | Map of path patterns (`"/exact"`, `"/prefix*"`, `"GET /..."`, `"HEAD /..."`, or exact `"POST /path"`) to caching policies. Either `rules` or `invalidations` must be non-empty. |
+| `invalidations` | Table (`Map<Pattern, Array<String>>`) | Conditional | `{}` | Declarative mutation invalidation rules mapping `"POST /path"`, `"PUT /..."`, `"PATCH /..."`, `"DELETE /..."` (or unprefixed paths matching mutating methods; trailing `*` allowed) to target namespaces invalidated zero-copy upon clean `HTTP 2xx` / gRPC `grpc-status: 0` completion. Protected against write-read races by per-namespace generation fences. |
 
 ##### Per-Rule Parameters (`[Server.Layers.Cache.rules."<pattern>"]`)
 | Parameter | Data Type | Requirement | Default Value | Description |
@@ -1213,11 +1216,12 @@ Enables process-wide W-TinyLFU HTTP response caching with cancellation-safe `Sin
 | `scope` | String | Optional | `"public"` | Isolation level: `"public"` (shared across all authorized callers), `"per_role"` (isolated by sorted mapped roles), or `"per_subject"` (isolated by JWT `sub` or mTLS SAN; unauthenticated requests bypass fail-safely). |
 | `namespace` | String | Optional | Layer `namespace` or server `name` | Rule-specific shared namespace across servers (e.g. `"shared_catalog"`). |
 | `vary_headers` | Array of Strings | Optional | `[]` | Request header names included in the cache key (case-insensitive). |
-| `max_entry_bytes` | Integer (`usize`) | Optional | `[cache].max_entry_bytes` | Per-rule body limit in bytes (`> 0`, capped by global `max_entry_bytes`). |
+| `max_entry_bytes` | Integer (`usize`) | Optional | `[cache].max_entry_bytes` | Per-rule response body limit in bytes (`> 0`, capped by global `max_entry_bytes`). |
+| `max_request_body_bytes` | Integer (`usize`) | Optional | `[cache].max_request_body_bytes` | Per-rule request body limit in bytes for `POST` SHA-256 hashing (`> 0`, capped by global `max_request_body_bytes`). |
 | `respect_cache_control` | Boolean | Optional | `[cache].respect_cache_control` | Per-rule override for `Cache-Control` / `Pragma` evaluation. |
 | `expose_cache_header` | Boolean | Optional | `[cache].expose_cache_header` | Per-rule override for `x-praeco-cache` and `age` response headers. |
 
-> **Admin Telemetry & Purging:** Cache status and outcome counters are exposed in `/status` JSON under `.cache` (process-wide configuration, `entries`, `bytes_used`, and totals) and `.servers[*].cache` (server active state, namespace, rule count, and counters), as well as on `/metrics` as `praeco_cache_entries`, `praeco_cache_bytes_used`, and `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`. Authenticated/CSRF-checked `POST /status?action=purge_cache` clears all entries (or `&namespace=<name>` for a single namespace).
+> **Admin Telemetry & Purging:** Cache status and outcome counters are exposed in `/status` JSON under `.cache` (process-wide configuration including `max_request_body_bytes`, `entries`, `bytes_used`, and totals including `total_invalidations`) and `.servers[*].cache` (server active state, namespace, `rules_count`, `invalidations_rules_count`, and `hits`/`misses`/`coalesced`/`bypasses`/`invalidations`), as well as on `/metrics` as `praeco_cache_entries`, `praeco_cache_bytes_used`, `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`, and `praeco_server_cache_invalidations_total{server}`. Authenticated/CSRF-checked `POST /status?action=purge_cache` clears all entries (or `&namespace=<name>` for a single namespace).
 
 ```toml
 [Server.Layers]
@@ -1232,6 +1236,14 @@ vary_headers = ["accept-language"]
 [Server.Layers.Cache.rules."GET /api/orders/*"]
 ttl_seconds = 30
 scope = "per_role"
+
+[Server.Layers.Cache.rules."POST /chat.ChatService/GetRoomProducts"]
+ttl_seconds = 60
+scope = "per_role"
+namespace = "shared_products"
+
+[Server.Layers.Cache.invalidations]
+"POST /chat.ChatService/CreateRoomProduct" = ["shared_products"]
 ```
 
 ---

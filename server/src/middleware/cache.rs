@@ -29,15 +29,16 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
-use http_body::Frame;
+use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
+use http_body::{Body as _, Frame};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::{
     HeaderMap, Method, Request, Response, StatusCode,
@@ -45,6 +46,7 @@ use hyper::{
 };
 use moka::{Expiry, sync::Cache};
 use pin_project::pin_project;
+use sha2::{Digest, Sha256};
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
@@ -302,7 +304,7 @@ pub struct CacheBypass;
 pub struct CacheKey {
     /// Logical cache namespace (defaults to the server name or an explicit shared namespace).
     pub namespace: String,
-    /// Canonical HTTP method used as the stored slot (`"GET"` for both `GET` and `HEAD`).
+    /// Canonical HTTP method used as the stored slot (`"GET"` for `GET`/`HEAD`, `"POST"` for exact `POST` RPCs).
     pub method: &'static str,
     /// Sanitized path plus lexicographically sorted query parameters.
     pub path_and_query: String,
@@ -310,9 +312,13 @@ pub struct CacheKey {
     pub vary_values: Vec<(String, String)>,
     /// Isolation scope key (`""` for `public`, sorted roles for `per_role`, subject for `per_subject`).
     pub scope_key: String,
+    /// SHA-256 digest of the request body for `POST` requests (`None` for `GET`/`HEAD`).
+    pub body_hash: Option<[u8; 32]>,
+    /// Normalized `(content-type, content-encoding, grpc-encoding)` tuple for `POST` requests.
+    pub post_encoding: Option<(String, String, String)>,
 }
 
-/// Cached HTTP response stored inside [`SharedResponseCache`].
+/// Cached HTTP / gRPC response stored inside [`SharedResponseCache`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CachedResponse {
@@ -322,6 +328,8 @@ pub struct CachedResponse {
     pub headers: HeaderMap,
     /// Buffered uncompressed response body payload.
     pub body: Bytes,
+    /// Optional sanitized HTTP/2 trailers (e.g. `grpc-status: 0` for unary gRPC responses).
+    pub trailers: Option<HeaderMap>,
     /// Monotonic timestamp when the entry was inserted.
     pub stored_at: Instant,
     /// Effective time-to-live for this entry.
@@ -331,14 +339,26 @@ pub struct CachedResponse {
 }
 
 impl CachedResponse {
-    fn new(status: StatusCode, headers: HeaderMap, body: Bytes, ttl: Duration) -> Self {
+    fn new(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+        trailers: Option<HeaderMap>,
+        ttl: Duration,
+    ) -> Self {
         let approx_header_bytes: usize = headers
             .iter()
             .map(|(k, v)| k.as_str().len() + v.as_bytes().len() + 16)
             .sum();
+        let approx_trailer_bytes: usize = trailers.as_ref().map_or(0, |tr| {
+            tr.iter()
+                .map(|(k, v)| k.as_str().len() + v.as_bytes().len() + 16)
+                .sum()
+        });
         let total = body
             .len()
             .saturating_add(approx_header_bytes)
+            .saturating_add(approx_trailer_bytes)
             .saturating_add(64);
         let byte_weight = u32::try_from(total.max(1)).unwrap_or(u32::MAX);
 
@@ -346,6 +366,7 @@ impl CachedResponse {
             status,
             headers,
             body,
+            trailers,
             stored_at: Instant::now(),
             ttl,
             byte_weight,
@@ -377,7 +398,7 @@ impl Expiry<CacheKey, Arc<CachedResponse>> for PerEntryExpiry {
     }
 }
 
-/// Outcome broadcast over [`Singleflight`] for a cacheable `GET` miss.
+/// Outcome broadcast over [`Singleflight`] for a cacheable miss.
 #[derive(Clone)]
 enum SingleflightOutcome {
     Cached(Arc<CachedResponse>),
@@ -385,10 +406,12 @@ enum SingleflightOutcome {
     UpstreamError(String),
 }
 
-/// Process-wide W-TinyLFU HTTP response cache shared across all `[[Server]]` instances.
+/// Process-wide W-TinyLFU HTTP & gRPC response cache shared across all `[[Server]]` instances.
 pub struct SharedResponseCache {
     store: Cache<CacheKey, Arc<CachedResponse>>,
     singleflight: Singleflight<CacheKey, SingleflightOutcome>,
+    global_generation: Arc<AtomicU64>,
+    namespace_generations: Arc<DashMap<String, u64>>,
     config: GlobalCacheConfig,
 }
 
@@ -399,6 +422,8 @@ impl SharedResponseCache {
         Arc::new(Self {
             store,
             singleflight: Singleflight::new(),
+            global_generation: Arc::new(AtomicU64::new(0)),
+            namespace_generations: Arc::new(DashMap::new()),
             config,
         })
     }
@@ -408,12 +433,23 @@ impl SharedResponseCache {
             .max_capacity(max_bytes.max(1))
             .weigher(|_k: &CacheKey, v: &Arc<CachedResponse>| v.byte_weight)
             .expire_after(PerEntryExpiry)
+            .support_invalidation_closures()
             .build()
     }
 
     /// Returns the active [`GlobalCacheConfig`] governing this cache instance.
     pub fn config(&self) -> &GlobalCacheConfig {
         &self.config
+    }
+
+    /// Returns the current `(global_generation, namespace_generation)` fence token for `namespace`.
+    pub fn current_generation(&self, namespace: &str) -> (u64, u64) {
+        let global_gen = self.global_generation.load(Ordering::Acquire);
+        let ns_gen = self
+            .namespace_generations
+            .get(namespace)
+            .map_or(0, |entry| *entry);
+        (global_gen, ns_gen)
     }
 
     /// Looks up an unexpired [`CachedResponse`] by `key`.
@@ -435,17 +471,53 @@ impl SharedResponseCache {
         }
     }
 
-    /// Discards all cached entries across all namespaces.
+    /// Inserts `entry` only if no global or namespace invalidation occurred since `expected_generation`.
+    pub fn insert_if_generation(
+        &self,
+        key: CacheKey,
+        entry: Arc<CachedResponse>,
+        expected_generation: (u64, u64),
+    ) -> bool {
+        if !self.config.enabled || entry.ttl.is_zero() {
+            return false;
+        }
+        if self.current_generation(&key.namespace) != expected_generation {
+            return false;
+        }
+        self.store.insert(key.clone(), entry);
+        if self.current_generation(&key.namespace) != expected_generation {
+            self.store.invalidate(&key);
+            return false;
+        }
+        true
+    }
+
+    /// Discards all cached entries across all namespaces and advances the global generation fence.
     pub fn invalidate_all(&self) {
+        self.global_generation.fetch_add(1, Ordering::AcqRel);
         self.store.invalidate_all();
     }
 
-    /// Discards all cached entries belonging to `namespace`.
+    /// Discards all cached entries belonging to `namespace` and advances its generation fence.
     pub fn invalidate_namespace(&self, namespace: &str) {
+        {
+            let mut gen_entry = self
+                .namespace_generations
+                .entry(namespace.to_string())
+                .or_insert(0);
+            *gen_entry = gen_entry.wrapping_add(1);
+        }
         let ns = namespace.to_string();
-        let _ = self
+        if let Err(err) = self
             .store
-            .invalidate_entries_if(move |k, _v| k.namespace == ns);
+            .invalidate_entries_if(move |k, _v| k.namespace == ns)
+        {
+            tracing::warn!(
+                namespace = %namespace,
+                error = %err,
+                "Failed to register Moka namespace invalidation predicate"
+            );
+        }
     }
 
     /// Flushes pending Moka maintenance tasks (primarily useful in deterministic tests).
@@ -495,6 +567,8 @@ pub fn configure_global_response_cache(cfg: Option<&GlobalCacheConfig>) {
         let preserved = Arc::new(SharedResponseCache {
             store: current.store.clone(),
             singleflight: current.singleflight.clone(),
+            global_generation: Arc::clone(&current.global_generation),
+            namespace_generations: Arc::clone(&current.namespace_generations),
             config: next_cfg,
         });
         holder.store(preserved);
@@ -561,7 +635,7 @@ pub enum CacheFuture<F> {
     Hit {
         response: Option<Response<ServiceRespBody>>,
     },
-    /// Passthrough request (non-GET/HEAD, disabled cache, or unmatched path) polling `S::Future` inline.
+    /// Passthrough request (unmatched path, unsupported method, or disabled cache) polling `S::Future` inline.
     Passthrough {
         #[pin]
         inner: F,
@@ -573,10 +647,19 @@ pub enum CacheFuture<F> {
         inner: F,
         expose_cache_header: bool,
     },
-    /// Asynchronous L1 `GET` cache miss running Singleflight coalescing and body buffering.
+    /// Asynchronous L1 `GET` miss or `POST` RPC lookup/coalescing path.
     Coalesce {
         #[pin]
         fut: Pin<Box<dyn Future<Output = Result<Response<ServiceRespBody>, SrvError>> + Send>>,
+    },
+    /// Zero-copy mutation passthrough that invalidates target namespaces once the upstream
+    /// response completes cleanly (`HTTP 2xx` or gRPC `grpc-status: 0`).
+    Invalidate {
+        #[pin]
+        inner: F,
+        cache: Arc<SharedResponseCache>,
+        namespaces: Vec<String>,
+        server_name: &'static str,
     },
 }
 
@@ -601,8 +684,217 @@ where
                 Poll::Ready(Ok(resp))
             }
             CacheFutureProj::Coalesce { fut } => fut.poll(cx),
+            CacheFutureProj::Invalidate {
+                inner,
+                cache,
+                namespaces,
+                server_name,
+            } => {
+                let resp = std::task::ready!(inner.poll(cx))?;
+                Poll::Ready(Ok(wrap_invalidation_response(
+                    resp,
+                    Arc::clone(cache),
+                    std::mem::take(namespaces),
+                    server_name,
+                )))
+            }
         }
     }
+}
+
+/// Response body that replays cached bytes followed by optional HTTP/2 trailers without altering framing.
+#[pin_project]
+struct CachedRespBody {
+    data: Option<Bytes>,
+    trailers: Option<HeaderMap>,
+}
+
+impl http_body::Body for CachedRespBody {
+    type Data = Bytes;
+    type Error = SrvError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.project();
+        if let Some(bytes) = this.data.take()
+            && !bytes.is_empty()
+        {
+            return Poll::Ready(Some(Ok(Frame::data(bytes))));
+        }
+        if let Some(tr) = this.trailers.take() {
+            return Poll::Ready(Some(Ok(Frame::trailers(tr))));
+        }
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().is_none_or(Bytes::is_empty) && self.trailers.is_none()
+    }
+}
+
+/// Zero-copy invalidation trigger mode matching either standard HTTP `2xx` or HTTP/2 gRPC streams.
+enum InvalidationMode {
+    Http2xx,
+    Grpc { saw_grpc_ok: bool },
+}
+
+fn trigger_namespace_invalidations(
+    cache: &SharedResponseCache,
+    namespaces: &[String],
+    server_name: &'static str,
+) {
+    for ns in namespaces {
+        cache.invalidate_namespace(ns);
+    }
+    ServerMetrics::inc_cache_invalidation(server_name);
+}
+
+/// Zero-copy body wrapper that triggers namespace invalidation once a mutation response
+/// finishes cleanly without transport errors or non-zero `grpc-status` trailers.
+#[pin_project]
+struct InvalidateOnSuccessBody {
+    #[pin]
+    inner: ServiceRespBody,
+    cache: Arc<SharedResponseCache>,
+    namespaces: Vec<String>,
+    server_name: &'static str,
+    mode: InvalidationMode,
+    done: bool,
+}
+
+impl http_body::Body for InvalidateOnSuccessBody {
+    type Data = Bytes;
+    type Error = SrvError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                if !*this.done {
+                    *this.done = true;
+                    let should_invalidate = match this.mode {
+                        InvalidationMode::Http2xx => true,
+                        InvalidationMode::Grpc { saw_grpc_ok } => *saw_grpc_ok,
+                    };
+                    if should_invalidate {
+                        trigger_namespace_invalidations(
+                            this.cache,
+                            this.namespaces,
+                            this.server_name,
+                        );
+                    }
+                }
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(e))) => {
+                *this.done = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if !*this.done {
+                    match this.mode {
+                        InvalidationMode::Grpc { saw_grpc_ok } => {
+                            if let Some(tr) = frame.trailers_ref() {
+                                let ok = grpc_status_is_ok(tr);
+                                *this.done = true;
+                                if ok {
+                                    trigger_namespace_invalidations(
+                                        this.cache,
+                                        this.namespaces,
+                                        this.server_name,
+                                    );
+                                }
+                            } else if *saw_grpc_ok && this.inner.is_end_stream() {
+                                *this.done = true;
+                                trigger_namespace_invalidations(
+                                    this.cache,
+                                    this.namespaces,
+                                    this.server_name,
+                                );
+                            }
+                        }
+                        InvalidationMode::Http2xx => {
+                            if let Some(tr) = frame.trailers_ref()
+                                && tr.get("grpc-status").is_some()
+                                && !grpc_status_is_ok(tr)
+                            {
+                                *this.done = true;
+                            } else if this.inner.is_end_stream() {
+                                *this.done = true;
+                                trigger_namespace_invalidations(
+                                    this.cache,
+                                    this.namespaces,
+                                    this.server_name,
+                                );
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+fn wrap_invalidation_response(
+    resp: Response<ServiceRespBody>,
+    cache: Arc<SharedResponseCache>,
+    namespaces: Vec<String>,
+    server_name: &'static str,
+) -> Response<ServiceRespBody> {
+    if !resp.status().is_success() || namespaces.is_empty() {
+        return resp;
+    }
+
+    let headers = resp.headers();
+    if let Some(raw_status) = headers.get("grpc-status")
+        && raw_status.to_str().ok().map(str::trim) != Some("0")
+    {
+        return resp;
+    }
+
+    let is_grpc = is_header_grpc_content_type(headers);
+    let header_grpc_ok = headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        == Some("0");
+
+    if resp.body().is_end_stream() {
+        if !is_grpc || header_grpc_ok {
+            trigger_namespace_invalidations(&cache, &namespaces, server_name);
+        }
+        return resp;
+    }
+
+    let (parts, body) = resp.into_parts();
+    let mode = if is_grpc {
+        InvalidationMode::Grpc {
+            saw_grpc_ok: header_grpc_ok,
+        }
+    } else {
+        InvalidationMode::Http2xx
+    };
+    let wrapped = InvalidateOnSuccessBody {
+        inner: body,
+        cache,
+        namespaces,
+        server_name,
+        mode,
+        done: false,
+    }
+    .boxed();
+    Response::from_parts(parts, wrapped)
 }
 
 /// Streaming fallback body used when a response exceeds `max_entry_bytes` mid-stream,
@@ -821,8 +1113,15 @@ fn build_response_from_cached(
     expose_cache_header: bool,
     outcome_label: &'static str,
 ) -> Response<ServiceRespBody> {
+    let is_grpc = is_header_grpc_content_type(&entry.headers);
     let body: ServiceRespBody = if is_head {
         Empty::<Bytes>::new().map_err(SrvError::from).boxed()
+    } else if let Some(ref trailers) = entry.trailers {
+        CachedRespBody {
+            data: (!entry.body.is_empty()).then(|| entry.body.clone()),
+            trailers: Some(trailers.clone()),
+        }
+        .boxed()
     } else {
         Full::new(entry.body.clone()).map_err(SrvError::from).boxed()
     };
@@ -831,7 +1130,10 @@ fn build_response_from_cached(
     for (name, val) in entry.headers.iter() {
         resp.headers_mut().append(name.clone(), val.clone());
     }
-    if let Ok(cl) = HeaderValue::from_str(&entry.body.len().to_string()) {
+    if entry.trailers.is_none()
+        && !is_grpc
+        && let Ok(cl) = HeaderValue::from_str(&entry.body.len().to_string())
+    {
         resp.headers_mut().insert(header::CONTENT_LENGTH, cl);
     }
     if expose_cache_header {
@@ -844,6 +1146,93 @@ fn build_response_from_cached(
     resp
 }
 
+#[inline]
+fn is_header_grpc_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(crate::is_grpc_content_type)
+}
+
+#[inline]
+fn is_header_grpc_web_binary(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            let media = ct.split(';').next().unwrap_or(ct).trim();
+            media.eq_ignore_ascii_case("application/grpc-web")
+                || (media.len() > "application/grpc-web+".len()
+                    && media[.."application/grpc-web+".len()]
+                        .eq_ignore_ascii_case("application/grpc-web+")
+                    && !media.eq_ignore_ascii_case("application/grpc-web-text"))
+        })
+}
+
+#[inline]
+fn grpc_status_is_ok(headers: &HeaderMap) -> bool {
+    headers
+        .get("grpc-status")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        == Some("0")
+}
+
+fn extract_post_encoding(headers: &HeaderMap) -> (String, String, String) {
+    let norm = |name: &str| -> String {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default()
+    };
+    (norm("content-type"), norm("content-encoding"), norm("grpc-encoding"))
+}
+
+/// Validates binary `application/grpc-web` length-prefixed frames and ensures any embedded
+/// trailer frame (`flag & 0x80 != 0`) reports `grpc-status: 0`.
+fn grpc_web_body_has_error(body: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let Some(header_slice) = body.get(offset..offset + 5) else {
+            return true;
+        };
+        let flag = header_slice[0];
+        let frame_len = u32::from_be_bytes([
+            header_slice[1],
+            header_slice[2],
+            header_slice[3],
+            header_slice[4],
+        ]) as usize;
+        let payload_start = offset + 5;
+        let Some(payload_end) = payload_start.checked_add(frame_len) else {
+            return true;
+        };
+        let Some(payload) = body.get(payload_start..payload_end) else {
+            return true;
+        };
+        if (flag & 0x80) != 0 {
+            let Ok(text) = std::str::from_utf8(payload) else {
+                return true;
+            };
+            let mut found_status = None;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if let Some((k, v)) = trimmed.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("grpc-status")
+                {
+                    found_status = Some(v.trim());
+                }
+            }
+            if found_status != Some("0") {
+                return true;
+            }
+        }
+        offset = payload_end;
+    }
+    false
+}
+
 /// Evaluates response status and headers to determine whether the response may be cached
 /// and computes its effective TTL. Returns `None` if the response must bypass the cache.
 fn evaluate_response_cacheability(
@@ -852,6 +1241,7 @@ fn evaluate_response_cacheability(
     global_cfg: &GlobalCacheConfig,
     respect_cache_control: bool,
     max_entry_bytes: usize,
+    is_post: bool,
 ) -> Option<Duration> {
     if resp.status() != StatusCode::OK {
         return None;
@@ -863,10 +1253,11 @@ fn evaluate_response_cacheability(
     if headers.contains_key(header::SET_COOKIE) {
         return None;
     }
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/grpc"))
+    if is_header_grpc_content_type(headers) && !is_post {
+        return None;
+    }
+    if let Some(raw_grpc_status) = headers.get("grpc-status")
+        && raw_grpc_status.to_str().ok().map(str::trim) != Some("0")
     {
         return None;
     }
@@ -906,21 +1297,324 @@ fn evaluate_response_cacheability(
     Some(base_ttl)
 }
 
-enum BufferedOrStream {
+const POST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const GRPC_UNARY_EOF_GRACE: Duration = Duration::from_millis(10);
+const GRPC_RESP_TRAILER_TIMEOUT: Duration = Duration::from_millis(250);
+
+enum PostReqBody {
     Buffered(Bytes),
-    Overflow {
+    Bypass(SrvBody),
+}
+
+fn spill_accumulated_stream(
+    accumulated: BytesMut,
+    extra_frames: Vec<Frame<Bytes>>,
+    rest: SrvBody,
+) -> SrvBody {
+    let mut buffered = VecDeque::with_capacity(extra_frames.len() + 1);
+    if !accumulated.is_empty() {
+        buffered.push_back(Frame::data(accumulated.freeze()));
+    }
+    for frame in extra_frames {
+        buffered.push_back(frame);
+    }
+    ChainedStreamBody {
+        buffered,
+        rest,
+        rest_done: false,
+    }
+    .boxed()
+}
+
+/// Reads at most `max_bytes` from a `POST` request body for SHA-256 cache-key computation.
+///
+/// For native HTTP/2 gRPC (`is_grpc = true`), validates that exactly one 5-byte length-prefixed
+/// gRPC message is followed by `EOF` (non-blockingly/bounded), spilling client-streaming or
+/// oversized requests into [`PostReqBody::Bypass`] without stalling or losing frames.
+async fn read_post_request_body(
+    mut body: SrvBody,
+    max_bytes: usize,
+    is_grpc: bool,
+) -> Result<PostReqBody, SrvError> {
+    let mut accumulated = BytesMut::new();
+
+    loop {
+        if is_grpc && accumulated.len() >= 5 {
+            if accumulated[0] > 1 {
+                return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                    accumulated,
+                    Vec::new(),
+                    body,
+                )));
+            }
+            let msg_len = u32::from_be_bytes([
+                accumulated[1],
+                accumulated[2],
+                accumulated[3],
+                accumulated[4],
+            ]) as usize;
+            let frame_end = 5usize.saturating_add(msg_len);
+            if frame_end > max_bytes || accumulated.len() > frame_end {
+                return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                    accumulated,
+                    Vec::new(),
+                    body,
+                )));
+            }
+            if accumulated.len() == frame_end {
+                if body.is_end_stream() {
+                    return Ok(PostReqBody::Buffered(accumulated.freeze()));
+                }
+                loop {
+                    match tokio::time::timeout(GRPC_UNARY_EOF_GRACE, body.frame()).await {
+                        Ok(None) => return Ok(PostReqBody::Buffered(accumulated.freeze())),
+                        Ok(Some(Err(e))) => return Err(e),
+                        Ok(Some(Ok(extra))) => {
+                            if extra.data_ref().is_some_and(Bytes::is_empty) {
+                                continue;
+                            }
+                            return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                                accumulated,
+                                vec![extra],
+                                body,
+                            )));
+                        }
+                        Err(_elapsed) => {
+                            return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                                accumulated,
+                                Vec::new(),
+                                body,
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        match tokio::time::timeout(POST_BODY_READ_TIMEOUT, body.frame()).await {
+            Err(_elapsed) => {
+                return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                    accumulated,
+                    Vec::new(),
+                    body,
+                )));
+            }
+            Ok(None) => {
+                if is_grpc {
+                    let valid_unary = accumulated.len() >= 5
+                        && accumulated[0] <= 1
+                        && 5usize.saturating_add(u32::from_be_bytes([
+                            accumulated[1],
+                            accumulated[2],
+                            accumulated[3],
+                            accumulated[4],
+                        ]) as usize)
+                            == accumulated.len();
+                    if !valid_unary {
+                        return Ok(PostReqBody::Bypass(
+                            Full::new(accumulated.freeze())
+                                .map_err(SrvError::from)
+                                .boxed(),
+                        ));
+                    }
+                }
+                return Ok(PostReqBody::Buffered(accumulated.freeze()));
+            }
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(Some(Ok(frame))) => match frame.into_data() {
+                Ok(data) => {
+                    if accumulated.len().saturating_add(data.len()) > max_bytes {
+                        return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                            accumulated,
+                            vec![Frame::data(data)],
+                            body,
+                        )));
+                    }
+                    accumulated.extend_from_slice(&data);
+                }
+                Err(non_data_frame) => {
+                    return Ok(PostReqBody::Bypass(spill_accumulated_stream(
+                        accumulated,
+                        vec![non_data_frame],
+                        body,
+                    )));
+                }
+            },
+        }
+    }
+}
+
+enum CollectedResponse {
+    Cacheable {
+        body: Bytes,
+        trailers: Option<HeaderMap>,
+    },
+    Bypass {
         buffered: VecDeque<Frame<Bytes>>,
         rest: SrvBody,
     },
 }
 
-/// Reads up to `max_entry_bytes` of data frames from `body`. If the stream exceeds
-/// `max_entry_bytes` or yields trailers/errors, returns [`BufferedOrStream::Overflow`]
-/// without discarding any frames so the leader can keep streaming seamlessly.
-async fn collect_up_to_limit(
+fn empty_srv_body() -> SrvBody {
+    Empty::<Bytes>::new().map_err(SrvError::from).boxed()
+}
+
+fn bypass_with_accumulated(
+    accumulated: BytesMut,
+    extra_frames: Vec<Frame<Bytes>>,
+    rest: SrvBody,
+) -> CollectedResponse {
+    let mut buffered = VecDeque::with_capacity(extra_frames.len() + 1);
+    if !accumulated.is_empty() {
+        buffered.push_back(Frame::data(accumulated.freeze()));
+    }
+    for f in extra_frames {
+        buffered.push_back(f);
+    }
+    CollectedResponse::Bypass { buffered, rest }
+}
+
+/// Collects a cacheable HTTP/JSON or unary gRPC response body (and HTTP/2 `grpc-status: 0`
+/// trailers when `content-type` is `application/grpc*`), spilling seamlessly to streaming
+/// bypass on oversized payloads, multi-frame server streams, or non-zero `grpc-status`.
+async fn collect_response_for_cache(
+    resp_headers: &HeaderMap,
     mut body: SrvBody,
     max_entry_bytes: usize,
-) -> Result<BufferedOrStream, SrvError> {
+) -> Result<CollectedResponse, SrvError> {
+    if is_header_grpc_content_type(resp_headers) {
+        let header_grpc_ok = grpc_status_is_ok(resp_headers);
+        let mut accumulated = BytesMut::new();
+
+        loop {
+            if accumulated.len() >= 5 {
+                if accumulated[0] > 1 {
+                    return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                }
+                let msg_len = u32::from_be_bytes([
+                    accumulated[1],
+                    accumulated[2],
+                    accumulated[3],
+                    accumulated[4],
+                ]) as usize;
+                let frame_end = 5usize.saturating_add(msg_len);
+                if frame_end > max_entry_bytes || accumulated.len() > frame_end {
+                    return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                }
+                if accumulated.len() == frame_end {
+                    if body.is_end_stream() {
+                        if header_grpc_ok {
+                            return Ok(CollectedResponse::Cacheable {
+                                body: accumulated.freeze(),
+                                trailers: None,
+                            });
+                        }
+                        return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                    }
+                    loop {
+                        match tokio::time::timeout(GRPC_RESP_TRAILER_TIMEOUT, body.frame()).await {
+                            Ok(Some(Err(e))) => return Err(e),
+                            Ok(Some(Ok(frame))) => {
+                                if frame.data_ref().is_some_and(Bytes::is_empty) {
+                                    continue;
+                                }
+                                if frame.is_trailers() {
+                                    let Ok(tr) = frame.into_trailers() else {
+                                        return Ok(bypass_with_accumulated(
+                                            accumulated,
+                                            Vec::new(),
+                                            body,
+                                        ));
+                                    };
+                                    if grpc_status_is_ok(&tr) {
+                                        return Ok(CollectedResponse::Cacheable {
+                                            body: accumulated.freeze(),
+                                            trailers: Some(sanitize_response_headers(&tr)),
+                                        });
+                                    }
+                                    return Ok(bypass_with_accumulated(
+                                        accumulated,
+                                        vec![Frame::trailers(tr)],
+                                        body,
+                                    ));
+                                }
+                                // 2nd message frame -> server streaming response, bypass immediately
+                                return Ok(bypass_with_accumulated(
+                                    accumulated,
+                                    vec![frame],
+                                    body,
+                                ));
+                            }
+                            Ok(None) => {
+                                if header_grpc_ok {
+                                    return Ok(CollectedResponse::Cacheable {
+                                        body: accumulated.freeze(),
+                                        trailers: None,
+                                    });
+                                }
+                                return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                            }
+                            Err(_elapsed) => {
+                                return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                            }
+                        }
+                    }
+                }
+            }
+
+            match body.frame().await {
+                None => {
+                    if accumulated.is_empty() && header_grpc_ok {
+                        return Ok(CollectedResponse::Cacheable {
+                            body: Bytes::new(),
+                            trailers: None,
+                        });
+                    }
+                    return Ok(bypass_with_accumulated(
+                        accumulated,
+                        Vec::new(),
+                        empty_srv_body(),
+                    ));
+                }
+                Some(Err(e)) => return Err(e),
+                Some(Ok(frame)) => {
+                    if frame.is_trailers() {
+                        let Ok(tr) = frame.into_trailers() else {
+                            return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                        };
+                        if accumulated.is_empty() && grpc_status_is_ok(&tr) {
+                            return Ok(CollectedResponse::Cacheable {
+                                body: Bytes::new(),
+                                trailers: Some(sanitize_response_headers(&tr)),
+                            });
+                        }
+                        return Ok(bypass_with_accumulated(
+                            accumulated,
+                            vec![Frame::trailers(tr)],
+                            body,
+                        ));
+                    }
+                    match frame.into_data() {
+                        Ok(data) => {
+                            if accumulated.len().saturating_add(data.len()) > max_entry_bytes {
+                                return Ok(bypass_with_accumulated(
+                                    accumulated,
+                                    vec![Frame::data(data)],
+                                    body,
+                                ));
+                            }
+                            accumulated.extend_from_slice(&data);
+                        }
+                        Err(other) => {
+                            return Ok(bypass_with_accumulated(accumulated, vec![other], body));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Standard HTTP / JSON / gRPC-Web response buffering up to `max_entry_bytes`
     let mut frames: VecDeque<Frame<Bytes>> = VecDeque::new();
     let mut total_bytes: usize = 0;
 
@@ -930,7 +1624,7 @@ async fn collect_up_to_limit(
             let next_total = total_bytes.saturating_add(data.len());
             if next_total > max_entry_bytes {
                 frames.push_back(frame);
-                return Ok(BufferedOrStream::Overflow {
+                return Ok(CollectedResponse::Bypass {
                     buffered: frames,
                     rest: body,
                 });
@@ -938,29 +1632,186 @@ async fn collect_up_to_limit(
             total_bytes = next_total;
             frames.push_back(frame);
         } else {
-            // Non-data frame (e.g. HTTP/2 trailers) -> bypass caching and stream directly.
             frames.push_back(frame);
-            return Ok(BufferedOrStream::Overflow {
+            return Ok(CollectedResponse::Bypass {
                 buffered: frames,
                 rest: body,
             });
         }
     }
 
-    if frames.len() == 1
+    let bytes = if frames.len() == 1
         && let Some(only) = frames.pop_front()
-        && let Ok(bytes) = only.into_data()
+        && let Ok(single) = only.into_data()
     {
-        return Ok(BufferedOrStream::Buffered(bytes));
+        single
+    } else {
+        let mut out = BytesMut::with_capacity(total_bytes);
+        for frame in frames {
+            if let Ok(chunk) = frame.into_data() {
+                out.extend_from_slice(&chunk);
+            }
+        }
+        out.freeze()
+    };
+
+    if is_header_grpc_web_binary(resp_headers) && grpc_web_body_has_error(&bytes) {
+        return Ok(CollectedResponse::Bypass {
+            buffered: VecDeque::from([Frame::data(bytes)]),
+            rest: empty_srv_body(),
+        });
     }
 
-    let mut out = bytes::BytesMut::with_capacity(total_bytes);
-    for frame in frames {
-        if let Ok(chunk) = frame.into_data() {
-            out.extend_from_slice(&chunk);
+    Ok(CollectedResponse::Cacheable {
+        body: bytes,
+        trailers: None,
+    })
+}
+
+struct CoalesceContext {
+    cache: Arc<SharedResponseCache>,
+    key: CacheKey,
+    rule: CompiledCacheRule,
+    global_cfg: GlobalCacheConfig,
+    server_name: &'static str,
+    expose_cache_header: bool,
+    respect_cache_control: bool,
+    max_entry_bytes: usize,
+    is_post: bool,
+}
+
+async fn coalesce_and_execute<S>(
+    ctx: CoalesceContext,
+    req: Request<SrvBody>,
+    mut inner: S,
+) -> Result<Response<ServiceRespBody>, SrvError>
+where
+    S: Service<Request<SrvBody>, Response = Response<ServiceRespBody>, Error = SrvError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+{
+    let CoalesceContext {
+        cache,
+        key,
+        rule,
+        global_cfg,
+        server_name,
+        expose_cache_header,
+        respect_cache_control,
+        max_entry_bytes,
+        is_post,
+    } = ctx;
+
+    let (direct_tx, mut direct_rx) = oneshot::channel::<Response<ServiceRespBody>>();
+    let cache_for_worker = Arc::clone(&cache);
+    let key_for_worker = key.clone();
+    let rule_for_worker = rule;
+    let global_cfg_for_worker = global_cfg;
+    let mut inner_for_worker = inner.clone();
+
+    let coalesced = cache
+        .singleflight
+        .work_with_input(key, req, move |leader_req| async move {
+            let gen_before = cache_for_worker.current_generation(&key_for_worker.namespace);
+            let resp = match inner_for_worker.call(leader_req).await {
+                Ok(r) => r,
+                Err(e) => return SingleflightOutcome::UpstreamError(e.to_string()),
+            };
+
+            let Some(ttl) = evaluate_response_cacheability(
+                &resp,
+                &rule_for_worker,
+                &global_cfg_for_worker,
+                respect_cache_control,
+                max_entry_bytes,
+                is_post,
+            ) else {
+                let _ = direct_tx.send(resp);
+                return SingleflightOutcome::Bypass;
+            };
+
+            let (parts, body) = resp.into_parts();
+            match collect_response_for_cache(&parts.headers, body, max_entry_bytes).await {
+                Ok(CollectedResponse::Cacheable { body, trailers }) => {
+                    let clean_headers = sanitize_response_headers(&parts.headers);
+                    let entry = Arc::new(CachedResponse::new(
+                        parts.status,
+                        clean_headers,
+                        body,
+                        trailers,
+                        ttl,
+                    ));
+                    let _ = cache_for_worker.insert_if_generation(
+                        key_for_worker,
+                        Arc::clone(&entry),
+                        gen_before,
+                    );
+                    SingleflightOutcome::Cached(entry)
+                }
+                Ok(CollectedResponse::Bypass { buffered, rest }) => {
+                    let chained = ChainedStreamBody {
+                        buffered,
+                        rest,
+                        rest_done: false,
+                    }
+                    .boxed();
+                    let mut rebuilt = Response::from_parts(parts, chained);
+                    if !is_header_grpc_content_type(rebuilt.headers()) {
+                        rebuilt.headers_mut().remove(header::CONTENT_LENGTH);
+                    }
+                    let _ = direct_tx.send(rebuilt);
+                    SingleflightOutcome::Bypass
+                }
+                Err(e) => SingleflightOutcome::UpstreamError(e.to_string()),
+            }
+        })
+        .await
+        .map_err(|_| SrvError::Other("Cache singleflight operation aborted".into()))?;
+
+    match coalesced {
+        CoalescedResult::Leader(SingleflightOutcome::Cached(entry)) => {
+            ServerMetrics::inc_cache_miss(server_name);
+            Ok(build_response_from_cached(
+                &entry,
+                false,
+                expose_cache_header,
+                "MISS",
+            ))
+        }
+        CoalescedResult::Follower(SingleflightOutcome::Cached(entry), _unused_req) => {
+            ServerMetrics::inc_cache_coalesced(server_name);
+            Ok(build_response_from_cached(
+                &entry,
+                false,
+                expose_cache_header,
+                "COALESCED",
+            ))
+        }
+        CoalescedResult::Leader(SingleflightOutcome::Bypass) => {
+            ServerMetrics::inc_cache_bypass(server_name);
+            let mut resp = direct_rx
+                .try_recv()
+                .map_err(|_| SrvError::Other("Cache leader bypass response channel closed".into()))?;
+            if expose_cache_header {
+                attach_cache_status_header(&mut resp, "BYPASS");
+            }
+            Ok(resp)
+        }
+        CoalescedResult::Follower(SingleflightOutcome::Bypass, follower_req) => {
+            ServerMetrics::inc_cache_bypass(server_name);
+            let mut resp = inner.call(follower_req).await?;
+            if expose_cache_header {
+                attach_cache_status_header(&mut resp, "BYPASS");
+            }
+            Ok(resp)
+        }
+        CoalescedResult::Leader(SingleflightOutcome::UpstreamError(msg))
+        | CoalescedResult::Follower(SingleflightOutcome::UpstreamError(msg), _) => {
+            Err(SrvError::Other(msg))
         }
     }
-    Ok(BufferedOrStream::Buffered(out.freeze()))
 }
 
 impl<S> Service<Request<SrvBody>> for CacheService<S>
@@ -981,7 +1832,10 @@ where
 
     fn call(&mut self, req: Request<SrvBody>) -> Self::Future {
         let method = req.method();
-        if *method != Method::GET && *method != Method::HEAD {
+        if !matches!(
+            *method,
+            Method::GET | Method::HEAD | Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ) {
             return CacheFuture::Passthrough {
                 inner: self.inner.call(req),
             };
@@ -1019,16 +1873,33 @@ where
             }
         };
 
-        let matched_rule = self
-            .rules
-            .match_request(method.as_str(), &canonical_path)
-            .or_else(|| {
-                (*method == Method::HEAD)
-                    .then(|| self.rules.match_request("GET", &canonical_path))
-                    .flatten()
-            });
+        let matched_rule = if matches!(*method, Method::GET | Method::HEAD | Method::POST) {
+            self.rules
+                .match_request(method.as_str(), &canonical_path)
+                .or_else(|| {
+                    (*method == Method::HEAD)
+                        .then(|| self.rules.match_request("GET", &canonical_path))
+                        .flatten()
+                })
+        } else {
+            None
+        };
 
         let Some(rule) = matched_rule.cloned() else {
+            if matches!(
+                *method,
+                Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+            ) && let Some(namespaces) = self
+                .rules
+                .match_invalidations(method.as_str(), &canonical_path)
+            {
+                return CacheFuture::Invalidate {
+                    inner: self.inner.call(req),
+                    cache,
+                    namespaces: namespaces.to_vec(),
+                    server_name: self.server_name,
+                };
+            }
             return CacheFuture::Passthrough {
                 inner: self.inner.call(req),
             };
@@ -1069,12 +1940,105 @@ where
             .unwrap_or(server_name)
             .to_string();
 
+        if *method == Method::POST {
+            let max_req_bytes = rule
+                .max_request_body_bytes
+                .unwrap_or(global_cfg.max_request_body_bytes)
+                .min(global_cfg.max_request_body_bytes);
+
+            if let Some(cl) = req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok())
+                && cl > max_req_bytes
+            {
+                ServerMetrics::inc_cache_bypass(server_name);
+                return CacheFuture::Bypass {
+                    inner: self.inner.call(req),
+                    expose_cache_header,
+                };
+            }
+
+            let path_and_query = canonical_path_and_query(&canonical_path, req.uri().query());
+            let vary_values = collect_vary_values(req.headers(), &rule.vary_headers);
+            let post_encoding = extract_post_encoding(req.headers());
+            let is_grpc_req = is_header_grpc_content_type(req.headers());
+            let mut inner = self.inner.clone();
+
+            return CacheFuture::Coalesce {
+                fut: Box::pin(async move {
+                    let (req_parts, req_body) = req.into_parts();
+                    let req_bytes = match read_post_request_body(
+                        req_body,
+                        max_req_bytes,
+                        is_grpc_req,
+                    )
+                    .await?
+                    {
+                        PostReqBody::Buffered(bytes) => bytes,
+                        PostReqBody::Bypass(bypass_body) => {
+                            ServerMetrics::inc_cache_bypass(server_name);
+                            let rebuilt_req = Request::from_parts(req_parts, bypass_body);
+                            let mut resp = inner.call(rebuilt_req).await?;
+                            if expose_cache_header {
+                                attach_cache_status_header(&mut resp, "BYPASS");
+                            }
+                            return Ok(resp);
+                        }
+                    };
+
+                    let digest: [u8; 32] = Sha256::digest(&req_bytes).into();
+                    let key = CacheKey {
+                        namespace,
+                        method: "POST",
+                        path_and_query,
+                        vary_values,
+                        scope_key,
+                        body_hash: Some(digest),
+                        post_encoding: Some(post_encoding),
+                    };
+
+                    if let Some(entry) = cache.get(&key) {
+                        ServerMetrics::inc_cache_hit(server_name);
+                        return Ok(build_response_from_cached(
+                            &entry,
+                            false,
+                            expose_cache_header,
+                            "HIT",
+                        ));
+                    }
+
+                    let rebuilt_body = Full::new(req_bytes).map_err(SrvError::from).boxed();
+                    let rebuilt_req = Request::from_parts(req_parts, rebuilt_body);
+                    coalesce_and_execute(
+                        CoalesceContext {
+                            cache,
+                            key,
+                            rule,
+                            global_cfg,
+                            server_name,
+                            expose_cache_header,
+                            respect_cache_control,
+                            max_entry_bytes,
+                            is_post: true,
+                        },
+                        rebuilt_req,
+                        inner,
+                    )
+                    .await
+                }),
+            };
+        }
+
         let key = CacheKey {
             namespace,
             method: "GET",
             path_and_query: canonical_path_and_query(&canonical_path, req.uri().query()),
             vary_values: collect_vary_values(req.headers(), &rule.vary_headers),
             scope_key,
+            body_hash: None,
+            post_encoding: None,
         };
 
         let is_head = *method == Method::HEAD;
@@ -1098,110 +2062,23 @@ where
         }
 
         // GET miss (cold path): coalesce concurrent callers via cancellation-safe Singleflight.
-        let mut inner = self.inner.clone();
-
+        let inner = self.inner.clone();
         CacheFuture::Coalesce {
-            fut: Box::pin(async move {
-                let (direct_tx, mut direct_rx) = oneshot::channel::<Response<ServiceRespBody>>();
-                let cache_for_worker = Arc::clone(&cache);
-                let key_for_worker = key.clone();
-                let rule_for_worker = rule.clone();
-                let global_cfg_for_worker = global_cfg.clone();
-                let mut inner_for_worker = inner.clone();
-
-                let coalesced = cache
-                    .singleflight
-                    .work_with_input(key, req, move |leader_req| async move {
-                        let resp = match inner_for_worker.call(leader_req).await {
-                            Ok(r) => r,
-                            Err(e) => return SingleflightOutcome::UpstreamError(e.to_string()),
-                        };
-
-                        let Some(ttl) = evaluate_response_cacheability(
-                            &resp,
-                            &rule_for_worker,
-                            &global_cfg_for_worker,
-                            respect_cache_control,
-                            max_entry_bytes,
-                        ) else {
-                            let _ = direct_tx.send(resp);
-                            return SingleflightOutcome::Bypass;
-                        };
-
-                        let (parts, body) = resp.into_parts();
-                        match collect_up_to_limit(body, max_entry_bytes).await {
-                            Ok(BufferedOrStream::Buffered(bytes)) => {
-                                let clean_headers = sanitize_response_headers(&parts.headers);
-                                let entry = Arc::new(CachedResponse::new(
-                                    parts.status,
-                                    clean_headers,
-                                    bytes,
-                                    ttl,
-                                ));
-                                cache_for_worker.insert(key_for_worker, Arc::clone(&entry));
-                                SingleflightOutcome::Cached(entry)
-                            }
-                            Ok(BufferedOrStream::Overflow { buffered, rest }) => {
-                                let chained = ChainedStreamBody {
-                                    buffered,
-                                    rest,
-                                    rest_done: false,
-                                }
-                                .boxed();
-                                let mut rebuilt = Response::from_parts(parts, chained);
-                                rebuilt.headers_mut().remove(header::CONTENT_LENGTH);
-                                let _ = direct_tx.send(rebuilt);
-                                SingleflightOutcome::Bypass
-                            }
-                            Err(e) => SingleflightOutcome::UpstreamError(e.to_string()),
-                        }
-                    })
-                    .await
-                    .map_err(|_| SrvError::Other("Cache singleflight operation aborted".into()))?;
-
-                match coalesced {
-                    CoalescedResult::Leader(SingleflightOutcome::Cached(entry)) => {
-                        ServerMetrics::inc_cache_miss(server_name);
-                        Ok(build_response_from_cached(
-                            &entry,
-                            false,
-                            expose_cache_header,
-                            "MISS",
-                        ))
-                    }
-                    CoalescedResult::Follower(SingleflightOutcome::Cached(entry), _unused_req) => {
-                        ServerMetrics::inc_cache_coalesced(server_name);
-                        Ok(build_response_from_cached(
-                            &entry,
-                            false,
-                            expose_cache_header,
-                            "COALESCED",
-                        ))
-                    }
-                    CoalescedResult::Leader(SingleflightOutcome::Bypass) => {
-                        ServerMetrics::inc_cache_bypass(server_name);
-                        let mut resp = direct_rx.try_recv().map_err(|_| {
-                            SrvError::Other("Cache leader bypass response channel closed".into())
-                        })?;
-                        if expose_cache_header {
-                            attach_cache_status_header(&mut resp, "BYPASS");
-                        }
-                        Ok(resp)
-                    }
-                    CoalescedResult::Follower(SingleflightOutcome::Bypass, follower_req) => {
-                        ServerMetrics::inc_cache_bypass(server_name);
-                        let mut resp = inner.call(follower_req).await?;
-                        if expose_cache_header {
-                            attach_cache_status_header(&mut resp, "BYPASS");
-                        }
-                        Ok(resp)
-                    }
-                    CoalescedResult::Leader(SingleflightOutcome::UpstreamError(msg))
-                    | CoalescedResult::Follower(SingleflightOutcome::UpstreamError(msg), _) => {
-                        Err(SrvError::Other(msg))
-                    }
-                }
-            }),
+            fut: Box::pin(coalesce_and_execute(
+                CoalesceContext {
+                    cache,
+                    key,
+                    rule,
+                    global_cfg,
+                    server_name,
+                    expose_cache_header,
+                    respect_cache_control,
+                    max_entry_bytes,
+                    is_post: false,
+                },
+                req,
+                inner,
+            )),
         }
     }
 }
@@ -1367,6 +2244,7 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let layer_cfg = CacheLayerConfig {
@@ -1379,6 +2257,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         let compiled = Arc::new(CompiledCacheConfig::from_raw(&layer_cfg, "srv_a").unwrap());
 
@@ -1446,6 +2325,7 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -1474,6 +2354,7 @@ mod tests {
                     },
                 ),
             ]),
+            ..Default::default()
         };
 
         let comp_a = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_a").unwrap());
@@ -1574,11 +2455,13 @@ mod tests {
             max_entry_bytes: 10, // tiny limit
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
             namespace: None,
             rules: HashMap::from([("/*".to_string(), CacheRuleConfig::default())]),
+            ..Default::default()
         };
         let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_stream").unwrap());
 
@@ -1622,6 +2505,7 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -1644,6 +2528,7 @@ mod tests {
                     },
                 ),
             ]),
+            ..Default::default()
         };
         let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_cc").unwrap());
         let calls = Arc::new(AtomicU64::new(0));
@@ -1741,6 +2626,7 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -1752,6 +2638,7 @@ mod tests {
                     ..Default::default()
                 },
             )]),
+            ..Default::default()
         };
         let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_vary").unwrap());
 
@@ -1809,11 +2696,13 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
             namespace: None,
             rules: HashMap::from([("/*".to_string(), CacheRuleConfig::default())]),
+            ..Default::default()
         };
         let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_coal").unwrap());
 
@@ -1907,6 +2796,8 @@ mod tests {
             path_and_query: "/item".to_string(),
             vary_values: vec![],
             scope_key: String::new(),
+            body_hash: None,
+            post_encoding: None,
         };
 
         let initial_cfg = GlobalCacheConfig {
@@ -1916,6 +2807,7 @@ mod tests {
             max_entry_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: false,
+            ..Default::default()
         };
         configure_global_response_cache(Some(&initial_cfg));
         let c1 = global_response_cache();
@@ -1925,6 +2817,7 @@ mod tests {
                 StatusCode::OK,
                 HeaderMap::new(),
                 Bytes::from_static(b"cached"),
+                None,
                 Duration::from_secs(60),
             )),
         );
@@ -1956,6 +2849,7 @@ mod tests {
                 StatusCode::OK,
                 HeaderMap::new(),
                 Bytes::from_static(b"cached2"),
+                None,
                 Duration::from_secs(60),
             )),
         );
@@ -1967,5 +2861,538 @@ mod tests {
 
         // Restore default global cache state for other tests in the process
         configure_global_response_cache(None);
+    }
+
+    fn grpc_unary_frame(payload: &[u8]) -> Bytes {
+        let mut buf = BytesMut::with_capacity(5 + payload.len());
+        buf.extend_from_slice(&[0u8]);
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf.freeze()
+    }
+
+    fn post_json_req(uri: &str, body: &'static [u8]) -> Request<SrvBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(body)).map_err(SrvError::from).boxed())
+            .unwrap()
+    }
+
+    fn post_grpc_req(uri: &str, frame: Bytes) -> Request<SrvBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .header(header::TE, "trailers")
+            .body(Full::new(frame).map_err(SrvError::from).boxed())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_post_json_body_hash_isolation_and_coalescing() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 16,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([(
+                "POST /api/GetUsers".to_string(),
+                CacheRuleConfig {
+                    ttl_seconds: Some(60),
+                    scope: CacheScope::Public,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_post_json").unwrap());
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let svc = CacheLayer::new(compiled, "srv_post_json")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls_ref);
+                    async move {
+                        let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let text = String::from_utf8_lossy(&body).into_owned();
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(
+                                    Full::new(Bytes::from(format!("n={n};req={text}")))
+                                        .map_err(SrvError::from)
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 1. Page 1 MISS -> HIT
+        let r1 = svc
+            .clone()
+            .oneshot(post_json_req("/api/GetUsers", br#"{"page":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(r1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let b1 = r1.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b1[..], br#"n=1;req={"page":1}"#);
+
+        let r2 = svc
+            .clone()
+            .oneshot(post_json_req("/api/GetUsers", br#"{"page":1}"#))
+            .await
+            .unwrap();
+        assert_eq!(r2.headers().get("x-praeco-cache").unwrap(), "HIT");
+        let b2 = r2.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b2[..], br#"n=1;req={"page":1}"#);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 2. Page 2 -> different SHA-256 key -> MISS
+        let r3 = svc
+            .clone()
+            .oneshot(post_json_req("/api/GetUsers", br#"{"page":2}"#))
+            .await
+            .unwrap();
+        assert_eq!(r3.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let b3 = r3.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b3[..], br#"n=2;req={"page":2}"#);
+
+        // 3. Different Content-Type -> isolated even for same bytes
+        let xml_req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/GetUsers")
+            .header(header::CONTENT_TYPE, "application/problem+json")
+            .body(
+                Full::new(Bytes::from_static(br#"{"page":1}"#))
+                    .map_err(SrvError::from)
+                    .boxed(),
+            )
+            .unwrap();
+        let r_ct = svc.clone().oneshot(xml_req).await.unwrap();
+        assert_eq!(r_ct.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // 4. Request body exceeding max_request_body_bytes (16B) streams through as BYPASS
+        let r_big = svc
+            .clone()
+            .oneshot(post_json_req("/api/GetUsers", br#"{"page":9999999999}"#))
+            .await
+            .unwrap();
+        assert_eq!(r_big.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+        let b_big = r_big.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b_big[..], br#"n=4;req={"page":9999999999}"#);
+    }
+
+    #[tokio::test]
+    async fn test_post_grpc_unary_trailers_cached_and_nonzero_status_bypassed() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([(
+                "POST /chat.ChatService/GetRoomProducts".to_string(),
+                CacheRuleConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_grpc").unwrap());
+
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let svc = CacheLayer::new(compiled, "srv_grpc")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls_ref);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        let req_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        let deny = req_bytes.ends_with(b"deny");
+                        let msg = grpc_unary_frame(if deny { b"" } else { b"products-ok" });
+                        let mut trailers = HeaderMap::new();
+                        trailers.insert(
+                            "grpc-status",
+                            HeaderValue::from_static(if deny { "7" } else { "0" }),
+                        );
+                        trailers.insert(
+                            "x-custom-trailer",
+                            HeaderValue::from_static("preserved"),
+                        );
+                        let stream = futures_util::stream::iter(vec![
+                            Ok::<_, SrvError>(Frame::data(msg)),
+                            Ok::<_, SrvError>(Frame::trailers(trailers)),
+                        ]);
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/grpc")
+                                .body(http_body_util::StreamBody::new(stream).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 1. Unary gRPC grpc-status: 0 -> MISS then HIT with preserved trailers and NO content-length
+        let req1 = post_grpc_req(
+            "/chat.ChatService/GetRoomProducts",
+            grpc_unary_frame(b"room-1"),
+        );
+        let r1 = svc.clone().oneshot(req1).await.unwrap();
+        assert_eq!(r1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert!(r1.headers().get(header::CONTENT_LENGTH).is_none());
+        let collected1 = r1.into_body().collect().await.unwrap();
+        assert_eq!(collected1.trailers().unwrap().get("grpc-status").unwrap(), "0");
+        assert_eq!(
+            collected1.trailers().unwrap().get("x-custom-trailer").unwrap(),
+            "preserved"
+        );
+        assert_eq!(collected1.to_bytes(), grpc_unary_frame(b"products-ok"));
+
+        let req2 = post_grpc_req(
+            "/chat.ChatService/GetRoomProducts",
+            grpc_unary_frame(b"room-1"),
+        );
+        let r2 = svc.clone().oneshot(req2).await.unwrap();
+        assert_eq!(r2.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert!(r2.headers().get(header::CONTENT_LENGTH).is_none());
+        let collected2 = r2.into_body().collect().await.unwrap();
+        assert_eq!(collected2.trailers().unwrap().get("grpc-status").unwrap(), "0");
+        assert_eq!(
+            collected2.trailers().unwrap().get("x-custom-trailer").unwrap(),
+            "preserved"
+        );
+        assert_eq!(collected2.to_bytes(), grpc_unary_frame(b"products-ok"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 2. Non-zero grpc-status (7) MUST NOT be cached and still preserve trailers
+        let err_req1 = post_grpc_req(
+            "/chat.ChatService/GetRoomProducts",
+            grpc_unary_frame(b"deny"),
+        );
+        let re1 = svc.clone().oneshot(err_req1).await.unwrap();
+        assert_eq!(re1.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+        let err_col1 = re1.into_body().collect().await.unwrap();
+        assert_eq!(err_col1.trailers().unwrap().get("grpc-status").unwrap(), "7");
+
+        let err_req2 = post_grpc_req(
+            "/chat.ChatService/GetRoomProducts",
+            grpc_unary_frame(b"deny"),
+        );
+        let re2 = svc.clone().oneshot(err_req2).await.unwrap();
+        assert_eq!(re2.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_post_grpc_streaming_request_and_response_bypass_without_hanging() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig::default());
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            expose_cache_header: true,
+            ..cache.config().clone()
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([(
+                "POST /chat.ChatService/MaybeStream".to_string(),
+                CacheRuleConfig::default(),
+            )]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_grpc_stream").unwrap());
+
+        let svc = CacheLayer::new(compiled, "srv_grpc_stream")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(|req: Request<SrvBody>| async move {
+                    let req_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+                    // Yield two gRPC data frames (server streaming) + trailers
+                    let stream = futures_util::stream::iter(vec![
+                        Ok::<_, SrvError>(Frame::data(grpc_unary_frame(&req_bytes))),
+                        Ok::<_, SrvError>(Frame::data(grpc_unary_frame(b"chunk2"))),
+                        Ok::<_, SrvError>(Frame::trailers(trailers)),
+                    ]);
+                    Ok::<_, SrvError>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/grpc")
+                            .body(http_body_util::StreamBody::new(stream).boxed())
+                            .unwrap(),
+                    )
+                })
+                .boxed_clone_sync(),
+            );
+
+        // Client keeps stream open for 40ms after frame 1 before sending frame 2 -> must spill into BYPASS immediately
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, SrvError>>(4);
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(Frame::data(grpc_unary_frame(b"f1")))).await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = tx.send(Ok(Frame::data(grpc_unary_frame(b"f2")))).await;
+        });
+        let req_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let client_stream_req = Request::builder()
+            .method(Method::POST)
+            .uri("/chat.ChatService/MaybeStream")
+            .header(header::CONTENT_TYPE, "application/grpc")
+            .body(http_body_util::StreamBody::new(req_stream).boxed())
+            .unwrap();
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            svc.clone().oneshot(client_stream_req),
+        )
+        .await
+        .expect("streaming request must not deadlock")
+        .unwrap();
+        assert_eq!(resp.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+        let col = resp.into_body().collect().await.unwrap();
+        assert_eq!(col.trailers().unwrap().get("grpc-status").unwrap(), "0");
+
+        // Multi-frame server-streaming response on a unary request also spills to BYPASS without caching
+        let unary_req = post_grpc_req("/chat.ChatService/MaybeStream", grpc_unary_frame(b"u1"));
+        let resp2 = svc.clone().oneshot(unary_req).await.unwrap();
+        assert_eq!(resp2.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+        let _ = resp2.into_body().collect().await.unwrap();
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_declarative_cross_server_mutation_invalidation_and_generation_guard() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let read_cfg = CompiledCacheConfig::from_raw(
+            &CacheLayerConfig {
+                namespace: Some("shared_products".to_string()),
+                rules: HashMap::from([(
+                    "POST /chat.ChatService/GetProducts".to_string(),
+                    CacheRuleConfig::default(),
+                )]),
+                ..Default::default()
+            },
+            "read_srv",
+        )
+        .unwrap();
+
+        let write_cfg = CompiledCacheConfig::from_raw(
+            &CacheLayerConfig {
+                namespace: None,
+                rules: HashMap::new(),
+                invalidations: HashMap::from([(
+                    "POST /chat.ChatService/CreateProduct".to_string(),
+                    vec!["shared_products".to_string()],
+                )]),
+            },
+            "write_srv",
+        )
+        .unwrap();
+
+        let slow_gate = Arc::new(Notify::new());
+        let slow_started = Arc::new(Notify::new());
+        let slow_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow_gate_ref = Arc::clone(&slow_gate);
+        let slow_started_ref = Arc::clone(&slow_started);
+        let slow_once_ref = Arc::clone(&slow_once);
+        let read_calls = Arc::new(AtomicU64::new(0));
+        let read_calls_ref = Arc::clone(&read_calls);
+
+        let read_svc = CacheLayer::new(Arc::new(read_cfg), "read_srv")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let calls = Arc::clone(&read_calls_ref);
+                    let gate = Arc::clone(&slow_gate_ref);
+                    let started = Arc::clone(&slow_started_ref);
+                    let once = Arc::clone(&slow_once_ref);
+                    async move {
+                        let req_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                        if req_bytes.as_ref() == br#"{"slow":true}"#
+                            && !once.swap(true, Ordering::SeqCst)
+                        {
+                            started.notify_one();
+                            gate.notified().await;
+                        }
+                        let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(
+                                    Full::new(Bytes::from(format!("products-v{n}")))
+                                        .map_err(SrvError::from)
+                                        .boxed(),
+                                )
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        let write_svc = CacheLayer::new(Arc::new(write_cfg), "write_srv")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(|req: Request<SrvBody>| async move {
+                    let req_bytes = req.into_body().collect().await.unwrap().to_bytes();
+                    if req_bytes.as_ref() == b"fail-http" {
+                        return Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                .body(Full::new(Bytes::from_static(b"err")).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        );
+                    }
+                    if req_bytes.as_ref() == b"fail-grpc" {
+                        let mut tr = HeaderMap::new();
+                        tr.insert("grpc-status", HeaderValue::from_static("7"));
+                        let s = futures_util::stream::iter(vec![
+                            Ok::<_, SrvError>(Frame::data(grpc_unary_frame(b""))),
+                            Ok::<_, SrvError>(Frame::trailers(tr)),
+                        ]);
+                        return Ok(Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/grpc")
+                            .body(http_body_util::StreamBody::new(s).boxed())
+                            .unwrap());
+                    }
+                    let mut tr = HeaderMap::new();
+                    tr.insert("grpc-status", HeaderValue::from_static("0"));
+                    let s = futures_util::stream::iter(vec![
+                        Ok::<_, SrvError>(Frame::data(grpc_unary_frame(b"created"))),
+                        Ok::<_, SrvError>(Frame::trailers(tr)),
+                    ]);
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/grpc")
+                        .body(http_body_util::StreamBody::new(s).boxed())
+                        .unwrap())
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 1. Populate read_svc -> HIT
+        let r1 = read_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"all":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(r1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let r2 = read_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"all":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(r2.headers().get("x-praeco-cache").unwrap(), "HIT");
+
+        // 2. Failed mutations (HTTP 500 or gRPC grpc-status: 7) MUST NOT invalidate
+        let _ = write_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/CreateProduct", b"fail-http"))
+            .await
+            .unwrap();
+        let fail_grpc_resp = write_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/CreateProduct", b"fail-grpc"))
+            .await
+            .unwrap();
+        let _ = fail_grpc_resp.into_body().collect().await.unwrap();
+        cache.run_pending_tasks();
+        let r3 = read_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"all":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(r3.headers().get("x-praeco-cache").unwrap(), "HIT");
+
+        // 3. Successful gRPC mutation (grpc-status: 0 trailer) invalidates shared_products upon stream completion
+        let before_inv = ServerMetrics::for_server("write_srv")
+            .cache_invalidations
+            .load(Ordering::Relaxed);
+        let ok_mut = write_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/CreateProduct", b"ok"))
+            .await
+            .unwrap();
+        let _ = ok_mut.into_body().collect().await.unwrap();
+        cache.run_pending_tasks();
+        assert_eq!(
+            ServerMetrics::for_server("write_srv")
+                .cache_invalidations
+                .load(Ordering::Relaxed),
+            before_inv + 1
+        );
+
+        let r4 = read_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"all":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(r4.headers().get("x-praeco-cache").unwrap(), "MISS");
+
+        // 4. Write-read race protection: in-flight slow MISS must NOT overwrite post-invalidation generation
+        let r_slow_fut = tokio::spawn({
+            let svc = read_svc.clone();
+            async move {
+                svc.oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"slow":true}"#))
+                    .await
+                    .unwrap()
+            }
+        });
+        slow_started.notified().await;
+        let ok_mut2 = write_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/CreateProduct", b"ok2"))
+            .await
+            .unwrap();
+        let _ = ok_mut2.into_body().collect().await.unwrap();
+        slow_gate.notify_waiters();
+        let slow_resp = r_slow_fut.await.unwrap();
+        assert_eq!(slow_resp.headers().get("x-praeco-cache").unwrap(), "MISS");
+        cache.run_pending_tasks();
+
+        // Next call must still be MISS (stale slow response was not inserted)
+        let r_after = read_svc
+            .clone()
+            .oneshot(post_json_req("/chat.ChatService/GetProducts", br#"{"slow":true}"#))
+            .await
+            .unwrap();
+        assert_eq!(r_after.headers().get("x-praeco-cache").unwrap(), "MISS");
     }
 }
