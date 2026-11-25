@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.1] - 2026-11-25
+
+Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache (`CacheLayer` / `SharedResponseCache`) shared across all configured `[[Server]]` instances, backed by a cancellation-safe `Singleflight` request coalescer.
+
+### Added
+* **Cancellation-Safe `Singleflight<K, T>` (`src/middleware/cache.rs`):**
+  * Decouples in-flight work onto a dedicated Tokio task using `tokio::sync::watch` (`borrow_and_update`), `WaiterGuard`, `CancellationToken`, and an `Arc::ptr_eq`-guarded `MapCleanupGuard`.
+  * Dropping a single caller future does not abort work for remaining waiters; dropping all waiters cancels the background task and cleans up the key safely without racing new callers.
+* **Process-Wide W-TinyLFU Response Cache (`SharedResponseCache`, `CacheLayer`, `[cache]`, `[Server.Layers.Cache]`):**
+  * Backed by `moka::sync::Cache` with byte-level `weigher` accounting (`max_bytes`, default `256 MiB`) and per-entry `Expiry` TTLs (`default_ttl_seconds`, default `60` s), shared across every enabled `[[Server]]` instance and preserved across `SIGHUP` reloads when `max_bytes` is unchanged.
+  * Opt-in rule matching under `[Server.Layers.Cache.rules]` supporting `"/exact"`, `"/prefix*"`, `"GET /..."`, and `"HEAD /..."` with lexicographic query normalization, `vary_headers`, `CacheScope` (`public`, `per_role`, `per_subject`), and explicit cross-server sharing via `namespace`.
+  * Enforces strict Zero-Trust ordering in `ServerConfig::finalize()` / `Layers::validate_middleware_order()`: `"Cache"` must follow `IpFilter`, `PathSanitizer`, `Decompression`, `MaxPayload`, `Inspection`, `JwtAuth`, `Rbac`, `RateLimiter`, and `Compression`, and is rejected on `ServiceType::Idp` and `ServiceType::Admin`.
+  * Streaming responses exceeding `max_entry_bytes` seamlessly switch to `ChainedStreamBody` bypass without buffering unbounded RAM; `aggregate` routes with partial optional failures (`_errors`) attach `CacheBypass` so degraded `200 OK` responses are never cached.
+* **Admin Telemetry & Cache Purge (`src/middleware/admin.rs`):**
+  * Added `praeco_cache_entries`, `praeco_cache_bytes_used`, and `praeco_server_cache_requests_total{server,outcome}` to Prometheus `/metrics`, plus CSRF-protected & audit-logged `POST ?action=purge_cache[&namespace=...]` control support.
+
+---
+
 ## [0.8.0] - 2026-11-25
 
 Major SemVer-breaking security & architecture release decoupling Role-Based Access Control into a standalone fail-closed Tower middleware (`RbacLayer`), adding `OptionalJwt` symmetry, and bringing first-class RBAC & auth extractors to `praeco_rs::web`.

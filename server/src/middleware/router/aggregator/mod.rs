@@ -658,6 +658,7 @@ struct ChunkedBytesBody {
     chunks: VecDeque<Bytes>,
     remaining_bytes: usize,
     reservation: BufferReservation,
+    has_errors: bool,
 }
 
 impl http_body::Body for ChunkedBytesBody {
@@ -745,7 +746,8 @@ fn assemble_aggregated_body(
         }
     }
 
-    if !errors_map.is_empty() {
+    let has_errors = !errors_map.is_empty();
+    if has_errors {
         push_chunk(Bytes::from_static(br#","_errors":"#));
         let errors_json = serde_json::to_vec(&errors_map)
             .map_err(|e| SrvError::Other(format!("Failed to serialize _errors map: {e}")))?;
@@ -757,6 +759,7 @@ fn assemble_aggregated_body(
         chunks,
         remaining_bytes: total_bytes,
         reservation: consolidated_reservation,
+        has_errors,
     })
 }
 
@@ -1057,13 +1060,20 @@ pub(crate) async fn handle_aggregate_with_budget(
     let chunked_body =
         assemble_aggregated_body(&route_info.aggregate_targets, outcomes, global_budget)?;
     let content_len = chunked_body.remaining_bytes;
+    let has_errors = chunked_body.has_errors;
 
-    Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, content_len)
         .body(chunked_body.boxed())
-        .map_err(|e| SrvError::Other(format!("Failed to build aggregate response: {e}")))
+        .map_err(|e| SrvError::Other(format!("Failed to build aggregate response: {e}")))?;
+
+    if has_errors {
+        resp.extensions_mut()
+            .insert(crate::middleware::cache::CacheBypass);
+    }
+    Ok(resp)
 }
 
 

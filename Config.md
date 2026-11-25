@@ -20,6 +20,7 @@ Every parameter includes:
    - [Tokio Worker Threads (`tokio_threads`)](#tokio-worker-threads-tokio_threads)
    - [Log Directory & Stdout Interaction (`log_dir`)](#log-directory--stdout-interaction-log_dir)
    - [PKI Base Object Identifier (`pki_base_oid`)](#pki-base-object-identifier-pki_base_oid)
+   - [Process-Wide Response Cache (`[cache]`)](#process-wide-response-cache-cache)
 3. [Telemetry & Distributed Tracing](#telemetry--distributed-tracing)
    - [Enable OpenTelemetry (`enable_opentelemetry`)](#enable-opentelemetry-enable_opentelemetry)
    - [Jaeger / OTLP Endpoint (`jaeger_endpoint`)](#jaeger--otlp-endpoint-jaeger_endpoint)
@@ -111,6 +112,7 @@ Global settings are defined at the root of `Config.toml` (outside any `[[Server]
 | [`tokio_threads`](#tokio-worker-threads-tokio_threads) | Integer | Optional | Available CPU Cores * 2 | Number of async worker OS threads for the Tokio runtime. |
 | [`log_dir`](#log-directory--stdout-interaction-log_dir) | String | Optional | `None` (Stdout only) | Directory for asynchronous, non-blocking rolling log files. |
 | [`pki_base_oid`](#pki-base-object-identifier-pki_base_oid) | String | Optional | `None` | Base Private Enterprise Number (PEN) OID for role mapping. |
+| [`[cache]`](#process-wide-response-cache-cache) | Table | Optional | Defaults (`256 MiB`, `60s`) | Process-wide W-TinyLFU HTTP response cache shared across all servers. |
 
 ---
 
@@ -206,6 +208,31 @@ log_dir = "/var/log/praeco"
 ```toml
 # Private Enterprise Number (PEN) assigned by IANA: 65111
 pki_base_oid = "1.3.6.1.4.1.65111"
+```
+
+---
+
+### Process-Wide Response Cache (`[cache]`)
+
+Configures the process-wide W-TinyLFU (`moka`) HTTP response cache shared across every enabled `[[Server]]` instance. Caching is activated per server via `"Cache"` in `[Server.Layers].enabled` and opt-in path rules under `[Server.Layers.Cache.rules]`.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `enabled` | Boolean | Optional | `true` | Master toggle for the shared in-memory cache. When `false`, all `"Cache"` layers act as pass-throughs and existing entries are cleared on reload. |
+| `max_bytes` | Integer (`u64`) | Optional | `268435456` (`256 MiB`) | Total RAM byte budget across all cached responses and servers (`> 0`). Preserved across `SIGHUP` reloads when unchanged. |
+| `default_ttl_seconds` | Integer (`u64`) | Optional | `60` | Fallback TTL in seconds when a path rule does not specify `ttl_seconds` (`> 0`). |
+| `max_entry_bytes` | Integer (`usize`) | Optional | `1048576` (`1 MiB`) | Maximum response body size in bytes eligible for caching (`> 0`, `<= max_bytes`). Larger responses stream directly as `BYPASS`. |
+| `respect_cache_control` | Boolean | Optional | `true` | Honors request `Cache-Control: no-store`/`no-cache` and `Pragma: no-cache`, as well as response `no-store`, `no-cache`, `private` (for `scope = "public"`), `s-maxage`, and `max-age`. |
+| `expose_cache_header` | Boolean | Optional | `false` | When `true`, attaches `x-praeco-cache: HIT\|MISS\|COALESCED\|BYPASS` (and `age` on hits) to responses. |
+
+```toml
+[cache]
+enabled = true
+max_bytes = 268435456          # 256 MiB across all [[Server]] instances
+default_ttl_seconds = 60
+max_entry_bytes = 1048576      # 1 MiB max per cached response
+respect_cache_control = true
+expose_cache_header = false
 ```
 
 ---
@@ -1068,7 +1095,8 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0). It extracts an incoming W3C `traceparent` (or `x-trace-id`) header—or synthesizes a fresh `00-{trace-id}-{span-id}-01` identifier—and links the OpenTelemetry parent context to the request span before downstream layers run.
 2. **`Inspection` After `Decompression`:** If both are enabled, `"Inspection"` must appear after `"Decompression"`. Otherwise, the WAF inspects compressed bytes.
 3. **`Rbac` After `JwtAuth`:** If both `"Rbac"` and `"JwtAuth"` (or `"JWT"`) are enabled, `"Rbac"` must appear after `"JwtAuth"` so JWT claims and mapped `UserRole`s are populated before role enforcement.
-4. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
+4. **`Cache` After Security, Auth, RBAC & Compression:** If `"Cache"` is enabled, it must appear **after** `"IpFilter"`, `"PathSanitizer"`, `"Decompression"`, `"MaxPayload"`, `"Inspection"`, `"JwtAuth"`, `"Rbac"`, `"RateLimiter:*"`, and `"Compression"`. This guarantees cache hits never bypass security/RBAC checks and responses are stored uncompressed so `br`/`gzip`/plain clients share the same entry. `"Cache"` cannot be enabled on `service = "Idp"` or `service = "Admin"`.
+5. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
 
 ---
 
@@ -1166,6 +1194,42 @@ enabled = ["TraceId", "Logger", "IpFilter", "PathSanitizer", "Inspection", "JwtA
 allow_cidrs = ["10.0.0.0/8", "192.168.0.0/16", "127.0.0.1/32", "::1/128"]
 deny_cidrs  = ["10.99.0.0/16"]
 trust_forwarded_headers = false
+```
+
+#### `[Server.Layers.Cache]` (Opt-In W-TinyLFU Response Cache & Singleflight)
+Enables process-wide W-TinyLFU HTTP response caching with cancellation-safe `Singleflight` request coalescing for `GET` and `HEAD` requests matching `[Server.Layers.Cache.rules]`. Unmatched paths and non-`GET`/`HEAD` requests pass through untouched.
+
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `namespace` | String | Optional | Server `name` | Default cache namespace for all rules on this server. Set identical `namespace` values across multiple `[[Server]]` instances to share cached responses between listeners. |
+| `rules` | Table (`Map<Pattern, Rule>`) | **Mandatory** | *None* | Non-empty map of path patterns (`"/exact"`, `"/prefix*"`, `"GET /..."`, `"HEAD /..."`) to caching policies. |
+
+##### Per-Rule Parameters (`[Server.Layers.Cache.rules."<pattern>"]`)
+| Parameter | Data Type | Requirement | Default Value | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `ttl_seconds` | Integer (`u64`) | Optional | `[cache].default_ttl_seconds` | Time-to-live in seconds (`> 0`). Clamped to upstream `s-maxage`/`max-age` when `respect_cache_control = true`. |
+| `scope` | String | Optional | `"public"` | Isolation level: `"public"` (shared across all authorized callers), `"per_role"` (isolated by sorted mapped roles), or `"per_subject"` (isolated by JWT `sub` or mTLS SAN; unauthenticated requests bypass fail-safely). |
+| `namespace` | String | Optional | Layer `namespace` or server `name` | Rule-specific shared namespace across servers (e.g. `"shared_catalog"`). |
+| `vary_headers` | Array of Strings | Optional | `[]` | Request header names included in the cache key (case-insensitive). |
+| `max_entry_bytes` | Integer (`usize`) | Optional | `[cache].max_entry_bytes` | Per-rule body limit in bytes (`> 0`, capped by global `max_entry_bytes`). |
+| `respect_cache_control` | Boolean | Optional | `[cache].respect_cache_control` | Per-rule override for `Cache-Control` / `Pragma` evaluation. |
+| `expose_cache_header` | Boolean | Optional | `[cache].expose_cache_header` | Per-rule override for `x-praeco-cache` and `age` response headers. |
+
+> **Admin Telemetry & Purging:** Cache metrics are exported on `/metrics` as `praeco_cache_entries`, `praeco_cache_bytes_used`, and `praeco_server_cache_requests_total{server,outcome="hit|miss|coalesced|bypass"}`. Authenticated/CSRF-checked `POST /status?action=purge_cache` clears all entries (or `&namespace=<name>` for a single namespace).
+
+```toml
+[Server.Layers]
+enabled = ["TraceId", "IpFilter", "PathSanitizer", "Inspection", "JwtAuth", "Rbac", "Compression", "Cache"]
+
+[Server.Layers.Cache.rules."/api/catalog/*"]
+ttl_seconds = 300
+scope = "public"
+namespace = "shared_catalog"
+vary_headers = ["accept-language"]
+
+[Server.Layers.Cache.rules."GET /api/orders/*"]
+ttl_seconds = 30
+scope = "per_role"
 ```
 
 ---

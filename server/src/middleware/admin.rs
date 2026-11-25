@@ -604,23 +604,89 @@ pub fn format_prometheus_metrics(status: &AdminStatusResponse) -> String {
             }
         }
     }
+    out.push('\n');
+
+    let shared_cache = crate::middleware::cache::global_response_cache();
+    out.push_str("# HELP praeco_cache_entries Approximate number of entries in the shared W-TinyLFU response cache.\n");
+    out.push_str("# TYPE praeco_cache_entries gauge\n");
+    out.push_str(&format!(
+        "praeco_cache_entries {}\n\n",
+        shared_cache.entry_count()
+    ));
+
+    out.push_str("# HELP praeco_cache_bytes_used Approximate byte weight currently held by the shared W-TinyLFU response cache.\n");
+    out.push_str("# TYPE praeco_cache_bytes_used gauge\n");
+    out.push_str(&format!(
+        "praeco_cache_bytes_used {}\n\n",
+        shared_cache.weighted_size()
+    ));
+
+    out.push_str("# HELP praeco_server_cache_requests_total Cacheable GET/HEAD outcomes per server.\n");
+    out.push_str("# TYPE praeco_server_cache_requests_total counter\n");
+    let ord = std::sync::atomic::Ordering::Relaxed;
+    for srv in &status.servers {
+        let srv_name = escape_prometheus_label(&srv.name);
+        let srv_metrics = crate::configuration::ServerMetrics::for_server(&srv.name);
+        for (outcome, count) in [
+            ("hit", srv_metrics.cache_hits.load(ord)),
+            ("miss", srv_metrics.cache_misses.load(ord)),
+            ("coalesced", srv_metrics.cache_coalesced.load(ord)),
+            ("bypass", srv_metrics.cache_bypasses.load(ord)),
+        ] {
+            out.push_str(&format!(
+                "praeco_server_cache_requests_total{{server=\"{}\",outcome=\"{}\"}} {}\n",
+                srv_name, outcome, count
+            ));
+        }
+    }
     out
 }
 
-/// Applies an optional circuit-breaker control action (`action=mark_dead` or `action=mark_alive`
-/// for a target `upstream=<uri>`) across all configured routes.
+/// Applies an optional admin control action (`action=mark_dead` / `action=mark_alive`
+/// for `upstream=<uri>`, or `action=purge_cache` with optional `namespace=<ns>`).
 fn apply_optional_control_action(query: &str, fallback_server: Option<&ServerConfig>) {
     let mut action: Option<&str> = None;
     let mut target_upstream: Option<String> = None;
+    let mut target_namespace: Option<String> = None;
 
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             match k {
                 "action" => action = Some(v),
                 "upstream" => target_upstream = Some(urlencoding_decode(v)),
+                "namespace" => target_namespace = Some(urlencoding_decode(v)),
                 _ => {}
             }
         }
+    }
+
+    if action == Some("purge_cache") {
+        let cache = crate::middleware::cache::global_response_cache();
+        match target_namespace
+            .as_deref()
+            .map(str::trim)
+            .filter(|ns| !ns.is_empty())
+        {
+            Some(ns) => {
+                cache.invalidate_namespace(ns);
+                tracing::warn!(
+                    target: "admin::audit",
+                    action = "purge_cache",
+                    namespace = %ns,
+                    "Admin response cache namespace purge executed"
+                );
+            }
+            None => {
+                cache.invalidate_all();
+                tracing::warn!(
+                    target: "admin::audit",
+                    action = "purge_cache",
+                    scope = "all",
+                    "Admin response cache full purge executed"
+                );
+            }
+        }
+        return;
     }
 
     let (Some(act), Some(up_str)) = (action, target_upstream) else {
@@ -1475,6 +1541,77 @@ mod tests {
             Some("/api/GetPraecoStatus"),
         );
         assert_eq!(resp_forbidden.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[test]
+    fn test_admin_prometheus_cache_metrics_and_purge_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let mut router_srv = ServerConfig {
+            name: "cache_admin_test".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8443),
+            service: crate::configuration::ServiceType::Router,
+            ..Default::default()
+        };
+        router_srv.finalize()?;
+
+        crate::configuration::ServerMetrics::inc_cache_hit("cache_admin_test");
+        crate::configuration::ServerMetrics::inc_cache_miss("cache_admin_test");
+
+        let metrics_uri: Uri = "https://127.0.0.1:8443/api/GetPraecoStatus/metrics".parse()?;
+        let metrics_resp = handle_admin_request_with_prefix(
+            &metrics_uri,
+            &Method::GET,
+            &HeaderMap::new(),
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(metrics_resp.status(), StatusCode::OK);
+        assert_eq!(
+            metrics_resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        let rt = tokio::runtime::Runtime::new()?;
+        let body = rt.block_on(async {
+            metrics_resp
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+        });
+        let text = String::from_utf8(body.to_vec())?;
+        assert!(text.contains("praeco_cache_entries "));
+        assert!(text.contains("praeco_cache_bytes_used "));
+        assert!(text.contains(
+            "praeco_server_cache_requests_total{server=\"cache_admin_test\",outcome=\"hit\"}"
+        ));
+
+        // Same-origin POST purge_cache succeeds
+        let purge_uri: Uri =
+            "https://127.0.0.1:8443/api/GetPraecoStatus?action=purge_cache&namespace=shared_ns"
+                .parse()?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            header::HeaderValue::from_static("https://127.0.0.1:8443"),
+        );
+        headers.insert(
+            "sec-fetch-site",
+            header::HeaderValue::from_static("same-origin"),
+        );
+        let purge_resp = handle_admin_request_with_prefix(
+            &purge_uri,
+            &Method::POST,
+            &headers,
+            Some(&router_srv),
+            Some("/api/GetPraecoStatus"),
+        );
+        assert_eq!(purge_resp.status(), StatusCode::OK);
         Ok(())
     }
 }

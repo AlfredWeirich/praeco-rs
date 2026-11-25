@@ -2194,3 +2194,294 @@ async fn test_router_max_payload_blocks_disguised_grpc_on_rest_but_allows_grpc_p
     cancel_token.cancel();
     Ok(())
 }
+
+async fn spawn_mock_http_backend(
+    handler: impl Fn(u16, String) -> (StatusCode, String) + Send + Sync + 'static,
+) -> Result<(SocketAddr, CancellationToken), Box<dyn std::error::Error>> {
+    use hyper::service::service_fn;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let handler = Arc::new(handler);
+    let req_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel_clone.cancelled() => break,
+                accepted = listener.accept() => {
+                    let Ok((stream, _)) = accepted else { break };
+                    let h = Arc::clone(&handler);
+                    let cnt = Arc::clone(&req_counter);
+                    tokio::spawn(async move {
+                        let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                            let h_inner = Arc::clone(&h);
+                            let n = cnt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let path = req.uri().path().to_string();
+                            async move {
+                                let (status, body) = h_inner(n as u16, path);
+                                Ok::<_, hyper::Error>(
+                                    hyper::Response::builder()
+                                        .status(status)
+                                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                                        .body(Full::new(Bytes::from(body)))
+                                        .expect("valid mock response"),
+                                )
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), svc)
+                            .await;
+                    });
+                }
+            }
+        }
+    });
+
+    Ok((addr, cancel))
+}
+
+#[tokio::test]
+async fn test_cross_server_shared_cache_and_rbac_layer_ordering()
+-> Result<(), Box<dyn std::error::Error>> {
+    use praeco_rs::configuration::{RoleVec, UserRole};
+    use tower::ServiceExt;
+
+    ensure_crypto_provider();
+    let backend_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend_hits_ref = Arc::clone(&backend_hits);
+    let (backend_addr, cancel_backend) = spawn_mock_http_backend(move |_n, path| {
+        let count = backend_hits_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        (StatusCode::OK, format!(r#"{{"path":"{path}","hit":{count}}}"#))
+    })
+    .await?;
+
+    let toml_cfg = format!(
+        r#"
+        [[Server]]
+        name = "it_cache_srv_public"
+        ip = "127.0.0.1"
+        port = 18081
+        protocol = "http"
+        authentication = "None"
+        service = "Router"
+
+        [Server.Layers]
+        enabled = ["Rbac", "Compression", "Cache"]
+
+        [Server.rbac]
+        "GET /catalog/*" = ["*"]
+
+        [Server.Layers.Cache.rules."/catalog/*"]
+        ttl_seconds = 60
+        scope = "public"
+        namespace = "it_shared_catalog_ns"
+        expose_cache_header = true
+
+        [Server.ReverseRoutes."/"]
+        upstreams = ["http://{backend_addr}"]
+        backend_type = "rest"
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+
+        [[Server]]
+        name = "it_cache_srv_admin"
+        ip = "127.0.0.1"
+        port = 18082
+        protocol = "http"
+        authentication = "None"
+        service = "Router"
+
+        [Server.Layers]
+        enabled = ["Rbac", "Compression", "Cache"]
+
+        [Server.rbac]
+        "GET /catalog/*" = ["Admin"]
+
+        [Server.Layers.Cache.rules."/catalog/*"]
+        ttl_seconds = 60
+        scope = "public"
+        namespace = "it_shared_catalog_ns"
+        expose_cache_header = true
+
+        [Server.ReverseRoutes."/"]
+        upstreams = ["http://{backend_addr}"]
+        backend_type = "rest"
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+        "#
+    );
+
+    let mut config: Config = toml::from_str(&toml_cfg)?;
+    for srv in config.servers.iter_mut() {
+        srv.finalize()?;
+    }
+
+    let srv_public = Arc::new(config.servers[0].clone());
+    let srv_admin = Arc::new(config.servers[1].clone());
+
+    let stack_public = build_service_stack(&srv_public)?;
+    let stack_admin = build_service_stack(&srv_admin)?;
+
+    // 1. Server A populates the shared cache namespace
+    let req_a = Request::builder()
+        .method(Method::GET)
+        .uri("/catalog/books")
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_a = stack_public.clone().oneshot(req_a).await?;
+    assert_eq!(resp_a.status(), StatusCode::OK);
+    assert_eq!(resp_a.headers().get("x-praeco-cache").unwrap(), "MISS");
+    let body_a = resp_a.into_body().collect().await?.to_bytes();
+    assert_eq!(&body_a[..], br#"{"path":"/catalog/books","hit":1}"#);
+    assert_eq!(backend_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // 2. Server B without Admin role is blocked by RbacLayer BEFORE CacheLayer
+    let req_b_unauth = Request::builder()
+        .method(Method::GET)
+        .uri("/catalog/books")
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    let resp_b_unauth = stack_admin.clone().oneshot(req_b_unauth).await?;
+    assert_eq!(resp_b_unauth.status(), StatusCode::FORBIDDEN);
+
+    // 3. Server B with Admin role gets a HIT from Server A's cached response (no extra backend call)
+    let mut req_b_auth = Request::builder()
+        .method(Method::GET)
+        .uri("/catalog/books")
+        .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?;
+    req_b_auth
+        .extensions_mut()
+        .insert(Arc::new(RoleVec::<6>::from_iter([UserRole("Admin".into())])));
+    let resp_b_auth = stack_admin.clone().oneshot(req_b_auth).await?;
+    assert_eq!(resp_b_auth.status(), StatusCode::OK);
+    assert_eq!(resp_b_auth.headers().get("x-praeco-cache").unwrap(), "HIT");
+    let body_b = resp_b_auth.into_body().collect().await?.to_bytes();
+    assert_eq!(&body_b[..], br#"{"path":"/catalog/books","hit":1}"#);
+    assert_eq!(backend_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    cancel_backend.cancel();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_aggregate_degraded_response_bypasses_cache_via_cache_bypass()
+-> Result<(), Box<dyn std::error::Error>> {
+    use tower::ServiceExt;
+
+    ensure_crypto_provider();
+    let (user_addr, cancel_user) =
+        spawn_mock_http_backend(|_n, _path| (StatusCode::OK, r#"{"name":"alice"}"#.to_string()))
+            .await?;
+
+    let notes_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let notes_calls_ref = Arc::clone(&notes_calls);
+    let (notes_addr, cancel_notes) = spawn_mock_http_backend(move |_n, _path| {
+        let count = notes_calls_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if count == 1 {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom".to_string())
+        } else {
+            (StatusCode::OK, r#"{"items":["ok"]}"#.to_string())
+        }
+    })
+    .await?;
+
+    let toml_cfg = format!(
+        r#"
+        [[Server]]
+        name = "it_agg_cache_srv"
+        ip = "127.0.0.1"
+        port = 18083
+        protocol = "http"
+        authentication = "None"
+        service = "Router"
+
+        [Server.Layers]
+        enabled = ["Cache"]
+
+        [Server.Layers.Cache.rules."/dashboard"]
+        ttl_seconds = 60
+        scope = "public"
+        namespace = "it_agg_bypass_ns"
+        expose_cache_header = true
+
+        [Server.ReverseRoutes."/dashboard"]
+        backend_type = "aggregate"
+
+        [[Server.ReverseRoutes."/dashboard".targets]]
+        key = "user"
+        backend_type = "rest"
+        upstreams = ["http://{user_addr}"]
+        path = "/user"
+        method = "GET"
+        required = true
+
+        [[Server.ReverseRoutes."/dashboard".targets]]
+        key = "notes"
+        backend_type = "rest"
+        upstreams = ["http://{notes_addr}"]
+        path = "/notes"
+        method = "GET"
+        required = false
+
+        [Server.RouterParams]
+        protocol = "http"
+        authentication = "None"
+        "#
+    );
+
+    let srv = parse_server_config(&toml_cfg);
+    let stack = build_service_stack(&srv)?;
+
+    // 1. First request has optional failure (_errors) -> CacheBypass -> BYPASS (not cached)
+    let r1 = stack
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/dashboard")
+                .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?,
+        )
+        .await?;
+    assert_eq!(r1.status(), StatusCode::OK);
+    assert_eq!(r1.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+    let b1 = String::from_utf8(r1.into_body().collect().await?.to_bytes().to_vec())?;
+    assert!(b1.contains("\"_errors\""));
+
+    // 2. Second request succeeds cleanly -> MISS (stored in cache)
+    let r2 = stack
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/dashboard")
+                .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?,
+        )
+        .await?;
+    assert_eq!(r2.status(), StatusCode::OK);
+    assert_eq!(r2.headers().get("x-praeco-cache").unwrap(), "MISS");
+    let b2 = String::from_utf8(r2.into_body().collect().await?.to_bytes().to_vec())?;
+    assert!(!b2.contains("\"_errors\""));
+    assert!(b2.contains(r#""items":["ok"]"#));
+
+    // 3. Third request hits cache cleanly
+    let r3 = stack
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/dashboard")
+                .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())?,
+        )
+        .await?;
+    assert_eq!(r3.status(), StatusCode::OK);
+    assert_eq!(r3.headers().get("x-praeco-cache").unwrap(), "HIT");
+    assert_eq!(notes_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    cancel_user.cancel();
+    cancel_notes.cancel();
+    Ok(())
+}

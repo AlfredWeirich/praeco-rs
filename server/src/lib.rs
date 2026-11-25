@@ -61,6 +61,10 @@ pub mod tls_conf;
 pub mod web;
 pub use common::Claims;
 pub use error::SrvError;
+pub use middleware::{
+    CacheBypass, CacheLayer, CachedResponse, FlightAborted, SharedResponseCache, Singleflight,
+    configure_global_response_cache, global_response_cache,
+};
 pub use runner::{
     CONNECTION_DRAIN_TIMEOUT, DualStackHandles, ServerReloadUpdate, run_dual_stack, run_servers,
     run_tunnel, run_tunnel_with_timeout, run_tunnel_with_timeout_and_base_oid, spawn_dual_stack,

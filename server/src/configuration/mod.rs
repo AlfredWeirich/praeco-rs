@@ -123,7 +123,7 @@ pub enum AuthenticationMethod {
 /// Deserialized from a TOML file by [`Config::init`]. Holds global settings
 /// (OID mappings, Tokio threads, log directory) and a list of
 /// [`ServerConfig`] instances.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// List of file globs to include (e.g., ["conf.d/*.toml"]).
@@ -149,6 +149,10 @@ pub struct Config {
     pub otel_log_level: Option<String>,
     /// Sampling ratio for OTLP traces (0.0 to 1.0, default: 1.0 = AlwaysOn)
     pub otel_sample_ratio: Option<f64>,
+
+    /// Process-wide W-TinyLFU HTTP response cache configuration shared across all servers.
+    #[serde(default, alias = "Cache")]
+    pub cache: Option<GlobalCacheConfig>,
 
     /// Pre-parsed integer representation of [`pki_base_oid`](Config::pki_base_oid).
     /// Computed in [`Config::init`] for fast OID prefix matching in
@@ -402,6 +406,14 @@ pub struct ServerMetrics {
     pub last_response_ms: std::sync::atomic::AtomicU64,
     /// Exponential moving average request latency in milliseconds.
     pub ema_response_ms: std::sync::atomic::AtomicU64,
+    /// Cache hits served from the shared W-TinyLFU response cache.
+    pub cache_hits: std::sync::atomic::AtomicU64,
+    /// Cache misses populated by this server as singleflight leader.
+    pub cache_misses: std::sync::atomic::AtomicU64,
+    /// Cache misses coalesced onto an in-flight leader via singleflight.
+    pub cache_coalesced: std::sync::atomic::AtomicU64,
+    /// Requests that bypassed caching (uncacheable headers, streaming, or missing subject).
+    pub cache_bypasses: std::sync::atomic::AtomicU64,
     /// Packed microsecond EMA state distinguishing uninitialized from 0 ms (`Q2-08`).
     ema_state: EmaState,
 }
@@ -486,6 +498,34 @@ impl ServerMetrics {
     pub fn inc_decompression_limit_exceeded(server_name: &str) {
         Self::for_server(server_name)
             .decompression_limit_exceeded
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_cache_hit(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_cache_miss(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_cache_coalesced(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_coalesced
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn inc_cache_bypass(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_bypasses
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -866,6 +906,8 @@ pub enum MiddlewareLayer {
     IpFilter(IpFilterConfig),
     /// Enforces fail-closed path- and method-based Role-Based Access Control (RBAC).
     Rbac,
+    /// Process-wide W-TinyLFU HTTP response cache with cancellation-safe Singleflight.
+    Cache(Arc<CompiledCacheConfig>),
 }
 
 /// Rate limiter algorithm selection.
@@ -915,6 +957,9 @@ pub struct Layers {
     /// Configuration for the [`IpFilter`](MiddlewareLayer::IpFilter) layer.
     #[serde(rename = "IpFilter")]
     pub ip_filter_config: Option<IpFilterConfig>,
+    /// Configuration for the [`Cache`](MiddlewareLayer::Cache) layer.
+    #[serde(default, rename = "Cache", alias = "cache")]
+    pub cache_config: Option<CacheLayerConfig>,
 }
 
 // --- Helper Structures for Configuration ---
@@ -1509,6 +1554,378 @@ impl Default for IpFilterConfig {
     }
 }
 
+fn default_cache_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_cache_ttl_seconds() -> u64 {
+    60
+}
+
+fn default_cache_max_entry_bytes() -> usize {
+    1024 * 1024
+}
+
+/// Process-wide configuration for the shared W-TinyLFU HTTP response cache (`[cache]`).
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct GlobalCacheConfig {
+    /// Whether the process-wide HTTP response cache is active (default: `true`).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Total RAM byte budget across all cached responses and all servers (default: 256 MiB).
+    #[serde(default = "default_cache_max_bytes")]
+    pub max_bytes: u64,
+    /// Default TTL in seconds when a rule does not specify `ttl_seconds` (default: `60`).
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub default_ttl_seconds: u64,
+    /// Maximum response body size in bytes eligible for caching (default: 1 MiB).
+    #[serde(default = "default_cache_max_entry_bytes")]
+    pub max_entry_bytes: usize,
+    /// Whether to honor `Cache-Control` / `Pragma` directives on requests and responses (default: `true`).
+    #[serde(default = "default_true")]
+    pub respect_cache_control: bool,
+    /// Whether to attach `x-praeco-cache: HIT|MISS|COALESCED|BYPASS` and `age` headers (default: `false`).
+    #[serde(default)]
+    pub expose_cache_header: bool,
+}
+
+impl Default for GlobalCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: default_cache_max_bytes(),
+            default_ttl_seconds: default_cache_ttl_seconds(),
+            max_entry_bytes: default_cache_max_entry_bytes(),
+            respect_cache_control: true,
+            expose_cache_header: false,
+        }
+    }
+}
+
+impl GlobalCacheConfig {
+    /// Validates global cache sizing and TTL bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `max_bytes`, `default_ttl_seconds`, or `max_entry_bytes` is `0`,
+    /// or if `max_entry_bytes > max_bytes`.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.max_bytes == 0 {
+            return Err(Error::msg(
+                "Configuration error in [cache]: 'max_bytes' must be greater than 0.",
+            ));
+        }
+        if self.default_ttl_seconds == 0 {
+            return Err(Error::msg(
+                "Configuration error in [cache]: 'default_ttl_seconds' must be greater than 0.",
+            ));
+        }
+        if self.max_entry_bytes == 0 {
+            return Err(Error::msg(
+                "Configuration error in [cache]: 'max_entry_bytes' must be greater than 0.",
+            ));
+        }
+        if (self.max_entry_bytes as u64) > self.max_bytes {
+            return Err(Error::msg(format!(
+                "Configuration error in [cache]: 'max_entry_bytes' ({}) must not exceed 'max_bytes' ({}).",
+                self.max_entry_bytes, self.max_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Isolation scope for cached responses under `[Server.Layers.Cache.rules.*]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheScope {
+    /// Shared across all authorized callers (default).
+    #[default]
+    Public,
+    /// Isolated per sorted set of mapped [`UserRole`]s.
+    PerRole,
+    /// Isolated per authenticated subject (JWT `sub` or mTLS SAN); unauthenticated callers bypass fail-safely.
+    PerSubject,
+}
+
+/// Per-path caching rule under `[Server.Layers.Cache.rules."<pattern>"]`.
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CacheRuleConfig {
+    /// Optional TTL override in seconds for responses matching this rule.
+    pub ttl_seconds: Option<u64>,
+    /// Isolation scope (`"public"`, `"per_role"`, or `"per_subject"`, default: `"public"`).
+    #[serde(default)]
+    pub scope: CacheScope,
+    /// Optional shared namespace allowing multiple `[[Server]]` instances to share cached entries.
+    pub namespace: Option<String>,
+    /// Optional request header names included in the cache key (case-insensitive).
+    #[serde(default)]
+    pub vary_headers: Vec<String>,
+    /// Optional per-rule maximum cacheable body size in bytes (bounded by global `max_entry_bytes`).
+    pub max_entry_bytes: Option<usize>,
+    /// Optional per-rule override for `Cache-Control` / `Pragma` handling.
+    pub respect_cache_control: Option<bool>,
+    /// Optional per-rule override for `x-praeco-cache` response header emission.
+    pub expose_cache_header: Option<bool>,
+}
+
+/// Per-server configuration for the `"Cache"` middleware layer (`[Server.Layers.Cache]`).
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CacheLayerConfig {
+    /// Optional default shared namespace for all rules on this server (defaults to the server name).
+    pub namespace: Option<String>,
+    /// Opt-in caching rules keyed by `"/exact"`, `"/prefix*"`, `"GET /..."`, or `"HEAD /..."`.
+    #[serde(default)]
+    pub rules: HashMap<String, CacheRuleConfig>,
+}
+
+/// Pre-compiled per-path cache rule ready for runtime lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompiledCacheRule {
+    pub ttl_seconds: Option<u64>,
+    pub scope: CacheScope,
+    pub namespace: Option<String>,
+    pub vary_headers: Vec<String>,
+    pub max_entry_bytes: Option<usize>,
+    pub respect_cache_control: Option<bool>,
+    pub expose_cache_header: Option<bool>,
+}
+
+/// Pre-compiled `[Server.Layers.Cache]` rule table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompiledCacheConfig {
+    pub default_namespace: Option<String>,
+    pub exact: HashMap<String, CompiledCacheRule>,
+    pub prefix: Vec<(String, CompiledCacheRule)>,
+    pub method_exact: HashMap<String, HashMap<String, CompiledCacheRule>>,
+    pub method_prefix: HashMap<String, Vec<(String, CompiledCacheRule)>>,
+}
+
+impl CompiledCacheConfig {
+    fn parse_cache_key(pattern: &str) -> Result<(Option<String>, &str), Error> {
+        if pattern.is_empty() {
+            return Err(Error::msg("Invalid Cache pattern '': pattern must not be empty"));
+        }
+
+        let (method_opt, path_pattern) = if pattern.contains(char::is_whitespace) {
+            let Some((method, rest)) = pattern.split_once(' ') else {
+                return Err(Error::msg(format!(
+                    "Invalid Cache pattern '{pattern}': expected 'METHOD /path'"
+                )));
+            };
+            if rest.is_empty() || rest.contains(char::is_whitespace) {
+                return Err(Error::msg(format!(
+                    "Invalid Cache pattern '{pattern}': unexpected whitespace in path"
+                )));
+            }
+            let upper = method.to_ascii_uppercase();
+            if !matches!(upper.as_str(), "GET" | "HEAD") {
+                return Err(Error::msg(format!(
+                    "Invalid Cache pattern '{pattern}': only GET and HEAD methods are supported for HTTP response caching"
+                )));
+            }
+            (Some(upper), rest)
+        } else {
+            (None, pattern)
+        };
+
+        if !path_pattern.starts_with('/') {
+            return Err(Error::msg(format!(
+                "Invalid Cache pattern '{pattern}': path must start with '/'"
+            )));
+        }
+        if path_pattern.contains(';')
+            || path_pattern
+                .as_bytes()
+                .windows(3)
+                .any(|w| w.eq_ignore_ascii_case(b"%3b"))
+        {
+            return Err(Error::msg(format!(
+                "Invalid Cache pattern '{pattern}': matrix parameter ';' is not permitted"
+            )));
+        }
+        if path_pattern[..path_pattern.len().saturating_sub(1)].contains('*') {
+            return Err(Error::msg(format!(
+                "Invalid Cache pattern '{pattern}': wildcard '*' is only permitted as a trailing suffix"
+            )));
+        }
+
+        Ok((method_opt, path_pattern))
+    }
+
+    /// Compiles and validates `[Server.Layers.Cache]` rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `rules` is empty, any pattern is invalid or targets an
+    /// unsupported HTTP method, any TTL/size is `0`, any `namespace` is blank, or any
+    /// `vary_headers` entry is not a valid HTTP header name.
+    pub fn from_raw(raw: &CacheLayerConfig, server_name: &str) -> Result<Self, Error> {
+        if raw.rules.is_empty() {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{server_name}': Layer 'Cache' is enabled, but [Server.Layers.Cache.rules] is empty."
+            )));
+        }
+
+        let default_namespace = match &raw.namespace {
+            Some(ns) => {
+                let trimmed = ns.trim();
+                if trimmed.is_empty() {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{server_name}': [Server.Layers.Cache].namespace must not be empty."
+                    )));
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
+
+        let mut exact = HashMap::new();
+        let mut prefix = Vec::new();
+        let mut method_exact: HashMap<String, HashMap<String, CompiledCacheRule>> = HashMap::new();
+        let mut method_prefix: HashMap<String, Vec<(String, CompiledCacheRule)>> = HashMap::new();
+
+        for (pattern, rule_cfg) in &raw.rules {
+            let (method_opt, path_pattern) = Self::parse_cache_key(pattern)?;
+
+            if rule_cfg.ttl_seconds == Some(0) {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{server_name}': Cache rule '{pattern}' ttl_seconds must be greater than 0."
+                )));
+            }
+            if rule_cfg.max_entry_bytes == Some(0) {
+                return Err(Error::msg(format!(
+                    "Configuration error in Server '{server_name}': Cache rule '{pattern}' max_entry_bytes must be greater than 0."
+                )));
+            }
+
+            let rule_namespace = match &rule_cfg.namespace {
+                Some(ns) => {
+                    let trimmed = ns.trim();
+                    if trimmed.is_empty() {
+                        return Err(Error::msg(format!(
+                            "Configuration error in Server '{server_name}': Cache rule '{pattern}' namespace must not be empty."
+                        )));
+                    }
+                    Some(trimmed.to_string())
+                }
+                None => None,
+            };
+
+            let mut vary_headers = Vec::with_capacity(rule_cfg.vary_headers.len());
+            for raw_h in &rule_cfg.vary_headers {
+                let normalized = raw_h.trim().to_ascii_lowercase();
+                if normalized.is_empty()
+                    || hyper::header::HeaderName::from_bytes(normalized.as_bytes()).is_err()
+                {
+                    return Err(Error::msg(format!(
+                        "Configuration error in Server '{server_name}': Cache rule '{pattern}' vary_headers contains invalid HTTP header name '{raw_h}'."
+                    )));
+                }
+                vary_headers.push(normalized);
+            }
+            vary_headers.sort();
+            vary_headers.dedup();
+
+            let compiled = CompiledCacheRule {
+                ttl_seconds: rule_cfg.ttl_seconds,
+                scope: rule_cfg.scope,
+                namespace: rule_namespace,
+                vary_headers,
+                max_entry_bytes: rule_cfg.max_entry_bytes,
+                respect_cache_control: rule_cfg.respect_cache_control,
+                expose_cache_header: rule_cfg.expose_cache_header,
+            };
+
+            match (method_opt, path_pattern.ends_with('*')) {
+                (Some(method), true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    method_prefix
+                        .entry(method)
+                        .or_default()
+                        .push((pfx.to_string(), compiled));
+                }
+                (Some(method), false) => {
+                    let normalized = CompiledRbac::normalize_exact_key(path_pattern).to_string();
+                    method_exact
+                        .entry(method)
+                        .or_default()
+                        .insert(normalized, compiled);
+                }
+                (None, true) => {
+                    let pfx = &path_pattern[..path_pattern.len() - 1];
+                    prefix.push((pfx.to_string(), compiled));
+                }
+                (None, false) => {
+                    let normalized = CompiledRbac::normalize_exact_key(path_pattern).to_string();
+                    exact.insert(normalized, compiled);
+                }
+            }
+        }
+
+        prefix.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        for list in method_prefix.values_mut() {
+            list.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
+        }
+
+        Ok(Self {
+            default_namespace,
+            exact,
+            prefix,
+            method_exact,
+            method_prefix,
+        })
+    }
+
+    /// Matches an HTTP `(method, path)` pair against compiled cache rules using
+    /// exact-first and longest-prefix-wins precedence.
+    pub fn match_request<'a>(&'a self, method: &str, path: &str) -> Option<&'a CompiledCacheRule> {
+        let exact_key = CompiledRbac::normalize_exact_key(path);
+        if let Some(method_map) = self.method_exact.get(method)
+            && let Some(rule) = method_map.get(exact_key)
+        {
+            return Some(rule);
+        }
+        if let Some(rule) = self.exact.get(exact_key) {
+            return Some(rule);
+        }
+
+        let method_match = self.method_prefix.get(method).and_then(|prefixes| {
+            prefixes
+                .iter()
+                .find(|(pfx, _)| path.starts_with(pfx))
+                .map(|(pfx, rule)| (pfx.len(), rule))
+        });
+        let global_match = self
+            .prefix
+            .iter()
+            .find(|(pfx, _)| path.starts_with(pfx))
+            .map(|(pfx, rule)| (pfx.len(), rule));
+
+        match (method_match, global_match) {
+            (Some((m_len, m_rule)), Some((g_len, g_rule))) => {
+                if m_len >= g_len {
+                    Some(m_rule)
+                } else {
+                    Some(g_rule)
+                }
+            }
+            (Some((_, m_rule)), None) => Some(m_rule),
+            (None, Some((_, g_rule))) => Some(g_rule),
+            (None, None) => None,
+        }
+    }
+}
+
 fn default_referrer_policy() -> String {
     "strict-origin-when-cross-origin".to_string()
 }
@@ -1710,6 +2127,10 @@ impl Config {
             config.parsed_pki_base_oid = Some(parse_pki_base_oid(oid_str)?);
         }
 
+        if let Some(ref cache_cfg) = config.cache {
+            cache_cfg.validate()?;
+        }
+
         // 4. Finalize individual server settings (e.g. compile regexes, load certs, validate layers)
         for server in config.servers.iter_mut() {
             server.finalize()?;
@@ -1723,6 +2144,7 @@ impl Config {
 
     /// Atomically updates the global configuration singleton.
     pub fn update_global(arc_config: Arc<Config>) {
+        crate::middleware::cache::configure_global_response_cache(arc_config.cache.as_ref());
         if let Some(existing) = CONFIG.get() {
             existing.store(arc_config);
         } else if CONFIG.set(ArcSwap::new(arc_config)).is_err() {
@@ -2002,6 +2424,25 @@ impl ServerConfig {
             return Err(Error::msg(format!(
                 "Configuration error in Server '{}': [Server.rbac] is configured, but 'Rbac' is NOT in [Server.Layers.enabled]. Enable the 'Rbac' layer to enforce these rules.",
                 self.name
+            )));
+        }
+
+        // 4.6 Validate Cache Layer Consistency & Service Restrictions
+        let has_cache_layer = self
+            .layers
+            .enabled
+            .iter()
+            .any(|l| l.eq_ignore_ascii_case("Cache"));
+        if !has_cache_layer && self.layers.cache_config.is_some() {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': [Server.Layers.Cache] is configured, but 'Cache' is NOT in [Server.Layers.enabled]. Enable the 'Cache' layer to activate caching.",
+                self.name
+            )));
+        }
+        if has_cache_layer && matches!(self.service, ServiceType::Idp | ServiceType::Admin) {
+            return Err(Error::msg(format!(
+                "Configuration error in Server '{}': Layer 'Cache' cannot be enabled on service '{:?}'.",
+                self.name, self.service
             )));
         }
 
@@ -2942,6 +3383,32 @@ impl Layers {
             )));
         }
 
+        // Rule 4: Cache must come AFTER security, auth, RBAC, rate limiting, and compression layers
+        if let Some(cache_idx) = self.enabled.iter().position(|l| l.eq_ignore_ascii_case("Cache")) {
+            for (idx, layer_name) in self.enabled.iter().enumerate() {
+                let must_precede_cache = matches!(
+                    layer_name.as_str(),
+                    "IpFilter"
+                        | "PathSanitizer"
+                        | "NormalizePath"
+                        | "Decompression"
+                        | "MaxPayload"
+                        | "Inspection"
+                        | "RateLimiter:Simple"
+                        | "RateLimiter:TokenBucket"
+                        | "Compression"
+                ) || layer_name.eq_ignore_ascii_case("JwtAuth")
+                    || layer_name.eq_ignore_ascii_case("JWT")
+                    || layer_name.eq_ignore_ascii_case("Rbac");
+
+                if must_precede_cache && cache_idx < idx {
+                    return Err(Error::msg(format!(
+                        "Cache (at index {cache_idx}) must come AFTER {layer_name} (at index {idx}) so security, RBAC, and compression run in the proper order."
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -3102,6 +3569,14 @@ impl Layers {
                         })?;
                     }
                     Ok(MiddlewareLayer::IpFilter(c.clone()))
+                }
+                "Cache" | "cache" => {
+                    let c = self
+                        .cache_config
+                        .as_ref()
+                        .context("Layer 'Cache' enabled but [Server.Layers.Cache] section is missing")?;
+                    let compiled = CompiledCacheConfig::from_raw(c, server_name)?;
+                    Ok(MiddlewareLayer::Cache(Arc::new(compiled)))
                 }
                 other => Err(Error::msg(format!("Unknown layer type: {}", other))),
             })

@@ -1719,3 +1719,86 @@ enabled = []
 
         Ok(())
     }
+
+    #[test]
+    fn test_cache_layer_validation_and_ordering() {
+        // 1. Cache before Rbac / JwtAuth / Compression must be rejected
+        for bad_order in [
+            vec!["Cache", "Rbac"],
+            vec!["JwtAuth", "Cache", "Rbac"],
+            vec!["Cache", "Compression"],
+            vec!["Cache", "IpFilter"],
+        ] {
+            let layers = Layers {
+                enabled: bad_order.iter().map(|s| (*s).to_string()).collect(),
+                cache_config: Some(CacheLayerConfig {
+                    namespace: None,
+                    rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                }),
+                ..Default::default()
+            };
+            assert!(
+                layers.build_middleware_layers("cache_order_test").is_err(),
+                "expected ordering error for {:?}",
+                bad_order
+            );
+        }
+
+        // 2. Cache in enabled without [Server.Layers.Cache] fails
+        let missing_cfg = Layers {
+            enabled: vec!["Cache".into()],
+            cache_config: None,
+            ..Default::default()
+        };
+        assert!(missing_cfg.build_middleware_layers("cache_missing").is_err());
+
+        // 3. [Server.Layers.Cache] present without "Cache" in enabled fails in finalize()
+        let mut unenabled_cfg = ServerConfig {
+            name: "cache_unenabled".into(),
+            ip: Some("127.0.0.1".into()),
+            port: Some(8080),
+            layers: Layers {
+                enabled: vec![],
+                cache_config: Some(CacheLayerConfig {
+                    namespace: None,
+                    rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(unenabled_cfg.finalize().is_err());
+
+        // 4. Cache on Admin or Idp service is rejected
+        for svc in [ServiceType::Admin, ServiceType::Idp] {
+            let mut disallowed = ServerConfig {
+                name: "cache_disallowed_svc".into(),
+                ip: Some("127.0.0.1".into()),
+                port: Some(8080),
+                service: svc,
+                layers: Layers {
+                    enabled: vec!["Cache".into()],
+                    cache_config: Some(CacheLayerConfig {
+                        namespace: None,
+                        rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert!(disallowed.finalize().is_err());
+        }
+
+        // 5. Unsupported method or empty rules in CacheLayerConfig fails
+        let bad_method = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([("POST /api/*".into(), CacheRuleConfig::default())]),
+        };
+        assert!(CompiledCacheConfig::from_raw(&bad_method, "srv").is_err());
+
+        let empty_rules = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::new(),
+        };
+        assert!(CompiledCacheConfig::from_raw(&empty_rules, "srv").is_err());
+    }

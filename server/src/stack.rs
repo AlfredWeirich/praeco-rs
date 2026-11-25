@@ -38,7 +38,7 @@ use crate::{
     },
     connection_tracker::{AcquireError, ConnectionTracker},
     middleware::{
-        AdminService, ConcurrencyLimitLayer, CountingLayer, DelayLayer, EchoService,
+        AdminService, CacheLayer, ConcurrencyLimitLayer, CountingLayer, DelayLayer, EchoService,
         InspectionLayer, IpFilterLayer, JwtAuthLayer, LoggerLayer, MaxPayloadLayer,
         PathSanitizerLayer, RbacLayer, RouterService, SecurityHeadersLayer, SimpleRateLimiterLayer,
         TimingLayer, TokenBucketRateLimiterLayer, TraceIdLayer,
@@ -673,6 +673,9 @@ fn apply_layers_internal(
                 .with_trusted_proxy_hops(cfg.trusted_proxy_hops);
                 layer.layer(svc).boxed_clone_sync()
             }
+            MiddlewareLayer::Cache(rules) => CacheLayer::new(rules, server_name)
+                .layer(svc)
+                .boxed_clone_sync(),
         };
     }
     Ok(svc)

@@ -14,6 +14,7 @@
 //! | Module | Layer | Purpose |
 //! |--------|-------|---------|
 //! | [`alt_svc`] | [`AltSvcLayer`] | Injects the `Alt-Svc` header to advertise HTTP/3. |
+//! | [`cache`] | [`CacheLayer`] | Process-wide W-TinyLFU HTTP response cache with cancellation-safe [`Singleflight`]. |
 //! | [`compression`] | [`SrvCompressionLayer`] / [`SrvDecompressionLayer`] | Gzip/Brotli response compression and request decompression with bomb protection. |
 //! | [`counter`] | [`CountingLayer`] | Atomic request counter with periodic logging. |
 //! | [`delay`] | [`DelayLayer`] | Artificial latency injection (testing / simulation). |
@@ -35,6 +36,8 @@
 pub mod admin;
 /// Injects the `Alt-Svc` HTTP header to advertise HTTP/3 support.
 pub mod alt_svc;
+/// Process-wide W-TinyLFU HTTP response cache and cancellation-safe Singleflight.
+pub mod cache;
 /// Gzip / Brotli response compression and request decompression.
 pub mod compression;
 /// Atomic request counter with periodic log output.
@@ -75,6 +78,10 @@ pub mod path_sanitizer;
 
 pub use admin::AdminService;
 pub use alt_svc::AltSvcLayer;
+pub use cache::{
+    CacheBypass, CacheLayer, CacheService, CachedResponse, FlightAborted, SharedResponseCache,
+    Singleflight, configure_global_response_cache, global_response_cache,
+};
 pub use counter::CountingLayer;
 pub use delay::DelayLayer;
 pub use echo::EchoService;
