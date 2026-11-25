@@ -50,7 +50,7 @@ Every parameter includes:
    - [HTTP/2 Trailers Preservation & Compression Layer Bypass](#http2-trailers-preservation--compression-layer-bypass)
    - [gRPC Error Propagation & Gateway Status Codes](#grpc-error-propagation--gateway-status-codes)
 7. [Granular Path-Level RBAC (`[Server.rbac]`, `"Rbac"` Layer)](#granular-path-level-rbac-serverrbac-rbac-layer)
-   - [Migrating from `0.7.x` to `0.8.0`](#migrating-from-07x-to-080)
+   - [Migrating from `0.6.x` / `0.7.x` to `0.8.0`](#migrating-from-06x--07x-to-080)
 8. [Lightweight WAF / Inspection Layer (`[Server.AllowedPathes]`)](#lightweight-waf--inspection-layer-serverallowedpathes)
 9. [Middleware Layer Pipeline (`[Server.Layers]`)](#middleware-layer-pipeline-serverlayers)
    - [Ordering Constraints & Execution Model](#ordering-constraints--execution-model)
@@ -972,7 +972,28 @@ Enforces **fail-closed** method- and path-level Role-Based Access Control via `R
 4. **Empty Role List (`[]`) = Fail-Closed:** Access is unconditionally denied with `403 Forbidden`.
 5. **Unmatched Paths = Fail-Closed (`403 Forbidden`):** If no rule in `[Server.rbac]` matches, `RbacLayer` rejects the request with `403 Forbidden`. Public endpoints (such as `"/health"`) must be explicitly allowed via `["*"]`.
 
-### Migrating from `0.7.x` to `0.8.0`
+### Migrating from `0.6.x` / `0.7.x` to `0.8.0`
+
+#### From `0.6.x` to `0.7.0+` (CRL, Headers, JWT & Defaults)
+
+If upgrading from `0.6.x`, verify these fail-closed defaults introduced in `0.7.0`:
+
+1. **Fail-Closed CRLs (`[[Server.client_certs]]` & `RelayConfig.toml`):**
+   - `strict_crl` now defaults to **`true`**: empty, malformed, `nextUpdate`-less, or expired CRL files fail startup/reload, and `rustls` enforces `nextUpdate` at TLS handshake time (`enforce_revocation_expiration()`). Keep `ca.crl.pem` fresh before `nextUpdate` (the legacy `PRAECO_STRICT_CRL` env var was removed; opt out only explicitly via `strict_crl = false` in TOML, and keep `strict_crl` uniform across all CRL-bearing `[[Server.client_certs]]` entries of a server).
+   - Whenever `ssl_client_crl` is set, TLS `session_cache_size` automatically defaults to `0` (`NoServerSessionStorage`), and `session_tickets = true` is rejected at startup so revoked certificates cannot bypass CRL checks via resumed sessions.
+2. **Upstream Credential Stripping by Default (`[Server.ReverseRoutes.*]`):**
+   - Client `Authorization` (`strip_authorization = true`) and `Cookie` (`strip_cookies = true`) headers are now stripped by default before forwarding to upstreams (alongside untrusted `x-forwarded-*`, `x-auth-*`, `x-user*`, `x-client-*`, `x-ssl-*`, and `remote-*` headers).
+   - If a backend requires client cookies or bearer tokens (e.g., an upstream verifying a JWT cookie itself), explicitly set `strip_cookies = false`, `strip_cookie_names = [...]`, `forward_authorization = true`, or `forward_headers = [...]` (and per-target `forward_headers` on `aggregate` routes).
+3. **Hardened JWT Verification (`[Server.Layers.JWT]`):**
+   - `require_jti` now defaults to `true` (every JWT must carry a non-empty `jti` `<= 256` bytes; set `require_jti = false` only for legacy issuers) and `max_token_lifetime_seconds` defaults to `2592000` (30 days; set `0` to disable). Tokens exceeding `4 KiB`, failing `nbf`, or carrying an unknown `kid` are rejected fail-closed.
+4. **Right-to-Left `X-Forwarded-For` (`IpFilter` & Rate Limiters):**
+   - When `trust_forwarded_headers = true`, client IPs are extracted right-to-left using `trusted_proxy_hops` (default `1`; set `0` to ignore XFF) instead of the spoofable leftmost entry.
+5. **Typed `IdpParams.on_webhook_failure`, `max_response_bytes` & `deny_unknown_fields`:**
+   - `on_webhook_failure` strictly accepts `"reject"` (default) or `"fallback_to_cert"`.
+   - Buffered `grpc_transcoding` / `aggregate` routes now default `max_response_bytes` to `4 MiB` (down from `16 MiB`) within a `256 MiB` global buffer budget; raise `max_response_bytes` explicitly on routes returning larger responses.
+   - Unknown or misspelled TOML keys are rejected fail-fast (`#[serde(deny_unknown_fields)]`).
+
+#### From `0.7.x` to `0.8.0` (Standalone `RbacLayer` & Removal of `allowed_roles`)
 
 In `0.8.0`, RBAC was decoupled from `RouterService` into the standalone fail-closed `RbacLayer` middleware (`"Rbac"`), and `allowed_roles` was removed from `[Server.ReverseRoutes.*]`. Existing `0.7.x` configurations require four straightforward updates:
 
