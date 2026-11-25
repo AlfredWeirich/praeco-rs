@@ -624,6 +624,42 @@
                 }
             }
 
+            // 1.5 Verify wurzelwerk_admin Cache layer configuration & ordering
+            let cache_idx = admin_srv
+                .layers
+                .enabled
+                .iter()
+                .position(|l| l == "Cache")
+                .expect("Cache layer missing in wurzelwerk_admin");
+            let rbac_idx = admin_srv
+                .layers
+                .enabled
+                .iter()
+                .position(|l| l == "Rbac")
+                .expect("Rbac layer missing in wurzelwerk_admin");
+            assert!(
+                cache_idx > rbac_idx,
+                "Cache must appear after Rbac in {}",
+                config_path
+            );
+            admin_srv
+                .layers
+                .validate_middleware_order()
+                .unwrap_or_else(|e| panic!("Invalid middleware order in {}: {}", config_path, e));
+            let cache_cfg = CompiledCacheConfig::from_raw(
+                admin_srv
+                    .layers
+                    .cache_config
+                    .as_ref()
+                    .expect("Cache config missing in wurzelwerk_admin"),
+                &admin_srv.name,
+            )
+            .unwrap();
+            assert!(cache_cfg.match_request("GET", "/admin/index.html").is_some());
+            assert!(cache_cfg.match_request("GET", "/favicon.ico").is_some());
+            assert!(cache_cfg.match_request("GET", "/apple-touch-icon.png").is_some());
+            assert!(cache_cfg.match_request("GET", "/api/GetPraecoStatus").is_none());
+
             // 2. Verify wurzelwerk_idp AllowedPathes & Layers
             let idp_srv = servers
                 .iter()

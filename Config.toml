@@ -19,6 +19,15 @@ otel_log_level = "info"
 # If commented out or omitted, the application will only log to Standard Output (stdout).
 log_dir = "logs"
 
+# Process-wide W-TinyLFU HTTP response cache shared across all [[Server]] instances
+[cache]
+enabled = true
+max_bytes = 268435456       # 256 MiB total cache memory budget
+default_ttl_seconds = 60
+max_entry_bytes = 1048576   # 1 MiB max per cached response
+respect_cache_control = true
+expose_cache_header = false
+
 ###############################################################################
 # SERVER INSTANCE DEFINITIONS
 # Server definitions have been moved to the conf.d/ directory.

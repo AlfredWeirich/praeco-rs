@@ -232,7 +232,7 @@
         "2" = "Seller"
     
     [Server.Layers]
-        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "ConcurrencyLimit"]
+        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
 
     [Server.Layers.IpFilter]
         allow_cidrs = []
@@ -266,6 +266,18 @@
         max_capacity = 1000
         refill = 50
         duration_micros = 10000
+
+    [Server.Layers.Cache.rules."/admin*"]
+        ttl_seconds = 300
+        scope = "per_role"
+
+    [Server.Layers.Cache.rules."/favicon.ico"]
+        ttl_seconds = 3600
+        scope = "public"
+
+    [Server.Layers.Cache.rules."/apple-touch-icon*"]
+        ttl_seconds = 3600
+        scope = "public"
     
     [Server.AllowedPathes.GET]
         "/admin" = ["^/admin$"]
