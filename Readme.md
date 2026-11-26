@@ -2,8 +2,7 @@
 # praeco-rs - Enterprise Zero-Trust API Gateway: the European sovereign proxy
 
 https://medium.com/@alfred.weirich/tokio-tower-hyper-and-rustls-building-high-performance-and-secure-servers-in-rust-part-11-7782d195ce2a?source=friends_link&sk=00042bfce222ddd16d8cd5f0380f161a
-
-Part 1 to 11
+(Part 1 to 11)
 
 ---
 
@@ -14,8 +13,7 @@ Part 1 to 11
 Designed for zero-trust enterprise environments, it provides deep mTLS integration, declarative middleware pipelines, dynamic JSON-to-gRPC transcoding (acting as a REST-to-gRPC Gateway), and zero-downtime hot-reloading.
 
 ---
-**Ergebnis Code Review von 19.11.2026 mit Claude Sonnet 5.5**
-Der Code ist insgesamt auf überdurchschnittlich hohem Niveau. Es hat eine ausgezeichnete Struktur, eine saubere Trennung von Belangen, robuste Fehlerbehandlung und eine hohe Performance.
+> **Quality & Verification:** Hardened with workspace-wide `deny(clippy::unwrap_used, clippy::expect_used)` in production code, strict `#[serde(deny_unknown_fields)]` schema validation, an extensive automated unit & integration test suite, and regular AI-assisted security & code reviews.
 
 **Newly Added**: 
 * **Embeddable Library Crate & `cli` Feature Gate (`v0.5.4`)**: Decoupled listener/lifecycle orchestration (`praeco_rs::runner`) and stream-generic Tower stack assembly (`praeco_rs::stack`) from the CLI binary (`src/server.rs`). External Rust applications can depend on `praeco-rs = { version = "0.5.4", default-features = false }` without pulling in `mimalloc`, `tracing-subscriber`, or OTLP exporters, and run full gateway pipelines over TCP, QUIC, Yamux tunnels, or in-memory `tokio::io::duplex` streams.
