@@ -814,9 +814,10 @@ impl ConnectionHandler {
     ///    check reads these roles later.
     /// 3. **Dispatch** – Forwards the enriched request to the inner service
     ///    stack and awaits its response.
-    /// 4. **Caching headers** – Appends headers that must
-    ///    apply universally, regardless of upstream or middleware behavior:
-    ///    - `Cache-Control: no-store`
+    /// 4. **Default caching fallback** – Injects a defensive `Cache-Control: no-store`
+    ///    header on non-gRPC HTTP responses only if neither the middleware stack (e.g.
+    ///    `CacheLayer`) nor the upstream/StaticFiles service already supplied an explicit
+    ///    `Cache-Control` directive.
     ///
     /// # Arguments
     ///
@@ -903,8 +904,16 @@ impl ConnectionHandler {
         }
 
         // === Universal Response Headers (pre-computed, zero-parse overhead) ===
-        let headers = resp.headers_mut();
-        headers.insert(hyper::header::CACHE_CONTROL, CACHE_CTL_VALUE);
+        let is_grpc_response = resp
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_grpc_content_type);
+        if !is_grpc_response {
+            resp.headers_mut()
+                .entry(hyper::header::CACHE_CONTROL)
+                .or_insert(CACHE_CTL_VALUE);
+        }
 
         Ok(resp)
     }
@@ -1285,6 +1294,92 @@ mod tests {
         assert_eq!(&*pem_from, "abc");
         assert_eq!(san_from.as_ref(), "san");
         assert_eq!(&*oid_from, &["1.2.3".to_string()]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_s04_connection_handler_cache_control_fallback_and_grpc_skip()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let svc = tower::service_fn(|req: Request<SrvBody>| async move {
+            let mut b = Response::builder().status(hyper::StatusCode::OK);
+            match req.uri().path() {
+                "/static/logo.png" => {
+                    b = b
+                        .header(hyper::header::CONTENT_TYPE, "image/png")
+                        .header(hyper::header::CACHE_CONTROL, "public, max-age=3600");
+                }
+                "/pkg.Service/Call" => {
+                    b = b.header(hyper::header::CONTENT_TYPE, "application/grpc");
+                }
+                _ => {
+                    b = b.header(hyper::header::CONTENT_TYPE, "application/json");
+                }
+            }
+            Ok::<_, SrvError>(
+                b.body(
+                    Full::new(Bytes::from_static(b"ok"))
+                        .map_err(SrvError::from)
+                        .boxed(),
+                )
+                .unwrap(),
+            )
+        });
+
+        let addr: SocketAddr = "127.0.0.1:4243".parse()?;
+        let handler = ConnectionHandler::new(
+            BoxedCloneService::new(svc),
+            addr,
+            vec![],
+            None,
+            None,
+            Arc::new(HashMap::new()),
+        );
+
+        // 1. Default non-gRPC response without Cache-Control receives fallback no-store
+        let r_api = handler
+            .clone()
+            .handle(
+                Request::builder()
+                    .uri("/api/items")
+                    .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?,
+            )
+            .await?;
+        assert_eq!(
+            r_api
+                .headers()
+                .get(hyper::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        // 2. Explicit Cache-Control header from StaticFiles / backend is preserved
+        let r_static = handler
+            .clone()
+            .handle(
+                Request::builder()
+                    .uri("/static/logo.png")
+                    .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?,
+            )
+            .await?;
+        assert_eq!(
+            r_static
+                .headers()
+                .get(hyper::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=3600")
+        );
+
+        // 3. Native gRPC responses do not receive an injected Cache-Control: no-store header
+        let r_grpc = handler
+            .clone()
+            .handle(
+                Request::builder()
+                    .uri("/pkg.Service/Call")
+                    .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?,
+            )
+            .await?;
+        assert!(r_grpc.headers().get(hyper::header::CACHE_CONTROL).is_none());
 
         Ok(())
     }

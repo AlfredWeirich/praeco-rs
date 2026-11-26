@@ -27,6 +27,7 @@ use hyper::{Method, Uri};
 use regex::Regex;
 use rustls::sign::CertifiedKey;
 use serde::Deserialize;
+use smallvec::SmallVec;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -1661,7 +1662,7 @@ impl GlobalCacheConfig {
 }
 
 /// Isolation scope for cached responses under `[Server.Layers.Cache.rules.*]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CacheScope {
@@ -1722,7 +1723,9 @@ pub struct CompiledCacheRule {
     pub ttl_seconds: Option<u64>,
     pub scope: CacheScope,
     pub namespace: Option<String>,
+    pub(crate) namespace_arc: Option<Arc<str>>,
     pub vary_headers: Vec<String>,
+    pub(crate) vary_headers_arc: SmallVec<[Arc<str>; 2]>,
     pub max_entry_bytes: Option<usize>,
     pub max_request_body_bytes: Option<usize>,
     pub respect_cache_control: Option<bool>,
@@ -1734,6 +1737,7 @@ pub struct CompiledCacheRule {
 #[non_exhaustive]
 pub struct CompiledCacheConfig {
     pub default_namespace: Option<String>,
+    pub(crate) default_namespace_arc: Option<Arc<str>>,
     pub exact: HashMap<String, CompiledCacheRule>,
     pub prefix: Vec<(String, CompiledCacheRule)>,
     pub method_exact: HashMap<String, HashMap<String, CompiledCacheRule>>,
@@ -1921,7 +1925,9 @@ impl CompiledCacheConfig {
             let compiled = CompiledCacheRule {
                 ttl_seconds: rule_cfg.ttl_seconds,
                 scope: rule_cfg.scope,
+                namespace_arc: rule_namespace.as_deref().map(Arc::from),
                 namespace: rule_namespace,
+                vary_headers_arc: vary_headers.iter().map(|s| Arc::from(s.as_str())).collect(),
                 vary_headers,
                 max_entry_bytes: rule_cfg.max_entry_bytes,
                 max_request_body_bytes: rule_cfg.max_request_body_bytes,
@@ -2019,6 +2025,7 @@ impl CompiledCacheConfig {
         }
 
         let compiled = Self {
+            default_namespace_arc: default_namespace.as_deref().map(Arc::from),
             default_namespace,
             exact,
             prefix,

@@ -129,7 +129,7 @@ pub struct SrvCompressionFuture<F> {
 }
 
 /// Checks whether `accept_encoding` permits `target_coding` with a quality value `q > 0`.
-fn accepts_coding(accept_encoding: &str, target_coding: &str) -> bool {
+pub(crate) fn accepts_coding(accept_encoding: &str, target_coding: &str) -> bool {
     for item in accept_encoding.split(',') {
         let mut parts = item.trim().split(';');
         let Some(coding) = parts.next().map(str::trim) else {
@@ -470,7 +470,7 @@ where
 }
 
 /// Ensures `Vary` includes `Accept-Encoding` so caches do not serve compressed responses to plain clients.
-fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
+pub(crate) fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
     let already_has_accept_encoding = headers.get_all(VARY).iter().any(|val| {
         val.to_str()
             .is_ok_and(|s| s.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("accept-encoding")))

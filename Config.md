@@ -1201,7 +1201,7 @@ trust_forwarded_headers = false
 ```
 
 #### `[Server.Layers.Cache]` (Opt-In W-TinyLFU Response Cache & Singleflight)
-Enables process-wide W-TinyLFU HTTP & gRPC response caching with cancellation-safe `Singleflight` request coalescing for requests matching `[Server.Layers.Cache.rules]`, as well as declarative cross-server cache invalidations under `[Server.Layers.Cache.invalidations]`. Unprefixed rules (`"/exact"`, `"/prefix*"`) match **only** `GET` and `HEAD`; `POST` RPC caching (JSON-over-POST, gRPC-Web, and native HTTP/2 Unary gRPC with `grpc-status: 0` trailer preservation) requires an **exact** `"POST /path"` rule (wildcards on `POST` rules are rejected at startup). Streaming requests/responses and any gRPC response with `grpc-status != 0` bypass automatically.
+Enables process-wide W-TinyLFU HTTP & gRPC response caching with cancellation-safe `Singleflight` request coalescing for requests matching `[Server.Layers.Cache.rules]`, as well as declarative cross-server cache invalidations under `[Server.Layers.Cache.invalidations]`. Unprefixed rules (`"/exact"`, `"/prefix*"`) match **only** `GET` and `HEAD`; `POST` RPC caching (JSON-over-POST, binary `application/grpc-web` requiring a valid `0x80` `grpc-status: 0` trailer, and native HTTP/2 Unary gRPC with `grpc-status: 0` trailer preservation) requires an **exact** `"POST /path"` rule (wildcards on `POST` rules are rejected at startup). Streaming requests/responses, `application/grpc-web-text`, and any gRPC response with `grpc-status != 0` bypass automatically. When `"Compression"` is also enabled, `CacheLayer` lazily caches precompressed `gzip`/`br` variants (`>= 64` bytes when smaller) so HITs avoid repeat compression.
 
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1213,7 +1213,7 @@ Enables process-wide W-TinyLFU HTTP & gRPC response caching with cancellation-sa
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
 | `ttl_seconds` | Integer (`u64`) | Optional | `[cache].default_ttl_seconds` | Time-to-live in seconds (`> 0`). Clamped to upstream `s-maxage`/`max-age` when `respect_cache_control = true`. |
-| `scope` | String | Optional | `"public"` | Isolation level: `"public"` (shared across all authorized callers), `"per_role"` (isolated by sorted mapped roles), or `"per_subject"` (isolated by JWT `sub` or mTLS SAN; unauthenticated requests bypass fail-safely). |
+| `scope` | String | Optional | `"public"` | Isolation level: `"public"` (shared across all authorized callers), `"per_role"` (isolated by sorted mapped roles), or `"per_subject"` (isolated by length-prefixed JWT `(iss, sub)` or mTLS SAN; unauthenticated requests bypass fail-safely). |
 | `namespace` | String | Optional | Layer `namespace` or server `name` | Rule-specific shared namespace across servers (e.g. `"shared_catalog"`). |
 | `vary_headers` | Array of Strings | Optional | `[]` | Request header names included in the cache key (case-insensitive). Responses returning `Vary: *` or any `Vary` header not listed here bypass caching (RFC 9111; `Accept-Encoding` is implicitly accepted only for unencoded entries handled by the outer `Compression` layer). |
 | `max_entry_bytes` | Integer (`usize`) | Optional | `[cache].max_entry_bytes` | Per-rule response body limit in bytes (`> 0`, capped by global `max_entry_bytes`). |

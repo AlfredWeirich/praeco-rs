@@ -456,6 +456,9 @@ fn apply_layers_internal(
     compiled_rbac: Option<Arc<CompiledRbac>>,
     optional_jwt: bool,
 ) -> Result<BoxedCloneService, SrvError> {
+    let compression_enabled = layers
+        .iter()
+        .any(|l| matches!(l, MiddlewareLayer::Compression));
     let mut svc = service;
     for layer in layers.into_iter().rev() {
         svc = match layer {
@@ -674,6 +677,7 @@ fn apply_layers_internal(
                 layer.layer(svc).boxed_clone_sync()
             }
             MiddlewareLayer::Cache(rules) => CacheLayer::new(rules, server_name)
+                .with_precompression(compression_enabled)
                 .layer(svc)
                 .boxed_clone_sync(),
         };

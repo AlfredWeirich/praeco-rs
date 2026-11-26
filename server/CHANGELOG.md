@@ -26,6 +26,14 @@ Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache
 * **CORS Layer Ordering & RFC 9111 Response `Vary` Validation (`src/configuration/mod.rs`, `src/middleware/cache.rs`):**
   * Required `"Cache"` to appear **after** `"Cors"` in `Layers::validate_middleware_order()` so `CorsLayer` never writes origin-specific headers into shared cache entries.
   * Validated upstream `Vary` response headers in `evaluate_response_cacheability()`: `Vary: *` and headers not listed in `vary_headers` always bypass caching (`Accept-Encoding` is implicitly accepted only for unencoded cache entries handled by the outer `Compression` layer).
+* **Multi-Issuer `PerSubject` Isolation & `CacheKey` Scope (`src/middleware/cache.rs`, `src/configuration/mod.rs`):**
+  * Added `pub scope: CacheScope` to `CacheKey` and encoded `per_subject` JWT keys as length-prefixed `(claims.iss, claims.sub)` tuples (and length-prefixed SANs) to eliminate cross-issuer collisions when multiple `expected_issuer` values are configured.
+* **Lazy Gzip/Brotli Precompression & Synchronous HIT Zero-Copy Fast-Path (`src/middleware/cache.rs`, `src/stack.rs`, `src/configuration/mod.rs`, `src/middleware/compression.rs`):**
+  * Added `CacheLayer::with_precompression(...)` (wired automatically from `apply_layers_internal` when `"Compression"` is enabled) and lazy `OnceCell<Option<PrecompressedVariant>>` storage for `gzip`/`br` payloads (`>= 64` bytes when smaller than uncompressed) with precomputed `Content-Length` and `Vary: Accept-Encoding`, allowing outer `SrvCompressionLayer` to skip re-compressing cache HITs.
+  * Reduced allocations on synchronous `GET` HITs via `Arc<str>` + `SmallVec` fields in `CacheKey`/`CompiledCacheConfig`, `global_response_cache_guard()` (`ArcSwap::load()`), borrowed rules/configs, a single-parameter `canonical_path_and_query` fast path, precomputed `Content-Length`, and a stack-buffer `u64_to_header_value` formatter for `Age`.
+* **Fallback `Cache-Control: no-store` & `grpc-web` / Semicolon Mutation Hardening (`src/lib.rs`, `src/middleware/cache.rs`):**
+  * Updated `ConnectionHandler::handle` to skip `is_grpc_content_type` responses and apply `.entry(CACHE_CONTROL).or_insert("no-store")` so explicit `Cache-Control` headers from `StaticFiles`, `CacheLayer`, or upstreams are preserved.
+  * Required at least one `0x80` trailer frame with `grpc-status: 0` in `grpc_web_body_has_error`, bypassed `application/grpc-web-text*` in `evaluate_response_cacheability`, and enforced `400 Bad Request` in `CacheService::call` for mutating methods containing `;`/`%3b` path matrix parameters.
 
 ### Added
 * **Cancellation-Safe `Singleflight<K, T>` (`src/middleware/cache.rs`):**

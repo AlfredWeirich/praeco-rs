@@ -26,6 +26,7 @@
 //!   `Vary` headers, or payloads larger than `max_entry_bytes` are never stored in the cache.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     future::Future,
     hash::Hash,
@@ -39,6 +40,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use async_compression::tokio::bufread::{BrotliEncoder, GzipEncoder};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use http_body::{Body as _, Frame};
@@ -50,7 +52,11 @@ use hyper::{
 use moka::{Expiry, sync::Cache};
 use pin_project::pin_project;
 use sha2::{Digest, Sha256};
-use tokio::sync::{oneshot, watch};
+use smallvec::SmallVec;
+use tokio::{
+    io::AsyncReadExt as _,
+    sync::{OnceCell, oneshot, watch},
+};
 use tokio_util::sync::CancellationToken;
 use tower::{Layer, Service};
 
@@ -60,6 +66,7 @@ use crate::{
         CacheScope, CompiledCacheConfig, CompiledCacheRule, GlobalCacheConfig, ServerMetrics,
     },
     middleware::{
+        compression::{accepts_coding, append_vary_accept_encoding},
         path_sanitizer::sanitize_and_normalize_path_cow,
         rbac::extract_user_roles_from_extensions,
         router::{BufferBudget, BufferReservation, BudgetedBytesBody, global_response_buffer_budget},
@@ -305,22 +312,84 @@ impl<K: Eq + Hash, T> Drop for MapCleanupGuard<K, T> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheBypass;
 
+/// Minimum uncompressed body length in bytes required to precompute a compressed variant.
+const MIN_PRECOMPRESS_BYTES: usize = 64;
+
+/// Supported precompression encodings cached lazily on [`CachedResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrecompressAlgo {
+    None,
+    Gzip,
+    Brotli,
+}
+
+#[derive(Debug, Clone)]
+struct PrecompressedVariant {
+    body: Bytes,
+    content_length: Option<HeaderValue>,
+}
+
+enum PrecompressedLookup<'a> {
+    Ready(Option<&'a PrecompressedVariant>),
+    NeedsInit,
+}
+
+/// Formats a `u64` into a [`HeaderValue`] using a 20-byte stack buffer (zero heap allocation).
+#[inline]
+fn u64_to_header_value(mut n: u64) -> Option<HeaderValue> {
+    if n == 0 {
+        return Some(HeaderValue::from_static("0"));
+    }
+    let mut buf = [0u8; 20];
+    let mut idx = buf.len();
+    while n > 0 {
+        idx -= 1;
+        buf[idx] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    HeaderValue::from_bytes(&buf[idx..]).ok()
+}
+
+async fn compress_bytes_variant(raw: &Bytes, algo: PrecompressAlgo) -> Option<PrecompressedVariant> {
+    if raw.len() < MIN_PRECOMPRESS_BYTES || algo == PrecompressAlgo::None {
+        return None;
+    }
+    let cursor = std::io::Cursor::new(raw.clone());
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let res = match algo {
+        PrecompressAlgo::Gzip => GzipEncoder::new(cursor).read_to_end(&mut out).await,
+        PrecompressAlgo::Brotli => BrotliEncoder::new(cursor).read_to_end(&mut out).await,
+        PrecompressAlgo::None => return None,
+    };
+    if res.is_err() || out.is_empty() || out.len() >= raw.len() {
+        return None;
+    }
+    let compressed = Bytes::from(out);
+    let content_length = u64_to_header_value(compressed.len() as u64);
+    Some(PrecompressedVariant {
+        body: compressed,
+        content_length,
+    })
+}
+
 /// Canonical lookup key for [`SharedResponseCache`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct CacheKey {
     /// Logical cache namespace (defaults to the server name or an explicit shared namespace).
-    pub namespace: String,
+    pub namespace: Arc<str>,
     /// Generation fence `(global_generation, namespace_generation)` for O(1) lock-free invalidation.
     pub generation: (u64, u64),
+    /// Configured [`CacheScope`] isolation level (`Public`, `PerRole`, `PerSubject`).
+    pub scope: CacheScope,
     /// Canonical HTTP method used as the stored slot (`"GET"` for `GET`/`HEAD`, `"POST"` for exact `POST` RPCs).
     pub method: &'static str,
     /// Sanitized path plus lexicographically sorted query parameters.
-    pub path_and_query: String,
+    pub path_and_query: Arc<str>,
     /// Lowercase header name/value pairs requested via `vary_headers`.
-    pub vary_values: Vec<(String, String)>,
-    /// Isolation scope key (`""` for `public`, sorted roles for `per_role`, subject for `per_subject`).
-    pub scope_key: String,
+    pub vary_values: SmallVec<[(Arc<str>, String); 2]>,
+    /// Isolation scope key (`""` for `public`, sorted roles for `per_role`, issuer+subject for `per_subject`).
+    pub scope_key: Arc<str>,
     /// SHA-256 digest of the request body for `POST` requests (`None` for `GET`/`HEAD`).
     pub body_hash: Option<[u8; 32]>,
     /// Normalized `(content-type, content-encoding, grpc-encoding)` tuple for `POST` requests.
@@ -337,6 +406,12 @@ pub struct CachedResponse {
     pub headers: HeaderMap,
     /// Buffered uncompressed response body payload.
     pub body: Bytes,
+    /// Precomputed `Content-Length` header value for the uncompressed body.
+    content_length: Option<HeaderValue>,
+    /// Lazily populated precompressed `gzip` variant (shared zero-copy across HITs).
+    compressed_gzip: Arc<OnceCell<Option<PrecompressedVariant>>>,
+    /// Lazily populated precompressed `br` variant (shared zero-copy across HITs).
+    compressed_br: Arc<OnceCell<Option<PrecompressedVariant>>>,
     /// Optional sanitized HTTP/2 trailers (e.g. `grpc-status: 0` for unary gRPC responses).
     pub trailers: Option<HeaderMap>,
     /// Monotonic timestamp when the entry was inserted.
@@ -370,16 +445,50 @@ impl CachedResponse {
             .saturating_add(approx_trailer_bytes)
             .saturating_add(64);
         let byte_weight = u32::try_from(total.max(1)).unwrap_or(u32::MAX);
+        let content_length = u64_to_header_value(body.len() as u64);
 
         Self {
             status,
             headers,
             body,
+            content_length,
+            compressed_gzip: Arc::new(OnceCell::new()),
+            compressed_br: Arc::new(OnceCell::new()),
             trailers,
             stored_at: Instant::now(),
             ttl,
             byte_weight,
         }
+    }
+
+    #[inline]
+    fn precompressed_slot(
+        &self,
+        algo: PrecompressAlgo,
+    ) -> Option<&OnceCell<Option<PrecompressedVariant>>> {
+        match algo {
+            PrecompressAlgo::None => None,
+            PrecompressAlgo::Gzip => Some(&self.compressed_gzip),
+            PrecompressAlgo::Brotli => Some(&self.compressed_br),
+        }
+    }
+
+    #[inline]
+    fn get_precompressed_sync(&self, algo: PrecompressAlgo) -> PrecompressedLookup<'_> {
+        let Some(slot) = self.precompressed_slot(algo) else {
+            return PrecompressedLookup::Ready(None);
+        };
+        match slot.get() {
+            Some(opt) => PrecompressedLookup::Ready(opt.as_ref()),
+            None => PrecompressedLookup::NeedsInit,
+        }
+    }
+
+    async fn ensure_precompressed(&self, algo: PrecompressAlgo) -> Option<&PrecompressedVariant> {
+        let slot = self.precompressed_slot(algo)?;
+        slot.get_or_init(|| compress_bytes_variant(&self.body, algo))
+            .await
+            .as_ref()
     }
 }
 
@@ -563,6 +672,11 @@ pub fn global_response_cache() -> Arc<SharedResponseCache> {
     global_cache_holder().load_full()
 }
 
+#[inline]
+fn global_response_cache_guard() -> arc_swap::Guard<Arc<SharedResponseCache>> {
+    global_cache_holder().load()
+}
+
 /// Updates the process-wide [`SharedResponseCache`] configuration (typically on startup or `SIGHUP`).
 ///
 /// Preserves existing cached entries across `SIGHUP` reloads when `enabled` remains `true`
@@ -601,6 +715,8 @@ pub fn configure_global_response_cache(cfg: Option<&GlobalCacheConfig>) {
 pub struct CacheLayer {
     rules: Arc<CompiledCacheConfig>,
     server_name: &'static str,
+    server_name_arc: Arc<str>,
+    precompression: bool,
     cache: Option<Arc<SharedResponseCache>>,
 }
 
@@ -610,6 +726,8 @@ impl CacheLayer {
         Self {
             rules,
             server_name,
+            server_name_arc: Arc::from(server_name),
+            precompression: false,
             cache: None,
         }
     }
@@ -617,6 +735,14 @@ impl CacheLayer {
     /// Overrides the backing [`SharedResponseCache`] (useful for isolated tests or embedded setups).
     pub fn with_cache(mut self, cache: Arc<SharedResponseCache>) -> Self {
         self.cache = Some(cache);
+        self
+    }
+
+    /// Enables serving and caching lazy precompressed (`gzip`/`br`) variants on [`CachedResponse`]
+    /// so outer [`SrvCompressionLayer`](crate::middleware::compression::SrvCompressionLayer) skips
+    /// re-compressing cache HITs.
+    pub fn with_precompression(mut self, enabled: bool) -> Self {
+        self.precompression = enabled;
         self
     }
 }
@@ -629,6 +755,8 @@ impl<S> Layer<S> for CacheLayer {
             inner,
             rules: Arc::clone(&self.rules),
             server_name: self.server_name,
+            server_name_arc: Arc::clone(&self.server_name_arc),
+            precompression: self.precompression,
             cache: self.cache.clone(),
         }
     }
@@ -640,6 +768,8 @@ pub struct CacheService<S> {
     inner: S,
     rules: Arc<CompiledCacheConfig>,
     server_name: &'static str,
+    server_name_arc: Arc<str>,
+    precompression: bool,
     cache: Option<Arc<SharedResponseCache>>,
 }
 
@@ -956,28 +1086,57 @@ impl http_body::Body for ChainedStreamBody {
     }
 }
 
+#[inline]
+fn public_scope_key() -> Arc<str> {
+    static PUBLIC_KEY: OnceLock<Arc<str>> = OnceLock::new();
+    Arc::clone(PUBLIC_KEY.get_or_init(|| Arc::from("")))
+}
+
+#[inline]
+fn guest_scope_key() -> Arc<str> {
+    static GUEST_KEY: OnceLock<Arc<str>> = OnceLock::new();
+    Arc::clone(GUEST_KEY.get_or_init(|| Arc::from("Guest")))
+}
+
 /// Normalizes a URI path and query string (sorting query pairs lexicographically)
 /// so `?a=1&b=2` and `?b=2&a=1` resolve to the same [`CacheKey`].
-fn canonical_path_and_query(canonical_path: &str, query: Option<&str>) -> String {
+fn canonical_path_and_query(canonical_path: &str, query: Option<&str>) -> Arc<str> {
     let Some(q) = query.filter(|s| !s.is_empty()) else {
-        return canonical_path.to_string();
+        return Arc::from(canonical_path);
     };
-    let mut pairs: Vec<(String, String)> = url::form_urlencoded::parse(q.as_bytes())
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-    if pairs.is_empty() {
-        return canonical_path.to_string();
+
+    // Fast-path for a single unencoded `key=value` query pair withoutpercent/plus encoding.
+    if !q.contains('&')
+        && q.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'='))
+        && q.matches('=').count() == 1
+    {
+        let mut combined = String::with_capacity(canonical_path.len() + 1 + q.len());
+        combined.push_str(canonical_path);
+        combined.push('?');
+        combined.push_str(q);
+        return Arc::from(combined);
     }
-    pairs.sort();
+
+    let mut pairs: SmallVec<[(Cow<'_, str>, Cow<'_, str>); 8]> =
+        url::form_urlencoded::parse(q.as_bytes()).collect();
+    if pairs.is_empty() {
+        return Arc::from(canonical_path);
+    }
+    pairs.sort_unstable();
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in pairs {
         serializer.append_pair(&k, &v);
     }
     let normalized_query = serializer.finish();
     if normalized_query.is_empty() {
-        canonical_path.to_string()
+        Arc::from(canonical_path)
     } else {
-        format!("{canonical_path}?{normalized_query}")
+        let mut combined = String::with_capacity(canonical_path.len() + 1 + normalized_query.len());
+        combined.push_str(canonical_path);
+        combined.push('?');
+        combined.push_str(&normalized_query);
+        Arc::from(combined)
     }
 }
 
@@ -988,50 +1147,115 @@ fn canonical_path_and_query(canonical_path: &str, query: Option<&str>) -> String
 fn build_scope_key(
     scope: CacheScope,
     extensions: &hyper::http::Extensions,
-) -> Option<String> {
+) -> Option<Arc<str>> {
     match scope {
-        CacheScope::Public => Some(String::new()),
+        CacheScope::Public => Some(public_scope_key()),
         CacheScope::PerRole => {
-            let mut roles: Vec<&str> = extract_user_roles_from_extensions(extensions)
-                .map(|slice| slice.iter().map(|r| r.0.as_str()).collect())
-                .unwrap_or_default();
-            if roles.is_empty() {
-                return Some("Guest".to_string());
+            let Some(roles_slice) = extract_user_roles_from_extensions(extensions) else {
+                return Some(guest_scope_key());
+            };
+            if roles_slice.is_empty() {
+                return Some(guest_scope_key());
             }
+            if roles_slice.len() == 1 {
+                return Some(Arc::from(roles_slice[0].0.as_str()));
+            }
+            let mut roles: SmallVec<[&str; 6]> =
+                roles_slice.iter().map(|r| r.0.as_str()).collect();
             roles.sort_unstable();
             roles.dedup();
-            Some(roles.join(","))
+            Some(Arc::from(roles.join(",")))
         }
         CacheScope::PerSubject => {
             if let Some(claims) = extensions.get::<Claims>()
                 && !claims.sub.trim().is_empty()
             {
-                return Some(format!("jwt:{}", claims.sub));
+                // Length-prefixed `(iss, sub)` prevents cross-issuer collisions even with delimiter chars.
+                return Some(Arc::from(format!(
+                    "jwt:{}:{}:{}:{}",
+                    claims.iss.len(),
+                    claims.iss,
+                    claims.sub.len(),
+                    claims.sub
+                )));
             }
             if let Some(san) = extensions.get::<SanCertExtension>()
                 && !san.0.trim().is_empty()
             {
-                return Some(format!("san:{}", san.0));
+                return Some(Arc::from(format!("san:{}:{}", san.0.len(), san.0)));
             }
             None
         }
     }
 }
 
-fn collect_vary_values(headers: &HeaderMap, vary_headers: &[String]) -> Vec<(String, String)> {
+fn collect_vary_values(
+    headers: &HeaderMap,
+    vary_headers: &[Arc<str>],
+) -> SmallVec<[(Arc<str>, String); 2]> {
+    if vary_headers.is_empty() {
+        return SmallVec::new();
+    }
     vary_headers
         .iter()
         .map(|name| {
-            let joined = headers
-                .get_all(name.as_str())
+            let mut iter = headers
+                .get_all(name.as_ref())
                 .iter()
                 .filter_map(|v| v.to_str().ok())
-                .map(str::trim)
-                .collect::<Vec<_>>()
-                .join(",");
-            (name.clone(), joined)
+                .map(str::trim);
+            let joined = match iter.next() {
+                None => String::new(),
+                Some(first) => match iter.next() {
+                    None => first.to_string(),
+                    Some(second) => {
+                        let mut acc = String::with_capacity(first.len() + 1 + second.len());
+                        acc.push_str(first);
+                        acc.push(',');
+                        acc.push_str(second);
+                        for next in iter {
+                            acc.push(',');
+                            acc.push_str(next);
+                        }
+                        acc
+                    }
+                },
+            };
+            (Arc::clone(name), joined)
         })
         .collect()
+}
+
+#[inline]
+fn negotiate_request_encoding(
+    req_headers: &HeaderMap,
+    precompression_enabled: bool,
+    is_head: bool,
+) -> PrecompressAlgo {
+    if !precompression_enabled || is_head {
+        return PrecompressAlgo::None;
+    }
+    let Some(accept_encoding) = req_headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return PrecompressAlgo::None;
+    };
+    if accepts_coding(accept_encoding, "gzip") {
+        PrecompressAlgo::Gzip
+    } else if accepts_coding(accept_encoding, "br") {
+        PrecompressAlgo::Brotli
+    } else {
+        PrecompressAlgo::None
+    }
+}
+
+#[inline]
+fn entry_eligible_for_precompression(entry: &CachedResponse) -> bool {
+    entry.trailers.is_none()
+        && entry.body.len() >= MIN_PRECOMPRESS_BYTES
+        && !entry.headers.contains_key(header::CONTENT_ENCODING)
+        && !is_header_grpc_content_type(&entry.headers)
 }
 
 fn contains_cache_directive(headers: &HeaderMap, header_name: HeaderName, target: &str) -> bool {
@@ -1132,34 +1356,61 @@ fn build_response_from_cached(
     is_head: bool,
     expose_cache_header: bool,
     outcome_label: &'static str,
+    precompress_algo: PrecompressAlgo,
 ) -> Response<ServiceRespBody> {
     let is_grpc = is_header_grpc_content_type(&entry.headers);
+    let precompressed_variant = if !is_head
+        && precompress_algo != PrecompressAlgo::None
+        && entry_eligible_for_precompression(entry)
+        && let PrecompressedLookup::Ready(opt) = entry.get_precompressed_sync(precompress_algo)
+    {
+        opt
+    } else {
+        None
+    };
+
+    let (body_bytes, content_length_val, content_encoding_val) =
+        if let Some(variant) = precompressed_variant {
+            let enc = match precompress_algo {
+                PrecompressAlgo::Gzip => Some(HeaderValue::from_static("gzip")),
+                PrecompressAlgo::Brotli => Some(HeaderValue::from_static("br")),
+                PrecompressAlgo::None => None,
+            };
+            (variant.body.clone(), variant.content_length.clone(), enc)
+        } else {
+            (entry.body.clone(), entry.content_length.clone(), None)
+        };
+
     let body: ServiceRespBody = if is_head {
         Empty::<Bytes>::new().map_err(SrvError::from).boxed()
     } else if let Some(ref trailers) = entry.trailers {
         CachedRespBody {
-            data: (!entry.body.is_empty()).then(|| entry.body.clone()),
+            data: (!body_bytes.is_empty()).then_some(body_bytes),
             trailers: Some(trailers.clone()),
         }
         .boxed()
     } else {
-        Full::new(entry.body.clone()).map_err(SrvError::from).boxed()
+        Full::new(body_bytes).map_err(SrvError::from).boxed()
     };
 
     let mut resp = crate::build_infallible_response(entry.status, None, body);
     for (name, val) in entry.headers.iter() {
         resp.headers_mut().append(name.clone(), val.clone());
     }
+    if let Some(enc_val) = content_encoding_val {
+        resp.headers_mut().insert(header::CONTENT_ENCODING, enc_val);
+        append_vary_accept_encoding(resp.headers_mut());
+    }
     if entry.trailers.is_none()
         && !is_grpc
-        && let Ok(cl) = HeaderValue::from_str(&entry.body.len().to_string())
+        && let Some(cl) = content_length_val
     {
         resp.headers_mut().insert(header::CONTENT_LENGTH, cl);
     }
     if expose_cache_header {
         attach_cache_status_header(&mut resp, outcome_label);
         let age_secs = entry.stored_at.elapsed().as_secs();
-        if let Ok(age_val) = HeaderValue::from_str(&age_secs.to_string()) {
+        if let Some(age_val) = u64_to_header_value(age_secs) {
             resp.headers_mut().insert(header::AGE, age_val);
         }
     }
@@ -1190,6 +1441,20 @@ fn is_header_grpc_web_binary(headers: &HeaderMap) -> bool {
 }
 
 #[inline]
+fn is_header_grpc_web_text(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            let media = ct.split(';').next().unwrap_or(ct).trim();
+            media.eq_ignore_ascii_case("application/grpc-web-text")
+                || (media.len() > "application/grpc-web-text+".len()
+                    && media[.."application/grpc-web-text+".len()]
+                        .eq_ignore_ascii_case("application/grpc-web-text+"))
+        })
+}
+
+#[inline]
 fn grpc_status_is_ok(headers: &HeaderMap) -> bool {
     headers
         .get("grpc-status")
@@ -1209,10 +1474,11 @@ fn extract_post_encoding(headers: &HeaderMap) -> (String, String, String) {
     (norm("content-type"), norm("content-encoding"), norm("grpc-encoding"))
 }
 
-/// Validates binary `application/grpc-web` length-prefixed frames and ensures any embedded
-/// trailer frame (`flag & 0x80 != 0`) reports `grpc-status: 0`.
+/// Validates binary `application/grpc-web` length-prefixed frames and ensures at least
+/// one embedded trailer frame (`flag & 0x80 != 0`) is present and reports `grpc-status: 0`.
 fn grpc_web_body_has_error(body: &[u8]) -> bool {
     let mut offset = 0usize;
+    let mut saw_ok_trailer = false;
     while offset < body.len() {
         let Some(header_slice) = body.get(offset..offset + 5) else {
             return true;
@@ -1247,10 +1513,11 @@ fn grpc_web_body_has_error(body: &[u8]) -> bool {
             if found_status != Some("0") {
                 return true;
             }
+            saw_ok_trailer = true;
         }
         offset = payload_end;
     }
-    false
+    !saw_ok_trailer
 }
 
 fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
@@ -1316,6 +1583,9 @@ fn evaluate_response_cacheability(
         return None;
     }
     if is_header_grpc_content_type(headers) && !is_post {
+        return None;
+    }
+    if is_header_grpc_web_text(headers) {
         return None;
     }
     if let Some(raw_grpc_status) = headers.get("grpc-status")
@@ -1872,6 +2142,7 @@ struct CoalesceContext {
     expose_cache_header: bool,
     respect_cache_control: bool,
     max_entry_bytes: usize,
+    precompress_algo: PrecompressAlgo,
     is_post: bool,
 }
 
@@ -1896,6 +2167,7 @@ where
         expose_cache_header,
         respect_cache_control,
         max_entry_bytes,
+        precompress_algo,
         is_post,
     } = ctx;
 
@@ -1938,6 +2210,11 @@ where
                         trailers,
                         ttl,
                     ));
+                    if precompress_algo != PrecompressAlgo::None
+                        && entry_eligible_for_precompression(&entry)
+                    {
+                        entry.ensure_precompressed(precompress_algo).await;
+                    }
                     let _ = cache_for_worker.insert_if_generation(
                         key_for_worker,
                         Arc::clone(&entry),
@@ -1978,15 +2255,22 @@ where
                 false,
                 expose_cache_header,
                 "MISS",
+                precompress_algo,
             ))
         }
         CoalescedResult::Follower(SingleflightOutcome::Cached(entry), _unused_req) => {
+            if precompress_algo != PrecompressAlgo::None
+                && entry_eligible_for_precompression(&entry)
+            {
+                entry.ensure_precompressed(precompress_algo).await;
+            }
             ServerMetrics::inc_cache_coalesced(server_name);
             Ok(build_response_from_cached(
                 &entry,
                 false,
                 expose_cache_header,
                 "COALESCED",
+                precompress_algo,
             ))
         }
         CoalescedResult::Leader(SingleflightOutcome::Bypass) => {
@@ -2041,11 +2325,17 @@ where
             };
         }
 
-        let cache = self
-            .cache
-            .clone()
-            .unwrap_or_else(global_response_cache);
-        let global_cfg = cache.config().clone();
+        let guard = if self.cache.is_none() {
+            Some(global_response_cache_guard())
+        } else {
+            None
+        };
+        let cache: &Arc<SharedResponseCache> = match (&self.cache, &guard) {
+            (Some(c), _) => c,
+            (None, Some(g)) => g,
+            (None, None) => unreachable!(),
+        };
+        let global_cfg = cache.config();
         if !global_cfg.enabled {
             return CacheFuture::Passthrough {
                 inner: self.inner.call(req),
@@ -2059,6 +2349,21 @@ where
                 .windows(3)
                 .any(|w| w.eq_ignore_ascii_case(b"%3b"))
         {
+            if matches!(
+                *method,
+                Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+            ) {
+                let body = Full::new(Bytes::from_static(b"Bad Request: invalid path"))
+                    .map_err(SrvError::from)
+                    .boxed();
+                return CacheFuture::Hit {
+                    response: Some(crate::build_infallible_response(
+                        StatusCode::BAD_REQUEST,
+                        None,
+                        body,
+                    )),
+                };
+            }
             return CacheFuture::Passthrough {
                 inner: self.inner.call(req),
             };
@@ -2085,7 +2390,7 @@ where
             None
         };
 
-        let Some(rule) = matched_rule.cloned() else {
+        let Some(rule) = matched_rule else {
             if matches!(
                 *method,
                 Method::POST | Method::PUT | Method::PATCH | Method::DELETE
@@ -2095,7 +2400,7 @@ where
             {
                 return CacheFuture::Invalidate {
                     inner: self.inner.call(req),
-                    cache,
+                    cache: Arc::clone(cache),
                     namespaces: namespaces.to_vec(),
                     server_name: self.server_name,
                 };
@@ -2133,12 +2438,11 @@ where
             };
         };
 
-        let namespace = rule
-            .namespace
-            .as_deref()
-            .or(self.rules.default_namespace.as_deref())
-            .unwrap_or(server_name)
-            .to_string();
+        let namespace: Arc<str> = rule
+            .namespace_arc
+            .as_ref()
+            .or(self.rules.default_namespace_arc.as_ref())
+            .map_or_else(|| Arc::clone(&self.server_name_arc), Arc::clone);
 
         if *method == Method::POST {
             let max_req_bytes = rule
@@ -2161,9 +2465,15 @@ where
             }
 
             let path_and_query = canonical_path_and_query(&canonical_path, req.uri().query());
-            let vary_values = collect_vary_values(req.headers(), &rule.vary_headers);
+            let vary_values = collect_vary_values(req.headers(), &rule.vary_headers_arc);
             let post_encoding = extract_post_encoding(req.headers());
             let is_grpc_req = is_header_grpc_content_type(req.headers());
+            let precompress_algo =
+                negotiate_request_encoding(req.headers(), self.precompression, false);
+            let rule_cloned = rule.clone();
+            let global_cfg_cloned = global_cfg.clone();
+            let cache_cloned = Arc::clone(cache);
+            let scope = rule.scope;
             let mut inner = self.inner.clone();
 
             return CacheFuture::Coalesce {
@@ -2188,11 +2498,12 @@ where
                         }
                     };
 
-                    let generation = cache.current_generation(&namespace);
+                    let generation = cache_cloned.current_generation(&namespace);
                     let digest: [u8; 32] = Sha256::digest(&req_bytes).into();
                     let key = CacheKey {
                         namespace,
                         generation,
+                        scope,
                         method: "POST",
                         path_and_query,
                         vary_values,
@@ -2201,14 +2512,20 @@ where
                         post_encoding: Some(post_encoding),
                     };
 
-                    if let Some(entry) = cache.get(&key) {
+                    if let Some(entry) = cache_cloned.get(&key) {
                         drop(req_reservation);
+                        if precompress_algo != PrecompressAlgo::None
+                            && entry_eligible_for_precompression(&entry)
+                        {
+                            entry.ensure_precompressed(precompress_algo).await;
+                        }
                         ServerMetrics::inc_cache_hit(server_name);
                         return Ok(build_response_from_cached(
                             &entry,
                             false,
                             expose_cache_header,
                             "HIT",
+                            precompress_algo,
                         ));
                     }
 
@@ -2216,14 +2533,15 @@ where
                     let rebuilt_req = Request::from_parts(req_parts, rebuilt_body);
                     coalesce_and_execute(
                         CoalesceContext {
-                            cache,
+                            cache: cache_cloned,
                             key,
-                            rule,
-                            global_cfg,
+                            rule: rule_cloned,
+                            global_cfg: global_cfg_cloned,
                             server_name,
                             expose_cache_header,
                             respect_cache_control,
                             max_entry_bytes,
+                            precompress_algo,
                             is_post: true,
                         },
                         rebuilt_req,
@@ -2238,22 +2556,57 @@ where
         let key = CacheKey {
             namespace,
             generation,
+            scope: rule.scope,
             method: "GET",
             path_and_query: canonical_path_and_query(&canonical_path, req.uri().query()),
-            vary_values: collect_vary_values(req.headers(), &rule.vary_headers),
+            vary_values: collect_vary_values(req.headers(), &rule.vary_headers_arc),
             scope_key,
             body_hash: None,
             post_encoding: None,
         };
 
         let is_head = *method == Method::HEAD;
+        let precompress_algo =
+            negotiate_request_encoding(req.headers(), self.precompression, is_head);
 
         // Synchronous L1 hit fast-path
         if let Some(entry) = cache.get(&key) {
-            ServerMetrics::inc_cache_hit(server_name);
-            let resp = build_response_from_cached(&entry, is_head, expose_cache_header, "HIT");
-            return CacheFuture::Hit {
-                response: Some(resp),
+            let ready_sync = if !is_head
+                && precompress_algo != PrecompressAlgo::None
+                && entry_eligible_for_precompression(&entry)
+            {
+                !matches!(
+                    entry.get_precompressed_sync(precompress_algo),
+                    PrecompressedLookup::NeedsInit
+                )
+            } else {
+                true
+            };
+            if ready_sync {
+                ServerMetrics::inc_cache_hit(server_name);
+                let resp = build_response_from_cached(
+                    &entry,
+                    is_head,
+                    expose_cache_header,
+                    "HIT",
+                    precompress_algo,
+                );
+                return CacheFuture::Hit {
+                    response: Some(resp),
+                };
+            }
+            return CacheFuture::Coalesce {
+                fut: Box::pin(async move {
+                    entry.ensure_precompressed(precompress_algo).await;
+                    ServerMetrics::inc_cache_hit(server_name);
+                    Ok(build_response_from_cached(
+                        &entry,
+                        false,
+                        expose_cache_header,
+                        "HIT",
+                        precompress_algo,
+                    ))
+                }),
             };
         }
 
@@ -2267,18 +2620,22 @@ where
         }
 
         // GET miss (cold path): coalesce concurrent callers via cancellation-safe Singleflight.
+        let rule_cloned = rule.clone();
+        let global_cfg_cloned = global_cfg.clone();
+        let cache_cloned = Arc::clone(cache);
         let inner = self.inner.clone();
         CacheFuture::Coalesce {
             fut: Box::pin(coalesce_and_execute(
                 CoalesceContext {
-                    cache,
+                    cache: cache_cloned,
                     key,
-                    rule,
-                    global_cfg,
+                    rule: rule_cloned,
+                    global_cfg: global_cfg_cloned,
                     server_name,
                     expose_cache_header,
                     respect_cache_control,
                     max_entry_bytes,
+                    precompress_algo,
                     is_post: false,
                 },
                 req,
@@ -2996,12 +3353,13 @@ mod tests {
     #[test]
     fn test_configure_global_response_cache_preserves_entries_on_same_max_bytes_and_clears_on_change() {
         let key = CacheKey {
-            namespace: "reload_test_ns".to_string(),
+            namespace: Arc::from("reload_test_ns"),
             generation: (0, 0),
+            scope: CacheScope::Public,
             method: "GET",
-            path_and_query: "/item".to_string(),
-            vary_values: vec![],
-            scope_key: String::new(),
+            path_and_query: Arc::from("/item"),
+            vary_values: SmallVec::new(),
+            scope_key: Arc::from(""),
             body_hash: None,
             post_encoding: None,
         };
@@ -3673,12 +4031,13 @@ mod tests {
 
         // Stale CacheKey lookup must immediately miss after O(1) invalidate_namespace without Moka predicates
         let stale_key = CacheKey {
-            namespace: "ns_a".to_string(),
+            namespace: Arc::from("ns_a"),
             generation: cache.current_generation("ns_a"),
+            scope: CacheScope::Public,
             method: "GET",
-            path_and_query: "/ns_a/item".to_string(),
-            vary_values: vec![],
-            scope_key: String::new(),
+            path_and_query: Arc::from("/ns_a/item"),
+            vary_values: SmallVec::new(),
+            scope_key: Arc::from(""),
             body_hash: None,
             post_encoding: None,
         };
@@ -3977,5 +4336,575 @@ mod tests {
             r_app2.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://app.example"
         );
+    }
+
+    #[tokio::test]
+    async fn test_s03_multi_issuer_jwt_subject_isolation_and_scope_keying() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([(
+                "/me/*".to_string(),
+                CacheRuleConfig {
+                    scope: CacheScope::PerSubject,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_s03").unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        let svc = CacheLayer::new(compiled, "srv_s03")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls_ref);
+                    async move {
+                        let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                        let claims = req.extensions().get::<Claims>().cloned();
+                        let tag = claims
+                            .map(|cl| format!("{}:{}:{n}", cl.iss, cl.sub))
+                            .unwrap_or_else(|| format!("none:{n}"));
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(tag)).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        let make_claims_req = |iss: &str, sub: &str| {
+            let mut r = empty_req("/me/data");
+            r.extensions_mut().insert(Claims {
+                sub: sub.to_string(),
+                iss: iss.to_string(),
+                aud: None,
+                exp: 9_999_999_999,
+                oids: vec![],
+                jti: None,
+            });
+            r
+        };
+
+        // Two distinct issuers sharing identical sub = "42" must stay isolated
+        let r1 = svc.clone().oneshot(make_claims_req("https://idp1.example", "42")).await.unwrap();
+        assert_eq!(r1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let b1 = r1.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b1[..], b"https://idp1.example:42:1");
+
+        let r2 = svc.clone().oneshot(make_claims_req("https://idp2.example", "42")).await.unwrap();
+        assert_eq!(r2.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let b2 = r2.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b2[..], b"https://idp2.example:42:2");
+
+        // Second request for idp1 + "42" hits idp1's cached entry
+        let r1_hit = svc.clone().oneshot(make_claims_req("https://idp1.example", "42")).await.unwrap();
+        assert_eq!(r1_hit.headers().get("x-praeco-cache").unwrap(), "HIT");
+        let b1_hit = r1_hit.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&b1_hit[..], b"https://idp1.example:42:1");
+
+        // Delimiter ambiguity check ("a:1:b" + "c" vs "a" + "b:1:c") must NOT collide thanks to length prefixing
+        let r_amb1 = svc.clone().oneshot(make_claims_req("a:1:b", "c")).await.unwrap();
+        assert_eq!(r_amb1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let r_amb2 = svc.clone().oneshot(make_claims_req("a", "b:1:c")).await.unwrap();
+        assert_eq!(r_amb2.headers().get("x-praeco-cache").unwrap(), "MISS");
+
+        // Scope field inside CacheKey isolates otherwise identical keys
+        let pub_key = CacheKey {
+            namespace: Arc::from("scope_iso"),
+            generation: (0, 0),
+            scope: CacheScope::Public,
+            method: "GET",
+            path_and_query: Arc::from("/me/data"),
+            vary_values: SmallVec::new(),
+            scope_key: Arc::from("same"),
+            body_hash: None,
+            post_encoding: None,
+        };
+        let subj_key = CacheKey {
+            scope: CacheScope::PerSubject,
+            ..pub_key.clone()
+        };
+        cache.insert(
+            pub_key.clone(),
+            Arc::new(CachedResponse::new(
+                StatusCode::OK,
+                HeaderMap::new(),
+                Bytes::from_static(b"pub"),
+                None,
+                Duration::from_secs(60),
+            )),
+        );
+        assert!(cache.get(&pub_key).is_some());
+        assert!(cache.get(&subj_key).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_p02_precompressed_gzip_and_brotli_zero_recompression_on_hits() {
+        use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder};
+        use crate::middleware::compression::SrvCompressionLayer;
+
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([("/assets/*".to_string(), CacheRuleConfig::default())]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_p02").unwrap());
+        let payload = "praeco-precompress-payload-".repeat(20);
+        let payload_bytes = Bytes::from(payload.clone());
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let p_ref = payload_bytes.clone();
+
+        let inner = tower::service_fn(move |_req: Request<SrvBody>| {
+            let c = Arc::clone(&calls_ref);
+            let body = p_ref.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, SrvError>(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(body).map_err(SrvError::from).boxed())
+                        .unwrap(),
+                )
+            }
+        })
+        .boxed_clone_sync();
+
+        let cached_svc = CacheLayer::new(compiled, "srv_p02")
+            .with_cache(cache)
+            .with_precompression(true)
+            .layer(inner);
+        let svc = SrvCompressionLayer::new("srv_p02").layer(cached_svc);
+
+        // 1. Cold MISS with Accept-Encoding: gzip -> precompresses once inside CacheLayer
+        let mut r_miss = empty_req("/assets/bundle.json");
+        r_miss.headers_mut().insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let res_miss = svc.clone().oneshot(r_miss).await.unwrap();
+        assert_eq!(res_miss.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert_eq!(res_miss.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert!(res_miss.headers().get(header::CONTENT_LENGTH).is_some());
+        let miss_gz = res_miss.into_body().collect().await.unwrap().to_bytes();
+        let mut miss_dec = Vec::new();
+        GzipDecoder::new(std::io::Cursor::new(miss_gz))
+            .read_to_end(&mut miss_dec)
+            .await
+            .unwrap();
+        assert_eq!(miss_dec, payload.as_bytes());
+
+        // 2. Warm HIT with Accept-Encoding: gzip -> synchronous precompressed HIT (Content-Length preserved!)
+        let mut r_hit_gz = empty_req("/assets/bundle.json");
+        r_hit_gz.headers_mut().insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let res_hit_gz = svc.clone().oneshot(r_hit_gz).await.unwrap();
+        assert_eq!(res_hit_gz.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert_eq!(res_hit_gz.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
+        assert!(
+            res_hit_gz.headers().get(header::CONTENT_LENGTH).is_some(),
+            "outer SrvCompressionLayer must see already_encoded and preserve Content-Length"
+        );
+        let hit_gz = res_hit_gz.into_body().collect().await.unwrap().to_bytes();
+        let mut hit_dec = Vec::new();
+        GzipDecoder::new(std::io::Cursor::new(hit_gz))
+            .read_to_end(&mut hit_dec)
+            .await
+            .unwrap();
+        assert_eq!(hit_dec, payload.as_bytes());
+
+        // 3. First Brotli HIT lazily populates `br`, second Brotli HIT is synchronous with Content-Length preserved
+        for _ in 0..2 {
+            let mut r_br = empty_req("/assets/bundle.json");
+            r_br.headers_mut().insert(header::ACCEPT_ENCODING, HeaderValue::from_static("br"));
+            let res_br = svc.clone().oneshot(r_br).await.unwrap();
+            assert_eq!(res_br.headers().get("x-praeco-cache").unwrap(), "HIT");
+            assert_eq!(res_br.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+            assert!(res_br.headers().get(header::CONTENT_LENGTH).is_some());
+            let hit_br = res_br.into_body().collect().await.unwrap().to_bytes();
+            let mut br_dec = Vec::new();
+            BrotliDecoder::new(std::io::Cursor::new(hit_br))
+                .read_to_end(&mut br_dec)
+                .await
+                .unwrap();
+            assert_eq!(br_dec, payload.as_bytes());
+        }
+
+        // 4. Plain client HIT gets uncompressed payload without Content-Encoding
+        let res_plain = svc.clone().oneshot(empty_req("/assets/bundle.json")).await.unwrap();
+        assert_eq!(res_plain.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert!(res_plain.headers().get(header::CONTENT_ENCODING).is_none());
+        let plain_bytes = res_plain.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(plain_bytes, payload_bytes);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_s05_grpc_web_missing_trailer_grpc_web_text_and_mutation_semicolon_fail_closed() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([
+                (
+                    "POST /rpc/MissingTrailer".to_string(),
+                    CacheRuleConfig::default(),
+                ),
+                (
+                    "POST /rpc/WithTrailer".to_string(),
+                    CacheRuleConfig::default(),
+                ),
+                (
+                    "POST /rpc/TextMode".to_string(),
+                    CacheRuleConfig::default(),
+                ),
+            ]),
+            invalidations: HashMap::from([(
+                "POST /api/Mutate".to_string(),
+                vec!["srv_s05".to_string()],
+            )]),
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_s05").unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        let svc = CacheLayer::new(compiled, "srv_s05")
+            .with_cache(cache)
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls_ref);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        match req.uri().path() {
+                            "/rpc/MissingTrailer" => {
+                                let mut frame = vec![0x00u8];
+                                frame.extend_from_slice(&4u32.to_be_bytes());
+                                frame.extend_from_slice(b"data");
+                                Ok::<_, SrvError>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(header::CONTENT_TYPE, "application/grpc-web+proto")
+                                        .body(Full::new(Bytes::from(frame)).map_err(SrvError::from).boxed())
+                                        .unwrap(),
+                                )
+                            }
+                            "/rpc/WithTrailer" => {
+                                let mut frame = vec![0x00u8];
+                                frame.extend_from_slice(&4u32.to_be_bytes());
+                                frame.extend_from_slice(b"data");
+                                let trailer = b"grpc-status: 0\r\n";
+                                frame.push(0x80u8);
+                                frame.extend_from_slice(&(trailer.len() as u32).to_be_bytes());
+                                frame.extend_from_slice(trailer);
+                                Ok::<_, SrvError>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header(header::CONTENT_TYPE, "application/grpc-web")
+                                        .body(Full::new(Bytes::from(frame)).map_err(SrvError::from).boxed())
+                                        .unwrap(),
+                                )
+                            }
+                            "/rpc/TextMode" => Ok::<_, SrvError>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_TYPE, "application/grpc-web-text+proto")
+                                    .body(Full::new(Bytes::from_static(b"AAAA")).map_err(SrvError::from).boxed())
+                                    .unwrap(),
+                            ),
+                            _ => Ok::<_, SrvError>(text_resp("mutated")),
+                        }
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 1. Binary grpc-web without 0x80 trailer frame -> BYPASS
+        let r_no_tr = svc
+            .clone()
+            .oneshot(post_json_req("/rpc/MissingTrailer", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_no_tr.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+
+        // 2. Binary grpc-web with 0x80 grpc-status: 0 trailer -> MISS then HIT
+        let r_ok1 = svc
+            .clone()
+            .oneshot(post_json_req("/rpc/WithTrailer", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_ok1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        let r_ok2 = svc
+            .clone()
+            .oneshot(post_json_req("/rpc/WithTrailer", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_ok2.headers().get("x-praeco-cache").unwrap(), "HIT");
+
+        // 3. application/grpc-web-text -> BYPASS
+        let r_text = svc
+            .clone()
+            .oneshot(post_json_req("/rpc/TextMode", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_text.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+
+        // 4. Semicolon matrix parameter on mutating request in standalone CacheLayer -> 400 Bad Request
+        let before_semi = calls.load(Ordering::SeqCst);
+        let r_semi = svc
+            .clone()
+            .oneshot(post_json_req("/api/Mutate;jsessionid=1", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_semi.status(), StatusCode::BAD_REQUEST);
+        let r_pct3b = svc
+            .clone()
+            .oneshot(post_json_req("/api/Mutate%3bbypass", b"{}"))
+            .await
+            .unwrap();
+        assert_eq!(r_pct3b.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(calls.load(Ordering::SeqCst), before_semi);
+    }
+
+    #[tokio::test]
+    async fn test_p02_p03_edge_cases_mixed_coalescing_head_incompressible_and_query_fastpath() {
+        use async_compression::tokio::bufread::GzipDecoder;
+
+        // 1. P-03 canonical_path_and_query fast-path and percent/plus normalization equivalence
+        assert_eq!(&*canonical_path_and_query("/items", None), "/items");
+        assert_eq!(&*canonical_path_and_query("/items", Some("")), "/items");
+        assert_eq!(&*canonical_path_and_query("/items", Some("k=v")), "/items?k=v");
+        assert_eq!(&*canonical_path_and_query("/items", Some("a=")), "/items?a=");
+        assert_eq!(&*canonical_path_and_query("/items", Some("=1")), "/items?=1");
+        assert_eq!(
+            canonical_path_and_query("/items", Some("a=1&b=2")),
+            canonical_path_and_query("/items", Some("b=2&a=1"))
+        );
+        assert_eq!(
+            canonical_path_and_query("/items", Some("q=a+b")),
+            canonical_path_and_query("/items", Some("q=a%20b"))
+        );
+
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: Some("p02_edge_ns".to_string()),
+            rules: HashMap::from([("/assets/*".to_string(), CacheRuleConfig::default())]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_p02_edge").unwrap());
+
+        let compressible = "edge-coalesce-compressible-payload-".repeat(12);
+        let compressible_bytes = Bytes::from(compressible.clone());
+        let compressible_len = compressible_bytes.len();
+
+        // Deterministic pseudo-random incompressible payload (> MIN_PRECOMPRESS_BYTES = 64)
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let incompressible: Vec<u8> = (0..256)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 32) as u8
+            })
+            .collect();
+        let incompressible_bytes = Bytes::from(incompressible);
+
+        let mixed_started = Arc::new(Notify::new());
+        let mixed_release = Arc::new(Notify::new());
+        let calls = Arc::new(AtomicU64::new(0));
+
+        let mixed_started_ref = Arc::clone(&mixed_started);
+        let mixed_release_ref = Arc::clone(&mixed_release);
+        let calls_ref = Arc::clone(&calls);
+        let comp_ref = compressible_bytes.clone();
+        let incomp_ref = incompressible_bytes.clone();
+
+        let mut svc = CacheLayer::new(compiled, "srv_p02_edge")
+            .with_cache(Arc::clone(&cache))
+            .with_precompression(true)
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let st = Arc::clone(&mixed_started_ref);
+                    let rel = Arc::clone(&mixed_release_ref);
+                    let c = Arc::clone(&calls_ref);
+                    let comp = comp_ref.clone();
+                    let incomp = incomp_ref.clone();
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        let body = match req.uri().path() {
+                            "/assets/mixed" => {
+                                st.notify_one();
+                                rel.notified().await;
+                                comp
+                            }
+                            "/assets/tiny" => Bytes::from_static(b"tiny"),
+                            "/assets/incomp" => incomp,
+                            _ => Bytes::new(),
+                        };
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/octet-stream")
+                                .body(Full::new(body).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 2. Mixed-encoding Singleflight: plain leader + concurrent gzip follower
+        let svc_leader = svc.clone();
+        let leader_fut = tokio::spawn(async move {
+            svc_leader.oneshot(empty_req("/assets/mixed")).await.unwrap()
+        });
+        mixed_started.notified().await;
+
+        let svc_follower = svc.clone();
+        let follower_fut = tokio::spawn(async move {
+            let mut req_gz = empty_req("/assets/mixed");
+            req_gz
+                .headers_mut()
+                .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+            svc_follower.oneshot(req_gz).await.unwrap()
+        });
+        tokio::task::yield_now().await;
+        mixed_release.notify_waiters();
+
+        let (resp_leader, resp_follower) = tokio::join!(leader_fut, follower_fut);
+        let resp_leader = resp_leader.unwrap();
+        let resp_follower = resp_follower.unwrap();
+        assert_eq!(resp_leader.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert!(resp_leader.headers().get(header::CONTENT_ENCODING).is_none());
+        let leader_body = resp_leader.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(leader_body, compressible_bytes);
+
+        assert_eq!(resp_follower.headers().get("x-praeco-cache").unwrap(), "COALESCED");
+        assert_eq!(
+            resp_follower.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let follower_gz = resp_follower.into_body().collect().await.unwrap().to_bytes();
+        let mut dec = Vec::new();
+        GzipDecoder::new(std::io::Cursor::new(follower_gz))
+            .read_to_end(&mut dec)
+            .await
+            .unwrap();
+        assert_eq!(dec, compressible.as_bytes());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 3. HEAD with Accept-Encoding: gzip on precompressed entry returns uncompressed Content-Length + empty body
+        let mut req_head = Request::builder()
+            .method(Method::HEAD)
+            .uri("/assets/mixed")
+            .header(header::ACCEPT_ENCODING, "gzip")
+            .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())
+            .unwrap();
+        let resp_head = svc.clone().oneshot(std::mem::replace(&mut req_head, empty_req("/"))).await.unwrap();
+        assert_eq!(resp_head.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert!(resp_head.headers().get(header::CONTENT_ENCODING).is_none());
+        assert_eq!(
+            resp_head
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            compressible_len.to_string()
+        );
+        let head_body = resp_head.into_body().collect().await.unwrap().to_bytes();
+        assert!(head_body.is_empty());
+
+        // 4. Small (< 64B) payload skips precompression and serves synchronously as plain HIT
+        let mut req_tiny = empty_req("/assets/tiny");
+        req_tiny
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let r_tiny1 = svc.clone().oneshot(req_tiny).await.unwrap();
+        assert_eq!(r_tiny1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert!(r_tiny1.headers().get(header::CONTENT_ENCODING).is_none());
+
+        let mut req_tiny_hit = empty_req("/assets/tiny");
+        req_tiny_hit
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(matches!(svc.call(req_tiny_hit), CacheFuture::Hit { .. }));
+
+        // 5. Incompressible >= 64B payload caches Ready(None) in OnceCell and takes synchronous CacheFuture::Hit thereafter
+        let mut req_inc1 = empty_req("/assets/incomp");
+        req_inc1
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let r_inc1 = svc.clone().oneshot(req_inc1).await.unwrap();
+        assert_eq!(r_inc1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert!(r_inc1.headers().get(header::CONTENT_ENCODING).is_none());
+        let inc_body1 = r_inc1.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(inc_body1, incompressible_bytes);
+
+        let inc_key = CacheKey {
+            namespace: Arc::from("p02_edge_ns"),
+            generation: cache.current_generation("p02_edge_ns"),
+            scope: CacheScope::Public,
+            method: "GET",
+            path_and_query: Arc::from("/assets/incomp"),
+            vary_values: SmallVec::new(),
+            scope_key: public_scope_key(),
+            body_hash: None,
+            post_encoding: None,
+        };
+        let stored_inc = cache.get(&inc_key).expect("incompressible entry must be cached");
+        assert!(matches!(
+            stored_inc.get_precompressed_sync(PrecompressAlgo::Gzip),
+            PrecompressedLookup::Ready(None)
+        ));
+
+        let mut req_inc2 = empty_req("/assets/incomp");
+        req_inc2
+            .headers_mut()
+            .insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
+        let hit_fut = svc.call(req_inc2);
+        assert!(
+            matches!(hit_fut, CacheFuture::Hit { .. }),
+            "subsequent HIT after Ready(None) must execute synchronously without re-compressing"
+        );
+        let r_inc2 = hit_fut.await.unwrap();
+        assert_eq!(r_inc2.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert!(r_inc2.headers().get(header::CONTENT_ENCODING).is_none());
     }
 }
