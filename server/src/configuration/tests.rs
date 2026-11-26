@@ -1761,15 +1761,22 @@ enabled = []
 
     #[test]
     fn test_cache_layer_validation_and_ordering() {
-        // 1. Cache before Rbac / JwtAuth / Compression must be rejected
+        // 1. Cache before Rbac / JwtAuth / Compression / Cors must be rejected
         for bad_order in [
             vec!["Cache", "Rbac"],
             vec!["JwtAuth", "Cache", "Rbac"],
             vec!["Cache", "Compression"],
             vec!["Cache", "IpFilter"],
+            vec!["Cache", "Cors"],
         ] {
             let layers = Layers {
                 enabled: bad_order.iter().map(|s| (*s).to_string()).collect(),
+                cors_config: Some(CorsConfig {
+                    allowed_origins: vec!["https://example.com".into()],
+                    allowed_methods: vec!["GET".into()],
+                    allowed_headers: vec!["Content-Type".into()],
+                    allow_credentials: false,
+                }),
                 cache_config: Some(CacheLayerConfig {
                     namespace: None,
                     rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
@@ -1777,12 +1784,39 @@ enabled = []
                 }),
                 ..Default::default()
             };
-            assert!(
-                layers.build_middleware_layers("cache_order_test").is_err(),
-                "expected ordering error for {:?}",
-                bad_order
-            );
+            let err = layers
+                .build_middleware_layers("cache_order_test")
+                .expect_err(&format!("expected ordering error for {:?}", bad_order));
+            if bad_order == vec!["Cache", "Cors"] {
+                assert!(
+                    err.to_string().contains("must come AFTER Cors"),
+                    "unexpected Cors ordering error: {err}"
+                );
+            }
         }
+
+        // Valid order: Cors before Cache succeeds
+        let valid_cors_cache = Layers {
+            enabled: vec!["Cors".into(), "Cache".into()],
+            cors_config: Some(CorsConfig {
+                allowed_origins: vec!["https://example.com".into()],
+                allowed_methods: vec!["GET".into()],
+                allowed_headers: vec!["Content-Type".into()],
+                allow_credentials: false,
+            }),
+            cache_config: Some(CacheLayerConfig {
+                namespace: None,
+                rules: HashMap::from([("/api/*".into(), CacheRuleConfig::default())]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(
+            valid_cors_cache
+                .build_middleware_layers("cache_cors_ok")
+                .is_ok(),
+            "Cors before Cache must be allowed"
+        );
 
         // 2. Cache in enabled without [Server.Layers.Cache] fails
         let missing_cfg = Layers {

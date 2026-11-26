@@ -13,14 +13,17 @@
 //! ## Zero-Trust Invariants
 //!
 //! - [`CacheLayer`] is validated at startup/reload to run **after** all security,
-//!   authentication, RBAC, and compression layers (`IpFilter`, `PathSanitizer`,
-//!   `Inspection`, `JwtAuth`, `Rbac`, `Compression`).
+//!   authentication, RBAC, CORS, and compression layers (`IpFilter`, `PathSanitizer`,
+//!   `Inspection`, `Cors`, `JwtAuth`, `Rbac`, `Compression`).
 //! - Caching is opt-in per path rule under `[Server.Layers.Cache.rules]`.
 //! - Cross-server sharing is controlled explicitly via `namespace` and isolated by
-//!   `CacheScope` (`public`, `per_role`, `per_subject`).
+//!   `CacheScope` (`public`, `per_role`, `per_subject`), while RFC 9111 `Vary` response
+//!   headers are enforced against `vary_headers`.
+//! - Request/response buffering for caching uses bounded total deadlines (`timeout_at`)
+//!   and the process-wide router `BufferBudget` (`BufferReservation`).
 //! - Responses marked with [`CacheBypass`] (e.g. partially degraded `aggregate` responses
-//!   containing `_errors`), `Set-Cookie`, `Cache-Control: no-store`, or payloads larger
-//!   than `max_entry_bytes` are never stored in the cache.
+//!   containing `_errors`), `Set-Cookie`, `Cache-Control: no-store`, `Vary: *`, uncovered
+//!   `Vary` headers, or payloads larger than `max_entry_bytes` are never stored in the cache.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -56,7 +59,11 @@ use crate::{
     configuration::{
         CacheScope, CompiledCacheConfig, CompiledCacheRule, GlobalCacheConfig, ServerMetrics,
     },
-    middleware::{path_sanitizer::sanitize_and_normalize_path_cow, rbac::extract_user_roles_from_extensions},
+    middleware::{
+        path_sanitizer::sanitize_and_normalize_path_cow,
+        rbac::extract_user_roles_from_extensions,
+        router::{BufferBudget, BufferReservation, BudgetedBytesBody, global_response_buffer_budget},
+    },
 };
 
 // ============================================================================
@@ -304,6 +311,8 @@ pub struct CacheBypass;
 pub struct CacheKey {
     /// Logical cache namespace (defaults to the server name or an explicit shared namespace).
     pub namespace: String,
+    /// Generation fence `(global_generation, namespace_generation)` for O(1) lock-free invalidation.
+    pub generation: (u64, u64),
     /// Canonical HTTP method used as the stored slot (`"GET"` for `GET`/`HEAD`, `"POST"` for exact `POST` RPCs).
     pub method: &'static str,
     /// Sanitized path plus lexicographically sorted query parameters.
@@ -406,12 +415,17 @@ enum SingleflightOutcome {
     UpstreamError(String),
 }
 
+/// Maximum number of distinct namespaces tracked in [`SharedResponseCache::namespace_generations`].
+/// Unknown namespaces beyond this cap fall back to advancing `global_generation` to prevent
+/// unbounded `DashMap` growth from arbitrary admin `?namespace=...` queries.
+const MAX_TRACKED_NAMESPACES: usize = 4096;
+
 /// Process-wide W-TinyLFU HTTP & gRPC response cache shared across all `[[Server]]` instances.
 pub struct SharedResponseCache {
     store: Cache<CacheKey, Arc<CachedResponse>>,
     singleflight: Singleflight<CacheKey, SingleflightOutcome>,
     global_generation: Arc<AtomicU64>,
-    namespace_generations: Arc<DashMap<String, u64>>,
+    namespace_generations: Arc<DashMap<String, AtomicU64>>,
     config: GlobalCacheConfig,
 }
 
@@ -433,7 +447,6 @@ impl SharedResponseCache {
             .max_capacity(max_bytes.max(1))
             .weigher(|_k: &CacheKey, v: &Arc<CachedResponse>| v.byte_weight)
             .expire_after(PerEntryExpiry)
-            .support_invalidation_closures()
             .build()
     }
 
@@ -448,13 +461,16 @@ impl SharedResponseCache {
         let ns_gen = self
             .namespace_generations
             .get(namespace)
-            .map_or(0, |entry| *entry);
+            .map_or(0, |entry| entry.load(Ordering::Acquire));
         (global_gen, ns_gen)
     }
 
     /// Looks up an unexpired [`CachedResponse`] by `key`.
     pub fn get(&self, key: &CacheKey) -> Option<Arc<CachedResponse>> {
         if !self.config.enabled {
+            return None;
+        }
+        if key.generation != self.current_generation(&key.namespace) {
             return None;
         }
         let entry = self.store.get(key)?;
@@ -478,7 +494,7 @@ impl SharedResponseCache {
         entry: Arc<CachedResponse>,
         expected_generation: (u64, u64),
     ) -> bool {
-        if !self.config.enabled || entry.ttl.is_zero() {
+        if !self.config.enabled || entry.ttl.is_zero() || key.generation != expected_generation {
             return false;
         }
         if self.current_generation(&key.namespace) != expected_generation {
@@ -498,25 +514,24 @@ impl SharedResponseCache {
         self.store.invalidate_all();
     }
 
-    /// Discards all cached entries belonging to `namespace` and advances its generation fence.
+    /// Discards all cached entries belonging to `namespace` in O(1) by advancing its generation fence.
+    ///
+    /// Because `(global_generation, namespace_generation)` is embedded directly in [`CacheKey`],
+    /// bumping the atomic counter immediately obsoletes all cached keys for `namespace` without
+    /// registering a Moka predicate closure on reads. Caps tracked namespaces at
+    /// [`MAX_TRACKED_NAMESPACES`]; overflow namespaces bump `global_generation` instead.
     pub fn invalidate_namespace(&self, namespace: &str) {
-        {
-            let mut gen_entry = self
-                .namespace_generations
-                .entry(namespace.to_string())
-                .or_insert(0);
-            *gen_entry = gen_entry.wrapping_add(1);
+        if let Some(counter) = self.namespace_generations.get(namespace) {
+            counter.fetch_add(1, Ordering::AcqRel);
+            return;
         }
-        let ns = namespace.to_string();
-        if let Err(err) = self
-            .store
-            .invalidate_entries_if(move |k, _v| k.namespace == ns)
-        {
-            tracing::warn!(
-                namespace = %namespace,
-                error = %err,
-                "Failed to register Moka namespace invalidation predicate"
-            );
+        if self.namespace_generations.len() < MAX_TRACKED_NAMESPACES {
+            self.namespace_generations
+                .entry(namespace.to_string())
+                .or_insert_with(|| AtomicU64::new(0))
+                .fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.global_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -897,11 +912,13 @@ fn wrap_invalidation_response(
     Response::from_parts(parts, wrapped)
 }
 
-/// Streaming fallback body used when a response exceeds `max_entry_bytes` mid-stream,
-/// seamlessly yielding already-buffered frames before polling the remaining upstream body.
+/// Streaming fallback body used when a response exceeds `max_entry_bytes`,
+/// budget capacity, or collection deadline mid-stream, seamlessly yielding
+/// already-buffered frames before polling the remaining upstream body.
 #[pin_project]
 struct ChainedStreamBody {
     buffered: VecDeque<Frame<Bytes>>,
+    reservation: BufferReservation,
     #[pin]
     rest: SrvBody,
     rest_done: bool,
@@ -917,6 +934,9 @@ impl http_body::Body for ChainedStreamBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.project();
         if let Some(frame) = this.buffered.pop_front() {
+            if let Some(data) = frame.data_ref() {
+                this.reservation.release(data.len());
+            }
             return Poll::Ready(Some(Ok(frame)));
         }
         if *this.rest_done {
@@ -1233,6 +1253,48 @@ fn grpc_web_body_has_error(body: &[u8]) -> bool {
     false
 }
 
+fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+    headers.get_all(header::CONTENT_ENCODING).iter().any(|val| {
+        let Ok(raw) = val.to_str() else {
+            return true;
+        };
+        raw.split(',')
+            .map(str::trim)
+            .filter(|tok| !tok.is_empty())
+            .any(|tok| !tok.eq_ignore_ascii_case("identity"))
+    })
+}
+
+/// Enforces RFC 9111 §4.1 response `Vary` rules: `Vary: *` is never cacheable, and any
+/// nominated header must be covered by the rule's `vary_headers` (with `Accept-Encoding`
+/// allowed automatically only when the cached payload is not already `Content-Encoding`-encoded).
+fn response_vary_is_cacheable(headers: &HeaderMap, rule: &CompiledCacheRule) -> bool {
+    for val in headers.get_all(header::VARY) {
+        let Ok(raw) = val.to_str() else {
+            return false;
+        };
+        for token in raw.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if token == "*" {
+                return false;
+            }
+            if rule
+                .vary_headers
+                .iter()
+                .any(|vh| vh.eq_ignore_ascii_case(token))
+            {
+                continue;
+            }
+            if token.eq_ignore_ascii_case("accept-encoding")
+                && !has_non_identity_content_encoding(headers)
+            {
+                continue;
+            }
+            return false;
+        }
+    }
+    true
+}
+
 /// Evaluates response status and headers to determine whether the response may be cached
 /// and computes its effective TTL. Returns `None` if the response must bypass the cache.
 fn evaluate_response_cacheability(
@@ -1259,6 +1321,9 @@ fn evaluate_response_cacheability(
     if let Some(raw_grpc_status) = headers.get("grpc-status")
         && raw_grpc_status.to_str().ok().map(str::trim) != Some("0")
     {
+        return None;
+    }
+    if !response_vary_is_cacheable(headers, rule) {
         return None;
     }
     if let Some(content_len) = headers
@@ -1298,11 +1363,12 @@ fn evaluate_response_cacheability(
 }
 
 const POST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const RESPONSE_BODY_COLLECT_TIMEOUT: Duration = Duration::from_secs(10);
 const GRPC_UNARY_EOF_GRACE: Duration = Duration::from_millis(10);
 const GRPC_RESP_TRAILER_TIMEOUT: Duration = Duration::from_millis(250);
 
 enum PostReqBody {
-    Buffered(Bytes),
+    Buffered(Bytes, BufferReservation),
     Bypass(SrvBody),
 }
 
@@ -1310,6 +1376,7 @@ fn spill_accumulated_stream(
     accumulated: BytesMut,
     extra_frames: Vec<Frame<Bytes>>,
     rest: SrvBody,
+    reservation: BufferReservation,
 ) -> SrvBody {
     let mut buffered = VecDeque::with_capacity(extra_frames.len() + 1);
     if !accumulated.is_empty() {
@@ -1320,6 +1387,7 @@ fn spill_accumulated_stream(
     }
     ChainedStreamBody {
         buffered,
+        reservation,
         rest,
         rest_done: false,
     }
@@ -1328,14 +1396,35 @@ fn spill_accumulated_stream(
 
 /// Reads at most `max_bytes` from a `POST` request body for SHA-256 cache-key computation.
 ///
-/// For native HTTP/2 gRPC (`is_grpc = true`), validates that exactly one 5-byte length-prefixed
-/// gRPC message is followed by `EOF` (non-blockingly/bounded), spilling client-streaming or
-/// oversized requests into [`PostReqBody::Bypass`] without stalling or losing frames.
+/// Enforces a fixed total deadline (`timeout_at`) and incremental reservations against the
+/// process-wide `BufferBudget`. For native HTTP/2 gRPC (`is_grpc = true`), validates that
+/// exactly one 5-byte length-prefixed gRPC message is followed by `EOF` (bounded by
+/// [`GRPC_UNARY_EOF_GRACE`]), spilling client-streaming, slow, or oversized requests into
+/// [`PostReqBody::Bypass`] without stalling or losing frames.
 async fn read_post_request_body(
-    mut body: SrvBody,
+    body: SrvBody,
     max_bytes: usize,
     is_grpc: bool,
 ) -> Result<PostReqBody, SrvError> {
+    read_post_request_body_with_limits(
+        body,
+        max_bytes,
+        is_grpc,
+        POST_BODY_READ_TIMEOUT,
+        global_response_buffer_budget(),
+    )
+    .await
+}
+
+async fn read_post_request_body_with_limits(
+    mut body: SrvBody,
+    max_bytes: usize,
+    is_grpc: bool,
+    timeout_dur: Duration,
+    budget: &Arc<BufferBudget>,
+) -> Result<PostReqBody, SrvError> {
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+    let mut reservation = BufferReservation::new(Arc::clone(budget));
     let mut accumulated = BytesMut::new();
 
     loop {
@@ -1345,6 +1434,7 @@ async fn read_post_request_body(
                     accumulated,
                     Vec::new(),
                     body,
+                    reservation,
                 )));
             }
             let msg_len = u32::from_be_bytes([
@@ -1359,15 +1449,20 @@ async fn read_post_request_body(
                     accumulated,
                     Vec::new(),
                     body,
+                    reservation,
                 )));
             }
             if accumulated.len() == frame_end {
                 if body.is_end_stream() {
-                    return Ok(PostReqBody::Buffered(accumulated.freeze()));
+                    return Ok(PostReqBody::Buffered(accumulated.freeze(), reservation));
                 }
+                let grace_deadline =
+                    (tokio::time::Instant::now() + GRPC_UNARY_EOF_GRACE).min(deadline);
                 loop {
-                    match tokio::time::timeout(GRPC_UNARY_EOF_GRACE, body.frame()).await {
-                        Ok(None) => return Ok(PostReqBody::Buffered(accumulated.freeze())),
+                    match tokio::time::timeout_at(grace_deadline, body.frame()).await {
+                        Ok(None) => {
+                            return Ok(PostReqBody::Buffered(accumulated.freeze(), reservation));
+                        }
                         Ok(Some(Err(e))) => return Err(e),
                         Ok(Some(Ok(extra))) => {
                             if extra.data_ref().is_some_and(Bytes::is_empty) {
@@ -1377,6 +1472,7 @@ async fn read_post_request_body(
                                 accumulated,
                                 vec![extra],
                                 body,
+                                reservation,
                             )));
                         }
                         Err(_elapsed) => {
@@ -1384,6 +1480,7 @@ async fn read_post_request_body(
                                 accumulated,
                                 Vec::new(),
                                 body,
+                                reservation,
                             )));
                         }
                     }
@@ -1391,12 +1488,13 @@ async fn read_post_request_body(
             }
         }
 
-        match tokio::time::timeout(POST_BODY_READ_TIMEOUT, body.frame()).await {
+        match tokio::time::timeout_at(deadline, body.frame()).await {
             Err(_elapsed) => {
                 return Ok(PostReqBody::Bypass(spill_accumulated_stream(
                     accumulated,
                     Vec::new(),
                     body,
+                    reservation,
                 )));
             }
             Ok(None) => {
@@ -1412,22 +1510,23 @@ async fn read_post_request_body(
                             == accumulated.len();
                     if !valid_unary {
                         return Ok(PostReqBody::Bypass(
-                            Full::new(accumulated.freeze())
-                                .map_err(SrvError::from)
-                                .boxed(),
+                            BudgetedBytesBody::new(accumulated.freeze(), reservation).boxed(),
                         ));
                     }
                 }
-                return Ok(PostReqBody::Buffered(accumulated.freeze()));
+                return Ok(PostReqBody::Buffered(accumulated.freeze(), reservation));
             }
             Ok(Some(Err(e))) => return Err(e),
             Ok(Some(Ok(frame))) => match frame.into_data() {
                 Ok(data) => {
-                    if accumulated.len().saturating_add(data.len()) > max_bytes {
+                    if accumulated.len().saturating_add(data.len()) > max_bytes
+                        || !reservation.try_reserve(data.len())
+                    {
                         return Ok(PostReqBody::Bypass(spill_accumulated_stream(
                             accumulated,
                             vec![Frame::data(data)],
                             body,
+                            reservation,
                         )));
                     }
                     accumulated.extend_from_slice(&data);
@@ -1437,6 +1536,7 @@ async fn read_post_request_body(
                         accumulated,
                         vec![non_data_frame],
                         body,
+                        reservation,
                     )));
                 }
             },
@@ -1451,6 +1551,7 @@ enum CollectedResponse {
     },
     Bypass {
         buffered: VecDeque<Frame<Bytes>>,
+        reservation: BufferReservation,
         rest: SrvBody,
     },
 }
@@ -1463,6 +1564,7 @@ fn bypass_with_accumulated(
     accumulated: BytesMut,
     extra_frames: Vec<Frame<Bytes>>,
     rest: SrvBody,
+    reservation: BufferReservation,
 ) -> CollectedResponse {
     let mut buffered = VecDeque::with_capacity(extra_frames.len() + 1);
     if !accumulated.is_empty() {
@@ -1471,17 +1573,43 @@ fn bypass_with_accumulated(
     for f in extra_frames {
         buffered.push_back(f);
     }
-    CollectedResponse::Bypass { buffered, rest }
+    CollectedResponse::Bypass {
+        buffered,
+        reservation,
+        rest,
+    }
 }
 
 /// Collects a cacheable HTTP/JSON or unary gRPC response body (and HTTP/2 `grpc-status: 0`
-/// trailers when `content-type` is `application/grpc*`), spilling seamlessly to streaming
-/// bypass on oversized payloads, multi-frame server streams, or non-zero `grpc-status`.
+/// trailers when `content-type` is `application/grpc*`), bounded by a total wall-clock
+/// deadline and the global [`BufferBudget`], spilling seamlessly to streaming bypass on
+/// timeout, budget exhaustion, oversized payloads, multi-frame server streams, or non-zero
+/// `grpc-status`.
 async fn collect_response_for_cache(
+    resp_headers: &HeaderMap,
+    body: SrvBody,
+    max_entry_bytes: usize,
+) -> Result<CollectedResponse, SrvError> {
+    collect_response_for_cache_with_limits(
+        resp_headers,
+        body,
+        max_entry_bytes,
+        RESPONSE_BODY_COLLECT_TIMEOUT,
+        global_response_buffer_budget(),
+    )
+    .await
+}
+
+async fn collect_response_for_cache_with_limits(
     resp_headers: &HeaderMap,
     mut body: SrvBody,
     max_entry_bytes: usize,
+    timeout_dur: Duration,
+    budget: &Arc<BufferBudget>,
 ) -> Result<CollectedResponse, SrvError> {
+    let deadline = tokio::time::Instant::now() + timeout_dur;
+    let mut reservation = BufferReservation::new(Arc::clone(budget));
+
     if is_header_grpc_content_type(resp_headers) {
         let header_grpc_ok = grpc_status_is_ok(resp_headers);
         let mut accumulated = BytesMut::new();
@@ -1489,7 +1617,12 @@ async fn collect_response_for_cache(
         loop {
             if accumulated.len() >= 5 {
                 if accumulated[0] > 1 {
-                    return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                    return Ok(bypass_with_accumulated(
+                        accumulated,
+                        Vec::new(),
+                        body,
+                        reservation,
+                    ));
                 }
                 let msg_len = u32::from_be_bytes([
                     accumulated[1],
@@ -1499,7 +1632,12 @@ async fn collect_response_for_cache(
                 ]) as usize;
                 let frame_end = 5usize.saturating_add(msg_len);
                 if frame_end > max_entry_bytes || accumulated.len() > frame_end {
-                    return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                    return Ok(bypass_with_accumulated(
+                        accumulated,
+                        Vec::new(),
+                        body,
+                        reservation,
+                    ));
                 }
                 if accumulated.len() == frame_end {
                     if body.is_end_stream() {
@@ -1509,10 +1647,17 @@ async fn collect_response_for_cache(
                                 trailers: None,
                             });
                         }
-                        return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                        return Ok(bypass_with_accumulated(
+                            accumulated,
+                            Vec::new(),
+                            body,
+                            reservation,
+                        ));
                     }
+                    let trailer_deadline =
+                        (tokio::time::Instant::now() + GRPC_RESP_TRAILER_TIMEOUT).min(deadline);
                     loop {
-                        match tokio::time::timeout(GRPC_RESP_TRAILER_TIMEOUT, body.frame()).await {
+                        match tokio::time::timeout_at(trailer_deadline, body.frame()).await {
                             Ok(Some(Err(e))) => return Err(e),
                             Ok(Some(Ok(frame))) => {
                                 if frame.data_ref().is_some_and(Bytes::is_empty) {
@@ -1524,6 +1669,7 @@ async fn collect_response_for_cache(
                                             accumulated,
                                             Vec::new(),
                                             body,
+                                            reservation,
                                         ));
                                     };
                                     if grpc_status_is_ok(&tr) {
@@ -1536,6 +1682,7 @@ async fn collect_response_for_cache(
                                         accumulated,
                                         vec![Frame::trailers(tr)],
                                         body,
+                                        reservation,
                                     ));
                                 }
                                 // 2nd message frame -> server streaming response, bypass immediately
@@ -1543,6 +1690,7 @@ async fn collect_response_for_cache(
                                     accumulated,
                                     vec![frame],
                                     body,
+                                    reservation,
                                 ));
                             }
                             Ok(None) => {
@@ -1552,18 +1700,36 @@ async fn collect_response_for_cache(
                                         trailers: None,
                                     });
                                 }
-                                return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                                return Ok(bypass_with_accumulated(
+                                    accumulated,
+                                    Vec::new(),
+                                    body,
+                                    reservation,
+                                ));
                             }
                             Err(_elapsed) => {
-                                return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                                return Ok(bypass_with_accumulated(
+                                    accumulated,
+                                    Vec::new(),
+                                    body,
+                                    reservation,
+                                ));
                             }
                         }
                     }
                 }
             }
 
-            match body.frame().await {
-                None => {
+            match tokio::time::timeout_at(deadline, body.frame()).await {
+                Err(_elapsed) => {
+                    return Ok(bypass_with_accumulated(
+                        accumulated,
+                        Vec::new(),
+                        body,
+                        reservation,
+                    ));
+                }
+                Ok(None) => {
                     if accumulated.is_empty() && header_grpc_ok {
                         return Ok(CollectedResponse::Cacheable {
                             body: Bytes::new(),
@@ -1574,13 +1740,19 @@ async fn collect_response_for_cache(
                         accumulated,
                         Vec::new(),
                         empty_srv_body(),
+                        reservation,
                     ));
                 }
-                Some(Err(e)) => return Err(e),
-                Some(Ok(frame)) => {
+                Ok(Some(Err(e))) => return Err(e),
+                Ok(Some(Ok(frame))) => {
                     if frame.is_trailers() {
                         let Ok(tr) = frame.into_trailers() else {
-                            return Ok(bypass_with_accumulated(accumulated, Vec::new(), body));
+                            return Ok(bypass_with_accumulated(
+                                accumulated,
+                                Vec::new(),
+                                body,
+                                reservation,
+                            ));
                         };
                         if accumulated.is_empty() && grpc_status_is_ok(&tr) {
                             return Ok(CollectedResponse::Cacheable {
@@ -1592,21 +1764,30 @@ async fn collect_response_for_cache(
                             accumulated,
                             vec![Frame::trailers(tr)],
                             body,
+                            reservation,
                         ));
                     }
                     match frame.into_data() {
                         Ok(data) => {
-                            if accumulated.len().saturating_add(data.len()) > max_entry_bytes {
+                            if accumulated.len().saturating_add(data.len()) > max_entry_bytes
+                                || !reservation.try_reserve(data.len())
+                            {
                                 return Ok(bypass_with_accumulated(
                                     accumulated,
                                     vec![Frame::data(data)],
                                     body,
+                                    reservation,
                                 ));
                             }
                             accumulated.extend_from_slice(&data);
                         }
                         Err(other) => {
-                            return Ok(bypass_with_accumulated(accumulated, vec![other], body));
+                            return Ok(bypass_with_accumulated(
+                                accumulated,
+                                vec![other],
+                                body,
+                                reservation,
+                            ));
                         }
                     }
                 }
@@ -1618,14 +1799,26 @@ async fn collect_response_for_cache(
     let mut frames: VecDeque<Frame<Bytes>> = VecDeque::new();
     let mut total_bytes: usize = 0;
 
-    while let Some(frame_res) = body.frame().await {
-        let frame = frame_res?;
+    loop {
+        let frame = match tokio::time::timeout_at(deadline, body.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) => break,
+            Err(_elapsed) => {
+                return Ok(CollectedResponse::Bypass {
+                    buffered: frames,
+                    reservation,
+                    rest: body,
+                });
+            }
+        };
         if let Some(data) = frame.data_ref() {
             let next_total = total_bytes.saturating_add(data.len());
-            if next_total > max_entry_bytes {
+            if next_total > max_entry_bytes || !reservation.try_reserve(data.len()) {
                 frames.push_back(frame);
                 return Ok(CollectedResponse::Bypass {
                     buffered: frames,
+                    reservation,
                     rest: body,
                 });
             }
@@ -1635,6 +1828,7 @@ async fn collect_response_for_cache(
             frames.push_back(frame);
             return Ok(CollectedResponse::Bypass {
                 buffered: frames,
+                reservation,
                 rest: body,
             });
         }
@@ -1658,6 +1852,7 @@ async fn collect_response_for_cache(
     if is_header_grpc_web_binary(resp_headers) && grpc_web_body_has_error(&bytes) {
         return Ok(CollectedResponse::Bypass {
             buffered: VecDeque::from([Frame::data(bytes)]),
+            reservation,
             rest: empty_srv_body(),
         });
     }
@@ -1714,7 +1909,7 @@ where
     let coalesced = cache
         .singleflight
         .work_with_input(key, req, move |leader_req| async move {
-            let gen_before = cache_for_worker.current_generation(&key_for_worker.namespace);
+            let gen_before = key_for_worker.generation;
             let resp = match inner_for_worker.call(leader_req).await {
                 Ok(r) => r,
                 Err(e) => return SingleflightOutcome::UpstreamError(e.to_string()),
@@ -1750,9 +1945,14 @@ where
                     );
                     SingleflightOutcome::Cached(entry)
                 }
-                Ok(CollectedResponse::Bypass { buffered, rest }) => {
+                Ok(CollectedResponse::Bypass {
+                    buffered,
+                    reservation,
+                    rest,
+                }) => {
                     let chained = ChainedStreamBody {
                         buffered,
+                        reservation,
                         rest,
                         rest_done: false,
                     }
@@ -1969,14 +2169,14 @@ where
             return CacheFuture::Coalesce {
                 fut: Box::pin(async move {
                     let (req_parts, req_body) = req.into_parts();
-                    let req_bytes = match read_post_request_body(
+                    let (req_bytes, req_reservation) = match read_post_request_body(
                         req_body,
                         max_req_bytes,
                         is_grpc_req,
                     )
                     .await?
                     {
-                        PostReqBody::Buffered(bytes) => bytes,
+                        PostReqBody::Buffered(bytes, reservation) => (bytes, reservation),
                         PostReqBody::Bypass(bypass_body) => {
                             ServerMetrics::inc_cache_bypass(server_name);
                             let rebuilt_req = Request::from_parts(req_parts, bypass_body);
@@ -1988,9 +2188,11 @@ where
                         }
                     };
 
+                    let generation = cache.current_generation(&namespace);
                     let digest: [u8; 32] = Sha256::digest(&req_bytes).into();
                     let key = CacheKey {
                         namespace,
+                        generation,
                         method: "POST",
                         path_and_query,
                         vary_values,
@@ -2000,6 +2202,7 @@ where
                     };
 
                     if let Some(entry) = cache.get(&key) {
+                        drop(req_reservation);
                         ServerMetrics::inc_cache_hit(server_name);
                         return Ok(build_response_from_cached(
                             &entry,
@@ -2009,7 +2212,7 @@ where
                         ));
                     }
 
-                    let rebuilt_body = Full::new(req_bytes).map_err(SrvError::from).boxed();
+                    let rebuilt_body = BudgetedBytesBody::new(req_bytes, req_reservation).boxed();
                     let rebuilt_req = Request::from_parts(req_parts, rebuilt_body);
                     coalesce_and_execute(
                         CoalesceContext {
@@ -2031,8 +2234,10 @@ where
             };
         }
 
+        let generation = cache.current_generation(&namespace);
         let key = CacheKey {
             namespace,
+            generation,
             method: "GET",
             path_and_query: canonical_path_and_query(&canonical_path, req.uri().query()),
             vary_values: collect_vary_values(req.headers(), &rule.vary_headers),
@@ -2792,6 +2997,7 @@ mod tests {
     fn test_configure_global_response_cache_preserves_entries_on_same_max_bytes_and_clears_on_change() {
         let key = CacheKey {
             namespace: "reload_test_ns".to_string(),
+            generation: (0, 0),
             method: "GET",
             path_and_query: "/item".to_string(),
             vary_values: vec![],
@@ -3394,5 +3600,382 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r_after.headers().get("x-praeco-cache").unwrap(), "MISS");
+    }
+
+    #[tokio::test]
+    async fn test_p01_o1_generation_invalidation_and_namespace_cap() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([
+                (
+                    "/ns_a/*".to_string(),
+                    CacheRuleConfig {
+                        namespace: Some("ns_a".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "/ns_b/*".to_string(),
+                    CacheRuleConfig {
+                        namespace: Some("ns_b".to_string()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_p01").unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        let svc = CacheLayer::new(compiled, "srv_p01")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls_ref);
+                    async move {
+                        let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+                        let body = format!("{}:{n}", req.uri().path());
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(body)).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone_sync(),
+            );
+
+        // Populate both namespaces and verify HIT
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_a/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "MISS"
+        );
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_b/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "MISS"
+        );
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_a/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "HIT"
+        );
+
+        // Stale CacheKey lookup must immediately miss after O(1) invalidate_namespace without Moka predicates
+        let stale_key = CacheKey {
+            namespace: "ns_a".to_string(),
+            generation: cache.current_generation("ns_a"),
+            method: "GET",
+            path_and_query: "/ns_a/item".to_string(),
+            vary_values: vec![],
+            scope_key: String::new(),
+            body_hash: None,
+            post_encoding: None,
+        };
+        assert!(cache.get(&stale_key).is_some());
+
+        cache.invalidate_namespace("ns_a");
+        assert!(cache.get(&stale_key).is_none());
+
+        // ns_a immediately misses while unrelated ns_b stays HIT
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_a/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "MISS"
+        );
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_b/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "HIT"
+        );
+
+        // Overflow guard beyond MAX_TRACKED_NAMESPACES (4096) caps DashMap growth and bumps global_generation
+        for i in 0..MAX_TRACKED_NAMESPACES {
+            cache.invalidate_namespace(&format!("cap_ns_{i}"));
+        }
+        let len_at_cap = cache.namespace_generations.len();
+        assert!(len_at_cap <= MAX_TRACKED_NAMESPACES);
+        let global_before = cache.current_generation("ns_b").0;
+        cache.invalidate_namespace("unbounded_overflow_ns");
+        assert_eq!(cache.namespace_generations.len(), len_at_cap);
+        assert_eq!(cache.current_generation("ns_b").0, global_before + 1);
+
+        // Global generation advance also invalidates ns_b immediately
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/ns_b/item")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "MISS"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_s01_total_deadline_and_buffer_budget_enforcement() {
+        // 1. Total deadline defeats Slowloris per-frame reset on POST request bodies
+        let budget = BufferBudget::new(1024);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, SrvError>>(16);
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                if tx.send(Ok(Frame::data(Bytes::from_static(b"ab")))).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        let slow_body = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
+        let start = Instant::now();
+        let res = read_post_request_body_with_limits(
+            slow_body,
+            1024,
+            false,
+            Duration::from_millis(55),
+            &budget,
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "slowloris drip must hit total deadline instead of resetting per frame (took {elapsed:?})"
+        );
+        match res {
+            PostReqBody::Bypass(stream) => {
+                let collected = stream.collect().await.unwrap().to_bytes();
+                assert_eq!(&collected[..], b"abababababababababab");
+                assert_eq!(budget.remaining(), 1024);
+            }
+            PostReqBody::Buffered(_, _) => panic!("expected Bypass on total deadline"),
+        }
+
+        // 2. Response collection hits fixed total deadline and releases reservation upon drain
+        let (rtx, rrx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, SrvError>>(8);
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                if rtx.send(Ok(Frame::data(Bytes::from_static(b"xyz")))).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        });
+        let slow_resp_body = http_body_util::StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rrx)).boxed();
+        let rstart = Instant::now();
+        let col = collect_response_for_cache_with_limits(
+            &HeaderMap::new(),
+            slow_resp_body,
+            1024,
+            Duration::from_millis(55),
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert!(rstart.elapsed() < Duration::from_millis(200));
+        match col {
+            CollectedResponse::Bypass {
+                buffered,
+                reservation,
+                rest,
+            } => {
+                let chained = ChainedStreamBody {
+                    buffered,
+                    reservation,
+                    rest,
+                    rest_done: false,
+                };
+                let bytes = chained.collect().await.unwrap().to_bytes();
+                assert_eq!(&bytes[..], b"xyzxyzxyzxyzxyzxyzxyzxyz");
+                assert_eq!(budget.remaining(), 1024);
+            }
+            CollectedResponse::Cacheable { .. } => panic!("expected Bypass on slow response"),
+        }
+
+        // 3. Exhausting BufferBudget spills immediately to Bypass and restores capacity on drain/drop
+        let tiny_budget = BufferBudget::new(10);
+        let req_stream = http_body_util::StreamBody::new(futures_util::stream::iter(vec![
+            Ok::<_, SrvError>(Frame::data(Bytes::from_static(b"123456"))),
+            Ok::<_, SrvError>(Frame::data(Bytes::from_static(b"789012"))),
+        ]))
+        .boxed();
+        match read_post_request_body_with_limits(
+            req_stream,
+            1024,
+            false,
+            Duration::from_secs(1),
+            &tiny_budget,
+        )
+        .await
+        .unwrap()
+        {
+            PostReqBody::Bypass(stream) => {
+                // While holding first 6 bytes buffered before consuming, only 4 remain in tiny_budget
+                assert_eq!(tiny_budget.remaining(), 4);
+                let drained = stream.collect().await.unwrap().to_bytes();
+                assert_eq!(&drained[..], b"123456789012");
+                assert_eq!(tiny_budget.remaining(), 10);
+            }
+            PostReqBody::Buffered(_, _) => panic!("expected Bypass when BufferBudget is exhausted"),
+        }
+
+        let resp_stream = http_body_util::StreamBody::new(futures_util::stream::iter(vec![
+            Ok::<_, SrvError>(Frame::data(Bytes::from_static(b"123456"))),
+            Ok::<_, SrvError>(Frame::data(Bytes::from_static(b"789012"))),
+        ]))
+        .boxed();
+        match collect_response_for_cache_with_limits(
+            &HeaderMap::new(),
+            resp_stream,
+            1024,
+            Duration::from_secs(1),
+            &tiny_budget,
+        )
+        .await
+        .unwrap()
+        {
+            CollectedResponse::Bypass {
+                buffered,
+                reservation,
+                rest,
+            } => {
+                assert_eq!(tiny_budget.remaining(), 4);
+                let chained = ChainedStreamBody {
+                    buffered,
+                    reservation,
+                    rest,
+                    rest_done: false,
+                };
+                // Dropping without draining must still release the reservation cleanly
+                drop(chained);
+                assert_eq!(tiny_budget.remaining(), 10);
+            }
+            CollectedResponse::Cacheable { .. } => {
+                panic!("expected Bypass when BufferBudget is exhausted")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_s02_response_vary_validation_prevents_cache_poisoning() {
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            max_request_body_bytes: 64 * 1024,
+            respect_cache_control: true,
+            expose_cache_header: true,
+        });
+
+        let cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([
+                ("/open/*".to_string(), CacheRuleConfig::default()),
+                (
+                    "/cors/*".to_string(),
+                    CacheRuleConfig {
+                        vary_headers: vec!["origin".to_string()],
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&cfg, "srv_s02").unwrap());
+
+        let svc = CacheLayer::new(compiled, "srv_s02")
+            .with_cache(Arc::clone(&cache))
+            .layer(
+                tower::service_fn(|req: Request<SrvBody>| async move {
+                    let mut b = Response::builder().status(StatusCode::OK);
+                    match req.uri().path() {
+                        "/open/star" => {
+                            b = b.header(header::VARY, "*");
+                        }
+                        "/open/origin_uncovered" => {
+                            b = b.header(header::VARY, "Origin");
+                        }
+                        "/open/accept_enc_plain" => {
+                            b = b.header(header::VARY, "Accept-Encoding");
+                        }
+                        "/open/accept_enc_compressed" => {
+                            b = b
+                                .header(header::VARY, "Accept-Encoding")
+                                .header(header::CONTENT_ENCODING, "gzip");
+                        }
+                        "/cors/ok" => {
+                            let origin = req
+                                .headers()
+                                .get(header::ORIGIN)
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("none");
+                            b = b
+                                .header(header::VARY, "Origin, Accept-Encoding")
+                                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+                        }
+                        _ => {}
+                    }
+                    Ok::<_, SrvError>(
+                        b.body(Full::new(Bytes::from_static(b"ok")).map_err(SrvError::from).boxed())
+                            .unwrap(),
+                    )
+                })
+                .boxed_clone_sync(),
+            );
+
+        // 1. Vary: * must never be cached (RFC 9111)
+        let r_star = svc.clone().oneshot(empty_req("/open/star")).await.unwrap();
+        assert_eq!(r_star.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+
+        // 2. Vary: Origin without `origin` in vary_headers must BYPASS
+        let r_uncovered = svc.clone().oneshot(empty_req("/open/origin_uncovered")).await.unwrap();
+        assert_eq!(r_uncovered.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+
+        // 3. Vary: Accept-Encoding without Content-Encoding is safe (Compression layer wraps outside)
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/open/accept_enc_plain")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "MISS"
+        );
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/open/accept_enc_plain")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "HIT"
+        );
+
+        // 4. Vary: Accept-Encoding WITH Content-Encoding: gzip (without vary_headers) must BYPASS
+        assert_eq!(
+            svc.clone().oneshot(empty_req("/open/accept_enc_compressed")).await.unwrap().headers().get("x-praeco-cache").unwrap(),
+            "BYPASS"
+        );
+
+        // 5. Rule with vary_headers = ["origin"] caches cleanly and partitions by Origin
+        let mut req_app = empty_req("/cors/ok");
+        req_app.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("https://app.example"));
+        let r_app1 = svc.clone().oneshot(req_app).await.unwrap();
+        assert_eq!(r_app1.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert_eq!(
+            r_app1.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
+
+        let mut req_evil = empty_req("/cors/ok");
+        req_evil.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("https://evil.example"));
+        let r_evil = svc.clone().oneshot(req_evil).await.unwrap();
+        assert_eq!(r_evil.headers().get("x-praeco-cache").unwrap(), "MISS");
+        assert_eq!(
+            r_evil.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://evil.example"
+        );
+
+        let mut req_app2 = empty_req("/cors/ok");
+        req_app2.headers_mut().insert(header::ORIGIN, HeaderValue::from_static("https://app.example"));
+        let r_app2 = svc.clone().oneshot(req_app2).await.unwrap();
+        assert_eq!(r_app2.headers().get("x-praeco-cache").unwrap(), "HIT");
+        assert_eq!(
+            r_app2.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.example"
+        );
     }
 }

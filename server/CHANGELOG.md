@@ -11,9 +11,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.8.1] - 2026-11-25
+## [0.8.1] - 2026-11-26
 
 Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache (`CacheLayer` / `SharedResponseCache`) shared across all configured `[[Server]]` instances, backed by a cancellation-safe `Singleflight` request coalescer.
+
+### Security & Performance
+* **O(1) Generation-Keyed Cache Invalidation (`src/middleware/cache.rs`):**
+  * Embedded `generation: (u64, u64)` (`(global_generation, namespace_generation)`) directly into `CacheKey` and converted `SharedResponseCache::namespace_generations` to `DashMap<String, AtomicU64>`.
+  * Removed Moka `invalidate_entries_if` predicate closures and `.support_invalidation_closures()`, eliminating UUID allocations per write and predicate scans on every read while preserving atomic write-read race fencing in `insert_if_generation`.
+  * Capped `namespace_generations` at `MAX_TRACKED_NAMESPACES` (`4096`), falling back to advancing `global_generation` on overflow so untrusted `Admin` `?namespace=...` inputs cannot grow memory unboundedly.
+* **Bounded Caching Deadlines & `BufferBudget` Integration (`src/middleware/cache.rs`):**
+  * Replaced per-frame timeouts in `read_post_request_body` and unbounded frame polling in `collect_response_for_cache` with fixed wall-clock deadlines (`tokio::time::timeout_at`, 5 s request / 10 s response + bounded gRPC EOF/trailer grace windows) to prevent Slowloris reset loops and stalled upstream flights.
+  * Integrated `read_post_request_body`, `collect_response_for_cache`, `ChainedStreamBody`, and `POST` request replay (`BudgetedBytesBody`) with the process-wide 256 MiB router `BufferBudget` (`BufferReservation`), spilling cleanly to `BYPASS` if budget capacity is exhausted.
+* **CORS Layer Ordering & RFC 9111 Response `Vary` Validation (`src/configuration/mod.rs`, `src/middleware/cache.rs`):**
+  * Required `"Cache"` to appear **after** `"Cors"` in `Layers::validate_middleware_order()` so `CorsLayer` never writes origin-specific headers into shared cache entries.
+  * Validated upstream `Vary` response headers in `evaluate_response_cacheability()`: `Vary: *` and headers not listed in `vary_headers` always bypass caching (`Accept-Encoding` is implicitly accepted only for unencoded cache entries handled by the outer `Compression` layer).
 
 ### Added
 * **Cancellation-Safe `Singleflight<K, T>` (`src/middleware/cache.rs`):**

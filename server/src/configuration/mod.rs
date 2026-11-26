@@ -3597,7 +3597,7 @@ impl Layers {
             )));
         }
 
-        // Rule 4: Cache must come AFTER security, auth, RBAC, rate limiting, and compression layers
+        // Rule 4: Cache must come AFTER security, auth, RBAC, CORS, and compression layers
         if let Some(cache_idx) = self.enabled.iter().position(|l| l.eq_ignore_ascii_case("Cache")) {
             for (idx, layer_name) in self.enabled.iter().enumerate() {
                 let must_precede_cache = matches!(
@@ -3608,6 +3608,7 @@ impl Layers {
                         | "Decompression"
                         | "MaxPayload"
                         | "Inspection"
+                        | "Cors"
                         | "RateLimiter:Simple"
                         | "RateLimiter:TokenBucket"
                         | "Compression"
@@ -3617,7 +3618,7 @@ impl Layers {
 
                 if must_precede_cache && cache_idx < idx {
                     return Err(Error::msg(format!(
-                        "Cache (at index {cache_idx}) must come AFTER {layer_name} (at index {idx}) so security, RBAC, and compression run in the proper order."
+                        "Cache (at index {cache_idx}) must come AFTER {layer_name} (at index {idx}) so security, RBAC, CORS, and compression run in the proper order."
                     )));
                 }
             }
