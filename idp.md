@@ -154,6 +154,8 @@ curl -s -v "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK
 {"status":"confirmed","redirect":"/admin"}
 ```
 
+See running example script in [Test_Identity.sh](Test_Identity.sh).
+
 ## Configuration & Security
 
 - **Session TTL:** Login sessions have a strict Time-To-Live (TTL) and expire automatically if not confirmed.

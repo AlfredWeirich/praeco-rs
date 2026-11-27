@@ -1,0 +1,64 @@
+# Minimalist Praeco configuration WITH response cache & Singleflight (A/B test)
+enable_opentelemetry = false
+
+[cache]
+enabled = true
+max_bytes = 67108864         # 64 MiB L1 cache budget
+default_ttl_seconds = 60
+max_entry_bytes = 1048576    # 1 MiB max cached response
+max_request_body_bytes = 65536
+respect_cache_control = true
+expose_cache_header = true   # Exposes x-praeco-cache: HIT | MISS | COALESCED | BYPASS
+
+[[Server]]
+name = "bench_gateway"
+ip = "127.0.0.1"
+port = 18080
+protocol = "http"
+authentication = "None"
+service = "Router"
+enabled = true
+graceful_shutdown_timeout_seconds = 1
+
+[Server.ReverseRoutes."/"]
+upstreams = ["http://127.0.0.1:18081"]
+backend_type = "rest"
+strategy = "RoundRobin"
+
+[Server.RouterParams]
+protocol = "http"
+authentication = "None"
+
+[Server.connection_limits]
+max_connections = 10000
+max_connections_per_ip = 1024
+
+[Server.Layers]
+enabled = ["Compression", "Cache"]
+
+[Server.Layers.Cache]
+namespace = "bench_db"
+
+[Server.Layers.Cache.rules."GET /api/products"]
+ttl_seconds = 60
+scope = "public"
+
+[Server.Layers.Cache.rules."POST /api/query"]
+ttl_seconds = 60
+scope = "public"
+
+[Server.Layers.Cache.invalidations]
+"POST /api/mutate" = ["bench_db"]
+
+[[Server]]
+name = "bench_admin"
+ip = "127.0.0.1"
+port = 18090
+protocol = "http"
+authentication = "None"
+service = "Admin"
+enabled = true
+graceful_shutdown_timeout_seconds = 1
+
+[Server.Layers]
+enabled = []

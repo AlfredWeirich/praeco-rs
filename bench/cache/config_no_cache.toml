@@ -1,0 +1,44 @@
+# Minimalist Praeco configuration WITHOUT caching (A/B baseline)
+enable_opentelemetry = false
+
+[cache]
+enabled = false
+
+[[Server]]
+name = "bench_gateway"
+ip = "127.0.0.1"
+port = 18080
+protocol = "http"
+authentication = "None"
+service = "Router"
+enabled = true
+graceful_shutdown_timeout_seconds = 1
+
+[Server.ReverseRoutes."/"]
+upstreams = ["http://127.0.0.1:18081"]
+backend_type = "rest"
+strategy = "RoundRobin"
+
+[Server.RouterParams]
+protocol = "http"
+authentication = "None"
+
+[Server.connection_limits]
+max_connections = 10000
+max_connections_per_ip = 1024
+
+[Server.Layers]
+enabled = ["Compression"]
+
+[[Server]]
+name = "bench_admin"
+ip = "127.0.0.1"
+port = 18090
+protocol = "http"
+authentication = "None"
+service = "Admin"
+enabled = true
+graceful_shutdown_timeout_seconds = 1
+
+[Server.Layers]
+enabled = []

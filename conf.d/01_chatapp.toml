@@ -508,6 +508,8 @@
         claims_webhook_timeout_ms = 3000
         # Fail-closed security: abort login if claims webhook fails
         on_webhook_failure = "reject"
+        # für Tests:
+        #on_webhook_failure = "fallback_to_cert"
         
         # We reuse the existing proxy-client certs to authenticate the webhook request
         # against the internal gRPC/API server on port 50053, which requires mTLS.
