@@ -104,6 +104,7 @@ Measured A/B comparison with identical minimal gateway configurations (without c
 > **Where it falls short**: `praeco-rs` is an incredibly feature-rich API Gateway, but differs from edge-tier CDNs in a few specific areas.
 
 - **Local-Only Response Caching (No L2 Distributed Cache Yet)**: Since `v0.8.1`, `praeco-rs` includes a process-wide W-TinyLFU in-memory HTTP response cache (`CacheLayer` + cancellation-safe `Singleflight`) shared across all local `[[Server]]` instances. However, unlike Pingora's multi-node edge CDN caching, cache entries are currently node-local (no shared Redis L2 tier or cross-node invalidation yet).
+- **No Per-Client Audience Authorization in the IdP**: The JWT `aud` claim only marks the target application (`?aud=...` is mandatory since the next release and validated against `allowed_audiences`). The IdP does not restrict *which* client certificate may obtain *which* audience: every holder of a valid, non-revoked client certificate can request any listed audience. Effective permissions are still governed by roles (`oids`) and the target service's RBAC. See open point 3 on the roadmap.
 - **Community & Maturity**: Pingora is backed by Cloudflare processing trillions of requests. `praeco-rs` is currently a bespoke, highly specialized enterprise solution. While its core leverages production-ready crates (`hyper`, `tower`), the proxy itself lacks the widespread community testing of older proxies.
 
 ---
@@ -119,6 +120,9 @@ Local process-wide W-TinyLFU caching with cancellation-safe `Singleflight`, unar
 Currently, `praeco-rs` terminates the middleware pipeline into a `Router` (for proxying and `aggregate` fan-out routes), an `Idp` (Identity Provider), a `StaticFiles` service, an `Admin` telemetry service, or an `Echo` service (for testing). Due to the modular `tower::Service` architecture, future roadmap items include adding new native end-services, such as:
 - **Redirect Service**: Simple port-to-port or HTTP-to-HTTPS redirects at the edge.
 - **Mock / Stub Service**: Returning predefined JSON responses for specific routes, allowing frontend teams to develop against the gateway before backend APIs are finished.
+
+### 3. Per-Client Audience Restriction via Claims Webhook (IdP)
+Today any valid client certificate may request any audience listed in `[Server.IdpParams].allowed_audiences`. Planned solution: extend the Claims Webhook (`claims_webhook_url`) so that, besides `oids`, it returns the audiences the authenticated subject (`sub`) is allowed to obtain, e.g. request `{"sub": "...", "cert_oids": [...], "requested_aud": "admin-dashboard"}` → response `{"oids": ["1"], "allowed_audiences": ["admin-dashboard"]}`. The IdP would then intersect the result with the global `allowed_audiences` and reject non-permitted requests with `403 Forbidden` (fail-closed on webhook errors, consistent with `on_webhook_failure`). Alternative without a webhook: a static SAN/CN → audiences mapping in `IdpParams`.
 
 ---
 

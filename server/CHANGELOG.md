@@ -11,6 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.3]
+
+### Changed (Behavior-Breaking) & Security
+* **Mandatory `?aud` on IdP Token Issuance (`src/middleware/idp/mod.rs`):**
+  * `IdpService::resolve_audience` no longer falls back to `allowed_audiences.first()` when `?aud` is omitted. If `allowed_audiences` is non-empty, `POST /auth/login` and `POST /auth/token` now return `400 Bad Request` (`"Query parameter 'aud' is required"`), so a client can never silently receive a token for the first (possibly most privileged) audience.
+  * With an empty `allowed_audiences`, behavior is unchanged: tokens are issued without `aud`, and any explicit `?aud=...` is rejected.
+  * **Migration:** clients and redirect URLs must pass `?aud=<audience>` explicitly (e.g. `redirect_on_failure = ".../auth/login_page?aud=admin-dashboard"`, `curl -X POST ".../auth/token?aud=admin-dashboard"`). `/auth/login_page` forwards its query string to `/auth/login`.
+  * Updated `test_idp_audience_validation_for_login_and_token` and existing IdP tests accordingly.
+* **Known limitation (documented in `Readme.md`):** the audience is a target marker, not a per-client authorization; any valid client certificate may request any listed audience. Per-client audience restriction via the Claims Webhook is on the roadmap.
+
+---
+
 ## [0.8.2] - 2026-11-27
 
 Patch security release fixing fail-closed JWT audience validation in the built-in Identity Provider (`IdpService`).

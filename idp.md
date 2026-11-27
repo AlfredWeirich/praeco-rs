@@ -158,7 +158,7 @@ curl -s -v "https://localhost:1339/auth/status?session=abc123xyz&poll_secret=4sK
 
 - **Session TTL:** Login sessions have a strict Time-To-Live (TTL) and expire automatically if not confirmed.
 - **JWT Expiry:** Issued JWTs have a configured expiration time.
-- **JWT Claims:** The IdP injects a customizable `iss` (Issuer) claim and optionally an `aud` (Audience) claim if requested by the client (via query parameter `?aud=...`) and whitelisted in the configuration.
+- **JWT Claims:** The IdP injects a customizable `iss` (Issuer) claim and an `aud` (Audience) claim. When `allowed_audiences` is configured, the client **must** request one via `?aud=...` on `/auth/login` and `/auth/token`; missing or unlisted values are rejected with `400 Bad Request` (no implicit default).
 - **Keys:** The IdP uses a configured private key (`jwt_private_key`) to sign the tokens. The corresponding public key is used by the middleware to verify incoming requests.
 - **Cookie Security:** Tokens issued to browsers are protected by specific cookie flags to mitigate common web vulnerabilities:
   - **`HttpOnly` (XSS Protection):** This flag ensures that the cookie cannot be accessed via client-side scripts (e.g., JavaScript using `document.cookie`). If an attacker successfully injects malicious JavaScript into the application (Cross-Site Scripting), they still cannot steal the JWT to impersonate the user.

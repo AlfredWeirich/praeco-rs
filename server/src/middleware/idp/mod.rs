@@ -164,8 +164,10 @@ impl IdpService {
     ///
     /// - When `requested_aud` is `Some(aud)`, it must match an entry in `allowed_audiences`;
     ///   otherwise an error is returned (fail-closed, even when `allowed_audiences` is empty).
-    /// - When `requested_aud` is `None`, falls back to the first configured entry in
-    ///   `allowed_audiences` (or `None` when none are configured).
+    /// - When `requested_aud` is `None` and `allowed_audiences` is non-empty, the audience is
+    ///   **mandatory** (fail-closed): no implicit default is applied, so a client can never
+    ///   silently receive a token for the first (possibly most privileged) audience.
+    /// - When `requested_aud` is `None` and `allowed_audiences` is empty, no audience is issued.
     fn resolve_audience(&self, requested_aud: Option<&str>) -> Result<Option<String>, &'static str> {
         match requested_aud {
             Some(a) => {
@@ -175,7 +177,8 @@ impl IdpService {
                     Err("Requested audience is not in allowed_audiences")
                 }
             }
-            None => Ok(self.params.allowed_audiences.first().cloned()),
+            None if self.params.allowed_audiences.is_empty() => Ok(None),
+            None => Err("Query parameter 'aud' is required"),
         }
     }
 
@@ -1323,7 +1326,7 @@ mod tests {
         let body_login: crate::SrvBody = Full::new(Bytes::new()).map_err(SrvError::from).boxed();
         let req_login = Request::builder()
             .method(Method::POST)
-            .uri("/auth/login")
+            .uri("/auth/login?aud=praeco-admin")
             .body(body_login)
             .unwrap();
         let resp_login = idp.ready().await.unwrap().call(req_login).await.unwrap();
@@ -1455,7 +1458,7 @@ mod tests {
 
         let req_login = Request::builder()
             .method(Method::POST)
-            .uri("/auth/login")
+            .uri("/auth/login?aud=praeco-admin")
             .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
             .unwrap();
         let resp_login = idp_host.ready().await.unwrap().call(req_login).await.unwrap();
@@ -1514,7 +1517,7 @@ mod tests {
 
         let mut req_token = Request::builder()
             .method(Method::POST)
-            .uri("/auth/token")
+            .uri("/auth/token?aud=praeco-admin")
             .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
             .unwrap();
         req_token
@@ -1550,7 +1553,7 @@ mod tests {
         let req_h2_login = Request::builder()
             .method(Method::POST)
             .version(hyper::Version::HTTP_2)
-            .uri("https://192.168.178.45:1339/auth/login")
+            .uri("https://192.168.178.45:1339/auth/login?aud=praeco-admin")
             .header(hyper::header::ORIGIN, "https://192.168.178.45:1339")
             .header("sec-fetch-site", "same-origin")
             .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
@@ -1630,18 +1633,29 @@ mod tests {
             "praeco-admin".to_string(),
         ];
 
-        // 1a. POST /auth/token without ?aud falls back to first allowed audience
+        // 1a. POST /auth/token without ?aud is rejected (no implicit default audience)
         let resp_default = idp.ready().await?.call(make_mtls_token_req("/auth/token")).await?;
-        assert_eq!(resp_default.status(), StatusCode::OK);
-        let json_default: serde_json::Value =
-            serde_json::from_slice(&resp_default.into_body().collect().await?.to_bytes())?;
-        let claims_default = common::verify_jwt(
-            json_default["token"].as_str().unwrap(),
+        assert_eq!(resp_default.status(), StatusCode::BAD_REQUEST);
+        let body_default =
+            String::from_utf8(resp_default.into_body().collect().await?.to_bytes().to_vec())?;
+        assert_eq!(body_default, "Query parameter 'aud' is required");
+
+        // 1a'. POST /auth/token?aud=admin-dashboard (first entry) succeeds when requested explicitly
+        let resp_first = idp
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token?aud=admin-dashboard"))
+            .await?;
+        assert_eq!(resp_first.status(), StatusCode::OK);
+        let json_first: serde_json::Value =
+            serde_json::from_slice(&resp_first.into_body().collect().await?.to_bytes())?;
+        let claims_first = common::verify_jwt(
+            json_first["token"].as_str().unwrap(),
             &idp.decoding_keys,
             "praeco-idp",
             "admin-dashboard",
         )?;
-        assert_eq!(claims_default.aud.as_deref(), Some("admin-dashboard"));
+        assert_eq!(claims_first.aud.as_deref(), Some("admin-dashboard"));
 
         // 1b. POST /auth/token?aud=praeco-admin uses the explicitly allowed audience
         let resp_allowed = idp
@@ -1701,6 +1715,14 @@ mod tests {
             .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
         let resp_login_ok = idp.ready().await?.call(req_login_ok).await?;
         assert_eq!(resp_login_ok.status(), StatusCode::OK);
+
+        // 1g. POST /auth/login without ?aud is rejected (no implicit default audience)
+        let req_login_missing = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_login_missing = idp.ready().await?.call(req_login_missing).await?;
+        assert_eq!(resp_login_missing.status(), StatusCode::BAD_REQUEST);
 
         // 2. Empty allowed_audiences: []
         let mut idp_empty = create_test_idp_service();

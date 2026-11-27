@@ -276,7 +276,7 @@
     [Server.Layers.JWT]
         jwt_public_keys = ["/Users/fredi/Data/Projekte/Rust/ios_test/260809_ChatApp/rust_core/certs/idp_public.pem"]
         cookie_fallback = "admin-jwt"
-        redirect_on_failure = "https://192.168.178.45:1339/auth/login_page"
+        redirect_on_failure = "https://192.168.178.45:1339/auth/login_page?aud=admin-dashboard"
         expected_issuer = "praeco-idp"
         expected_audience = "admin-dashboard"
         revoke_on_paths = ["/api/Logout"]
