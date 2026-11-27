@@ -624,7 +624,29 @@
                 }
             }
 
-            // 1.5 Verify wurzelwerk_admin Cache layer configuration & ordering
+            // 1.5 Verify wurzelwerk & wurzelwerk_admin Cache layer configuration & ordering
+            let gw_srv = servers
+                .iter()
+                .find(|s| s.name == "wurzelwerk")
+                .expect("wurzelwerk missing");
+            let gw_cache_idx = gw_srv
+                .layers
+                .enabled
+                .iter()
+                .position(|l| l == "Cache")
+                .expect("Cache layer missing in wurzelwerk");
+            let gw_conc_idx = gw_srv
+                .layers
+                .enabled
+                .iter()
+                .position(|l| l == "ConcurrencyLimit")
+                .expect("ConcurrencyLimit layer missing in wurzelwerk");
+            assert!(
+                gw_cache_idx < gw_conc_idx,
+                "Cache must appear before ConcurrencyLimit in wurzelwerk ({})",
+                config_path
+            );
+
             let cache_idx = admin_srv
                 .layers
                 .enabled
@@ -637,9 +659,15 @@
                 .iter()
                 .position(|l| l == "Rbac")
                 .expect("Rbac layer missing in wurzelwerk_admin");
+            let conc_idx = admin_srv
+                .layers
+                .enabled
+                .iter()
+                .position(|l| l == "ConcurrencyLimit")
+                .expect("ConcurrencyLimit layer missing in wurzelwerk_admin");
             assert!(
-                cache_idx > rbac_idx,
-                "Cache must appear after Rbac in {}",
+                cache_idx > rbac_idx && cache_idx < conc_idx,
+                "Cache must appear after Rbac and before ConcurrencyLimit in {}",
                 config_path
             );
             admin_srv
@@ -1955,4 +1983,29 @@ enabled = []
             ..Default::default()
         };
         assert!(bad_global.validate().is_err());
+    }
+
+    #[test]
+    fn test_g01_intern_static_server_name_reuses_pointer_across_reloads() {
+        let mut srv1 = ServerConfig {
+            name: "g01_reload_test_srv".to_string(),
+            enabled: true,
+            protocol: Protocol::Http,
+            authentication: AuthenticationMethod::None,
+            service: ServiceType::Echo,
+            ip: Some("127.0.0.1".to_string()),
+            port: Some(19091),
+            ..Default::default()
+        };
+        let mut srv2 = srv1.clone();
+
+        srv1.finalize().unwrap();
+        srv2.finalize().unwrap();
+
+        let n1 = srv1.static_name.expect("static_name set on finalize");
+        let n2 = srv2.static_name.expect("static_name set on finalize");
+        assert!(
+            std::ptr::eq(n1.as_ptr(), n2.as_ptr()),
+            "repeated finalize() reloads must reuse the interned &'static str allocation"
+        );
     }

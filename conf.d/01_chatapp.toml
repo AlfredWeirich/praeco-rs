@@ -22,7 +22,7 @@
     pki_base_oid = "1.3.6.1.4.1.65111"
 
     [Server.Layers]
-    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
+    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "Cache", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
     allow_cidrs = []
@@ -266,7 +266,7 @@
         "2" = "Seller"
     
     [Server.Layers]
-        enabled = ["TraceId", "Logger", "SecurityHeaders", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
+        enabled = ["TraceId", "Logger", "SecurityHeaders", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "Cache", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
         allow_cidrs = []

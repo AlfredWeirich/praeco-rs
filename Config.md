@@ -1099,7 +1099,7 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 1. **`TraceId` Must Be First:** If present, `"TraceId"` must be the first entry in `enabled` (index 0). It extracts an incoming W3C `traceparent` (or `x-trace-id`) header—or synthesizes a fresh `00-{trace-id}-{span-id}-01` identifier—and links the OpenTelemetry parent context to the request span before downstream layers run.
 2. **`Inspection` After `Decompression`:** If both are enabled, `"Inspection"` must appear after `"Decompression"`. Otherwise, the WAF inspects compressed bytes.
 3. **`Rbac` After `JwtAuth`:** If both `"Rbac"` and `"JwtAuth"` (or `"JWT"`) are enabled, `"Rbac"` must appear after `"JwtAuth"` so JWT claims and mapped `UserRole`s are populated before role enforcement.
-4. **`Cache` After Security, Auth, RBAC, CORS & Compression:** If `"Cache"` is enabled, it must appear **after** `"IpFilter"`, `"PathSanitizer"`, `"Decompression"`, `"MaxPayload"`, `"Inspection"`, `"Cors"`, `"JwtAuth"`, `"Rbac"`, `"RateLimiter:*"`, and `"Compression"`. This guarantees cache hits never bypass security/RBAC checks, prevents origin-specific CORS headers from leaking across cached entries, and stores responses uncompressed so `br`/`gzip`/plain clients share the same entry. `"Cache"` cannot be enabled on `service = "Idp"` or `service = "Admin"`.
+4. **`Cache` After Security, Auth, RBAC, CORS & Compression (Recommended Before `ConcurrencyLimit`):** If `"Cache"` is enabled, it must appear **after** `"IpFilter"`, `"PathSanitizer"`, `"Decompression"`, `"MaxPayload"`, `"Inspection"`, `"Cors"`, `"JwtAuth"`, `"Rbac"`, `"RateLimiter:*"`, and `"Compression"`. This guarantees cache hits never bypass security/RBAC checks, prevents origin-specific CORS headers from leaking across cached entries, and stores responses uncompressed so `br`/`gzip`/plain clients share the same entry. Placing `"Cache"` **before** `"ConcurrencyLimit"` is recommended so L1 cache HITs do not consume backend concurrency permits while slow clients drain response bodies. `"Cache"` cannot be enabled on `service = "Idp"` or `service = "Admin"`.
 5. **Automatic `SecurityHeaders` Injection:** If omitted from `enabled`, Praeco automatically injects `SecurityHeaders` near the top of the stack so that all early rejection responses (401, 403, 429, 503) carry security headers.
 
 ---
@@ -1114,7 +1114,7 @@ Partitions by HTTP method: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`.
 #### `[Server.Layers.Decompression]`
 | Parameter | Data Type | Requirement | Default Value | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `max_decompressed_bytes` | Integer | **Mandatory** | *None* | Maximum decompressed request body size in bytes. Prevents decompression bomb attacks from exhausting memory. |
+| `max_decompressed_bytes` | Integer | **Mandatory** | *None* | Maximum decompressed request body size in bytes. Prevents decompression bomb attacks from exhausting memory. Native gRPC requests (`application/grpc` / `application/grpc+*`, case-insensitive) automatically bypass HTTP decompression so `grpc-encoding` framing and trailers stay intact. |
 
 #### `[Server.Layers.Delay]`
 | Parameter | Data Type | Requirement | Default Value | Description |
@@ -1225,7 +1225,7 @@ Enables process-wide W-TinyLFU HTTP & gRPC response caching with cancellation-sa
 
 ```toml
 [Server.Layers]
-enabled = ["TraceId", "IpFilter", "PathSanitizer", "Inspection", "JwtAuth", "Rbac", "Compression", "Cache"]
+enabled = ["TraceId", "IpFilter", "PathSanitizer", "Inspection", "JwtAuth", "Rbac", "Compression", "Cache", "ConcurrencyLimit"]
 
 [Server.Layers.Cache.rules."/api/catalog/*"]
 ttl_seconds = 300

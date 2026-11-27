@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.8.1] - 2026-11-26
 
-Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache (`CacheLayer` / `SharedResponseCache`) shared across all configured `[[Server]]` instances, backed by a cancellation-safe `Singleflight` request coalescer.
+Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache (`CacheLayer` / `SharedResponseCache`) shared across all configured `[[Server]]` instances, backed by a sharded, cancellation-safe `Singleflight` request coalescer.
 
 ### Security & Performance
 * **O(1) Generation-Keyed Cache Invalidation (`src/middleware/cache.rs`):**
@@ -34,10 +34,19 @@ Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache
 * **Fallback `Cache-Control: no-store` & `grpc-web` / Semicolon Mutation Hardening (`src/lib.rs`, `src/middleware/cache.rs`):**
   * Updated `ConnectionHandler::handle` to skip `is_grpc_content_type` responses and apply `.entry(CACHE_CONTROL).or_insert("no-store")` so explicit `Cache-Control` headers from `StaticFiles`, `CacheLayer`, or upstreams are preserved.
   * Required at least one `0x80` trailer frame with `grpc-status: 0` in `grpc_web_body_has_error`, bypassed `application/grpc-web-text*` in `evaluate_response_cacheability`, and enforced `400 Bad Request` in `CacheService::call` for mutating methods containing `;`/`%3b` path matrix parameters.
+* **Sharded `Singleflight`, `Cache` Before `ConcurrencyLimit` & Tower `poll_ready` Compliance (`src/middleware/cache.rs`, `conf.d/01_chatapp.toml*`):**
+  * Replaced the global `Mutex<HashMap<...>>` in `Singleflight` with shard-locked `DashMap` storage (`try_acquire_waiter` CAS loop, `remove_if` with `Arc::ptr_eq`), eliminating cross-key contention across cache misses.
+  * Added `ready_and_call` (`poll_fn(|cx| svc.poll_ready(cx)).await`) for cloned inner services in `CacheService` async paths and ordered `"Cache"` before `"ConcurrencyLimit"` in the ChatApp gateway configs so L1 cache HITs do not occupy backend concurrency permits during slow client reads.
+* **Case-Insensitive gRPC Bypass & Typed Decompression Limit Error (`src/middleware/compression.rs`):**
+  * Unified response compression (`SrvCompressionFuture::poll`) and request decompression (`SrvDecompressionService::call`) on `crate::is_grpc_content_type` (skipping HTTP decompression cleanly for gRPC requests without per-request `.to_ascii_lowercase()` heap allocations) and replaced string-matching in `wrap_decompressed_reader` with the typed `DecompressionLimitExceededError`.
+* **Workspace Hot-Path Allocations & Reload Leak Elimination (`src/configuration/mod.rs`, `src/tls_conf.rs`, `src/middleware/rate_limiter.rs`, `src/stack.rs`, `src/middleware/logger.rs`):**
+  * Added `intern_static_server_name` in `ServerConfig::finalize()` to reuse interned `&'static str` server names across repeated `SIGHUP` reloads instead of leaking on every reload.
+  * Replaced per-handshake `Config::try_global()` + linear server scan in `DynamicCertResolver::resolve` with an O(1) lock-free `ArcSwap<HashMap<&'static str, Arc<CertifiedKey>>>` index refreshed in `Config::update_global`.
+  * Eliminated per-request heap allocations in `SimpleRateLimiterService` / `TokenBucketRateLimiterService` (`RateLimitKeyRef` + `ShardedKeyMap` borrowing `&str` / `Arc<str>` while preserving `RateLimitKey` 0.8.0 SemVer compatibility), in `TraceLayer::make_span_with` (`%format_args!` + early `tracing::enabled!(Level::INFO)` guard), and in `logger::sanitize_uri` (`Cow<'_, str>` fast path).
 
 ### Added
-* **Cancellation-Safe `Singleflight<K, T>` (`src/middleware/cache.rs`):**
-  * Decouples in-flight work onto a dedicated Tokio task using `tokio::sync::watch` (`borrow_and_update`), `WaiterGuard`, `CancellationToken`, and an `Arc::ptr_eq`-guarded `MapCleanupGuard`.
+* **Sharded, Cancellation-Safe `Singleflight<K, T>` (`src/middleware/cache.rs`):**
+  * Decouples in-flight work onto a dedicated Tokio task using `DashMap`, `tokio::sync::watch` (`borrow_and_update`), `WaiterGuard`, `CancellationToken`, and an `Arc::ptr_eq`-guarded `MapCleanupGuard`.
   * Dropping a single caller future does not abort work for remaining waiters; dropping all waiters cancels the background task and cleans up the key safely without racing new callers.
 * **Process-Wide W-TinyLFU Response Cache (`SharedResponseCache`, `CacheLayer`, `[cache]`, `[Server.Layers.Cache]`):**
   * Backed by `moka::sync::Cache` with byte-level `weigher` accounting (`max_bytes`, default `256 MiB`) and per-entry `Expiry` TTLs (`default_ttl_seconds`, default `60` s), shared across every enabled `[[Server]]` instance and preserved across `SIGHUP` reloads when `max_bytes` is unchanged.

@@ -275,13 +275,15 @@ fn build_service_stack_internal(
                     req_metrics
                         .total_requests
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !tracing::enabled!(Level::INFO) {
+                        return tracing::Span::none();
+                    }
                     let path = request.uri().path();
                     let method = request.method();
                     let safe_uri = crate::middleware::logger::sanitize_uri(request.uri());
-                    let otel_name = format!("{} {}", method, path);
                     let span = info_span!(
                         "request",
-                        otel.name = otel_name.as_str(),
+                        otel.name = %format_args!("{method} {path}"),
                         http.method = %method,
                         http.uri = %safe_uri,
                         traceparent = tracing::field::Empty

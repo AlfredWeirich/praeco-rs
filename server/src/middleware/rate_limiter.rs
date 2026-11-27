@@ -140,6 +140,155 @@ fn extract_ip_key<ReqBody>(
     RateLimitKey::Global
 }
 
+/// Borrowed representation of a [`RateLimitKey`] avoiding per-request heap allocations.
+#[derive(Clone, Copy)]
+enum RateLimitKeyRef<'a> {
+    User(&'a str),
+    ClientCertArc(&'a Arc<str>),
+    ClientCertStr(&'a str),
+    Ip(std::net::IpAddr),
+    Global,
+}
+
+impl<'a> RateLimitKeyRef<'a> {
+    fn from_owned(key: &'a RateLimitKey) -> Self {
+        match key {
+            RateLimitKey::User(u) => Self::User(u.as_str()),
+            RateLimitKey::ClientCert(c) => Self::ClientCertStr(c.as_str()),
+            RateLimitKey::Ip(ip) => Self::Ip(*ip),
+            RateLimitKey::Global => Self::Global,
+        }
+    }
+}
+
+impl std::fmt::Display for RateLimitKeyRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(u) => write!(f, "user:{u}"),
+            Self::ClientCertArc(c) => write!(f, "cert:{c}"),
+            Self::ClientCertStr(c) => write!(f, "cert:{c}"),
+            Self::Ip(ip) => write!(f, "ip:{ip}"),
+            Self::Global => write!(f, "global"),
+        }
+    }
+}
+
+/// Extracts a borrowed [`RateLimitKeyRef`] from `req` without heap allocation on hot paths.
+fn extract_rate_limit_key_ref<'a, ReqBody>(
+    req: &'a Request<ReqBody>,
+    strategy: RateLimitKeyStrategy,
+    trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
+) -> RateLimitKeyRef<'a> {
+    match strategy {
+        RateLimitKeyStrategy::Global => RateLimitKeyRef::Global,
+        RateLimitKeyStrategy::Ip => {
+            extract_ip_key_ref(req, trust_forwarded_headers, trusted_proxy_hops)
+        }
+        RateLimitKeyStrategy::Identity => {
+            if let Some(claims) = req.extensions().get::<common::Claims>()
+                && !claims.sub.is_empty()
+            {
+                return RateLimitKeyRef::User(claims.sub.as_str());
+            }
+            if let Some(san) = req.extensions().get::<crate::SanCertExtension>()
+                && !san.0.is_empty()
+            {
+                return RateLimitKeyRef::ClientCertArc(&san.0);
+            }
+            extract_ip_key_ref(req, trust_forwarded_headers, trusted_proxy_hops)
+        }
+    }
+}
+
+fn extract_ip_key_ref<ReqBody>(
+    req: &Request<ReqBody>,
+    trust_forwarded_headers: bool,
+    trusted_proxy_hops: usize,
+) -> RateLimitKeyRef<'static> {
+    match extract_ip_key(req, trust_forwarded_headers, trusted_proxy_hops) {
+        RateLimitKey::Ip(ip) => RateLimitKeyRef::Ip(ip),
+        _ => RateLimitKeyRef::Global,
+    }
+}
+
+/// Partitioned concurrent rate-limit bucket map enabling zero-allocation `&str` / `Arc<str>` lookups.
+struct ShardedKeyMap<V> {
+    users: DashMap<Arc<str>, V>,
+    certs: DashMap<Arc<str>, V>,
+    ips: DashMap<std::net::IpAddr, V>,
+    global: DashMap<(), V>,
+}
+
+impl<V> ShardedKeyMap<V> {
+    fn new() -> Self {
+        Self {
+            users: DashMap::new(),
+            certs: DashMap::new(),
+            ips: DashMap::new(),
+            global: DashMap::new(),
+        }
+    }
+
+    #[inline]
+    fn with_existing_mut<R>(
+        &self,
+        key: RateLimitKeyRef<'_>,
+        f: impl FnOnce(&mut V) -> R,
+    ) -> Option<R> {
+        match key {
+            RateLimitKeyRef::User(u) => self.users.get_mut(u).map(|mut e| f(&mut *e)),
+            RateLimitKeyRef::ClientCertArc(c) => {
+                self.certs.get_mut(c.as_ref()).map(|mut e| f(&mut *e))
+            }
+            RateLimitKeyRef::ClientCertStr(c) => self.certs.get_mut(c).map(|mut e| f(&mut *e)),
+            RateLimitKeyRef::Ip(ip) => self.ips.get_mut(&ip).map(|mut e| f(&mut *e)),
+            RateLimitKeyRef::Global => self.global.get_mut(&()).map(|mut e| f(&mut *e)),
+        }
+    }
+
+    #[inline]
+    fn insert(&self, key: RateLimitKeyRef<'_>, value: V) {
+        match key {
+            RateLimitKeyRef::User(u) => {
+                self.users.insert(Arc::from(u), value);
+            }
+            RateLimitKeyRef::ClientCertArc(c) => {
+                self.certs.insert(Arc::clone(c), value);
+            }
+            RateLimitKeyRef::ClientCertStr(c) => {
+                self.certs.insert(Arc::from(c), value);
+            }
+            RateLimitKeyRef::Ip(ip) => {
+                self.ips.insert(ip, value);
+            }
+            RateLimitKeyRef::Global => {
+                self.global.insert((), value);
+            }
+        }
+    }
+
+    fn retain(&self, mut predicate: impl FnMut(&V) -> bool) {
+        self.users.retain(|_, v| predicate(v));
+        self.certs.retain(|_, v| predicate(v));
+        self.ips.retain(|_, v| predicate(v));
+        self.global.retain(|_, v| predicate(v));
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.users.len() + self.certs.len() + self.ips.len() + self.global.len()
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.users.is_empty()
+            && self.certs.is_empty()
+            && self.ips.is_empty()
+            && self.global.is_empty()
+    }
+}
+
 // ============================================================================
 //  SIMPLE RATE LIMITER
 // ============================================================================
@@ -153,7 +302,7 @@ struct KeyedSimpleEntry {
 /// Thread-safe storage for keyed fixed-window rate limiter state.
 #[derive(Clone)]
 pub struct KeyedSimpleRateLimitStore {
-    entries: Arc<DashMap<RateLimitKey, KeyedSimpleEntry>>,
+    entries: Arc<ShardedKeyMap<KeyedSimpleEntry>>,
     max_entries: usize,
     ttl: Duration,
     last_cleanup: Arc<std::sync::Mutex<Instant>>,
@@ -162,7 +311,7 @@ pub struct KeyedSimpleRateLimitStore {
 impl KeyedSimpleRateLimitStore {
     pub fn new(max_entries: usize, ttl: Duration) -> Self {
         Self {
-            entries: Arc::new(DashMap::new()),
+            entries: Arc::new(ShardedKeyMap::new()),
             max_entries,
             ttl,
             last_cleanup: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -170,19 +319,31 @@ impl KeyedSimpleRateLimitStore {
     }
 
     pub fn check_and_record(&self, key: &RateLimitKey, limit_duration: Duration) -> Result<(), u64> {
+        self.check_and_record_ref(RateLimitKeyRef::from_owned(key), limit_duration)
+    }
+
+    fn check_and_record_ref(
+        &self,
+        key: RateLimitKeyRef<'_>,
+        limit_duration: Duration,
+    ) -> Result<(), u64> {
         let now = Instant::now();
         self.maybe_cleanup(now);
 
-        // 1. Fast path (O(1)): Key is already tracked in the map
-        if let Some(mut entry) = self.entries.get_mut(key) {
+        // 1. Fast path (O(1), zero-alloc for User/SAN/IP): Key is already tracked in the map
+        if let Some(res) = self.entries.with_existing_mut(key, |entry| {
             if now < entry.next_allowed {
-                let wait_secs = (entry.next_allowed.duration_since(now).as_secs_f64()).ceil().max(1.0) as u64;
-                return Err(wait_secs);
+                let wait_secs = (entry.next_allowed.duration_since(now).as_secs_f64())
+                    .ceil()
+                    .max(1.0) as u64;
+                Err(wait_secs)
             } else {
                 entry.last_seen = now;
                 entry.next_allowed = now + limit_duration;
-                return Ok(());
+                Ok(())
             }
+        }) {
+            return res;
         }
 
         // 2. Slow path for new unknown keys: enforce hard max_entries cap (Fail-Closed)
@@ -194,7 +355,7 @@ impl KeyedSimpleRateLimitStore {
         }
 
         self.entries.insert(
-            key.clone(),
+            key,
             KeyedSimpleEntry {
                 next_allowed: now + limit_duration,
                 last_seen: now,
@@ -206,28 +367,29 @@ impl KeyedSimpleRateLimitStore {
     /// Explicitly purges entries that have been inactive longer than `ttl`.
     pub fn cleanup(&self, now: Instant) {
         let ttl = self.ttl;
-        self.entries.retain(|_, entry| {
-            now.duration_since(entry.last_seen) < ttl
-        });
+        self.entries
+            .retain(|entry| now.duration_since(entry.last_seen) < ttl);
     }
 
     fn maybe_cleanup(&self, now: Instant) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
-            && now.duration_since(*last_cleanup) > Duration::from_secs(10) {
-                *last_cleanup = now;
-                self.cleanup(now);
-            }
+            && now.duration_since(*last_cleanup) > Duration::from_secs(10)
+        {
+            *last_cleanup = now;
+            self.cleanup(now);
+        }
     }
 
     fn maybe_cleanup_when_full(&self, now: Instant) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
-            && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
-                *last_cleanup = now;
-                let ttl = self.ttl;
-                self.entries.retain(|_, entry| {
-                    now.duration_since(entry.last_seen) < ttl && now < entry.next_allowed
-                });
-            }
+            && now.duration_since(*last_cleanup) >= Duration::from_secs(1)
+        {
+            *last_cleanup = now;
+            let ttl = self.ttl;
+            self.entries.retain(|entry| {
+                now.duration_since(entry.last_seen) < ttl && now < entry.next_allowed
+            });
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -405,7 +567,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key_with_hops(
+        let key = extract_rate_limit_key_ref(
             &req,
             self.key_by,
             self.trust_forwarded_headers,
@@ -413,7 +575,7 @@ where
         );
         let server_name = self.server_name;
 
-        match self.store.check_and_record(&key, self.limit_duration) {
+        match self.store.check_and_record_ref(key, self.limit_duration) {
             Ok(()) => {
                 trace!("{}: Allowed request for key {}", server_name, key);
                 let fut = self.inner.call(req);
@@ -454,7 +616,7 @@ struct KeyedBucketEntry {
 /// Thread-safe storage for keyed token-bucket rate limiter states.
 #[derive(Clone)]
 pub struct KeyedTokenBucketStore {
-    entries: Arc<DashMap<RateLimitKey, KeyedBucketEntry>>,
+    entries: Arc<ShardedKeyMap<KeyedBucketEntry>>,
     max_entries: usize,
     ttl: Duration,
     last_cleanup: Arc<std::sync::Mutex<Instant>>,
@@ -463,7 +625,7 @@ pub struct KeyedTokenBucketStore {
 impl KeyedTokenBucketStore {
     pub fn new(max_entries: usize, ttl: Duration) -> Self {
         Self {
-            entries: Arc::new(DashMap::new()),
+            entries: Arc::new(ShardedKeyMap::new()),
             max_entries,
             ttl,
             last_cleanup: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -477,14 +639,29 @@ impl KeyedTokenBucketStore {
         refill_tokens: usize,
         interval: Duration,
     ) -> Result<(), u64> {
+        self.try_consume_ref(
+            RateLimitKeyRef::from_owned(key),
+            capacity,
+            refill_tokens,
+            interval,
+        )
+    }
+
+    fn try_consume_ref(
+        &self,
+        key: RateLimitKeyRef<'_>,
+        capacity: usize,
+        refill_tokens: usize,
+        interval: Duration,
+    ) -> Result<(), u64> {
         let now = Instant::now();
         let cap_f64 = capacity as f64;
         let rate = refill_tokens as f64 / interval.as_secs_f64();
 
         self.maybe_cleanup(now);
 
-        // 1. Fast path (O(1)): Key is already tracked in the map
-        if let Some(mut entry) = self.entries.get_mut(key) {
+        // 1. Fast path (O(1), zero-alloc for User/SAN/IP): Key is already tracked in the map
+        if let Some(res) = self.entries.with_existing_mut(key, |entry| {
             let elapsed = now.duration_since(entry.last_refill);
             let added = elapsed.as_secs_f64() * rate;
             let new_tokens = (entry.tokens + added).min(cap_f64);
@@ -493,12 +670,14 @@ impl KeyedTokenBucketStore {
                 entry.tokens = new_tokens - 1.0;
                 entry.last_refill = now;
                 entry.last_seen = now;
-                return Ok(());
+                Ok(())
             } else {
                 let needed = 1.0 - new_tokens;
                 let retry_after_secs = (needed / rate).ceil().max(1.0) as u64;
-                return Err(retry_after_secs);
+                Err(retry_after_secs)
             }
+        }) {
+            return res;
         }
 
         // 2. Slow path for new unknown keys: enforce hard max_entries cap (Fail-Closed)
@@ -511,7 +690,7 @@ impl KeyedTokenBucketStore {
 
         if cap_f64 >= 1.0 {
             self.entries.insert(
-                key.clone(),
+                key,
                 KeyedBucketEntry {
                     tokens: cap_f64 - 1.0,
                     last_refill: now,
@@ -527,30 +706,32 @@ impl KeyedTokenBucketStore {
     /// Explicitly purges entries that have been inactive longer than `ttl`.
     pub fn cleanup(&self, now: Instant) {
         let ttl = self.ttl;
-        self.entries.retain(|_, entry| {
-            now.duration_since(entry.last_seen) < ttl
-        });
+        self.entries
+            .retain(|entry| now.duration_since(entry.last_seen) < ttl);
     }
 
     fn maybe_cleanup(&self, now: Instant) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
-            && now.duration_since(*last_cleanup) > Duration::from_secs(10) {
-                *last_cleanup = now;
-                self.cleanup(now);
-            }
+            && now.duration_since(*last_cleanup) > Duration::from_secs(10)
+        {
+            *last_cleanup = now;
+            self.cleanup(now);
+        }
     }
 
     fn maybe_cleanup_when_full(&self, now: Instant, cap_f64: f64, rate: f64) {
         if let Ok(mut last_cleanup) = self.last_cleanup.try_lock()
-            && now.duration_since(*last_cleanup) >= Duration::from_secs(1) {
-                *last_cleanup = now;
-                let ttl = self.ttl;
-                self.entries.retain(|_, entry| {
-                    let within_ttl = now.duration_since(entry.last_seen) < ttl;
-                    let refilled = entry.tokens + now.duration_since(entry.last_refill).as_secs_f64() * rate;
-                    within_ttl && (rate <= 0.0 || refilled < cap_f64)
-                });
-            }
+            && now.duration_since(*last_cleanup) >= Duration::from_secs(1)
+        {
+            *last_cleanup = now;
+            let ttl = self.ttl;
+            self.entries.retain(|entry| {
+                let within_ttl = now.duration_since(entry.last_seen) < ttl;
+                let refilled =
+                    entry.tokens + now.duration_since(entry.last_refill).as_secs_f64() * rate;
+                within_ttl && (rate <= 0.0 || refilled < cap_f64)
+            });
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -760,7 +941,7 @@ where
     }
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let key = extract_rate_limit_key_with_hops(
+        let key = extract_rate_limit_key_ref(
             &req,
             self.key_by,
             self.trust_forwarded_headers,
@@ -768,7 +949,7 @@ where
         );
         let server_name = self.server_name;
 
-        match self.store.try_consume(&key, self.capacity, self.refill_tokens, self.interval) {
+        match self.store.try_consume_ref(key, self.capacity, self.refill_tokens, self.interval) {
             Ok(()) => {
                 debug!(
                     "{}: Token consumed for key {} (bucket limiter)",
@@ -1100,5 +1281,60 @@ mod tests {
         // Because rejected requests do not refresh last_seen, cleanup evicts the stale entry
         store.cleanup(Instant::now());
         assert_eq!(store.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_g03_zero_alloc_client_cert_san_and_user_identity_isolation() {
+        let mut tb_limiter = TokenBucketRateLimiterService::with_config(
+            DummyOkService,
+            1,
+            1,
+            Duration::from_secs(60),
+            RateLimitKeyStrategy::Identity,
+            100,
+            Duration::from_secs(300),
+            "test_g03_tb",
+        );
+
+        let mut req_d1 = Request::builder().uri("/").body(Full::new(Bytes::new())).unwrap();
+        req_d1
+            .extensions_mut()
+            .insert(crate::SanCertExtension(Arc::from("device-1.internal")));
+        assert_eq!(tb_limiter.call(req_d1).await.unwrap().status(), StatusCode::OK);
+
+        let mut req_d1_again = Request::builder().uri("/").body(Full::new(Bytes::new())).unwrap();
+        req_d1_again
+            .extensions_mut()
+            .insert(crate::SanCertExtension(Arc::from("device-1.internal")));
+        let blocked = tb_limiter.call(req_d1_again).await.unwrap();
+        assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(blocked.headers().contains_key(hyper::header::RETRY_AFTER));
+
+        let mut req_d2 = Request::builder().uri("/").body(Full::new(Bytes::new())).unwrap();
+        req_d2
+            .extensions_mut()
+            .insert(crate::SanCertExtension(Arc::from("device-2.internal")));
+        assert_eq!(tb_limiter.call(req_d2).await.unwrap().status(), StatusCode::OK);
+
+        let mut simple_limiter = SimpleRateLimiterService::with_config(
+            DummyOkService,
+            Duration::from_secs(5),
+            RateLimitKeyStrategy::Identity,
+            100,
+            Duration::from_secs(300),
+            "test_g03_simple",
+        );
+        let mut s_d1 = Request::builder().uri("/").body(Full::new(Bytes::new())).unwrap();
+        s_d1.extensions_mut()
+            .insert(crate::SanCertExtension(Arc::from("device-1.internal")));
+        assert_eq!(simple_limiter.call(s_d1).await.unwrap().status(), StatusCode::OK);
+
+        let mut s_d1_again = Request::builder().uri("/").body(Full::new(Bytes::new())).unwrap();
+        s_d1_again
+            .extensions_mut()
+            .insert(crate::SanCertExtension(Arc::from("device-1.internal")));
+        let s_blocked = simple_limiter.call(s_d1_again).await.unwrap();
+        assert_eq!(s_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(s_blocked.headers().contains_key(hyper::header::RETRY_AFTER));
     }
 }

@@ -27,12 +27,12 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     future::Future,
     hash::Hash,
     pin::Pin,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -97,6 +97,29 @@ struct Flight<T> {
     cancel_token: CancellationToken,
 }
 
+impl<T> Flight<T> {
+    /// Atomically attaches a new waiter unless the flight is already cancelled or drained.
+    #[inline]
+    fn try_acquire_waiter(&self) -> bool {
+        if self.cancel_token.is_cancelled() {
+            return false;
+        }
+        let mut w = self.waiters.load(Ordering::Acquire);
+        while w > 0 {
+            match self.waiters.compare_exchange_weak(
+                w,
+                w + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => w = next,
+            }
+        }
+        false
+    }
+}
+
 /// Result of [`Singleflight::work_with_input`], returning unused input to followers.
 enum CoalescedResult<T, I> {
     Leader(T),
@@ -106,9 +129,9 @@ enum CoalescedResult<T, I> {
 /// Coordinates concurrent async computations for identical keys `K` so the
 /// underlying operation executes only once across concurrent callers.
 ///
-/// Cheaply cloneable (`Arc`-backed) and thread-safe.
+/// Cheaply cloneable (`Arc`-backed), shard-locked via [`DashMap`], and thread-safe.
 pub struct Singleflight<K, T> {
-    flights: Arc<Mutex<HashMap<K, Arc<Flight<T>>>>>,
+    flights: Arc<DashMap<K, Arc<Flight<T>>>>,
 }
 
 impl<K, T> Clone for Singleflight<K, T> {
@@ -137,7 +160,7 @@ where
     /// Creates a new, empty [`Singleflight`] registry.
     pub fn new() -> Self {
         Self {
-            flights: Arc::new(Mutex::new(HashMap::new())),
+            flights: Arc::new(DashMap::new()),
         }
     }
 
@@ -175,30 +198,43 @@ where
         Fut: Future<Output = T> + Send + 'static,
     {
         // 1. Look up an active, non-cancelled flight or register a new leader flight.
-        //    The mutex is never held across `.await` or user `make_fut()` execution.
-        let (flight, leader_handle) = {
-            let mut map = self
-                .flights
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        //    DashMap shard guards are scoped strictly inside this block and dropped before `.await`.
+        let (flight, leader_handle) = if let Some(existing) = self.flights.get(&key)
+            && existing.try_acquire_waiter()
+        {
+            (Arc::clone(&*existing), None)
+        } else {
+            match self.flights.entry(key.clone()) {
+                dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                    if occ.get().try_acquire_waiter() {
+                        (Arc::clone(occ.get()), None)
+                    } else {
+                        let (tx, rx) = watch::channel(None);
+                        let cancel_token = CancellationToken::new();
 
-            if let Some(existing) = map.get(&key)
-                && !existing.cancel_token.is_cancelled()
-            {
-                existing.waiters.fetch_add(1, Ordering::AcqRel);
-                (Arc::clone(existing), None)
-            } else {
-                let (tx, rx) = watch::channel(None);
-                let cancel_token = CancellationToken::new();
+                        let flight = Arc::new(Flight {
+                            rx,
+                            waiters: AtomicUsize::new(1),
+                            cancel_token: cancel_token.clone(),
+                        });
 
-                let flight = Arc::new(Flight {
-                    rx,
-                    waiters: AtomicUsize::new(1),
-                    cancel_token: cancel_token.clone(),
-                });
+                        occ.insert(Arc::clone(&flight));
+                        (flight, Some((tx, cancel_token)))
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(vac) => {
+                    let (tx, rx) = watch::channel(None);
+                    let cancel_token = CancellationToken::new();
 
-                map.insert(key.clone(), Arc::clone(&flight));
-                (flight, Some((tx, cancel_token)))
+                    let flight = Arc::new(Flight {
+                        rx,
+                        waiters: AtomicUsize::new(1),
+                        cancel_token: cancel_token.clone(),
+                    });
+
+                    vac.insert(Arc::clone(&flight));
+                    (flight, Some((tx, cancel_token)))
+                }
             }
         };
 
@@ -284,22 +320,16 @@ impl<T> Drop for WaiterGuard<T> {
 /// worker future panics, checking `Arc::ptr_eq` so an older cancelled flight
 /// never evicts a newer replacement flight for the same key.
 struct MapCleanupGuard<K: Eq + Hash, T> {
-    flights: Arc<Mutex<HashMap<K, Arc<Flight<T>>>>>,
+    flights: Arc<DashMap<K, Arc<Flight<T>>>>,
     key: K,
     flight: Arc<Flight<T>>,
 }
 
 impl<K: Eq + Hash, T> Drop for MapCleanupGuard<K, T> {
     fn drop(&mut self) {
-        let mut map = self
+        let _ = self
             .flights
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(current) = map.get(&self.key)
-            && Arc::ptr_eq(current, &self.flight)
-        {
-            map.remove(&self.key);
-        }
+            .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.flight));
     }
 }
 
@@ -2133,6 +2163,18 @@ async fn collect_response_for_cache_with_limits(
     })
 }
 
+/// Drives `poll_ready` to completion before invoking `call` on a cloned inner [`Service`].
+async fn ready_and_call<S>(
+    svc: &mut S,
+    req: Request<SrvBody>,
+) -> Result<Response<ServiceRespBody>, SrvError>
+where
+    S: Service<Request<SrvBody>, Response = Response<ServiceRespBody>, Error = SrvError>,
+{
+    std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
+    svc.call(req).await
+}
+
 struct CoalesceContext {
     cache: Arc<SharedResponseCache>,
     key: CacheKey,
@@ -2182,7 +2224,7 @@ where
         .singleflight
         .work_with_input(key, req, move |leader_req| async move {
             let gen_before = key_for_worker.generation;
-            let resp = match inner_for_worker.call(leader_req).await {
+            let resp = match ready_and_call(&mut inner_for_worker, leader_req).await {
                 Ok(r) => r,
                 Err(e) => return SingleflightOutcome::UpstreamError(e.to_string()),
             };
@@ -2285,7 +2327,7 @@ where
         }
         CoalescedResult::Follower(SingleflightOutcome::Bypass, follower_req) => {
             ServerMetrics::inc_cache_bypass(server_name);
-            let mut resp = inner.call(follower_req).await?;
+            let mut resp = ready_and_call(&mut inner, follower_req).await?;
             if expose_cache_header {
                 attach_cache_status_header(&mut resp, "BYPASS");
             }
@@ -2490,7 +2532,7 @@ where
                         PostReqBody::Bypass(bypass_body) => {
                             ServerMetrics::inc_cache_bypass(server_name);
                             let rebuilt_req = Request::from_parts(req_parts, bypass_body);
-                            let mut resp = inner.call(rebuilt_req).await?;
+                            let mut resp = ready_and_call(&mut inner, rebuilt_req).await?;
                             if expose_cache_header {
                                 attach_cache_status_header(&mut resp, "BYPASS");
                             }
@@ -2654,6 +2696,7 @@ mod tests {
     use super::*;
     use crate::BoxCloneSyncServiceExt;
     use crate::configuration::{CacheLayerConfig, CacheRuleConfig, RoleVec, UserRole};
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicU64;
     use tokio::sync::Notify;
     use tower::ServiceExt;
@@ -4906,5 +4949,111 @@ mod tests {
         let r_inc2 = hit_fut.await.unwrap();
         assert_eq!(r_inc2.headers().get("x-praeco-cache").unwrap(), "HIT");
         assert!(r_inc2.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_p04_g04_sharded_singleflight_multi_key_and_cache_before_concurrency_limit() {
+        // 1. P-04: Concurrent multi-key Singleflight coalescing across shards + cancellation replacement
+        let sf: Singleflight<String, usize> = Singleflight::new();
+        let execs = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for key_idx in 0..8usize {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            for caller_idx in 0..2usize {
+                let sf_c = sf.clone();
+                let execs_c = Arc::clone(&execs);
+                let barrier_c = Arc::clone(&barrier);
+                handles.push(tokio::spawn(async move {
+                    barrier_c.wait().await;
+                    let key = format!("key-{key_idx}");
+                    let (val, _shared) = sf_c
+                        .work(key, move || async move {
+                            execs_c.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            key_idx * 10 + caller_idx - caller_idx
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(val, key_idx * 10);
+                }));
+            }
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(execs.load(Ordering::SeqCst), 8);
+        assert!(
+            sf.flights.is_empty(),
+            "all sharded Singleflight entries must be cleaned up after completion"
+        );
+
+        // 2. G-04: CacheLayer outside ConcurrencyLimitLayer(1) serves L1 HITs even when
+        //    the single backend concurrency permit is held by a slow uncached request.
+        let uncached_entered = Arc::new(Notify::new());
+        let uncached_release = Arc::new(Notify::new());
+        let uncached_entered_c = Arc::clone(&uncached_entered);
+        let uncached_release_c = Arc::clone(&uncached_release);
+
+        let backend = tower::service_fn(move |req: Request<SrvBody>| {
+            let entered = Arc::clone(&uncached_entered_c);
+            let release = Arc::clone(&uncached_release_c);
+            async move {
+                if req.uri().path() == "/uncached_slow" {
+                    entered.notify_one();
+                    release.notified().await;
+                    return Ok::<_, SrvError>(text_resp("slow-uncached"));
+                }
+                Ok::<_, SrvError>(text_resp("fast-cached"))
+            }
+        })
+        .boxed_clone_sync();
+
+        let limited = crate::middleware::limit::ConcurrencyLimitLayer::new(1, "test_g04")
+            .layer(backend);
+
+        let cache = SharedResponseCache::new(GlobalCacheConfig {
+            enabled: true,
+            max_bytes: 1024 * 1024,
+            default_ttl_seconds: 60,
+            max_entry_bytes: 64 * 1024,
+            expose_cache_header: true,
+            respect_cache_control: false,
+            ..Default::default()
+        });
+        let raw_rules = crate::configuration::CacheLayerConfig {
+            namespace: Some("p04_g04_ns".to_string()),
+            rules: HashMap::from([("/cached".to_string(), CacheRuleConfig::default())]),
+            invalidations: HashMap::new(),
+        };
+        let compiled = Arc::new(CompiledCacheConfig::from_raw(&raw_rules, "test_g04").unwrap());
+        let svc = CacheLayer::new(compiled, "test_g04")
+            .with_cache(cache)
+            .layer(limited);
+
+        // Populate L1 entry for /cached
+        let warm = svc.clone().oneshot(empty_req("/cached")).await.unwrap();
+        assert_eq!(warm.status(), StatusCode::OK);
+        assert_eq!(warm.headers().get("x-praeco-cache").unwrap(), "MISS");
+
+        // Saturate the single backend permit with /uncached_slow
+        let svc_slow = svc.clone();
+        let slow_task = tokio::spawn(async move {
+            svc_slow.oneshot(empty_req("/uncached_slow")).await.unwrap()
+        });
+        uncached_entered.notified().await;
+
+        // While the sole backend permit is occupied:
+        // a) Uncached /other_miss hits ConcurrencyLimit -> 503 Service Unavailable
+        let shed_resp = svc.clone().oneshot(empty_req("/other_miss")).await.unwrap();
+        assert_eq!(shed_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // b) Cached GET /cached still returns 200 OK (x-praeco-cache: HIT) without touching ConcurrencyLimit!
+        let hit_resp = svc.clone().oneshot(empty_req("/cached")).await.unwrap();
+        assert_eq!(hit_resp.status(), StatusCode::OK);
+        assert_eq!(hit_resp.headers().get("x-praeco-cache").unwrap(), "HIT");
+
+        uncached_release.notify_one();
+        let slow_resp = slow_task.await.unwrap();
+        assert_eq!(slow_resp.status(), StatusCode::OK);
     }
 }

@@ -186,7 +186,7 @@ where
             .headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("application/grpc"));
+            .is_some_and(crate::is_grpc_content_type);
 
         let algo = if is_bodiless_status || already_encoded || is_grpc {
             NegotiatedEncoding::None
@@ -406,6 +406,10 @@ where
 
     /// Decompresses the request body (if applicable) and forwards the request.
     ///
+    /// Native gRPC requests (`application/grpc` / `application/grpc+*`, matched
+    /// case-insensitively) bypass HTTP-level decompression so `grpc-encoding` framing
+    /// and HTTP/2 trailers stay intact.
+    ///
     /// ## Streaming Pipeline
     ///
     /// ```text
@@ -417,24 +421,49 @@ where
     /// The [`LimitedReader`] wrapper aborts with an `io::Error` if the
     /// decompressed output exceeds `max_decompressed_bytes`.
     fn call(&mut self, mut req: Request<SrvBody>) -> Self::Future {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum RequestEncoding {
+            None,
+            Gzip,
+            Brotli,
+        }
+
         let server_name = self.server_name;
         let max_bytes = self.max_decompressed_bytes;
 
-        // Inspect the Content-Encoding header to decide whether decompression
-        // is needed.
-        let encoding = req
+        let is_grpc = req
             .headers()
-            .get(CONTENT_ENCODING)
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(crate::is_grpc_content_type);
 
-        if encoding == "gzip" || encoding == "br" {
+        // Inspect the Content-Encoding header without allocating unless decompression applies.
+        let encoding = if is_grpc {
+            RequestEncoding::None
+        } else {
+            match req
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|h| h.to_str().ok())
+                .map(str::trim)
+            {
+                Some(s) if s.eq_ignore_ascii_case("gzip") => RequestEncoding::Gzip,
+                Some(s) if s.eq_ignore_ascii_case("br") => RequestEncoding::Brotli,
+                _ => RequestEncoding::None,
+            }
+        };
+
+        if encoding != RequestEncoding::None {
             let (parts, body) = req.into_parts();
+            let encoding_label = match encoding {
+                RequestEncoding::Gzip => "gzip",
+                RequestEncoding::Brotli => "br",
+                RequestEncoding::None => unreachable!(),
+            };
             tracing::trace!(
                 "{}: Decompressing body: {} (max {} bytes)",
                 server_name,
-                encoding,
+                encoding_label,
                 max_bytes
             );
 
@@ -449,7 +478,7 @@ where
             let body_reader = StreamReader::new(data_stream);
 
             // 2. Decompress & Wrap in LimitedReader for bomb protection
-            let new_body: SrvBody = if encoding == "gzip" {
+            let new_body: SrvBody = if encoding == RequestEncoding::Gzip {
                 wrap_decompressed_reader(GzipDecoder::new(body_reader), max_bytes, server_name)
             } else {
                 wrap_decompressed_reader(BrotliDecoder::new(body_reader), max_bytes, server_name)
@@ -480,6 +509,18 @@ pub(crate) fn append_vary_accept_encoding(headers: &mut hyper::HeaderMap) {
     }
 }
 
+/// Typed marker error emitted when [`LimitedReader`] exceeds `max_decompressed_bytes`.
+#[derive(Debug)]
+struct DecompressionLimitExceededError;
+
+impl std::fmt::Display for DecompressionLimitExceededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Decompressed payload exceeds maximum allowed size")
+    }
+}
+
+impl std::error::Error for DecompressionLimitExceededError {}
+
 /// Wraps a decompressor [`AsyncRead`] in [`LimitedReader`] and converts limit errors
 /// into [`SrvError::DecompressionLimitExceeded`] while recording [`ServerMetrics`].
 fn wrap_decompressed_reader<R: AsyncRead + Send + Sync + 'static>(
@@ -492,12 +533,13 @@ fn wrap_decompressed_reader<R: AsyncRead + Send + Sync + 'static>(
 
     StreamBody::new(stream)
         .map_err(move |e: io::Error| {
-            let msg = e.to_string();
-            if msg.contains("Decompressed payload exceeds maximum allowed size") {
+            if e.get_ref()
+                .is_some_and(|inner| inner.is::<DecompressionLimitExceededError>())
+            {
                 crate::configuration::ServerMetrics::inc_decompression_limit_exceeded(server_name);
                 SrvError::DecompressionLimitExceeded { max: max_bytes }
             } else {
-                SrvError::Other(msg)
+                SrvError::Other(e.to_string())
             }
         })
         .boxed()
@@ -551,8 +593,9 @@ impl<R: AsyncRead> AsyncRead for LimitedReader<R> {
                 if bytes_read > *this.remaining {
                     // Limit exceeded — zero out remaining and return an error.
                     *this.remaining = 0;
-                    Poll::Ready(Err(io::Error::other(
-                        "Decompressed payload exceeds maximum allowed size",
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        DecompressionLimitExceededError,
                     )))
                 } else {
                     *this.remaining -= bytes_read;
@@ -813,6 +856,64 @@ mod tests {
             .body(full_body(b""))?;
         let resp_204 = svc_204.oneshot(req_204).await?;
         assert!(resp_204.headers().get(CONTENT_ENCODING).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_g02_mixed_case_grpc_trailers_and_grpc_request_decompression_bypass()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Mixed-case Application/gRPC+Proto response must not be compressed and must keep trailers
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let frames: Vec<Result<Frame<Bytes>, SrvError>> = vec![
+            Ok(Frame::data(Bytes::from_static(PAYLOAD))),
+            Ok(Frame::trailers(trailers)),
+        ];
+        let body: SrvBody = BodyExt::boxed(StreamBody::new(futures_util::stream::iter(frames)));
+        let resp = run(Some("Application/gRPC+Proto"), None, "gzip", body).await;
+        assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+        let collected = resp.into_body().collect().await?;
+        assert_eq!(
+            collected
+                .trailers()
+                .and_then(|t| t.get("grpc-status"))
+                .and_then(|v| v.to_str().ok()),
+            Some("0")
+        );
+
+        // 2. Native gRPC request with Content-Encoding: gzip must bypass HTTP decompression and preserve trailers
+        let inner = service_fn(|req: Request<SrvBody>| async move {
+            assert_eq!(
+                req.headers().get(CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
+                Some("gzip")
+            );
+            let collected = req.into_body().collect().await?;
+            let trailers = collected.trailers().cloned();
+            assert_eq!(collected.to_bytes(), Bytes::from_static(b"\x00\x00\x00\x00\x02hi"));
+            assert_eq!(
+                trailers
+                    .as_ref()
+                    .and_then(|t| t.get("x-req-trailer"))
+                    .and_then(|v| v.to_str().ok()),
+                Some("kept")
+            );
+            Ok::<Response<SrvBody>, SrvError>(Response::new(full_body(b"OK")))
+        });
+        let mut req_trailers = HeaderMap::new();
+        req_trailers.insert("x-req-trailer", HeaderValue::from_static("kept"));
+        let req_frames: Vec<Result<Frame<Bytes>, SrvError>> = vec![
+            Ok(Frame::data(Bytes::from_static(b"\x00\x00\x00\x00\x02hi"))),
+            Ok(Frame::trailers(req_trailers)),
+        ];
+        let req_body: SrvBody =
+            BodyExt::boxed(StreamBody::new(futures_util::stream::iter(req_frames)));
+        let req = Request::builder()
+            .header(CONTENT_TYPE, "Application/gRPC")
+            .header(CONTENT_ENCODING, "gzip")
+            .body(req_body)?;
+        let svc = SrvDecompressionLayer::new("test_grpc_bypass", 64).layer(inner);
+        let resp = svc.oneshot(req).await?;
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
         Ok(())
     }
 }

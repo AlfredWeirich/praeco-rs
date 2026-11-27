@@ -57,6 +57,31 @@ pub fn load_certified_key(
     Ok(Arc::new(CertifiedKey::new(server_certs, signing_key)))
 }
 
+static CERTIFIED_KEY_INDEX: std::sync::OnceLock<
+    arc_swap::ArcSwap<std::collections::HashMap<&'static str, Arc<CertifiedKey>>>,
+> = std::sync::OnceLock::new();
+
+/// Atomically rebuilds the O(1) server certificate index queried by [`DynamicCertResolver`].
+pub(crate) fn update_certified_key_index(servers: &[crate::configuration::ServerConfig]) {
+    let mut index = std::collections::HashMap::with_capacity(servers.len());
+    for srv in servers {
+        if let Some(key) = srv.certified_key.as_ref() {
+            let name = srv
+                .static_name
+                .unwrap_or_else(|| crate::configuration::intern_static_server_name(&srv.name));
+            index.insert(name, Arc::clone(key));
+        }
+    }
+    let arc_index = Arc::new(index);
+    if let Some(existing) = CERTIFIED_KEY_INDEX.get() {
+        existing.store(arc_index);
+    } else if let Err(arc_index) = CERTIFIED_KEY_INDEX.set(arc_swap::ArcSwap::new(arc_index))
+        && let Some(existing) = CERTIFIED_KEY_INDEX.get()
+    {
+        existing.store(arc_index.into_inner());
+    }
+}
+
 #[derive(Debug)]
 pub struct DynamicCertResolver {
     server_name: &'static str,
@@ -72,9 +97,9 @@ impl DynamicCertResolver {
     }
 
     /// Creates a [`DynamicCertResolver`] that prefers the hot-reloaded key from
-    /// [`Config::try_global`](crate::configuration::Config::try_global) and falls
-    /// back to `fallback_key` when the global config singleton is not initialized
-    /// or does not contain `server_name`.
+    /// the O(1) [`CERTIFIED_KEY_INDEX`] populated by
+    /// [`Config::update_global`](crate::configuration::Config::update_global) and falls
+    /// back to `fallback_key` when no entry exists for `server_name`.
     pub fn with_fallback(server_name: &'static str, fallback_key: Arc<CertifiedKey>) -> Self {
         Self {
             server_name,
@@ -85,14 +110,11 @@ impl DynamicCertResolver {
 
 impl ResolvesServerCert for DynamicCertResolver {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        if let Some(config) = crate::configuration::Config::try_global()
-            && let Some(key) = config
-                .servers
-                .iter()
-                .find(|s| s.static_name == Some(self.server_name))
-                .and_then(|s| s.certified_key.clone())
-        {
-            return Some(key);
+        if let Some(swap) = CERTIFIED_KEY_INDEX.get() {
+            let guard = swap.load();
+            if let Some(key) = guard.get(self.server_name) {
+                return Some(Arc::clone(key));
+            }
         }
         self.fallback_key.clone()
     }
@@ -1041,6 +1063,71 @@ mod tests {
         assert_eq!(meta.san, expected_san);
         assert_eq!(meta.oids, vec!["1"]);
         assert_eq!(meta.oids, expected_oids);
+        Ok(())
+    }
+
+    #[test]
+    fn test_g03_dynamic_cert_resolver_o1_index_and_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let pki = common::test_pki::TestPki::new();
+
+        let fallback_cfg = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.praeco_public_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.praeco_public_key).to_string(),
+            ..Default::default()
+        };
+        let rotated_cfg = ServerCertConfig {
+            ssl_certificate: common::test_pki::TestPki::s(&pki.relay_server_pem).to_string(),
+            ssl_certificate_key: common::test_pki::TestPki::s(&pki.relay_server_key).to_string(),
+            ..Default::default()
+        };
+
+        let srv_name = crate::configuration::intern_static_server_name("test_g03_o1_cert_srv");
+        let fallback_key = load_certified_key(srv_name, &fallback_cfg)?;
+        let rotated_key = load_certified_key(srv_name, &rotated_cfg)?;
+
+        let resolver = DynamicCertResolver::with_fallback(srv_name, Arc::clone(&fallback_key));
+
+        // Build a minimal ClientHello via a real ClientConnection + Acceptor
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in load_certs(common::test_pki::TestPki::s(&pki.public_ca_pem), "test_g03")? {
+            root_store.add(cert)?;
+        }
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        let extract_and_resolve = |resolver: &DynamicCertResolver| -> Option<Arc<CertifiedKey>> {
+            let sni = rustls::pki_types::ServerName::try_from("localhost".to_string()).ok()?;
+            let mut client = rustls::ClientConnection::new(Arc::clone(&client_cfg), sni).ok()?;
+            let mut hello_bytes = Vec::new();
+            while client.wants_write() {
+                let _ = client.write_tls(&mut hello_bytes);
+            }
+            let mut acceptor = rustls::server::Acceptor::default();
+            let mut cursor = std::io::Cursor::new(&hello_bytes);
+            let _ = acceptor.read_tls(&mut cursor).ok()?;
+            let accepted = acceptor.accept().ok()??;
+            resolver.resolve(accepted.client_hello())
+        };
+
+        // 1. Before server is present in CERTIFIED_KEY_INDEX, fallback_key is returned
+        update_certified_key_index(&[]);
+        let before = extract_and_resolve(&resolver).expect("fallback key expected");
+        assert!(Arc::ptr_eq(&before, &fallback_key));
+
+        // 2. Once indexed via update_certified_key_index, O(1) index returns hot-reloaded key
+        let srv_entry = crate::configuration::ServerConfig {
+            name: srv_name.to_string(),
+            static_name: Some(srv_name),
+            certified_key: Some(Arc::clone(&rotated_key)),
+            ..Default::default()
+        };
+        update_certified_key_index(&[srv_entry]);
+        let after = extract_and_resolve(&resolver).expect("indexed rotated key expected");
+        assert!(Arc::ptr_eq(&after, &rotated_key));
         Ok(())
     }
 }

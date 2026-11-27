@@ -2366,6 +2366,7 @@ impl Config {
     /// Atomically updates the global configuration singleton.
     pub fn update_global(arc_config: Arc<Config>) {
         crate::middleware::cache::configure_global_response_cache(arc_config.cache.as_ref());
+        crate::tls_conf::update_certified_key_index(&arc_config.servers);
         if let Some(existing) = CONFIG.get() {
             existing.store(arc_config);
         } else if CONFIG.set(ArcSwap::new(arc_config)).is_err() {
@@ -2405,6 +2406,29 @@ impl Config {
             .expect("Configuration not initialized - check if Config::init was called in main")
             .load_full()
     }
+}
+
+/// Interns a server name as `&'static str`, reusing the existing allocation across
+/// repeated `SIGHUP` configuration reloads so heap usage cannot grow monotonically.
+pub(crate) fn intern_static_server_name(name: &str) -> &'static str {
+    static INTERNED_SERVER_NAMES: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashSet<&'static str>>,
+    > = std::sync::OnceLock::new();
+    let lock = INTERNED_SERVER_NAMES
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+    {
+        let read_guard = lock.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(&existing) = read_guard.get(name) {
+            return existing;
+        }
+    }
+    let mut write_guard = lock.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(&existing) = write_guard.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    write_guard.insert(leaked);
+    leaked
 }
 
 /// Parses a dot-separated OID string (e.g. `"1.3.6.1.4.1.65111"`) into `u64` components.
@@ -2454,15 +2478,14 @@ impl ServerConfig {
                 "Configuration error: Server 'name' must not be empty.",
             ));
         }
-        let static_name: &'static str = Box::leak(self.name.clone().into_boxed_str());
+        let static_name = intern_static_server_name(&self.name);
         self.static_name = Some(static_name);
-        let server_name = self.name.clone();
-        self.metrics = ServerMetrics::for_server(&server_name);
+        self.metrics = ServerMetrics::for_server(static_name);
 
         if let Some(ref oid_str) = self.pki_base_oid {
             self.parsed_pki_base_oid = Some(
                 parse_pki_base_oid(oid_str)
-                    .with_context(|| format!("{server_name}: invalid pki_base_oid"))?,
+                    .with_context(|| format!("{static_name}: invalid pki_base_oid"))?,
             );
         }
 
@@ -2554,7 +2577,7 @@ impl ServerConfig {
         // We discard the result ('let _') because we only care if it fails.
         let _ = self
             .layers
-            .build_middleware_layers(&server_name)
+            .build_middleware_layers(&self.name)
             .with_context(|| format!("Configuration error in Server '{}'", self.name))?;
         // 3. === VALIDATION: HTTPS Requirements ===
         if self.protocol == Protocol::Https {

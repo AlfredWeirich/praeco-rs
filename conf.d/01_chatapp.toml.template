@@ -29,7 +29,7 @@
     proxy_protocol = true
 
     [Server.Layers]
-    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
+    enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "RateLimiter:TokenBucket", "Cache", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
     allow_cidrs = []
@@ -288,7 +288,7 @@
         "2" = "Seller"
     
     [Server.Layers]
-        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "ConcurrencyLimit", "Cache"]
+        enabled = ["TraceId", "Logger", "IpFilter", "Decompression", "MaxPayload", "Inspection", "JwtAuth", "Rbac", "RateLimiter:TokenBucket", "Cache", "ConcurrencyLimit"]
 
     [Server.Layers.IpFilter]
         allow_cidrs = []

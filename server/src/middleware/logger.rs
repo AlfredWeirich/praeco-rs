@@ -203,30 +203,51 @@ fn sanitize_headers(headers: &hyper::HeaderMap) -> hyper::HeaderMap {
 
 /// Redacts sensitive query parameters from logs via case-insensitive substring matching (`S-09`).
 ///
+/// Returns [`std::borrow::Cow::Borrowed`] when no query parameters require redaction and the
+/// URI has no scheme/authority prefix, avoiding per-request heap allocation on clean paths.
+///
 /// Note: `code` is kept visible strictly on `/auth/confirm` for device onboarding pairing codes,
 /// and redacted on all other paths (e.g. OAuth authorization-code callbacks).
-pub(crate) fn sanitize_uri(uri: &hyper::Uri) -> String {
+pub(crate) fn sanitize_uri(uri: &hyper::Uri) -> std::borrow::Cow<'_, str> {
     let path = uri.path();
     if let Some(query) = uri.query() {
-        let sanitized_query: Vec<String> = query
-            .split('&')
-            .map(|pair| {
-                if let Some((k, _)) = pair.split_once('=') {
-                    let is_oauth_code =
-                        k.eq_ignore_ascii_case("code") && path != "/auth/confirm";
-                    if is_sensitive_key(k) || is_oauth_code {
-                        format!("{}=[REDACTED]", k)
-                    } else {
-                        pair.to_string()
-                    }
-                } else {
-                    pair.to_string()
-                }
+        let needs_redaction = query.split('&').any(|pair| {
+            pair.split_once('=').is_some_and(|(k, _)| {
+                is_sensitive_key(k) || (k.eq_ignore_ascii_case("code") && path != "/auth/confirm")
             })
-            .collect();
-        format!("{}?{}", path, sanitized_query.join("&"))
+        });
+        if !needs_redaction && let Some(pq) = uri.path_and_query() {
+            return std::borrow::Cow::Borrowed(pq.as_str());
+        }
+
+        let mut out = String::with_capacity(path.len() + 1 + query.len());
+        out.push_str(path);
+        out.push('?');
+        for (idx, pair) in query.split('&').enumerate() {
+            if idx > 0 {
+                out.push('&');
+            }
+            if let Some((k, _)) = pair.split_once('=') {
+                let is_oauth_code =
+                    k.eq_ignore_ascii_case("code") && path != "/auth/confirm";
+                if is_sensitive_key(k) || is_oauth_code {
+                    out.push_str(k);
+                    out.push_str("=[REDACTED]");
+                } else {
+                    out.push_str(pair);
+                }
+            } else {
+                out.push_str(pair);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    } else if uri.scheme().is_none()
+        && uri.authority().is_none()
+        && let Some(pq) = uri.path_and_query()
+    {
+        std::borrow::Cow::Borrowed(pq.as_str())
     } else {
-        uri.to_string()
+        std::borrow::Cow::Owned(uri.to_string())
     }
 }
 
@@ -333,7 +354,9 @@ mod tests {
         assert_eq!(sanitized, "/auth/status?session=[REDACTED]&poll_secret=[REDACTED]&foo=bar");
 
         let plain_uri: hyper::Uri = "/api/products?category=food".parse().unwrap();
-        assert_eq!(sanitize_uri(&plain_uri), "/api/products?category=food");
+        let plain_sanitized = sanitize_uri(&plain_uri);
+        assert!(matches!(plain_sanitized, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(plain_sanitized, "/api/products?category=food");
 
         let code_uri: hyper::Uri = "/auth/confirm?session=abc123456&code=891023".parse().unwrap();
         assert_eq!(sanitize_uri(&code_uri), "/auth/confirm?session=[REDACTED]&code=891023");
