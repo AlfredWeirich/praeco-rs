@@ -444,9 +444,11 @@ pub struct CachedResponse {
     compressed_br: Arc<OnceCell<Option<PrecompressedVariant>>>,
     /// Optional sanitized HTTP/2 trailers (e.g. `grpc-status: 0` for unary gRPC responses).
     pub trailers: Option<HeaderMap>,
-    /// Monotonic timestamp when the entry was inserted.
+    /// Monotonic timestamp when the entry was inserted into the local L1 cache.
     pub stored_at: Instant,
-    /// Effective time-to-live for this entry.
+    /// Accumulated upstream/L2 age prior to insertion into the local L1 cache.
+    pub initial_age: Duration,
+    /// Effective time-to-live for this entry in the local L1 cache.
     pub ttl: Duration,
     /// Approximate memory footprint in bytes used by `moka`'s weigher.
     pub byte_weight: u32,
@@ -486,9 +488,93 @@ impl CachedResponse {
             compressed_br: Arc::new(OnceCell::new()),
             trailers,
             stored_at: Instant::now(),
+            initial_age: Duration::ZERO,
             ttl,
             byte_weight,
         }
+    }
+
+    #[inline]
+    pub(crate) fn peek_precompressed_gzip(&self) -> Option<Bytes> {
+        self.compressed_gzip
+            .get()
+            .and_then(|opt| opt.as_ref())
+            .map(|v| v.body.clone())
+    }
+
+    #[inline]
+    pub(crate) fn peek_precompressed_br(&self) -> Option<Bytes> {
+        self.compressed_br
+            .get()
+            .and_then(|opt| opt.as_ref())
+            .map(|v| v.body.clone())
+    }
+
+    /// Reconstructs a [`CachedResponse`] from decoded L2 wire parts, keeping `stored_at` at
+    /// `Instant::now()` while preserving `initial_age` and zero-copy precompressed variants when eligible.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_l2_parts(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+        trailers: Option<HeaderMap>,
+        ttl: Duration,
+        initial_age: Duration,
+        precompressed_gzip: Option<Bytes>,
+        precompressed_br: Option<Bytes>,
+    ) -> Self {
+        let mut entry = Self::new(status, headers, body, trailers, ttl);
+        entry.initial_age = initial_age;
+
+        if entry_eligible_for_precompression(&entry) {
+            if let Some(gz) = precompressed_gzip.filter(|b| !b.is_empty() && b.len() < entry.body.len())
+            {
+                let content_length = u64_to_header_value(gz.len() as u64);
+                entry.compressed_gzip = Arc::new(OnceCell::new_with(Some(Some(
+                    PrecompressedVariant {
+                        body: gz,
+                        content_length,
+                    },
+                ))));
+            }
+            if let Some(br) = precompressed_br.filter(|b| !b.is_empty() && b.len() < entry.body.len())
+            {
+                let content_length = u64_to_header_value(br.len() as u64);
+                entry.compressed_br = Arc::new(OnceCell::new_with(Some(Some(
+                    PrecompressedVariant {
+                        body: br,
+                        content_length,
+                    },
+                ))));
+            }
+        }
+
+        entry
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+        trailers: Option<HeaderMap>,
+        ttl: Duration,
+    ) -> Self {
+        Self::new(status, headers, body, trailers, ttl)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ensure_gzip_for_test(&self) -> bool {
+        self.ensure_precompressed(PrecompressAlgo::Gzip)
+            .await
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ensure_br_for_test(&self) -> bool {
+        self.ensure_precompressed(PrecompressAlgo::Brotli)
+            .await
+            .is_some()
     }
 
     #[inline]
@@ -1281,7 +1367,7 @@ fn negotiate_request_encoding(
 }
 
 #[inline]
-fn entry_eligible_for_precompression(entry: &CachedResponse) -> bool {
+pub(crate) fn entry_eligible_for_precompression(entry: &CachedResponse) -> bool {
     entry.trailers.is_none()
         && entry.body.len() >= MIN_PRECOMPRESS_BYTES
         && !entry.headers.contains_key(header::CONTENT_ENCODING)
@@ -1439,7 +1525,10 @@ fn build_response_from_cached(
     }
     if expose_cache_header {
         attach_cache_status_header(&mut resp, outcome_label);
-        let age_secs = entry.stored_at.elapsed().as_secs();
+        let age_secs = entry
+            .initial_age
+            .saturating_add(entry.stored_at.elapsed())
+            .as_secs();
         if let Some(age_val) = u64_to_header_value(age_secs) {
             resp.headers_mut().insert(header::AGE, age_val);
         }
@@ -1550,7 +1639,7 @@ fn grpc_web_body_has_error(body: &[u8]) -> bool {
     !saw_ok_trailer
 }
 
-fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
+pub(crate) fn has_non_identity_content_encoding(headers: &HeaderMap) -> bool {
     headers.get_all(header::CONTENT_ENCODING).iter().any(|val| {
         let Ok(raw) = val.to_str() else {
             return true;

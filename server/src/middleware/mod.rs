@@ -15,6 +15,7 @@
 //! |--------|-------|---------|
 //! | [`alt_svc`] | [`AltSvcLayer`] | Injects the `Alt-Svc` header to advertise HTTP/3. |
 //! | [`cache`] | [`CacheLayer`] | Process-wide W-TinyLFU HTTP response cache with cancellation-safe [`Singleflight`]. |
+//! | [`cache_l2`] | [`L2CacheBackend`] | Optional L2 wire codec (`PRC2`), bounded write budget, circuit breaker & in-memory test cluster. |
 //! | [`compression`] | [`SrvCompressionLayer`] / [`SrvDecompressionLayer`] | Gzip/Brotli response compression and request decompression with bomb protection. |
 //! | [`counter`] | [`CountingLayer`] | Atomic request counter with periodic logging. |
 //! | [`delay`] | [`DelayLayer`] | Artificial latency injection (testing / simulation). |
@@ -38,6 +39,8 @@ pub mod admin;
 pub mod alt_svc;
 /// Process-wide W-TinyLFU HTTP response cache and cancellation-safe Singleflight.
 pub mod cache;
+/// Optional L2 response cache backend abstractions, `PRC2` wire codec, and test cluster.
+pub mod cache_l2;
 /// Gzip / Brotli response compression and request decompression.
 pub mod compression;
 /// Atomic request counter with periodic log output.
@@ -81,6 +84,11 @@ pub use alt_svc::AltSvcLayer;
 pub use cache::{
     CacheBypass, CacheLayer, CacheService, CachedResponse, FlightAborted, SharedResponseCache,
     Singleflight, configure_global_response_cache, global_response_cache,
+};
+pub use cache_l2::{
+    InMemoryL2Backend, InMemoryL2Cluster, L2CacheBackend, L2CircuitBreaker, L2CircuitState,
+    L2InvalidationEvent, L2LookupOutcome, L2StatusSnapshot, L2WireError, L2WriteBudget,
+    L2WritePermit,
 };
 pub use counter::CountingLayer;
 pub use delay::DelayLayer;
