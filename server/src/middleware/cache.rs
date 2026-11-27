@@ -3507,6 +3507,7 @@ mod tests {
             max_request_body_bytes: 16,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -3616,6 +3617,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -3803,6 +3805,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let read_cfg = CompiledCacheConfig::from_raw(
@@ -4013,6 +4016,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -4270,6 +4274,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -4391,6 +4396,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -4509,6 +4515,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -4614,6 +4621,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {
@@ -4765,6 +4773,7 @@ mod tests {
             max_request_body_bytes: 64 * 1024,
             respect_cache_control: true,
             expose_cache_header: true,
+            ..Default::default()
         });
 
         let cfg = CacheLayerConfig {

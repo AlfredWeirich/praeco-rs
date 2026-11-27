@@ -1581,6 +1581,331 @@ fn default_cache_max_request_body_bytes() -> usize {
     64 * 1024
 }
 
+fn default_l2_key_prefix() -> String {
+    "praeco".to_string()
+}
+
+fn default_l2_read_timeout_ms() -> u64 {
+    10
+}
+
+fn default_l2_write_timeout_ms() -> u64 {
+    50
+}
+
+fn default_l2_connect_timeout_ms() -> u64 {
+    500
+}
+
+fn default_l2_l1_max_ttl_seconds() -> u64 {
+    15
+}
+
+fn default_l2_write_queue_capacity() -> usize {
+    256
+}
+
+fn default_l2_max_write_queue_bytes() -> usize {
+    32 * 1024 * 1024
+}
+
+fn default_l2_write_batch_size() -> usize {
+    32
+}
+
+fn default_l2_write_batch_max_bytes() -> usize {
+    512 * 1024
+}
+
+fn default_l2_write_flush_ms() -> u64 {
+    3
+}
+
+fn default_l2_compress_min_bytes() -> usize {
+    1024
+}
+
+fn default_l2_cb_failure_threshold() -> u32 {
+    5
+}
+
+fn default_l2_cb_open_seconds() -> u64 {
+    10
+}
+
+/// Optional Dragonfly/Redis L2 response cache configuration (`[cache.l2]`).
+///
+/// Requires compiling `praeco-rs` with the `cache-l2-dragonfly` Cargo feature when `enabled = true`.
+#[derive(Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct L2CacheConfig {
+    /// Whether the distributed L2 cache backend is enabled (default: `false`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dragonfly/Redis connection URL (`redis://` or `rediss://`, without inline password).
+    #[serde(default)]
+    pub url: String,
+    /// Environment variable name holding the Dragonfly/Redis authentication password.
+    pub password_env: Option<String>,
+    /// File path containing the Dragonfly/Redis authentication password.
+    pub password_file: Option<String>,
+    /// Optional CA certificate PEM path for verifying Dragonfly TLS (`rediss://`).
+    pub tls_ca_file: Option<String>,
+    /// Optional client certificate PEM path for mutual TLS to Dragonfly.
+    pub tls_cert_file: Option<String>,
+    /// Optional client private key PEM path for mutual TLS to Dragonfly.
+    pub tls_key_file: Option<String>,
+    /// Key namespace prefix in Dragonfly (default: `"praeco"`).
+    #[serde(default = "default_l2_key_prefix")]
+    pub key_prefix: String,
+    /// Hard read timeout in milliseconds for L2 `GET` pipelines (default: `10`).
+    #[serde(default = "default_l2_read_timeout_ms")]
+    pub read_timeout_ms: u64,
+    /// Hard write timeout in milliseconds for L2 `SET` pipelines (default: `50`).
+    #[serde(default = "default_l2_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    /// Connection establishment timeout in milliseconds (default: `500`).
+    #[serde(default = "default_l2_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Upper cap in seconds for L1 backfill TTLs fetched from L2 (default: `15`).
+    #[serde(default = "default_l2_l1_max_ttl_seconds")]
+    pub l1_max_ttl_seconds: u64,
+    /// Bounded mailbox capacity of the `L2WriterActor` (default: `256`).
+    #[serde(default = "default_l2_write_queue_capacity")]
+    pub write_queue_capacity: usize,
+    /// Maximum total bytes queued in `L2WriterActor` before dropping writes (default: `32 MiB`).
+    #[serde(default = "default_l2_max_write_queue_bytes")]
+    pub max_write_queue_bytes: usize,
+    /// Maximum number of writes flushed per Redis pipeline batch (default: `32`).
+    #[serde(default = "default_l2_write_batch_size")]
+    pub write_batch_size: usize,
+    /// Maximum accumulated payload bytes flushed per Redis pipeline batch (default: `512 KiB`).
+    #[serde(default = "default_l2_write_batch_max_bytes")]
+    pub write_batch_max_bytes: usize,
+    /// Maximum micro-batching delay in milliseconds before flushing pending writes (default: `3`).
+    #[serde(default = "default_l2_write_flush_ms")]
+    pub write_flush_ms: u64,
+    /// Minimum body size in bytes before L2 payload compression applies (`0` disables compression, default: `1024`).
+    #[serde(default = "default_l2_compress_min_bytes")]
+    pub compress_min_bytes: usize,
+    /// Consecutive L2 failures required to trip the fail-open circuit breaker (default: `5`).
+    #[serde(default = "default_l2_cb_failure_threshold")]
+    pub cb_failure_threshold: u32,
+    /// Duration in seconds the L2 circuit breaker stays `Open` before `HalfOpen` probing (default: `10`).
+    #[serde(default = "default_l2_cb_open_seconds")]
+    pub cb_open_seconds: u64,
+}
+
+impl Default for L2CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            password_env: None,
+            password_file: None,
+            tls_ca_file: None,
+            tls_cert_file: None,
+            tls_key_file: None,
+            key_prefix: default_l2_key_prefix(),
+            read_timeout_ms: default_l2_read_timeout_ms(),
+            write_timeout_ms: default_l2_write_timeout_ms(),
+            connect_timeout_ms: default_l2_connect_timeout_ms(),
+            l1_max_ttl_seconds: default_l2_l1_max_ttl_seconds(),
+            write_queue_capacity: default_l2_write_queue_capacity(),
+            max_write_queue_bytes: default_l2_max_write_queue_bytes(),
+            write_batch_size: default_l2_write_batch_size(),
+            write_batch_max_bytes: default_l2_write_batch_max_bytes(),
+            write_flush_ms: default_l2_write_flush_ms(),
+            compress_min_bytes: default_l2_compress_min_bytes(),
+            cb_failure_threshold: default_l2_cb_failure_threshold(),
+            cb_open_seconds: default_l2_cb_open_seconds(),
+        }
+    }
+}
+
+impl std::fmt::Debug for L2CacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L2CacheConfig")
+            .field("enabled", &self.enabled)
+            .field("url", &self.redacted_url())
+            .field("password_env", &self.password_env.as_ref().map(|_| "<set>"))
+            .field("password_file", &self.password_file.as_ref().map(|_| "<set>"))
+            .field("tls_ca_file", &self.tls_ca_file)
+            .field("tls_cert_file", &self.tls_cert_file)
+            .field("tls_key_file", &self.tls_key_file)
+            .field("key_prefix", &self.key_prefix)
+            .field("read_timeout_ms", &self.read_timeout_ms)
+            .field("write_timeout_ms", &self.write_timeout_ms)
+            .field("connect_timeout_ms", &self.connect_timeout_ms)
+            .field("l1_max_ttl_seconds", &self.l1_max_ttl_seconds)
+            .field("write_queue_capacity", &self.write_queue_capacity)
+            .field("max_write_queue_bytes", &self.max_write_queue_bytes)
+            .field("write_batch_size", &self.write_batch_size)
+            .field("write_batch_max_bytes", &self.write_batch_max_bytes)
+            .field("write_flush_ms", &self.write_flush_ms)
+            .field("compress_min_bytes", &self.compress_min_bytes)
+            .field("cb_failure_threshold", &self.cb_failure_threshold)
+            .field("cb_open_seconds", &self.cb_open_seconds)
+            .finish()
+    }
+}
+
+impl L2CacheConfig {
+    /// Returns `url` stripped of userinfo, password, query parameters, and fragments
+    /// so logs and `/status` outputs never expose credentials.
+    pub fn redacted_url(&self) -> String {
+        let trimmed = self.url.trim();
+        if trimmed.is_empty() {
+            return String::new();
+        }
+        let Ok(parsed) = url::Url::parse(trimmed) else {
+            return "<invalid-url>".to_string();
+        };
+        let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+            return "<invalid-url>".to_string();
+        };
+        match parsed.port() {
+            Some(port) => format!("{}://{}:{}{}", parsed.scheme(), host, port, parsed.path()),
+            None => format!("{}://{}{}", parsed.scheme(), host, parsed.path()),
+        }
+    }
+
+    /// Validates `[cache.l2]` endpoint, secret hygiene, TLS pairing, bounds, and Cargo feature gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `url` embeds an inline password (even when `enabled = false`),
+    /// if `url` is missing/invalid when enabled, if both `password_env` and `password_file`
+    /// are configured, if TLS client cert/key are unpaired, if `key_prefix` is invalid, if
+    /// any positive numeric bound is `0`, or if `enabled = true` without `cache-l2-dragonfly`.
+    pub fn validate(&self) -> Result<(), Error> {
+        let trimmed_url = self.url.trim();
+        if !trimmed_url.is_empty()
+            && let Ok(parsed) = url::Url::parse(trimmed_url)
+            && parsed.password().is_some()
+        {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: inline password in 'url' is forbidden; use 'password_env' or 'password_file' instead.",
+            ));
+        }
+
+        if !self.enabled {
+            return Ok(());
+        }
+
+        if trimmed_url.is_empty() {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'url' must not be empty when 'enabled = true'.",
+            ));
+        }
+        let parsed = url::Url::parse(trimmed_url).map_err(|e| {
+            Error::msg(format!(
+                "Configuration error in [cache.l2]: invalid 'url': {e}."
+            ))
+        })?;
+        if !matches!(parsed.scheme(), "redis" | "rediss") {
+            return Err(Error::msg(format!(
+                "Configuration error in [cache.l2]: 'url' scheme '{}' is unsupported; expected 'redis' or 'rediss'.",
+                parsed.scheme()
+            )));
+        }
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'url' must include a valid host.",
+            ));
+        }
+        if parsed.password().is_some() {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: inline password in 'url' is forbidden; use 'password_env' or 'password_file' instead.",
+            ));
+        }
+
+        if self.password_env.is_some() && self.password_file.is_some() {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'password_env' and 'password_file' are mutually exclusive.",
+            ));
+        }
+        if self
+            .password_env
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'password_env' must not be empty.",
+            ));
+        }
+        if self
+            .password_file
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'password_file' must not be empty.",
+            ));
+        }
+
+        if self.tls_cert_file.is_some() != self.tls_key_file.is_some() {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'tls_cert_file' and 'tls_key_file' must both be set for mTLS.",
+            ));
+        }
+        for (field, val) in [
+            ("tls_ca_file", &self.tls_ca_file),
+            ("tls_cert_file", &self.tls_cert_file),
+            ("tls_key_file", &self.tls_key_file),
+        ] {
+            if val.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                return Err(Error::msg(format!(
+                    "Configuration error in [cache.l2]: '{field}' must not be empty."
+                )));
+            }
+        }
+
+        if self.key_prefix.is_empty()
+            || !self
+                .key_prefix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
+        {
+            return Err(Error::msg(
+                "Configuration error in [cache.l2]: 'key_prefix' must be non-empty and contain only [A-Za-z0-9:_-].",
+            ));
+        }
+
+        for (field, is_zero) in [
+            ("read_timeout_ms", self.read_timeout_ms == 0),
+            ("write_timeout_ms", self.write_timeout_ms == 0),
+            ("connect_timeout_ms", self.connect_timeout_ms == 0),
+            ("l1_max_ttl_seconds", self.l1_max_ttl_seconds == 0),
+            ("write_queue_capacity", self.write_queue_capacity == 0),
+            ("max_write_queue_bytes", self.max_write_queue_bytes == 0),
+            ("write_batch_size", self.write_batch_size == 0),
+            ("write_batch_max_bytes", self.write_batch_max_bytes == 0),
+            ("write_flush_ms", self.write_flush_ms == 0),
+            ("cb_failure_threshold", self.cb_failure_threshold == 0),
+            ("cb_open_seconds", self.cb_open_seconds == 0),
+        ] {
+            if is_zero {
+                return Err(Error::msg(format!(
+                    "Configuration error in [cache.l2]: '{field}' must be greater than 0."
+                )));
+            }
+        }
+
+        #[cfg(not(feature = "cache-l2-dragonfly"))]
+        {
+            Err(Error::msg(
+                "Configuration error in [cache.l2]: 'enabled = true' requires compiling praeco-rs with the 'cache-l2-dragonfly' Cargo feature.",
+            ))
+        }
+        #[cfg(feature = "cache-l2-dragonfly")]
+        {
+            Ok(())
+        }
+    }
+}
+
 /// Process-wide configuration for the shared W-TinyLFU HTTP response cache (`[cache]`).
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1607,6 +1932,9 @@ pub struct GlobalCacheConfig {
     /// Whether to attach `x-praeco-cache: HIT|MISS|COALESCED|BYPASS` and `age` headers (default: `false`).
     #[serde(default)]
     pub expose_cache_header: bool,
+    /// Optional Dragonfly/Redis L2 cache tier configuration (`[cache.l2]`).
+    #[serde(default)]
+    pub l2: Option<L2CacheConfig>,
 }
 
 impl Default for GlobalCacheConfig {
@@ -1619,17 +1947,19 @@ impl Default for GlobalCacheConfig {
             max_request_body_bytes: default_cache_max_request_body_bytes(),
             respect_cache_control: true,
             expose_cache_header: false,
+            l2: None,
         }
     }
 }
 
 impl GlobalCacheConfig {
-    /// Validates global cache sizing and TTL bounds.
+    /// Validates global cache sizing, TTL bounds, and optional `[cache.l2]` configuration.
     ///
     /// # Errors
     ///
     /// Returns an error if `max_bytes`, `default_ttl_seconds`, `max_entry_bytes`, or
-    /// `max_request_body_bytes` is `0`, or if `max_entry_bytes > max_bytes`.
+    /// `max_request_body_bytes` is `0`, if `max_entry_bytes > max_bytes`, or if `[cache.l2]`
+    /// validation fails.
     pub fn validate(&self) -> Result<(), Error> {
         if self.max_bytes == 0 {
             return Err(Error::msg(
@@ -1656,6 +1986,9 @@ impl GlobalCacheConfig {
                 "Configuration error in [cache]: 'max_entry_bytes' ({}) must not exceed 'max_bytes' ({}).",
                 self.max_entry_bytes, self.max_bytes
             )));
+        }
+        if let Some(ref l2) = self.l2 {
+            l2.validate()?;
         }
         Ok(())
     }
@@ -1698,6 +2031,8 @@ pub struct CacheRuleConfig {
     pub respect_cache_control: Option<bool>,
     /// Optional per-rule override for `x-praeco-cache` response header emission.
     pub expose_cache_header: Option<bool>,
+    /// Optional per-rule override enabling/disabling L2 storage (default: `true` for `public`, `false` for `per_role`/`per_subject`).
+    pub l2: Option<bool>,
 }
 
 /// Per-server configuration for the `"Cache"` middleware layer (`[Server.Layers.Cache]`).
@@ -1730,6 +2065,18 @@ pub struct CompiledCacheRule {
     pub max_request_body_bytes: Option<usize>,
     pub respect_cache_control: Option<bool>,
     pub expose_cache_header: Option<bool>,
+    pub l2: Option<bool>,
+}
+
+impl CompiledCacheRule {
+    /// Returns whether responses matching this rule may be read from and written to the L2 tier.
+    ///
+    /// Enforces a Zero-Trust default: only [`CacheScope::Public`] allows L2 unless explicitly
+    /// overridden via `l2 = true` or `l2 = false`.
+    #[inline]
+    pub fn allows_l2(&self) -> bool {
+        self.l2.unwrap_or(matches!(self.scope, CacheScope::Public))
+    }
 }
 
 /// Pre-compiled `[Server.Layers.Cache]` rule and mutation invalidation tables.
@@ -1933,6 +2280,7 @@ impl CompiledCacheConfig {
                 max_request_body_bytes: rule_cfg.max_request_body_bytes,
                 respect_cache_control: rule_cfg.respect_cache_control,
                 expose_cache_header: rule_cfg.expose_cache_header,
+                l2: rule_cfg.l2,
             };
 
             match (method_opt, path_pattern.ends_with('*')) {

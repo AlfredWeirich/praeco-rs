@@ -27,6 +27,8 @@ cli = [
     "dep:tracing-subscriber",
 ]
 web = ["dep:serde_urlencoded"]
+cache-l2-dragonfly = ["dep:otp-actor", "dep:redis"]
+cache-l2-chaos = ["cache-l2-dragonfly", "otp-actor/chaos_test"]
 
 [dependencies]
 # --- Core ---
@@ -106,6 +108,8 @@ rand = { workspace = true }
 num_cpus = { workspace = true, optional = true }
 dashmap = { workspace = true }
 moka = { workspace = true }
+otp-actor = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
 mimalloc = { workspace = true, optional = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }

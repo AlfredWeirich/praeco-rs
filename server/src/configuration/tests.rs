@@ -2009,3 +2009,216 @@ enabled = []
             "repeated finalize() reloads must reuse the interned &'static str allocation"
         );
     }
+
+    #[test]
+    fn test_l2_cache_config_toml_parsing_defaults_and_deny_unknown_fields() {
+        let minimal_toml = r#"
+            enabled = true
+            url = "rediss://dragonfly.internal:6379/0"
+            password_env = "PRAECO_L2_PASSWORD"
+        "#;
+        let cfg: L2CacheConfig = toml::from_str(minimal_toml).expect("valid minimal L2 TOML");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.key_prefix, "praeco");
+        assert_eq!(cfg.read_timeout_ms, 10);
+        assert_eq!(cfg.write_timeout_ms, 50);
+        assert_eq!(cfg.connect_timeout_ms, 500);
+        assert_eq!(cfg.l1_max_ttl_seconds, 15);
+        assert_eq!(cfg.write_queue_capacity, 256);
+        assert_eq!(cfg.max_write_queue_bytes, 32 * 1024 * 1024);
+        assert_eq!(cfg.write_batch_size, 32);
+        assert_eq!(cfg.write_batch_max_bytes, 512 * 1024);
+        assert_eq!(cfg.write_flush_ms, 3);
+        assert_eq!(cfg.compress_min_bytes, 1024);
+        assert_eq!(cfg.cb_failure_threshold, 5);
+        assert_eq!(cfg.cb_open_seconds, 10);
+
+        let zero_compress: L2CacheConfig = toml::from_str(
+            r#"
+                enabled = false
+                compress_min_bytes = 0
+            "#,
+        )
+        .expect("compress_min_bytes = 0 must parse");
+        assert_eq!(zero_compress.compress_min_bytes, 0);
+        assert!(zero_compress.validate().is_ok());
+
+        let unknown_l2_field = r#"
+            enabled = false
+            unexpected_field = 42
+        "#;
+        assert!(toml::from_str::<L2CacheConfig>(unknown_l2_field).is_err());
+
+        let unknown_rule_field = r#"
+            scope = "public"
+            unknown_opt = true
+        "#;
+        assert!(toml::from_str::<CacheRuleConfig>(unknown_rule_field).is_err());
+    }
+
+    #[test]
+    fn test_l2_cache_config_validation_security_bounds_and_feature_gate() {
+        let valid_cfg = L2CacheConfig {
+            enabled: true,
+            url: "rediss://alice:supersecret@dragonfly.internal:6379/0?foo=bar".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            valid_cfg.redacted_url(),
+            "rediss://dragonfly.internal:6379/0"
+        );
+        let debug_str = format!("{valid_cfg:?}");
+        assert!(!debug_str.contains("supersecret"));
+        assert!(!debug_str.contains("foo=bar"));
+        // Inline passwords must be rejected even when enabled = false
+        let disabled_inline_pw = L2CacheConfig {
+            enabled: false,
+            url: "redis://:supersecret@127.0.0.1:6379".to_string(),
+            ..Default::default()
+        };
+        assert!(disabled_inline_pw.validate().is_err());
+        assert!(valid_cfg.validate().is_err());
+
+        let clean_valid = L2CacheConfig {
+            enabled: true,
+            url: "rediss://dragonfly.internal:6379/0".to_string(),
+            password_env: Some("PRAECO_L2_PW".to_string()),
+            tls_ca_file: Some("/etc/praeco/ca.pem".to_string()),
+            compress_min_bytes: 0,
+            ..Default::default()
+        };
+        assert!(!format!("{clean_valid:?}").contains("PRAECO_L2_PW"));
+        #[cfg(not(feature = "cache-l2-dragonfly"))]
+        {
+            let err = clean_valid.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("cache-l2-dragonfly"),
+                "expected feature-gate message, got: {err}"
+            );
+        }
+        #[cfg(feature = "cache-l2-dragonfly")]
+        {
+            assert!(clean_valid.validate().is_ok());
+        }
+
+        // Invalid URL schemes, missing host, conflicting password options, unpaired mTLS, bad prefix
+        let bad_cases = [
+            L2CacheConfig {
+                enabled: true,
+                url: "http://127.0.0.1:6379".to_string(),
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: String::new(),
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "redis://127.0.0.1:6379".to_string(),
+                password_env: Some("ENV_PW".to_string()),
+                password_file: Some("/tmp/pw".to_string()),
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "rediss://127.0.0.1:6379".to_string(),
+                tls_cert_file: Some("/etc/cert.pem".to_string()),
+                tls_key_file: None,
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "redis://127.0.0.1:6379".to_string(),
+                key_prefix: "bad prefix!".to_string(),
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "redis://127.0.0.1:6379".to_string(),
+                read_timeout_ms: 0,
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "redis://127.0.0.1:6379".to_string(),
+                max_write_queue_bytes: 0,
+                ..Default::default()
+            },
+            L2CacheConfig {
+                enabled: true,
+                url: "redis://127.0.0.1:6379".to_string(),
+                cb_failure_threshold: 0,
+                ..Default::default()
+            },
+        ];
+        for case in &bad_cases {
+            assert!(case.validate().is_err(), "expected error for {case:?}");
+        }
+    }
+
+    #[test]
+    fn test_cache_rule_allows_l2_zero_trust_defaults_and_overrides() {
+        let layer_cfg = CacheLayerConfig {
+            namespace: None,
+            rules: HashMap::from([
+                (
+                    "GET /public".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::Public,
+                        l2: None,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "GET /public-l1-only".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::Public,
+                        l2: Some(false),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "GET /role".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::PerRole,
+                        l2: None,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "GET /role-l2".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::PerRole,
+                        l2: Some(true),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "GET /subject".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::PerSubject,
+                        l2: None,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "GET /subject-l2".to_string(),
+                    CacheRuleConfig {
+                        scope: CacheScope::PerSubject,
+                        l2: Some(true),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let compiled = CompiledCacheConfig::from_raw(&layer_cfg, "srv").expect("valid rules");
+        assert!(compiled.match_request("GET", "/public").unwrap().allows_l2());
+        assert!(!compiled.match_request("GET", "/public-l1-only").unwrap().allows_l2());
+        assert!(!compiled.match_request("GET", "/role").unwrap().allows_l2());
+        assert!(compiled.match_request("GET", "/role-l2").unwrap().allows_l2());
+        assert!(!compiled.match_request("GET", "/subject").unwrap().allows_l2());
+        assert!(compiled.match_request("GET", "/subject-l2").unwrap().allows_l2());
+    }
