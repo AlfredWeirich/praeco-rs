@@ -159,6 +159,26 @@ impl IdpService {
         )
     }
 
+    /// Resolves and validates an optional requested JWT audience (`?aud=...`) against
+    /// `self.params.allowed_audiences`.
+    ///
+    /// - When `requested_aud` is `Some(aud)`, it must match an entry in `allowed_audiences`;
+    ///   otherwise an error is returned (fail-closed, even when `allowed_audiences` is empty).
+    /// - When `requested_aud` is `None`, falls back to the first configured entry in
+    ///   `allowed_audiences` (or `None` when none are configured).
+    fn resolve_audience(&self, requested_aud: Option<&str>) -> Result<Option<String>, &'static str> {
+        match requested_aud {
+            Some(a) => {
+                if self.params.allowed_audiences.iter().any(|allowed| allowed == a) {
+                    Ok(Some(a.to_string()))
+                } else {
+                    Err("Requested audience is not in allowed_audiences")
+                }
+            }
+            None => Ok(self.params.allowed_audiences.first().cloned()),
+        }
+    }
+
     fn generate_jwt_cookie_response(
         &self,
         mut claims: Claims,
@@ -416,11 +436,6 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
         let client_ip = req.extensions().get::<std::net::SocketAddr>().map(|a| a.ip());
 
-        let aud = requested_aud.as_ref()
-            .filter(|a| self.params.allowed_audiences.contains(a))
-            .cloned()
-            .or_else(|| self.params.allowed_audiences.first().cloned());
-
         // Determine if the request has a valid mTLS certificate.
         let mtls_claims = if req.extensions().get::<crate::PemCertExtension>().is_some() {
             let sub = if let Some(san) = req.extensions().get::<crate::SanCertExtension>() {
@@ -440,7 +455,7 @@ impl Service<Request<crate::SrvBody>> for IdpService {
             Some(Claims {
                 sub,
                 iss: self.params.issuer.clone(),
-                aud,
+                aud: None,
                 exp: 0,
                 oids,
                 jti: None,
@@ -473,16 +488,14 @@ impl Service<Request<crate::SrvBody>> for IdpService {
                         response: Some(Self::response_err(StatusCode::FORBIDDEN, msg)),
                     };
                 }
-                if let Some(ref a) = requested_aud
-                    && !self.params.allowed_audiences.is_empty() && !self.params.allowed_audiences.contains(a) {
+                let target_aud = match self.resolve_audience(requested_aud.as_deref()) {
+                    Ok(aud) => aud,
+                    Err(msg) => {
                         return IdpFuture::Ready {
-                            response: Some(Self::response_err(
-                                StatusCode::BAD_REQUEST,
-                                "Requested audience is not in allowed_audiences",
-                            )),
+                            response: Some(Self::response_err(StatusCode::BAD_REQUEST, msg)),
                         };
                     }
-                let target_aud = requested_aud.or_else(|| self.params.allowed_audiences.first().cloned());
+                };
 
                 match self.session_store.create_session(client_ip, target_aud) {
                     Ok(info) => {
@@ -670,9 +683,25 @@ impl Service<Request<crate::SrvBody>> for IdpService {
 
             // 4. Direct JWT issuance via mTLS (for devices that don't need QR code)
             (Method::POST, "/auth/token") => {
-                let claims = match mtls_claims {
+                let mut claims = match mtls_claims {
                     Some(c) => c,
-                    None => return IdpFuture::Ready { response: Some(Self::response_err(StatusCode::UNAUTHORIZED, "mTLS required")) },
+                    None => {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(
+                                StatusCode::UNAUTHORIZED,
+                                "mTLS required",
+                            )),
+                        };
+                    }
+                };
+
+                claims.aud = match self.resolve_audience(requested_aud.as_deref()) {
+                    Ok(aud) => aud,
+                    Err(msg) => {
+                        return IdpFuture::Ready {
+                            response: Some(Self::response_err(StatusCode::BAD_REQUEST, msg)),
+                        };
+                    }
                 };
 
                 if let Some(wh) = &self.webhook_client {
@@ -1573,6 +1602,151 @@ mod tests {
         let mut h_bad_origin = hyper::HeaderMap::new();
         h_bad_origin.insert(hyper::header::ORIGIN, hyper::header::HeaderValue::from_static("https://evil@192.168.178.45:1339"));
         assert!(verify_same_origin(&https_uri, &h_bad_origin).is_err(), "Origin with userinfo must be rejected");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_idp_audience_validation_for_login_and_token() -> Result<(), Box<dyn std::error::Error>> {
+        use tower::Service;
+
+        let make_mtls_token_req = |uri: &str| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())
+                .unwrap();
+            req.extensions_mut()
+                .insert(crate::PemCertExtension::from("dummy-pem"));
+            req.extensions_mut()
+                .insert(crate::SanCertExtension::from("svc@example.test"));
+            req
+        };
+
+        // 1. Configured allowed_audiences: ["admin-dashboard", "praeco-admin"]
+        let mut idp = create_test_idp_service();
+        idp.params.allowed_audiences = vec![
+            "admin-dashboard".to_string(),
+            "praeco-admin".to_string(),
+        ];
+
+        // 1a. POST /auth/token without ?aud falls back to first allowed audience
+        let resp_default = idp.ready().await?.call(make_mtls_token_req("/auth/token")).await?;
+        assert_eq!(resp_default.status(), StatusCode::OK);
+        let json_default: serde_json::Value =
+            serde_json::from_slice(&resp_default.into_body().collect().await?.to_bytes())?;
+        let claims_default = common::verify_jwt(
+            json_default["token"].as_str().unwrap(),
+            &idp.decoding_keys,
+            "praeco-idp",
+            "admin-dashboard",
+        )?;
+        assert_eq!(claims_default.aud.as_deref(), Some("admin-dashboard"));
+
+        // 1b. POST /auth/token?aud=praeco-admin uses the explicitly allowed audience
+        let resp_allowed = idp
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token?aud=praeco-admin"))
+            .await?;
+        assert_eq!(resp_allowed.status(), StatusCode::OK);
+        let json_allowed: serde_json::Value =
+            serde_json::from_slice(&resp_allowed.into_body().collect().await?.to_bytes())?;
+        let claims_allowed = common::verify_jwt(
+            json_allowed["token"].as_str().unwrap(),
+            &idp.decoding_keys,
+            "praeco-idp",
+            "praeco-admin",
+        )?;
+        assert_eq!(claims_allowed.aud.as_deref(), Some("praeco-admin"));
+
+        // 1c. POST /auth/token?aud=xadmin-dashboard must fail with 400 Bad Request
+        let resp_bad_aud = idp
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token?aud=xadmin-dashboard"))
+            .await?;
+        assert_eq!(resp_bad_aud.status(), StatusCode::BAD_REQUEST);
+        let body_bad_aud =
+            String::from_utf8(resp_bad_aud.into_body().collect().await?.to_bytes().to_vec())?;
+        assert_eq!(body_bad_aud, "Requested audience is not in allowed_audiences");
+
+        // 1d. POST /auth/token?aud= (empty audience) must fail with 400 Bad Request
+        let resp_empty_aud = idp
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token?aud="))
+            .await?;
+        assert_eq!(resp_empty_aud.status(), StatusCode::BAD_REQUEST);
+
+        // 1e. Unauthenticated POST /auth/token?aud=xadmin-dashboard must return 401 first
+        let req_unauth = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/token?aud=xadmin-dashboard")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_unauth = idp.ready().await?.call(req_unauth).await?;
+        assert_eq!(resp_unauth.status(), StatusCode::UNAUTHORIZED);
+
+        // 1f. POST /auth/login?aud=xadmin-dashboard fails with 400; ?aud=praeco-admin succeeds
+        let req_login_bad = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login?aud=xadmin-dashboard")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_login_bad = idp.ready().await?.call(req_login_bad).await?;
+        assert_eq!(resp_login_bad.status(), StatusCode::BAD_REQUEST);
+
+        let req_login_ok = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login?aud=praeco-admin")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_login_ok = idp.ready().await?.call(req_login_ok).await?;
+        assert_eq!(resp_login_ok.status(), StatusCode::OK);
+
+        // 2. Empty allowed_audiences: []
+        let mut idp_empty = create_test_idp_service();
+        idp_empty.params.allowed_audiences = vec![];
+
+        // 2a. POST /auth/token without ?aud issues token with aud == None
+        let resp_no_aud = idp_empty
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token"))
+            .await?;
+        assert_eq!(resp_no_aud.status(), StatusCode::OK);
+        let json_no_aud: serde_json::Value =
+            serde_json::from_slice(&resp_no_aud.into_body().collect().await?.to_bytes())?;
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::EdDSA);
+        validation.validate_aud = false;
+        validation.set_issuer(&["praeco-idp"]);
+        let decoded = jsonwebtoken::decode::<Claims>(
+            json_no_aud["token"].as_str().unwrap(),
+            &idp_empty.decoding_keys[0],
+            &validation,
+        )?;
+        assert_eq!(decoded.claims.aud, None);
+
+        // 2b. POST /auth/token?aud=any-app fails closed with 400
+        let resp_empty_token_aud = idp_empty
+            .ready()
+            .await?
+            .call(make_mtls_token_req("/auth/token?aud=any-app"))
+            .await?;
+        assert_eq!(resp_empty_token_aud.status(), StatusCode::BAD_REQUEST);
+
+        // 2c. POST /auth/login?aud=any-app fails closed with 400; without ?aud succeeds
+        let req_empty_login_bad = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login?aud=any-app")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_empty_login_bad = idp_empty.ready().await?.call(req_empty_login_bad).await?;
+        assert_eq!(resp_empty_login_bad.status(), StatusCode::BAD_REQUEST);
+
+        let req_empty_login_ok = Request::builder()
+            .method(Method::POST)
+            .uri("/auth/login")
+            .body(Full::new(Bytes::new()).map_err(SrvError::from).boxed())?;
+        let resp_empty_login_ok = idp_empty.ready().await?.call(req_empty_login_ok).await?;
+        assert_eq!(resp_empty_login_ok.status(), StatusCode::OK);
 
         Ok(())
     }

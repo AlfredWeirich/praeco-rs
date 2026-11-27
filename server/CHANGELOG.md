@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.2] - 2026-11-27
+
+Patch security release fixing fail-closed JWT audience validation in the built-in Identity Provider (`IdpService`).
+
+### Fixed & Security
+* **Strict Fail-Closed IdP Audience Validation (`src/middleware/idp/mod.rs`):**
+  * Extracted shared `IdpService::resolve_audience` helper used by both `POST /auth/login` and `POST /auth/token`, removing the silent fallback in `IdpService::call` that previously issued tokens for `allowed_audiences[0]` when an unlisted `?aud=...` was requested on `POST /auth/token`.
+  * Explicitly requested `?aud=...` values not present in `allowed_audiences` (including empty `?aud=` and when `allowed_audiences` is empty) are now consistently rejected with `400 Bad Request` (`"Requested audience is not in allowed_audiences"`), while omitting `?aud` continues to default to `allowed_audiences.first()`.
+  * Preserved mTLS authentication ordering on `POST /auth/token` so unauthenticated callers still receive `401 Unauthorized` before audience validation (preventing audience enumeration).
+  * Added unit test `test_idp_audience_validation_for_login_and_token` covering default, allowed, unlisted, empty, and unauthenticated audience flows on both endpoints.
+
+---
+
 ## [0.8.1] - 2026-11-26
 
 Non-breaking feature release adding a process-wide W-TinyLFU HTTP response cache (`CacheLayer` / `SharedResponseCache`) shared across all configured `[[Server]]` instances, backed by a sharded, cancellation-safe `Singleflight` request coalescer.
