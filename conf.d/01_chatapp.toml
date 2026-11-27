@@ -499,7 +499,7 @@
         cookie_name = "admin-jwt"
         cookie_domain = "192.168.178.45"
         redirect_after_login = "https://192.168.178.45:1338/admin"
-        allowed_audiences = ["admin-dashboard", "praeco-admin"]
+        allowed_audiences = ["admin-dashboard"]
 
         # --- NEW: Claims Webhook (Dynamic Role Resolution) ---
         # If configured, the IdP queries this URL to dynamically resolve user roles
