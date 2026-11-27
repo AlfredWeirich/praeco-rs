@@ -15,6 +15,24 @@ Designed for zero-trust enterprise environments, it provides deep mTLS integrati
 ---
 > **Quality & Verification:** Hardened with workspace-wide `deny(clippy::unwrap_used, clippy::expect_used)` in production code, strict `#[serde(deny_unknown_fields)]` schema validation, an extensive automated unit & integration test suite, and regular AI-assisted security & code reviews.
 
+---
+
+### Response Cache & Singleflight Benchmark (`v0.8.1`)
+
+Measured A/B comparison with identical minimal gateway configurations (without cache vs. with `CacheLayer` + lazy precompression + O(1) `Singleflight`) on Apple M4 Max (16 cores, macOS `arm64`, `--release`), `wrk -t4 -c32 -d5s --latency` against a local Python SQLite mock DB backend (`5,000` indexed rows, `10 ms` simulated query latency, ~5.5 KiB JSON / ~1.2 KiB `gzip` payload):
+
+| Scenario | Without Cache | With Cache | Speedup | Avg Latency | p99 Latency | Backend DB Queries |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`GET /api/products`** (plain JSON) | 2,247.1 req/s | **183,945.3 req/s** | **81.9x** | 14.23 ms $\rightarrow$ **158.63 µs** | 18.62 ms $\rightarrow$ **219.00 µs** | 11,309 $\rightarrow$ **1** |
+| **`GET /api/products`** (`gzip` precompressed) | 2,221.7 req/s | **185,449.2 req/s** | **83.5x** | 14.36 ms $\rightarrow$ **156.98 µs** | 18.37 ms $\rightarrow$ **212.00 µs** | 11,187 $\rightarrow$ **0*** |
+| **`POST /api/query`** (SHA-256 body-hashed RPC) | 2,238.0 req/s | **183,886.8 req/s** | **82.2x** | 14.26 ms $\rightarrow$ **159.23 µs** | 18.18 ms $\rightarrow$ **218.00 µs** | 11,281 $\rightarrow$ **1** |
+
+\* Served directly from the lazily precompressed `OnceCell` `gzip` variant populated on the already-warmed entry (`0` additional upstream calls, `0` per-HIT re-compression).  
+**Invalidation & Stampede Protection (`Singleflight`):** Immediately after `POST /api/mutate` (O(1) generation invalidation), `32` concurrent clients requesting `/api/products` produced **`31 COALESCED` + `1 MISS`** and triggered **only `1` backend DB query** instead of `32`.  
+**Reproduce locally:** Run `bench/cache/run_bench.sh` (`DURATION=5s CONNECTIONS=32 THREADS=4 DB_DELAY_MS=10 ./bench/cache/run_bench.sh`).
+
+---
+
 **Newly Added**: 
 * **Embeddable Library Crate & `cli` Feature Gate (`v0.5.4`)**: Decoupled listener/lifecycle orchestration (`praeco_rs::runner`) and stream-generic Tower stack assembly (`praeco_rs::stack`) from the CLI binary (`src/server.rs`). External Rust applications can depend on `praeco-rs = { version = "0.5.4", default-features = false }` without pulling in `mimalloc`, `tracing-subscriber`, or OTLP exporters, and run full gateway pipelines over TCP, QUIC, Yamux tunnels, or in-memory `tokio::io::duplex` streams.
 * **Built-in Admin & Telemetry Service (`Admin`)**: Dedicated `service = "Admin"` listener or router-mounted `backend_type = "admin"` exposing `/healthz` (`/health`), `/status`, `/upstreams`, and Prometheus `/metrics` (with strict label escaping against exposition format injection) with strict `404` routing, per-layer security block counters, circuit-breaker telemetry, response latency EMA, and X.509 certificate / CRL expiration monitoring. Unauthenticated standalone `Admin` listeners are enforced loopback-only and read-only (`POST ?action=...` returns `403`), `backend_type = "admin"` requires authentication or explicit RBAC, and `POST` control actions enforce fail-closed `Sec-Fetch-Site` and `Origin` anti-CSRF checks plus `admin::audit` logging.
