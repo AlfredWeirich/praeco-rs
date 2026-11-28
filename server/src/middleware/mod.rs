@@ -42,6 +42,9 @@ pub mod cache;
 /// Optional L2 response cache backend abstractions, `PRC2` wire codec, and test cluster.
 #[cfg(feature = "cache-l2-dragonfly")]
 pub mod cache_l2;
+/// Supervised Dragonfly/Redis L2 backend powered by `otp-actor`.
+#[cfg(feature = "cache-l2-dragonfly")]
+pub mod cache_l2_dragonfly;
 /// Gzip / Brotli response compression and request decompression.
 pub mod compression;
 /// Atomic request counter with periodic log output.
@@ -92,6 +95,8 @@ pub use cache_l2::{
     L2InvalidationEvent, L2LookupOutcome, L2StatusSnapshot, L2WireError, L2WriteBudget,
     L2WritePermit,
 };
+#[cfg(feature = "cache-l2-dragonfly")]
+pub use cache_l2_dragonfly::{DragonflyL2Backend, DragonflyL2Error};
 pub use counter::CountingLayer;
 pub use delay::DelayLayer;
 pub use echo::EchoService;
