@@ -1,7 +1,7 @@
 # L2-Response-Cache-Konzept: Dragonfly + `otp-actor` für `praeco-rs`
 
-**Stand:** 27.11.2026  
-**Status:** In Umsetzung auf Branch `feat/l2-cache-dragonfly` (**Schritte 1–3 abgeschlossen**)  
+**Stand:** 28.11.2026  
+**Status:** In Umsetzung auf Branch `feat/l2-cache-dragonfly` (**Schritte 1–4 abgeschlossen**)  
 **Bezug:**  
 - L1-Implementierung: [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs)  
 - Konfiguration & Metriken: [server/src/configuration/mod.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/configuration/mod.rs)  
@@ -17,15 +17,15 @@ Bevor Code geschrieben wird, wurde der erste L2-Entwurf systematisch gegen die r
 
 | ID | Kategorie | Schweregrad | Status | Kurztitel | Betroffene Stelle / Ursache | Lösung im finalen Konzept |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **K-01** | Korrektheit / RAM | **KRITISCH** | Offen (Schritt 4/5) | Lokale Generationen im L2-Key verursachen Split-Brain, Stale-Reads & Zombie-Keys | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L598-L605) (`current_generation`) | Generationsfreier L2-Slot-Key + kanonische Remote-Generation im Wire-Header + 1-RTT-Verifikation |
-| **K-02** | Korrektheit / Plattform | **KRITISCH** | **Teilweise behoben (Schritt 3, 27.11.2026)** | `Instant::now() - age` Underflow & falsche L1-Expiry nach L2-Backfill | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L448-L450), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1442) | `initial_age: Duration` auf `CachedResponse` & `Age`-Berechnung umgesetzt; Einbindung in `coalesce_and_execute` folgt in Schritt 4 |
+| **K-01** | Korrektheit / RAM | **KRITISCH** | **Teilweise behoben (Schritte 3–4, 28.11.2026)** | Lokale Generationen im L2-Key verursachen Split-Brain, Stale-Reads & Zombie-Keys | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L598-L605) (`current_generation`) | Slot-Key, `expected_remote_gen`-Übergabe & Read-Prüfung aktiv; echte Dragonfly-1-RTT-Pipeline folgt in Schritt 5 |
+| **K-02** | Korrektheit / Plattform | **KRITISCH** | **Behoben (Schritte 3–4, 28.11.2026)** | `Instant::now() - age` Underflow & falsche L1-Expiry nach L2-Backfill | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L448-L450), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1442) | `initial_age: Duration` auf `CachedResponse` + Backfill mit `l1_max_ttl` im Flow integriert & getestet |
 | **K-03** | Latenz / Availability | **HOCH** | Offen (Schritt 5) | `ResourceClient::get()` blockiert im Kaltstart/Reconnect über die Mailbox | [generic_actor.rs](file:///Users/fredi/Data/Projekte/Rust/261102_actor/src/actor/generic_actor.rs#L1994-L2022) | Lock-freie 0-ns Vorabprüfung über [`ResourceClient::cache_state()`](file:///Users/fredi/Data/Projekte/Rust/261102_actor/src/actor/generic_actor.rs#L2042-L2047) |
 | **K-04** | Build / TLS | **HOCH** | **Behoben (Schritt 1, 27.11.2026)** | `redis`-TLS-Feature kann `ring` neben `aws-lc-rs` einschleppen | [Cargo.toml](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/Cargo.toml#L62), [deny.toml](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/deny.toml) | `redis 1.8.3` mit `tokio-rustls-comp` + `tls-rustls-webpki-roots`; `cargo tree` bestätigt reines `aws-lc-rs` ohne `ring` |
-| **K-05** | Sicherheit (`S-02`) | **HOCH** | **Teilweise behoben (Schritt 3, 27.11.2026)** | Verkürzter 64-Bit-Namespace-Hash & fehlende `Vary`/`max_entry_bytes`-Revalidierung bei L2-HIT | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1568-L1593) | 256-Bit-`ns_tag` + `max_entry_bytes`-Check in `decode_wire_v1` umgesetzt; `Vary`-Revalidierung im Flow folgt in Schritt 4 |
+| **K-05** | Sicherheit (`S-02`) | **HOCH** | **Behoben (Schritte 3–4, 28.11.2026)** | Verkürzter 64-Bit-Namespace-Hash & fehlende `Vary`/`max_entry_bytes`-Revalidierung bei L2-HIT | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1568-L1593) | 256-Bit-`ns_tag` + `l2_entry_passes_local_policy` (`Vary`, `max_entry_bytes`, `Cache-Control`) aktiv & getestet |
 | **K-06** | Speicher / DoS | **MITTEL-HOCH** | **Teilweise behoben (Schritte 2–3, 27.11.2026)** | Unbegrenztes Byte-Volumen in `L2WriterActor`-Mailbox & bei großen L2-Reads | `write_queue_capacity = 1024` × `1 MiB` = `1 GiB` | Config-Defaults, `L2WriteBudget`, `MAX_WIRE_HEADER_OVERHEAD` & Zip-Bomb-Guard umgesetzt; Dragonfly-Integration in Schritt 5 |
-| **K-07** | Korrektheit / DoS | **MITTEL** | Offen (Schritt 4/5) | `fetch_max` auf lokaler Generation bricht nach Dragonfly-Restart; Pub/Sub-`DashMap`-DoS | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L560), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L662-L675) | Strikte Trennung: lokale `fetch_add(1)`-Epoche vs. `last_remote_gens` im `L2InvalidationActor` |
-| **K-08** | Performance / Protokoll | **MITTEL** | Offen (Schritt 4) | Fehlender L1-Double-Check im `Singleflight`-Leader & ungenutztes L2 bei `HEAD` | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L2225), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L2656) | L1-Double-Check zu Leader-Beginn; Read-Only-L2-Lookup für `HEAD` ohne L2-Write |
-| **K-09** | Performance / Stabilität | **NIEDRIG-MITTEL** | Offen (Schritt 4) | Eviction-Churn bei winzigen Rest-TTLs & konsequente Einhaltung von `CacheBypass` | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1605-L1625) | `MIN_L2_HIT_REMAINING_TTL` (`100 ms`), `MIN_L2_WRITE_TTL` (`500 ms`), harte Bypass-Guards |
+| **K-07** | Korrektheit / DoS | **MITTEL** | **Teilweise behoben (Schritt 4, 28.11.2026)** | `fetch_max` auf lokaler Generation bricht nach Dragonfly-Restart; Pub/Sub-`DashMap`-DoS | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L560), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L662-L675) | Lokale `fetch_add(1)`-Epoche (`invalidate_*_local`) entkoppelt & gegen Restart getestet; `L2InvalidationActor` folgt in Schritt 5 |
+| **K-08** | Performance / Protokoll | **MITTEL** | **Behoben (Schritt 4, 28.11.2026)** | Fehlender L1-Double-Check im `Singleflight`-Leader & ungenutztes L2 bei `HEAD` | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L2225), [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L2656) | L1-Double-Check (`CachedL1`) & Read-Only-L2-Lookup für `HEAD` ohne L2-Write aktiv & getestet |
+| **K-09** | Performance / Stabilität | **NIEDRIG-MITTEL** | **Behoben (Schritte 3–4, 28.11.2026)** | Eviction-Churn bei winzigen Rest-TTLs & konsequente Einhaltung von `CacheBypass` | [cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L1605-L1625) | `MIN_L2_HIT_REMAINING_TTL` (`100 ms`), `MIN_L2_WRITE_TTL` (`500 ms`), Bypass- & `PerSubject`-Guards aktiv & getestet |
 | **K-10** | Sicherheit / Codequalität | **NIEDRIG-MITTEL** | **Teilweise behoben (Schritt 2, 27.11.2026)** | Klartext-Passwörter in Redis-URLs & projektweites `deny(unwrap_used, expect_used)` | [server/src/lib.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/lib.rs#L1) | Inline-Passwort in `L2CacheConfig::validate()` verboten, redaktiertes `Debug` + `redacted_url()`, 0 `unwrap`/`expect`; `/status`-Redaktion folgt in Schritt 7 |
 
 ### Detailanalyse der kritischen Befunde
@@ -101,6 +101,7 @@ Bevor Code geschrieben wird, wurde der erste L2-Entwurf systematisch gegen die r
 4. **Zero-Trust Scope-Isolation:** `CacheScope::PerSubject` und `CacheScope::PerRole` schreiben **niemals** standardmäßig nach L2 (`l2 = false` Default); nur `CacheScope::Public` nutzt L2 ohne explizites Opt-in.
 5. **Kein unbegrenztes Buffering (OOM-Schutz):** Bounded Mailbox (`write_queue_capacity`) **plus** atomares `L2WriteBudget` (`max_write_queue_bytes`).
 6. **Kein `unwrap()`/`expect()` im Produktionscode:** Alle neuen Module folgen den Workspace-Lints und `thiserror`-Fehlertypen.
+7. **Striktes Feature-Gate:** Im Default-Build existiert ausschließlich das TOML-Konfigurationsschema (`L2CacheConfig`, `CacheRuleConfig::l2`, `CompiledCacheRule::allows_l2` inkl. Feature-Gate-Prüfung in `validate()`). Der gesamte L2-Runtime-Code (`cache_l2.rs`, `cache_l2_dragonfly.rs` sowie alle L2-Felder und -Hooks in `cache.rs`, `admin.rs` und `server.rs`) kompiliert ausschließlich mit `--features cache-l2-dragonfly`.
 
 ---
 
@@ -408,9 +409,9 @@ l2 = true   # Optional<bool>: Default = true für `public`, false für `per_role
 - `L2CacheConfig::validate()` prüft URL-Schema, verbietet Inline-Passwörter (auch bei `enabled = false`), validiert Password-/TLS-Paarungen, `key_prefix`, Bounds `> 0` (`compress_min_bytes = 0` erlaubt) und erzwingt das `cache-l2-dragonfly` Feature-Gate.
 - **Verifiziert:** Unit-Tests (`test_l2_cache_config_*`, `test_cache_rule_allows_l2_*`), `cargo check` und `cargo clippy -- -D warnings` (mit und ohne Feature `cache-l2-dragonfly`) grün.
 
-### Schritt 3: `L2CacheBackend`-Trait, `PRC2`-Codec, `L2WriteBudget` & `InMemoryL2Backend` — ✅ Abgeschlossen (27.11.2026)
-- **Dateien:** [server/src/middleware/cache_l2.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache_l2.rs) (neu), [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs), [server/src/middleware/mod.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/mod.rs)
-- Implementiert:
+### Schritt 3: `L2CacheBackend`-Trait, `PRC2`-Codec, `L2WriteBudget` & `InMemoryL2Backend` — ✅ Abgeschlossen (27./28.11.2026)
+- **Dateien:** [server/src/middleware/cache_l2.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache_l2.rs) (neu, `#[cfg(feature = "cache-l2-dragonfly")]`), [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs), [server/src/middleware/mod.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/mod.rs)
+- Implementiert (strikt hinter `#[cfg(feature = "cache-l2-dragonfly")]` nach Option B):
   - `L2CacheBackend`-Trait (`get`, `enqueue_set`, `enqueue_invalidate_namespace`, `enqueue_invalidate_all`, `status_snapshot`, `shutdown`).
   - `encode_l2_entry_key` (generationsfrei mit vollem 256-Bit `ns_tag`, `K-01`/`K-05`), `encode_wire_v1` / `decode_wire_v1` (`PRC2`, Zero-Copy `Bytes::slice`, gRPC-Trailers, `async-compression` `gzip`/`brotli` + `OnceCell`-Reuse & `.take(uncompressed_len + 1)` Zip-Bomb-Guard).
   - `CachedResponse::initial_age` & `from_l2_parts` (`K-02`, `G-02`).
@@ -418,22 +419,14 @@ l2 = true   # Optional<bool>: Default = true für `public`, false für `per_role
   - `InMemoryL2Cluster` / `InMemoryL2Backend` mit konfigurierbarer Latenz, Fehler-Injektion, `simulate_dragonfly_restart()` und Multi-Node-Pub/Sub-Simulation.
 - **Verifiziert:** 7 neue Unit-Tests (`middleware::cache_l2::tests::*`), L1-Regression, `cargo check` und `cargo clippy -- -D warnings` (Default & `--features cache-l2-dragonfly`) grün.
 
-### Schritt 4: Integration in `SharedResponseCache` & `coalesce_and_execute` (`K-01`, `K-02`, `K-05`, `K-08`, `K-09`)
-- **Dateien:** [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs)
-- `CachedResponse` um `initial_age: Duration` erweitern (`K-02`).
-- `SharedResponseCache` um `l2: Option<Arc<dyn L2CacheBackend>>` sowie `invalidate_namespace_local` / `invalidate_all_local` (ohne L2-Echo) erweitern.
-- In [`coalesce_and_execute`](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs#L2191-L2341):
-  - L1-Double-Check zu Leader-Beginn (`K-08`).
-  - L2-Lookup + Revalidierung (`max_entry_bytes`, `response_vary_is_cacheable`, `K-05`) + L1-Backfill (`l1_max_ttl`).
-  - `SingleflightOutcome::CachedL2` → `HIT-L2` / `COALESCED`.
-  - `enqueue_set` nur bei `insert_if_generation == true`, `allows_l2()`, `ttl >= 500 ms` und fehlendem `CacheBypass`.
-- In `CacheService::call`: `HEAD`-Read-Only-L2-Pfad (`K-08`).
-- **Abnahme-Gate:** Multi-Node-Tests mit `InMemoryL2Backend`:
-  - Node A schreibt → Node B (kalter L1, lokale Gen `0`) liest `HIT-L2` → 2. Request auf Node B ist `HIT`.
-  - 50 parallele Misses → genau 1 L2-GET (`Singleflight`).
-  - `K-01` Race/Stale-Test & `K-07` Dragonfly-Restart-Simulation (Remote-Gen fällt von `10` auf `1`).
-  - `K-05` unterschiedliches `Vary` / `max_entry_bytes` auf Node B → L2-Eintrag wird sicher verworfen.
-  - `PerSubject` ohne `l2 = true` berührt L2 nicht.
+### Schritt 4: Integration in `SharedResponseCache` & `coalesce_and_execute` (`K-01`, `K-02`, `K-05`, `K-08`, `K-09`) — ✅ Abgeschlossen (28.11.2026)
+- **Dateien:** [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs), [server/src/configuration/mod.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/configuration/mod.rs)
+- Implementiert (strikt hinter `#[cfg(feature = "cache-l2-dragonfly")]`):
+  - `ServerMetrics::cache_l2_hits` / `cache_l2_misses` / `cache_l2_errors` + `inc_cache_l2_*`.
+  - `SharedResponseCache`: `l2`, `new_with_l2_factory`, `with_l2_backend`, `l2_backend`, `invalidate_all_local` / `invalidate_namespace_local`, clusterweite Weiterleitung in `invalidate_*` sowie `l2`-Erhalt in `configure_global_response_cache`.
+  - `coalesce_and_execute`: L1-Double-Check (`CachedL1`), L2-Lookup + `l2_entry_passes_local_policy` (`Vary`, `max_entry_bytes`, `Cache-Control`, `K-05`), L1-Backfill mit `l1_max_ttl` & `initial_age`, `CachedL2` → `HIT-L2` / `COALESCED`, non-blocking `enqueue_set` (`ttl >= 500 ms`, `allows_l2()`, ohne `CacheBypass`).
+  - `CacheService::call`: `HEAD`-Read-Only-L2-Pfad (`K-08`).
+- **Verifiziert:** 5 neue Multi-Node-Tests (`middleware::cache::tests::l2_integration_tests::*`), vollständige L1-Suite sowie `cargo check` / `cargo clippy -- -D warnings` (Default & `--features cache-l2-dragonfly`) grün.
 
 ### Schritt 5: `DragonflyL2Backend` auf `otp-actor` (`K-03`, `K-04`, `K-06`, `K-07`)
 - **Dateien:** `server/src/middleware/cache_l2_dragonfly.rs` (neu, `#[cfg(feature = "cache-l2-dragonfly")]`)
@@ -473,11 +466,11 @@ Die Tests folgen exakt der bestehenden Teststruktur von `praeco-rs`: schnelle, d
 | Test-Ebene | Ort / Datei | Feature / Trigger | Externe Abhängigkeit | Schwerpunkt & abgedeckte Findings |
 | :--- | :--- | :--- | :--- | :--- |
 | **Config & Schema** | [server/src/configuration/tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/configuration/tests.rs) | Default **&** `cache-l2-dragonfly` | Keine | `[cache.l2]`-Parsing, Defaults, Feature-Gate, Secret-Hygiene (`K-06`, `K-10`) |
-| **Codec, Budget & CB** | `server/src/middleware/cache_l2.rs` (`#[cfg(test)]`) | Default (immer aktiv) | Keine | `PRC2`-Wire-Codec, `async-compression` Zip-Bomb-Guard, `L2WriteBudget`, `L2CircuitBreaker` (`K-05`, `K-06`) |
-| **L1+L2 Verbund & Multi-Node** | [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs) (`#[cfg(test)]`) | Default (über `InMemoryL2Backend`) | Keine | Singleflight, `HIT-L2`, `initial_age`, `HEAD`/`POST`, Cold-Start, Restart-Resync, `SIGHUP` (`K-01`, `K-02`, `K-05`, `K-07`–`K-09`) |
-| **Dragonfly-Actors & Chaos** | `server/src/middleware/cache_l2_dragonfly.rs` (`#[cfg(test)]`) | `cache-l2-dragonfly` (+ `chaos_test`) | Keine (Mock/Loopback) | `cache_state()`-0-ns-Fast-Fail, Writer-Batching/Drain, `ActorScope`-Cancel, Supervisor-Crash-Recovery (`K-03`, `K-04`, `K-06`, `K-07`) |
+| **Codec, Budget & CB** | `server/src/middleware/cache_l2.rs` (`#[cfg(test)]`) | `cache-l2-dragonfly` | Keine | `PRC2`-Wire-Codec, `async-compression` Zip-Bomb-Guard, `L2WriteBudget`, `L2CircuitBreaker` (`K-05`, `K-06`) |
+| **L1+L2 Verbund & Multi-Node** | [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs) (`#[cfg(all(test, feature = "cache-l2-dragonfly"))]`) | `cache-l2-dragonfly` (über `InMemoryL2Backend`) | Keine | Singleflight, `HIT-L2`, `initial_age`, `HEAD`/`POST`, Cold-Start, Restart-Resync, `SIGHUP` (`K-01`, `K-02`, `K-05`, `K-07`–`K-09`) |
+| **Dragonfly-Actors & Chaos** | `server/src/middleware/cache_l2_dragonfly.rs` (`#[cfg(test)]`) | `cache-l2-dragonfly` (+ `cache-l2-chaos`) | Keine (Mock/Loopback) | `cache_state()`-0-ns-Fast-Fail, Writer-Batching/Drain, `ActorScope`-Cancel, Supervisor-Crash-Recovery (`K-03`, `K-04`, `K-06`, `K-07`) |
 | **Admin `/status` & `/metrics`** | [server/src/middleware/admin.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/admin.rs) (`#[cfg(test)]`) | Default **&** `cache-l2-dragonfly` | Keine | `.cache.l2` JSON, Prometheus-Metriken, `purge_cache`-Cluster-Trigger, Secret-Redaktion (`K-10`) |
-| **Full-Stack Duplex** | [server/tests/integration_tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/tests/integration_tests.rs) | Default (über `InMemoryL2Backend`) | Keine (`tokio::io::duplex`) | Kompletter Tower-Stack (`Compression` + `Cache` + `Router`) inkl. HTTP/1.1, H2, `grpc-web` & Unary-gRPC |
+| **Full-Stack Duplex** | [server/tests/integration_tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/tests/integration_tests.rs) | `cache-l2-dragonfly` (über `InMemoryL2Backend`) | Keine (`tokio::io::duplex`) | Kompletter Tower-Stack (`Compression` + `Cache` + `Router`) inkl. HTTP/1.1, H2, `grpc-web` & Unary-gRPC |
 | **Dragonfly E2E & Chaos** | `server/tests/e2e_l2_dragonfly_tests.rs` (neu, analog zu [e2e_relay_tunnel_tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/tests/e2e_relay_tunnel_tests.rs)) | `cache-l2-dragonfly` + `--ignored` | Lokales Dragonfly | Multi-Node-Sharing, TLS/mTLS (`TestPki`), Live-Pub/Sub, Dragonfly-Neustart unter Last |
 
 ---
@@ -505,7 +498,7 @@ Die Tests folgen exakt der bestehenden Teststruktur von `praeco-rs`: schnelle, d
 - **`L2WriteBudget` (`K-06`):** Atomare Reservierung, Ablehnung über `max_write_queue_bytes`, RAII-Freigabe bei `Drop` und Konkurrenz-Test unter parallelen Tasks.
 - **`L2CircuitBreaker`:** Zustandsübergänge `Closed → Open` (ab `cb_failure_threshold`), `Open → HalfOpen` (nach `cb_open_seconds`), `HalfOpen → Closed` bei Probe-Erfolg, `HalfOpen → Open` bei Probe-Fehler.
 
-### 10.3 [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs) (`#[cfg(test)]`) — L1+L2-Verbund, Multi-Node & `SIGHUP`
+### 10.3 [server/src/middleware/cache.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/src/middleware/cache.rs) (`#[cfg(all(test, feature = "cache-l2-dragonfly"))]`) — L1+L2-Verbund, Multi-Node & `SIGHUP`
 Alle Tests nutzen `InMemoryL2Backend` (vollständig deterministisch, ohne Netzwerk/Flakiness):
 - **Grundfluss:** L1-Miss → L2-HIT (`x-praeco-cache: HIT-L2`) → L1-Backfill → zweiter Request ist synchroner L1-`HIT`.
 - **Cold-Start & Write-Race (`K-01`):**
@@ -541,7 +534,7 @@ Alle Tests nutzen `InMemoryL2Backend` (vollständig deterministisch, ohne Netzwe
 - **Prometheus `/metrics`:** Prüft `praeco_server_cache_requests_total{server,outcome="hit_l2"}`, `praeco_cache_l2_state`, `praeco_cache_l2_writer_queue_len`, `praeco_cache_l2_writer_queue_capacity`, `praeco_cache_l2_writer_queue_bytes`, `praeco_cache_l2_writes_dropped_total` und `praeco_cache_l2_invalidation_connected`.
 - **Cluster-Purge:** `POST /status?action=purge_cache` (global sowie `&namespace=<ns>`) invalidiert L1 und delegiert zusätzlich an `L2CacheBackend::enqueue_invalidate_all` / `enqueue_invalidate_namespace`.
 
-### 10.6 [server/tests/integration_tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/tests/integration_tests.rs) — Full-Stack über `tokio::io::duplex`
+### 10.6 [server/tests/integration_tests.rs](file:///Users/fredi/Data/Projekte/Rust/260225_Tower_Hyper_Rustls_refactor_client_gprc/server/tests/integration_tests.rs) (`#[cfg(feature = "cache-l2-dragonfly")]`) — Full-Stack über `tokio::io::duplex`
 - Vollständige Middleware-Kette (`Compression` + `Cache` + `Router`) mit geteiltem `InMemoryL2Backend`:
   - HTTP/1.1 & HTTP/2 `Accept-Encoding: gzip` / `br` über zwei Server-Instanzen (verifiziert Zero-Copy-`OnceCell`-Warmup und korrekte `Content-Encoding`/`Vary`-Header).
   - Unary-gRPC & `grpc-web` über L2 mit korrektem Trailer-Replay (`grpc-status: 0`) ohne unerlaubte HTTP-Kompression.
@@ -575,5 +568,5 @@ PRAECO_TEST_DRAGONFLY_URL=redis://127.0.0.1:6379 \
 
 ## Festgelegte Design-Entscheidungen
 1. **`otp-actor`-Quelle:** Einbindung über **crates.io** (`otp-actor = { version = "0.4.3", default-features = false }`).
-2. **Feature-Flag `cache-l2-dragonfly`:** Bleibt strikt **opt-in (nicht in `default`)**; Standard-Builds bleiben ohne zusätzliche Dependencies.
+2. **Feature-Flag `cache-l2-dragonfly` (Option B — striktes Feature-Gate):** Bleibt strikt **opt-in (nicht in `default`)**. Im Default-Build kompiliert ausschließlich das TOML-Konfigurationsschema (`L2CacheConfig`, `CacheRuleConfig::l2`, Feature-Gate-Prüfung in `validate()`); sämtlicher L2-Runtime-Code (`cache_l2.rs`, `cache_l2_dragonfly.rs` sowie alle L2-Felder/-Hooks in `cache.rs`, `admin.rs`, `server.rs`) liegt strikt hinter `#[cfg(feature = "cache-l2-dragonfly")]`.
 3. **L2-Payload-Kompression:** Nutzt das bereits vorhandene `async-compression` (`gzip` / `brotli`, inkl. Zero-Copy-Reuse von `OnceCell`).

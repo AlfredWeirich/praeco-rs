@@ -40,6 +40,7 @@ pub mod alt_svc;
 /// Process-wide W-TinyLFU HTTP response cache and cancellation-safe Singleflight.
 pub mod cache;
 /// Optional L2 response cache backend abstractions, `PRC2` wire codec, and test cluster.
+#[cfg(feature = "cache-l2-dragonfly")]
 pub mod cache_l2;
 /// Gzip / Brotli response compression and request decompression.
 pub mod compression;
@@ -85,6 +86,7 @@ pub use cache::{
     CacheBypass, CacheLayer, CacheService, CachedResponse, FlightAborted, SharedResponseCache,
     Singleflight, configure_global_response_cache, global_response_cache,
 };
+#[cfg(feature = "cache-l2-dragonfly")]
 pub use cache_l2::{
     InMemoryL2Backend, InMemoryL2Cluster, L2CacheBackend, L2CircuitBreaker, L2CircuitState,
     L2InvalidationEvent, L2LookupOutcome, L2StatusSnapshot, L2WireError, L2WriteBudget,

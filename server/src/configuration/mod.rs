@@ -417,6 +417,15 @@ pub struct ServerMetrics {
     pub cache_bypasses: std::sync::atomic::AtomicU64,
     /// Declarative cache namespace invalidation events triggered by successful mutations on this server.
     pub cache_invalidations: std::sync::atomic::AtomicU64,
+    /// Cache hits served from the optional L2 (Dragonfly/Redis) tier.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub cache_l2_hits: std::sync::atomic::AtomicU64,
+    /// Cache misses observed when probing the optional L2 tier.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub cache_l2_misses: std::sync::atomic::AtomicU64,
+    /// L2 read/circuit-breaker failures handled fail-open.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub cache_l2_errors: std::sync::atomic::AtomicU64,
     /// Packed microsecond EMA state distinguishing uninitialized from 0 ms (`Q2-08`).
     ema_state: EmaState,
 }
@@ -537,6 +546,33 @@ impl ServerMetrics {
     pub fn inc_cache_invalidation(server_name: &str) {
         Self::for_server(server_name)
             .cache_invalidations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the L2 cache hit counter for `server_name`.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    #[inline]
+    pub fn inc_cache_l2_hit(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_l2_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the L2 cache miss counter for `server_name`.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    #[inline]
+    pub fn inc_cache_l2_miss(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_l2_misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Increments the L2 fail-open error/unavailable counter for `server_name`.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    #[inline]
+    pub fn inc_cache_l2_error(server_name: &str) {
+        Self::for_server(server_name)
+            .cache_l2_errors
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 

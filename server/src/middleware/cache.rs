@@ -447,6 +447,7 @@ pub struct CachedResponse {
     /// Monotonic timestamp when the entry was inserted into the local L1 cache.
     pub stored_at: Instant,
     /// Accumulated upstream/L2 age prior to insertion into the local L1 cache.
+    #[cfg(feature = "cache-l2-dragonfly")]
     pub initial_age: Duration,
     /// Effective time-to-live for this entry in the local L1 cache.
     pub ttl: Duration,
@@ -488,12 +489,14 @@ impl CachedResponse {
             compressed_br: Arc::new(OnceCell::new()),
             trailers,
             stored_at: Instant::now(),
+            #[cfg(feature = "cache-l2-dragonfly")]
             initial_age: Duration::ZERO,
             ttl,
             byte_weight,
         }
     }
 
+    #[cfg(feature = "cache-l2-dragonfly")]
     #[inline]
     pub(crate) fn peek_precompressed_gzip(&self) -> Option<Bytes> {
         self.compressed_gzip
@@ -502,6 +505,7 @@ impl CachedResponse {
             .map(|v| v.body.clone())
     }
 
+    #[cfg(feature = "cache-l2-dragonfly")]
     #[inline]
     pub(crate) fn peek_precompressed_br(&self) -> Option<Bytes> {
         self.compressed_br
@@ -512,6 +516,7 @@ impl CachedResponse {
 
     /// Reconstructs a [`CachedResponse`] from decoded L2 wire parts, keeping `stored_at` at
     /// `Instant::now()` while preserving `initial_age` and zero-copy precompressed variants when eligible.
+    #[cfg(feature = "cache-l2-dragonfly")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_l2_parts(
         status: StatusCode,
@@ -552,7 +557,7 @@ impl CachedResponse {
         entry
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-l2-dragonfly"))]
     pub(crate) fn new_for_test(
         status: StatusCode,
         headers: HeaderMap,
@@ -563,14 +568,14 @@ impl CachedResponse {
         Self::new(status, headers, body, trailers, ttl)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-l2-dragonfly"))]
     pub(crate) async fn ensure_gzip_for_test(&self) -> bool {
         self.ensure_precompressed(PrecompressAlgo::Gzip)
             .await
             .is_some()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cache-l2-dragonfly"))]
     pub(crate) async fn ensure_br_for_test(&self) -> bool {
         self.ensure_precompressed(PrecompressAlgo::Brotli)
             .await
@@ -635,6 +640,9 @@ impl Expiry<CacheKey, Arc<CachedResponse>> for PerEntryExpiry {
 /// Outcome broadcast over [`Singleflight`] for a cacheable miss.
 #[derive(Clone)]
 enum SingleflightOutcome {
+    CachedL1(Arc<CachedResponse>),
+    #[cfg(feature = "cache-l2-dragonfly")]
+    CachedL2(Arc<CachedResponse>),
     Cached(Arc<CachedResponse>),
     Bypass,
     UpstreamError(String),
@@ -645,6 +653,26 @@ enum SingleflightOutcome {
 /// unbounded `DashMap` growth from arbitrary admin `?namespace=...` queries.
 const MAX_TRACKED_NAMESPACES: usize = 4096;
 
+#[inline]
+fn invalidate_namespace_in_maps(
+    namespace: &str,
+    namespace_generations: &DashMap<String, AtomicU64>,
+    global_generation: &AtomicU64,
+) {
+    if let Some(counter) = namespace_generations.get(namespace) {
+        counter.fetch_add(1, Ordering::AcqRel);
+        return;
+    }
+    if namespace_generations.len() < MAX_TRACKED_NAMESPACES {
+        namespace_generations
+            .entry(namespace.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::AcqRel);
+    } else {
+        global_generation.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// Process-wide W-TinyLFU HTTP & gRPC response cache shared across all `[[Server]]` instances.
 pub struct SharedResponseCache {
     store: Cache<CacheKey, Arc<CachedResponse>>,
@@ -652,6 +680,8 @@ pub struct SharedResponseCache {
     global_generation: Arc<AtomicU64>,
     namespace_generations: Arc<DashMap<String, AtomicU64>>,
     config: GlobalCacheConfig,
+    #[cfg(feature = "cache-l2-dragonfly")]
+    l2: Option<Arc<dyn crate::middleware::cache_l2::L2CacheBackend>>,
 }
 
 impl SharedResponseCache {
@@ -664,7 +694,74 @@ impl SharedResponseCache {
             global_generation: Arc::new(AtomicU64::new(0)),
             namespace_generations: Arc::new(DashMap::new()),
             config,
+            #[cfg(feature = "cache-l2-dragonfly")]
+            l2: None,
         })
+    }
+
+    /// Creates a new [`SharedResponseCache`] wired to an L2 backend produced by `build_l2`.
+    ///
+    /// Supplies an invalidation callback bound directly to the underlying local generation fences
+    /// and Moka store, avoiding `Arc` reference cycles and remaining valid across `SIGHUP` reloads.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub fn new_with_l2_factory<F>(config: GlobalCacheConfig, build_l2: F) -> Arc<Self>
+    where
+        F: FnOnce(
+            Arc<dyn Fn(crate::middleware::cache_l2::L2InvalidationEvent) + Send + Sync>,
+        ) -> Arc<dyn crate::middleware::cache_l2::L2CacheBackend>,
+    {
+        let store = Self::build_store(config.max_bytes);
+        let global_generation = Arc::new(AtomicU64::new(0));
+        let namespace_generations = Arc::new(DashMap::new());
+
+        let store_cb = store.clone();
+        let global_cb = Arc::clone(&global_generation);
+        let ns_cb = Arc::clone(&namespace_generations);
+        let on_invalidation: Arc<
+            dyn Fn(crate::middleware::cache_l2::L2InvalidationEvent) + Send + Sync,
+        > = Arc::new(move |ev| match ev {
+            crate::middleware::cache_l2::L2InvalidationEvent::All => {
+                global_cb.fetch_add(1, Ordering::AcqRel);
+                store_cb.invalidate_all();
+            }
+            crate::middleware::cache_l2::L2InvalidationEvent::Namespace(ns) => {
+                invalidate_namespace_in_maps(&ns, &ns_cb, &global_cb);
+            }
+        });
+
+        let l2 = build_l2(on_invalidation);
+        Arc::new(Self {
+            store,
+            singleflight: Singleflight::new(),
+            global_generation,
+            namespace_generations,
+            config,
+            l2: Some(l2),
+        })
+    }
+
+    /// Returns a cloned [`SharedResponseCache`] sharing the existing L1 store and generation
+    /// fences while replacing the attached L2 backend handle.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub fn with_l2_backend(
+        &self,
+        l2: Option<Arc<dyn crate::middleware::cache_l2::L2CacheBackend>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store: self.store.clone(),
+            singleflight: self.singleflight.clone(),
+            global_generation: Arc::clone(&self.global_generation),
+            namespace_generations: Arc::clone(&self.namespace_generations),
+            config: self.config.clone(),
+            l2,
+        })
+    }
+
+    /// Returns the attached L2 cache backend, if configured and active.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    #[inline]
+    pub fn l2_backend(&self) -> Option<&Arc<dyn crate::middleware::cache_l2::L2CacheBackend>> {
+        self.l2.as_ref()
     }
 
     fn build_store(max_bytes: u64) -> Cache<CacheKey, Arc<CachedResponse>> {
@@ -733,30 +830,50 @@ impl SharedResponseCache {
         true
     }
 
-    /// Discards all cached entries across all namespaces and advances the global generation fence.
-    pub fn invalidate_all(&self) {
+    /// Discards all local L1 cached entries without broadcasting to L2.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub fn invalidate_all_local(&self) {
         self.global_generation.fetch_add(1, Ordering::AcqRel);
         self.store.invalidate_all();
     }
 
-    /// Discards all cached entries belonging to `namespace` in O(1) by advancing its generation fence.
+    /// Discards local L1 cached entries for `namespace` without broadcasting to L2.
+    #[cfg(feature = "cache-l2-dragonfly")]
+    pub fn invalidate_namespace_local(&self, namespace: &str) {
+        invalidate_namespace_in_maps(
+            namespace,
+            &self.namespace_generations,
+            &self.global_generation,
+        );
+    }
+
+    /// Discards all cached entries across all namespaces and advances the global generation fence
+    /// (propagating cluster-wide when L2 is attached).
+    pub fn invalidate_all(&self) {
+        self.global_generation.fetch_add(1, Ordering::AcqRel);
+        self.store.invalidate_all();
+        #[cfg(feature = "cache-l2-dragonfly")]
+        if let Some(ref l2) = self.l2 {
+            l2.enqueue_invalidate_all();
+        }
+    }
+
+    /// Discards all cached entries belonging to `namespace` in O(1) by advancing its generation fence
+    /// (propagating cluster-wide when L2 is attached).
     ///
     /// Because `(global_generation, namespace_generation)` is embedded directly in [`CacheKey`],
     /// bumping the atomic counter immediately obsoletes all cached keys for `namespace` without
     /// registering a Moka predicate closure on reads. Caps tracked namespaces at
     /// [`MAX_TRACKED_NAMESPACES`]; overflow namespaces bump `global_generation` instead.
     pub fn invalidate_namespace(&self, namespace: &str) {
-        if let Some(counter) = self.namespace_generations.get(namespace) {
-            counter.fetch_add(1, Ordering::AcqRel);
-            return;
-        }
-        if self.namespace_generations.len() < MAX_TRACKED_NAMESPACES {
-            self.namespace_generations
-                .entry(namespace.to_string())
-                .or_insert_with(|| AtomicU64::new(0))
-                .fetch_add(1, Ordering::AcqRel);
-        } else {
-            self.global_generation.fetch_add(1, Ordering::AcqRel);
+        invalidate_namespace_in_maps(
+            namespace,
+            &self.namespace_generations,
+            &self.global_generation,
+        );
+        #[cfg(feature = "cache-l2-dragonfly")]
+        if let Some(ref l2) = self.l2 {
+            l2.enqueue_invalidate_namespace(namespace);
         }
     }
 
@@ -803,18 +920,29 @@ pub fn configure_global_response_cache(cfg: Option<&GlobalCacheConfig>) {
     let current = holder.load_full();
 
     if !next_cfg.enabled {
-        current.invalidate_all();
+        current.global_generation.fetch_add(1, Ordering::AcqRel);
+        current.store.invalidate_all();
         holder.store(SharedResponseCache::new(next_cfg));
         return;
     }
 
     if current.config.enabled && current.config.max_bytes == next_cfg.max_bytes {
+        #[cfg(feature = "cache-l2-dragonfly")]
+        let preserved_l2 = if next_cfg.l2.as_ref().is_some_and(|c| c.enabled)
+            && current.config.l2 == next_cfg.l2
+        {
+            current.l2.clone()
+        } else {
+            None
+        };
         let preserved = Arc::new(SharedResponseCache {
             store: current.store.clone(),
             singleflight: current.singleflight.clone(),
             global_generation: Arc::clone(&current.global_generation),
             namespace_generations: Arc::clone(&current.namespace_generations),
             config: next_cfg,
+            #[cfg(feature = "cache-l2-dragonfly")]
+            l2: preserved_l2,
         });
         holder.store(preserved);
     } else {
@@ -1525,10 +1653,13 @@ fn build_response_from_cached(
     }
     if expose_cache_header {
         attach_cache_status_header(&mut resp, outcome_label);
+        #[cfg(feature = "cache-l2-dragonfly")]
         let age_secs = entry
             .initial_age
             .saturating_add(entry.stored_at.elapsed())
             .as_secs();
+        #[cfg(not(feature = "cache-l2-dragonfly"))]
+        let age_secs = entry.stored_at.elapsed().as_secs();
         if let Some(age_val) = u64_to_header_value(age_secs) {
             resp.headers_mut().insert(header::AGE, age_val);
         }
@@ -1675,6 +1806,34 @@ fn response_vary_is_cacheable(headers: &HeaderMap, rule: &CompiledCacheRule) -> 
             {
                 continue;
             }
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(feature = "cache-l2-dragonfly")]
+fn l2_entry_passes_local_policy(
+    entry: &CachedResponse,
+    rule: &CompiledCacheRule,
+    respect_cache_control: bool,
+    max_entry_bytes: usize,
+) -> bool {
+    if entry.body.len() > max_entry_bytes {
+        return false;
+    }
+    if !response_vary_is_cacheable(&entry.headers, rule) {
+        return false;
+    }
+    if respect_cache_control {
+        if contains_cache_directive(&entry.headers, header::CACHE_CONTROL, "no-store")
+            || contains_cache_directive(&entry.headers, header::CACHE_CONTROL, "no-cache")
+        {
+            return false;
+        }
+        if rule.scope == CacheScope::Public
+            && contains_cache_directive(&entry.headers, header::CACHE_CONTROL, "private")
+        {
             return false;
         }
     }
@@ -2277,6 +2436,25 @@ struct CoalesceContext {
     is_post: bool,
 }
 
+async fn serve_coalesced_follower(
+    entry: &CachedResponse,
+    server_name: &'static str,
+    expose_cache_header: bool,
+    precompress_algo: PrecompressAlgo,
+) -> Response<ServiceRespBody> {
+    if precompress_algo != PrecompressAlgo::None && entry_eligible_for_precompression(entry) {
+        entry.ensure_precompressed(precompress_algo).await;
+    }
+    ServerMetrics::inc_cache_coalesced(server_name);
+    build_response_from_cached(
+        entry,
+        false,
+        expose_cache_header,
+        "COALESCED",
+        precompress_algo,
+    )
+}
+
 async fn coalesce_and_execute<S>(
     ctx: CoalesceContext,
     req: Request<SrvBody>,
@@ -2312,7 +2490,60 @@ where
     let coalesced = cache
         .singleflight
         .work_with_input(key, req, move |leader_req| async move {
-            let gen_before = key_for_worker.generation;
+            let gen_before = cache_for_worker.current_generation(&key_for_worker.namespace);
+            let mut lookup_key = key_for_worker;
+            lookup_key.generation = gen_before;
+            if let Some(l1_entry) = cache_for_worker.get(&lookup_key) {
+                if precompress_algo != PrecompressAlgo::None
+                    && entry_eligible_for_precompression(&l1_entry)
+                {
+                    l1_entry.ensure_precompressed(precompress_algo).await;
+                }
+                return SingleflightOutcome::CachedL1(l1_entry);
+            }
+
+            #[cfg(feature = "cache-l2-dragonfly")]
+            let l2_allowed = rule_for_worker.allows_l2();
+            #[cfg(feature = "cache-l2-dragonfly")]
+            let mut l2_observed_gen: Option<(u64, u64)> = None;
+            #[cfg(feature = "cache-l2-dragonfly")]
+            if l2_allowed
+                && let Some(l2_backend) = cache_for_worker.l2_backend()
+            {
+                match l2_backend.get(&lookup_key, max_entry_bytes).await {
+                    crate::middleware::cache_l2::L2LookupOutcome::Hit { entry, .. } => {
+                        if l2_entry_passes_local_policy(
+                            &entry,
+                            &rule_for_worker,
+                            respect_cache_control,
+                            max_entry_bytes,
+                        ) {
+                            if precompress_algo != PrecompressAlgo::None
+                                && entry_eligible_for_precompression(&entry)
+                            {
+                                entry.ensure_precompressed(precompress_algo).await;
+                            }
+                            let _ = cache_for_worker.insert_if_generation(
+                                lookup_key,
+                                Arc::clone(&entry),
+                                gen_before,
+                            );
+                            return SingleflightOutcome::CachedL2(entry);
+                        }
+                        ServerMetrics::inc_cache_l2_miss(server_name);
+                    }
+                    crate::middleware::cache_l2::L2LookupOutcome::Miss {
+                        observed_remote_gen,
+                    } => {
+                        ServerMetrics::inc_cache_l2_miss(server_name);
+                        l2_observed_gen = observed_remote_gen;
+                    }
+                    crate::middleware::cache_l2::L2LookupOutcome::Unavailable => {
+                        ServerMetrics::inc_cache_l2_error(server_name);
+                    }
+                }
+            }
+
             let resp = match ready_and_call(&mut inner_for_worker, leader_req).await {
                 Ok(r) => r,
                 Err(e) => return SingleflightOutcome::UpstreamError(e.to_string()),
@@ -2346,11 +2577,21 @@ where
                     {
                         entry.ensure_precompressed(precompress_algo).await;
                     }
-                    let _ = cache_for_worker.insert_if_generation(
-                        key_for_worker,
+                    let inserted_l1 = cache_for_worker.insert_if_generation(
+                        lookup_key.clone(),
                         Arc::clone(&entry),
                         gen_before,
                     );
+                    #[cfg(feature = "cache-l2-dragonfly")]
+                    if inserted_l1
+                        && l2_allowed
+                        && entry.ttl >= crate::middleware::cache_l2::MIN_L2_WRITE_TTL
+                        && let Some(l2_backend) = cache_for_worker.l2_backend()
+                    {
+                        l2_backend.enqueue_set(lookup_key, Arc::clone(&entry), l2_observed_gen);
+                    }
+                    #[cfg(not(feature = "cache-l2-dragonfly"))]
+                    let _ = inserted_l1;
                     SingleflightOutcome::Cached(entry)
                 }
                 Ok(CollectedResponse::Bypass {
@@ -2379,6 +2620,27 @@ where
         .map_err(|_| SrvError::Other("Cache singleflight operation aborted".into()))?;
 
     match coalesced {
+        CoalescedResult::Leader(SingleflightOutcome::CachedL1(entry)) => {
+            ServerMetrics::inc_cache_hit(server_name);
+            Ok(build_response_from_cached(
+                &entry,
+                false,
+                expose_cache_header,
+                "HIT",
+                precompress_algo,
+            ))
+        }
+        #[cfg(feature = "cache-l2-dragonfly")]
+        CoalescedResult::Leader(SingleflightOutcome::CachedL2(entry)) => {
+            ServerMetrics::inc_cache_l2_hit(server_name);
+            Ok(build_response_from_cached(
+                &entry,
+                false,
+                expose_cache_header,
+                "HIT-L2",
+                precompress_algo,
+            ))
+        }
         CoalescedResult::Leader(SingleflightOutcome::Cached(entry)) => {
             ServerMetrics::inc_cache_miss(server_name);
             Ok(build_response_from_cached(
@@ -2389,20 +2651,33 @@ where
                 precompress_algo,
             ))
         }
-        CoalescedResult::Follower(SingleflightOutcome::Cached(entry), _unused_req) => {
-            if precompress_algo != PrecompressAlgo::None
-                && entry_eligible_for_precompression(&entry)
-            {
-                entry.ensure_precompressed(precompress_algo).await;
-            }
-            ServerMetrics::inc_cache_coalesced(server_name);
-            Ok(build_response_from_cached(
+        CoalescedResult::Follower(SingleflightOutcome::CachedL1(entry), _unused_req) => {
+            Ok(serve_coalesced_follower(
                 &entry,
-                false,
+                server_name,
                 expose_cache_header,
-                "COALESCED",
                 precompress_algo,
-            ))
+            )
+            .await)
+        }
+        #[cfg(feature = "cache-l2-dragonfly")]
+        CoalescedResult::Follower(SingleflightOutcome::CachedL2(entry), _unused_req) => {
+            Ok(serve_coalesced_follower(
+                &entry,
+                server_name,
+                expose_cache_header,
+                precompress_algo,
+            )
+            .await)
+        }
+        CoalescedResult::Follower(SingleflightOutcome::Cached(entry), _unused_req) => {
+            Ok(serve_coalesced_follower(
+                &entry,
+                server_name,
+                expose_cache_header,
+                precompress_algo,
+            )
+            .await)
         }
         CoalescedResult::Leader(SingleflightOutcome::Bypass) => {
             ServerMetrics::inc_cache_bypass(server_name);
@@ -2741,8 +3016,62 @@ where
             };
         }
 
-        // HEAD misses bypass caching/singleflight so empty HEAD responses never populate GET slots.
+        // HEAD misses never write into GET slots, but may read-through from L2 (K-08).
         if is_head {
+            #[cfg(feature = "cache-l2-dragonfly")]
+            if rule.allows_l2()
+                && let Some(l2_backend) = cache.l2_backend().cloned()
+            {
+                let cache_cloned = Arc::clone(cache);
+                let rule_cloned = rule.clone();
+                let mut inner = self.inner.clone();
+                return CacheFuture::Coalesce {
+                    fut: Box::pin(async move {
+                        match l2_backend.get(&key, max_entry_bytes).await {
+                            crate::middleware::cache_l2::L2LookupOutcome::Hit { entry, .. }
+                                if l2_entry_passes_local_policy(
+                                    &entry,
+                                    &rule_cloned,
+                                    respect_cache_control,
+                                    max_entry_bytes,
+                                ) =>
+                            {
+                                let _ = cache_cloned.insert_if_generation(
+                                    key,
+                                    Arc::clone(&entry),
+                                    generation,
+                                );
+                                ServerMetrics::inc_cache_l2_hit(server_name);
+                                Ok(build_response_from_cached(
+                                    &entry,
+                                    true,
+                                    expose_cache_header,
+                                    "HIT-L2",
+                                    PrecompressAlgo::None,
+                                ))
+                            }
+                            crate::middleware::cache_l2::L2LookupOutcome::Unavailable => {
+                                ServerMetrics::inc_cache_l2_error(server_name);
+                                ServerMetrics::inc_cache_bypass(server_name);
+                                let mut resp = ready_and_call(&mut inner, req).await?;
+                                if expose_cache_header {
+                                    attach_cache_status_header(&mut resp, "BYPASS");
+                                }
+                                Ok(resp)
+                            }
+                            _ => {
+                                ServerMetrics::inc_cache_l2_miss(server_name);
+                                ServerMetrics::inc_cache_bypass(server_name);
+                                let mut resp = ready_and_call(&mut inner, req).await?;
+                                if expose_cache_header {
+                                    attach_cache_status_header(&mut resp, "BYPASS");
+                                }
+                                Ok(resp)
+                            }
+                        }
+                    }),
+                };
+            }
             ServerMetrics::inc_cache_bypass(server_name);
             return CacheFuture::Bypass {
                 inner: self.inner.call(req),
@@ -5153,5 +5482,603 @@ mod tests {
         uncached_release.notify_one();
         let slow_resp = slow_task.await.unwrap();
         assert_eq!(slow_resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "cache-l2-dragonfly")]
+    mod l2_integration_tests {
+        use super::*;
+        use crate::middleware::cache_l2::{InMemoryL2Backend, InMemoryL2Cluster, L2CacheBackend};
+
+        fn build_node_cache(
+            cluster: &Arc<InMemoryL2Cluster>,
+            l1_max_ttl: Duration,
+            read_timeout: Duration,
+            max_entry_bytes: usize,
+        ) -> (Arc<SharedResponseCache>, Arc<InMemoryL2Backend>) {
+            let cfg = GlobalCacheConfig {
+                enabled: true,
+                max_bytes: 2 * 1024 * 1024,
+                default_ttl_seconds: 60,
+                max_entry_bytes,
+                max_request_body_bytes: 64 * 1024,
+                respect_cache_control: true,
+                expose_cache_header: true,
+                ..Default::default()
+            };
+            let mut backend_holder: Option<Arc<InMemoryL2Backend>> = None;
+            let cache = SharedResponseCache::new_with_l2_factory(cfg, |on_inv| {
+                let backend = cluster.connect_node(
+                    "praeco",
+                    l1_max_ttl,
+                    read_timeout,
+                    128,
+                    4 * 1024 * 1024,
+                    on_inv,
+                );
+                backend_holder = Some(Arc::clone(&backend));
+                backend
+            });
+            (cache, backend_holder.expect("backend created"))
+        }
+
+        fn make_layer(
+            cache: Arc<SharedResponseCache>,
+            server_name: &'static str,
+            rules: HashMap<String, CacheRuleConfig>,
+            namespace: Option<&str>,
+        ) -> Arc<CompiledCacheConfig> {
+            let _ = cache;
+            Arc::new(
+                CompiledCacheConfig::from_raw(
+                    &CacheLayerConfig {
+                        namespace: namespace.map(str::to_string),
+                        rules,
+                        ..Default::default()
+                    },
+                    server_name,
+                )
+                .expect("valid test cache config"),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_l2_hit_backfill_l1_max_ttl_and_initial_age_k02() {
+            let cluster = InMemoryL2Cluster::new();
+            let (cache_a, backend_a) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                64 * 1024,
+            );
+            let (cache_b, _backend_b) = build_node_cache(
+                &cluster,
+                Duration::from_millis(250),
+                Duration::from_millis(50),
+                64 * 1024,
+            );
+
+            let rules = HashMap::from([("/items/*".to_string(), CacheRuleConfig::default())]);
+            let cfg_a = make_layer(Arc::clone(&cache_a), "node_a", rules.clone(), Some("shared"));
+            let cfg_b = make_layer(Arc::clone(&cache_b), "node_b", rules, Some("shared"));
+
+            let upstream_calls = Arc::new(AtomicUsize::new(0));
+            let mk_svc = |cache: Arc<SharedResponseCache>,
+                          cfg: Arc<CompiledCacheConfig>,
+                          name: &'static str,
+                          calls: Arc<AtomicUsize>| {
+                let layer = CacheLayer::new(cfg, name).with_cache(cache);
+                let inner = tower::service_fn(move |_req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SrvError>(text_resp("shared-l2-value"))
+                    }
+                })
+                .boxed_clone();
+                layer.layer(inner)
+            };
+
+            let svc_a = mk_svc(cache_a, cfg_a, "node_a", Arc::clone(&upstream_calls));
+            let svc_b = mk_svc(cache_b, cfg_b, "node_b", Arc::clone(&upstream_calls));
+
+            // 1. Node A populates L1 and writes asynchronously to L2
+            let resp_a = svc_a.clone().oneshot(empty_req("/items/42")).await.unwrap();
+            assert_eq!(resp_a.headers().get("x-praeco-cache").unwrap(), "MISS");
+            backend_a.flush_writes().await;
+            assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+            // Wait > 1s so initial_age >= 1s on Node B (K-02 without Instant underflow)
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+
+            // 2. Node B (cold L1) reads from L2 -> HIT-L2 and backfills L1 with 250ms l1_max_ttl
+            let resp_b1 = svc_b.clone().oneshot(empty_req("/items/42")).await.unwrap();
+            assert_eq!(resp_b1.headers().get("x-praeco-cache").unwrap(), "HIT-L2");
+            let age_hdr: u64 = resp_b1
+                .headers()
+                .get(header::AGE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(age_hdr >= 1, "expected age >= 1s from L2, got {age_hdr}");
+            assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+            let gets_after_b1 = cluster.get_calls();
+
+            // 3. Immediate 2nd request on Node B hits local L1 synchronously (no extra L2 GET)
+            let resp_b2 = svc_b.clone().oneshot(empty_req("/items/42")).await.unwrap();
+            assert_eq!(resp_b2.headers().get("x-praeco-cache").unwrap(), "HIT");
+            assert_eq!(cluster.get_calls(), gets_after_b1);
+
+            // 4. After Node B's capped l1_max_ttl (250ms) expires, Node B fetches from L2 again
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let resp_b3 = svc_b.clone().oneshot(empty_req("/items/42")).await.unwrap();
+            assert_eq!(resp_b3.headers().get("x-praeco-cache").unwrap(), "HIT-L2");
+            assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_l2_singleflight_50_parallel_misses_head_readonly_and_post_rpc_k08() {
+            let cluster = InMemoryL2Cluster::new();
+            let (cache_a, backend_a) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(200),
+                64 * 1024,
+            );
+            let (cache_b, _backend_b) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(200),
+                64 * 1024,
+            );
+            let (cache_c, _backend_c) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(200),
+                64 * 1024,
+            );
+
+            let rules = HashMap::from([
+                ("/catalog/*".to_string(), CacheRuleConfig::default()),
+                (
+                    "POST /rpc.Catalog/List".to_string(),
+                    CacheRuleConfig::default(),
+                ),
+            ]);
+            let cfg_a = make_layer(Arc::clone(&cache_a), "sf_a", rules.clone(), Some("sf_ns"));
+            let cfg_b = make_layer(Arc::clone(&cache_b), "sf_b", rules.clone(), Some("sf_ns"));
+            let cfg_c = make_layer(Arc::clone(&cache_c), "sf_c", rules, Some("sf_ns"));
+
+            let upstream_calls = Arc::new(AtomicUsize::new(0));
+            let mk_svc = |cache: Arc<SharedResponseCache>,
+                          cfg: Arc<CompiledCacheConfig>,
+                          name: &'static str,
+                          calls: Arc<AtomicUsize>| {
+                let layer = CacheLayer::new(cfg, name).with_cache(cache);
+                let inner = tower::service_fn(move |req: Request<SrvBody>| {
+                    let c = Arc::clone(&calls);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        if *req.method() == Method::HEAD {
+                            return Ok::<_, SrvError>(
+                                Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(header::CONTENT_LENGTH, "13")
+                                    .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())
+                                    .unwrap(),
+                            );
+                        }
+                        Ok::<_, SrvError>(text_resp("catalog-entry"))
+                    }
+                })
+                .boxed_clone();
+                layer.layer(inner)
+            };
+
+            let svc_a = mk_svc(cache_a, cfg_a, "sf_a", Arc::clone(&upstream_calls));
+            let svc_b = mk_svc(cache_b, cfg_b, "sf_b", Arc::clone(&upstream_calls));
+            let svc_c = mk_svc(Arc::clone(&cache_c), cfg_c, "sf_c", Arc::clone(&upstream_calls));
+
+            // Warm L2 from Node A
+            let r_a = svc_a.clone().oneshot(empty_req("/catalog/1")).await.unwrap();
+            assert_eq!(r_a.headers().get("x-praeco-cache").unwrap(), "MISS");
+            backend_a.flush_writes().await;
+
+            // Inject 25ms L2 read delay and fan out 50 concurrent GETs on cold Node B
+            cluster.set_read_delay(Duration::from_millis(25));
+            let gets_before = cluster.get_calls();
+            let mut tasks = Vec::with_capacity(50);
+            for _ in 0..50 {
+                let s = svc_b.clone();
+                tasks.push(tokio::spawn(async move {
+                    let resp = s.oneshot(empty_req("/catalog/1")).await.unwrap();
+                    resp.headers()
+                        .get("x-praeco-cache")
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .to_string()
+                }));
+            }
+            let mut hit_l2_count = 0usize;
+            let mut coalesced_count = 0usize;
+            for t in tasks {
+                match t.await.unwrap().as_str() {
+                    "HIT-L2" => hit_l2_count += 1,
+                    "COALESCED" => coalesced_count += 1,
+                    other => panic!("unexpected outcome: {other}"),
+                }
+            }
+            assert_eq!(hit_l2_count, 1);
+            assert_eq!(coalesced_count, 49);
+            assert_eq!(cluster.get_calls() - gets_before, 1);
+            assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+
+            cluster.set_read_delay(Duration::ZERO);
+
+            // HEAD on cold Node C reads existing GET slot from L2, returns empty body + Content-Length, and backfills L1
+            let head_req = Request::builder()
+                .method(Method::HEAD)
+                .uri("/catalog/1")
+                .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())
+                .unwrap();
+            let head_hit = svc_c.clone().oneshot(head_req).await.unwrap();
+            assert_eq!(head_hit.headers().get("x-praeco-cache").unwrap(), "HIT-L2");
+            assert_eq!(head_hit.headers().get(header::CONTENT_LENGTH).unwrap(), "13");
+            let head_body = head_hit.into_body().collect().await.unwrap().to_bytes();
+            assert!(head_body.is_empty());
+
+            // HEAD miss must NOT populate L1/L2
+            let head_miss_req = Request::builder()
+                .method(Method::HEAD)
+                .uri("/catalog/missing")
+                .body(Empty::<Bytes>::new().map_err(SrvError::from).boxed())
+                .unwrap();
+            let head_miss = svc_c.clone().oneshot(head_miss_req).await.unwrap();
+            assert_eq!(head_miss.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+            assert!(cache_c.entry_count() <= 1);
+            let get_after_head_miss = svc_c.clone().oneshot(empty_req("/catalog/missing")).await.unwrap();
+            assert_eq!(get_after_head_miss.headers().get("x-praeco-cache").unwrap(), "MISS");
+
+            // POST RPC caching works across L2 with body_hash isolation
+            let post_req = |body: &'static [u8]| {
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/rpc.Catalog/List")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(Bytes::from_static(body)).map_err(SrvError::from).boxed())
+                    .unwrap()
+            };
+            let p1 = svc_a.clone().oneshot(post_req(br#"{"id":1}"#)).await.unwrap();
+            assert_eq!(p1.headers().get("x-praeco-cache").unwrap(), "MISS");
+            backend_a.flush_writes().await;
+
+            let p2 = svc_b.clone().oneshot(post_req(br#"{"id":1}"#)).await.unwrap();
+            assert_eq!(p2.headers().get("x-praeco-cache").unwrap(), "HIT-L2");
+            let p3 = svc_b.clone().oneshot(post_req(br#"{"id":2}"#)).await.unwrap();
+            assert_eq!(p3.headers().get("x-praeco-cache").unwrap(), "MISS");
+        }
+
+        #[tokio::test]
+        async fn test_l2_cold_start_generation_write_race_and_dragonfly_restart_k01_k07() {
+            let cluster = InMemoryL2Cluster::new();
+            let (cache_a, backend_a) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                64 * 1024,
+            );
+
+            // K-01: Node A invalidates twice before writing -> remote ns_gen = 2
+            cache_a.invalidate_namespace("k01_ns");
+            cache_a.invalidate_namespace("k01_ns");
+
+            let rules = HashMap::from([("/k01/*".to_string(), CacheRuleConfig::default())]);
+            let cfg_a = make_layer(Arc::clone(&cache_a), "k01_a", rules.clone(), Some("k01_ns"));
+            let version = Arc::new(AtomicUsize::new(1));
+            let ver_a = Arc::clone(&version);
+            let svc_a = CacheLayer::new(cfg_a, "k01_a")
+                .with_cache(Arc::clone(&cache_a))
+                .layer(
+                tower::service_fn(move |_req: Request<SrvBody>| {
+                    let v = ver_a.load(Ordering::SeqCst);
+                    async move {
+                        let body = Bytes::from(format!("v{v}"));
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(body).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone(),
+            );
+
+            let _ = svc_a.clone().oneshot(empty_req("/k01/item")).await.unwrap();
+            backend_a.flush_writes().await;
+
+            // Fresh cold Node B starts at local gen (0, 0), yet hits Node A's L2 entry at remote gen (0, 2)
+            let (cache_b, _backend_b) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                64 * 1024,
+            );
+            let cfg_b = make_layer(Arc::clone(&cache_b), "k01_b", rules.clone(), Some("k01_ns"));
+            let ver_b = Arc::clone(&version);
+            let svc_b = CacheLayer::new(cfg_b, "k01_b")
+                .with_cache(Arc::clone(&cache_b))
+                .layer(
+                tower::service_fn(move |_req: Request<SrvBody>| {
+                    let v = ver_b.load(Ordering::SeqCst);
+                    async move {
+                        let body = Bytes::from(format!("v{v}"));
+                        Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(body).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        )
+                    }
+                })
+                .boxed_clone(),
+            );
+
+            let hit_b = svc_b.clone().oneshot(empty_req("/k01/item")).await.unwrap();
+            assert_eq!(hit_b.headers().get("x-praeco-cache").unwrap(), "HIT-L2");
+            assert_eq!(hit_b.into_body().collect().await.unwrap().to_bytes(), &b"v1"[..]);
+
+            // Simulate late stale write race with outdated remote_gen (0, 0) while cluster is at (0, 2)
+            let stale_key = CacheKey {
+                namespace: Arc::from("k01_ns"),
+                generation: (0, 0),
+                scope: CacheScope::Public,
+                method: "GET",
+                path_and_query: Arc::from("/k01/race"),
+                vary_values: SmallVec::new(),
+                scope_key: Arc::from(""),
+                body_hash: None,
+                post_encoding: None,
+            };
+            let stale_entry = Arc::new(CachedResponse::new_for_test(
+                StatusCode::OK,
+                HeaderMap::new(),
+                Bytes::from_static(b"stale-race-v0"),
+                None,
+                Duration::from_secs(60),
+            ));
+            backend_a.enqueue_set(stale_key, stale_entry, Some((0, 0)));
+            backend_a.flush_writes().await;
+
+            version.store(2, Ordering::SeqCst);
+            let race_resp = svc_b.clone().oneshot(empty_req("/k01/race")).await.unwrap();
+            assert_eq!(race_resp.headers().get("x-praeco-cache").unwrap(), "MISS");
+            assert_eq!(
+                race_resp.into_body().collect().await.unwrap().to_bytes(),
+                &b"v2"[..]
+            );
+
+            // K-07: Node B has high local generation (15) before Dragonfly restarts back to remote gen (0, 0)
+            for _ in 0..15 {
+                cache_b.invalidate_namespace_local("k01_ns");
+            }
+            cluster.simulate_dragonfly_restart();
+
+            // Populate Node B L1 & L2 after restart
+            version.store(3, Ordering::SeqCst);
+            let r_b3 = svc_b.clone().oneshot(empty_req("/k01/after_restart")).await.unwrap();
+            assert_eq!(r_b3.headers().get("x-praeco-cache").unwrap(), "MISS");
+            assert_eq!(r_b3.into_body().collect().await.unwrap().to_bytes(), &b"v3"[..]);
+
+            // Node A invalidates -> remote_gen becomes 1 (< Node B's local 15), yet Node B MUST invalidate L1!
+            version.store(4, Ordering::SeqCst);
+            cache_a.invalidate_namespace("k01_ns");
+            let r_b4 = svc_b.clone().oneshot(empty_req("/k01/after_restart")).await.unwrap();
+            assert_eq!(r_b4.headers().get("x-praeco-cache").unwrap(), "MISS");
+            assert_eq!(r_b4.into_body().collect().await.unwrap().to_bytes(), &b"v4"[..]);
+        }
+
+        #[tokio::test]
+        async fn test_l2_cross_node_vary_and_max_entry_bytes_revalidation_k05() {
+            let cluster = InMemoryL2Cluster::new();
+            let (cache_a, backend_a) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                64 * 1024,
+            );
+            let (cache_b, _backend_b) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                512,
+            );
+
+            let cfg_a = make_layer(
+                Arc::clone(&cache_a),
+                "k05_a",
+                HashMap::from([(
+                    "/v/*".to_string(),
+                    CacheRuleConfig {
+                        vary_headers: vec!["X-Region".to_string()],
+                        ..Default::default()
+                    },
+                )]),
+                Some("k05_ns"),
+            );
+            // Node B omits vary_headers and has tighter max_entry_bytes = 512
+            let cfg_b = make_layer(
+                Arc::clone(&cache_b),
+                "k05_b",
+                HashMap::from([("/v/*".to_string(), CacheRuleConfig::default())]),
+                Some("k05_ns"),
+            );
+
+            let upstream_b = Arc::new(AtomicUsize::new(0));
+            let svc_a = CacheLayer::new(cfg_a, "k05_a").with_cache(cache_a).layer(
+                tower::service_fn(|req: Request<SrvBody>| async move {
+                    if req.uri().path() == "/v/big" {
+                        return Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .body(Full::new(Bytes::from(vec![b'B'; 2048])).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        );
+                    }
+                    Ok::<_, SrvError>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::VARY, "X-Region")
+                            .body(Full::new(Bytes::from_static(b"eu-only")).map_err(SrvError::from).boxed())
+                            .unwrap(),
+                    )
+                })
+                .boxed_clone(),
+            );
+            let ub_clone = Arc::clone(&upstream_b);
+            let svc_b = CacheLayer::new(cfg_b, "k05_b").with_cache(cache_b).layer(
+                tower::service_fn(move |_req: Request<SrvBody>| {
+                    let c = Arc::clone(&ub_clone);
+                    async move {
+                        c.fetch_add(1, Ordering::SeqCst);
+                        Ok::<_, SrvError>(text_resp("b-origin"))
+                    }
+                })
+                .boxed_clone(),
+            );
+
+            // Node A writes both /v/vary (Vary: X-Region) and /v/big (2048B)
+            let mut req_vary = empty_req("/v/vary");
+            req_vary
+                .headers_mut()
+                .insert("x-region", HeaderValue::from_static("eu"));
+            let _ = svc_a.clone().oneshot(req_vary).await.unwrap();
+            let _ = svc_a.clone().oneshot(empty_req("/v/big")).await.unwrap();
+            backend_a.flush_writes().await;
+
+            // Even with matching x-region header, Node B's rule does NOT cover Vary: X-Region -> reject L2
+            let mut req_b_vary = empty_req("/v/vary");
+            req_b_vary
+                .headers_mut()
+                .insert("x-region", HeaderValue::from_static("eu"));
+            let r_vary = svc_b.clone().oneshot(req_b_vary).await.unwrap();
+            assert_eq!(r_vary.headers().get("x-praeco-cache").unwrap(), "MISS");
+            assert_eq!(r_vary.into_body().collect().await.unwrap().to_bytes(), &b"b-origin"[..]);
+
+            // /v/big exceeds Node B's max_entry_bytes (512) -> rejected safely at L2 decode
+            let r_big = svc_b.clone().oneshot(empty_req("/v/big")).await.unwrap();
+            assert_eq!(r_big.headers().get("x-praeco-cache").unwrap(), "MISS");
+            assert_eq!(upstream_b.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_l2_zero_trust_per_subject_bypass_and_fail_open_k09() {
+            let cluster = InMemoryL2Cluster::new();
+            let (cache, backend) = build_node_cache(
+                &cluster,
+                Duration::from_secs(15),
+                Duration::from_millis(25),
+                64 * 1024,
+            );
+
+            let cfg = make_layer(
+                Arc::clone(&cache),
+                "k09_srv",
+                HashMap::from([
+                    (
+                        "/private/*".to_string(),
+                        CacheRuleConfig {
+                            scope: CacheScope::PerSubject,
+                            l2: None, // Zero-Trust default: L1 only
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "/private-l2/*".to_string(),
+                        CacheRuleConfig {
+                            scope: CacheScope::PerSubject,
+                            l2: Some(true),
+                            ..Default::default()
+                        },
+                    ),
+                    ("/public/*".to_string(), CacheRuleConfig::default()),
+                ]),
+                Some("k09_ns"),
+            );
+
+            let svc = CacheLayer::new(cfg, "k09_srv").with_cache(cache).layer(
+                tower::service_fn(|req: Request<SrvBody>| async move {
+                    if req.uri().path() == "/public/degraded" {
+                        let mut resp = text_resp("partial");
+                        resp.extensions_mut().insert(CacheBypass);
+                        return Ok::<_, SrvError>(resp);
+                    }
+                    if req.uri().path() == "/public/cookie" {
+                        return Ok::<_, SrvError>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::SET_COOKIE, "sid=abc")
+                                .body(Full::new(Bytes::from_static(b"cook")).map_err(SrvError::from).boxed())
+                                .unwrap(),
+                        );
+                    }
+                    Ok::<_, SrvError>(text_resp("ok"))
+                })
+                .boxed_clone(),
+            );
+
+            let sub_req = |uri: &str| {
+                let mut req = empty_req(uri);
+                req.extensions_mut().insert(Claims {
+                    sub: "user-1".to_string(),
+                    iss: "https://idp.local".to_string(),
+                    aud: None,
+                    exp: 4_000_000_000,
+                    jti: None,
+                    oids: vec![],
+                });
+                req
+            };
+
+            // 1. PerSubject without l2=true -> L1 MISS, 0 L2 writes
+            let r_priv = svc.clone().oneshot(sub_req("/private/me")).await.unwrap();
+            assert_eq!(r_priv.headers().get("x-praeco-cache").unwrap(), "MISS");
+            backend.flush_writes().await;
+            assert_eq!(cluster.set_calls(), 0);
+
+            // 2. CacheBypass (_errors) & Set-Cookie -> BYPASS, 0 L2 writes
+            let r_deg = svc.clone().oneshot(empty_req("/public/degraded")).await.unwrap();
+            assert_eq!(r_deg.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+            let r_cook = svc.clone().oneshot(empty_req("/public/cookie")).await.unwrap();
+            assert_eq!(r_cook.headers().get("x-praeco-cache").unwrap(), "BYPASS");
+            backend.flush_writes().await;
+            assert_eq!(cluster.set_calls(), 0);
+
+            // 3. PerSubject with explicit l2 = true writes to L2
+            let r_priv_l2 = svc.clone().oneshot(sub_req("/private-l2/me")).await.unwrap();
+            assert_eq!(r_priv_l2.headers().get("x-praeco-cache").unwrap(), "MISS");
+            backend.flush_writes().await;
+            assert_eq!(cluster.set_calls(), 1);
+
+            // 4. Fail-open on L2 read timeout (> 25ms) and explicit read failures
+            let err_before = ServerMetrics::for_server("k09_srv")
+                .cache_l2_errors
+                .load(Ordering::Relaxed);
+            cluster.set_read_delay(Duration::from_millis(80));
+            let r_to = svc.clone().oneshot(empty_req("/public/timeout")).await.unwrap();
+            assert_eq!(r_to.status(), StatusCode::OK);
+            assert_eq!(r_to.headers().get("x-praeco-cache").unwrap(), "MISS");
+
+            cluster.set_read_delay(Duration::ZERO);
+            cluster.set_fail_reads(true);
+            let r_err = svc.clone().oneshot(empty_req("/public/fail")).await.unwrap();
+            assert_eq!(r_err.status(), StatusCode::OK);
+            let err_after = ServerMetrics::for_server("k09_srv")
+                .cache_l2_errors
+                .load(Ordering::Relaxed);
+            assert!(err_after >= err_before + 2);
+        }
     }
 }
